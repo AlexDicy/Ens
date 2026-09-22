@@ -84,17 +84,23 @@ public check(List<ModuleContext> contexts) -> FileDiagnostic[] {
 }
 
 // A set of exception class types. Members dedup by identity only, so a base and one of its
-// subclasses can coexist; covers() is the subsumption-aware query.
+// subclasses can coexist; covers() is the subsumption-aware query. A set can also hold an
+// unresolved type. Its full extent is then unknown.
 public class ThrowSet {
     List<Type> memberTypes;
+    bool holdsUnresolved;
 
     public constructor() {
         this.memberTypes = new List<Type>();
+        this.holdsUnresolved = false;
     }
 
     // A type parameter stays in the set until substitution replaces it with what the
-    // instantiation named.
+    // instantiation named. The error type marks the set as holding an unresolved type.
     public add(Type candidate) -> bool {
+        if (candidate is ErrorType) {
+            return this.addUnresolved();
+        }
         if (!types.isClassLike(candidate) && !(candidate is TypeParamType)) {
             return false;
         }
@@ -107,8 +113,21 @@ public class ThrowSet {
         return true;
     }
 
-    protected addAll(ThrowSet other) -> bool {
+    // Marks the set as holding an unresolved type. False when it already held one.
+    protected addUnresolved() -> bool {
+        if (this.holdsUnresolved) {
+            return false;
+        }
+        this.holdsUnresolved = true;
+        return true;
+    }
+
+    // Adds every type the other set holds, an unresolved one included. False when nothing was new.
+    public addAll(ThrowSet other) -> bool {
         bool grew = false;
+        if (other.holdsUnresolved && this.addUnresolved()) {
+            grew = true;
+        }
         for (long i = 0; i < other.memberTypes.length(); i++) {
             if (this.add(other.memberTypes.get(i))) {
                 grew = true;
@@ -117,8 +136,12 @@ public class ThrowSet {
         return grew;
     }
 
-    // True when some member is the thrown type or a superclass of it, in every instantiation.
+    // True when some member is the thrown type or a superclass of it, in every instantiation. A
+    // set holding an unresolved type covers every type.
     public covers(Type thrown) -> bool {
+        if (this.holdsUnresolved) {
+            return true;
+        }
         for (long i = 0; i < this.memberTypes.length(); i++) {
             if (types.isAlwaysSubclassOf(thrown, this.memberTypes.get(i))) {
                 return true;
@@ -127,8 +150,19 @@ public class ThrowSet {
         return false;
     }
 
+    // True when the set has no member type. It can still hold an unresolved type.
     public isEmpty() -> bool {
         return this.memberTypes.length() == 0;
+    }
+
+    // True when some raised type did not resolve.
+    public hasUnresolved() -> bool {
+        return this.holdsUnresolved;
+    }
+
+    // True when the set holds no member type and no unresolved type.
+    public raisesNothing() -> bool {
+        return this.isEmpty() && !this.holdsUnresolved;
     }
 
     public members() -> List<Type> {
@@ -350,6 +384,9 @@ class ModuleExceptions {
     }
 
     relatedToAny(Type clauseType, ThrowSet bodySet) -> bool {
+        if (bodySet.hasUnresolved()) {
+            return true;
+        }
         for (long i = 0; i < bodySet.members().length(); i++) {
             if (this.mightOverlap(clauseType, bodySet.members().get(i))) {
                 return true;
@@ -358,9 +395,13 @@ class ModuleExceptions {
         return false;
     }
 
-    // The thrown members the allowed set does not cover in every instantiation.
+    // The thrown members the allowed set does not cover in every instantiation. An allowed set
+    // holding an unresolved type covers them all.
     strayUnderScope(ThrowSet thrown, ThrowSet allowed) -> ThrowSet {
         let strays = new ThrowSet();
+        if (allowed.hasUnresolved()) {
+            return strays;
+        }
         for (long i = 0; i < thrown.members().length(); i++) {
             let member = thrown.members().get(i);
             bool covered = false;
@@ -554,6 +595,9 @@ class ModuleExceptions {
                 outward.add(thrown);
             }
         }
+        if (bodySet.hasUnresolved() && !this.catchesEveryError(clauseTypes)) {
+            outward.addUnresolved();
+        }
         for (long i = 0; i < declaration.catchClausesCount(); i++) {
             let clause = declaration.catchClauses(i);
             let clauseType = clauseTypes.get(i);
@@ -565,11 +609,18 @@ class ModuleExceptions {
         return outward;
     }
 
+    // True when a clause catches 'Error' itself. Such a clause also catches an unresolved type.
+    catchesEveryError(List<Type?> clauseTypes) -> bool {
+        let errorBase = this.errorClass;
+        return errorBase != null && this.caughtBefore(errorBase, clauseTypes, clauseTypes.length());
+    }
+
     // What a 'rethrow' in clause i re-raises: every body type the clause fully catches, and the
     // clause's own type when the body only throws a broader base, since instances of the base
-    // that are not the clause's type pass the clause by.
+    // that are not the clause's type pass the clause by. A rethrow over an unresolved body type
+    // re-raises the clause's own type.
     addRethrown(ThrowSet bodySet, List<Type?> clauseTypes, long index, Type clauseType, ThrowSet outward) {
-        bool partial = false;
+        bool partial = bodySet.hasUnresolved();
         for (long m = 0; m < bodySet.members().length(); m++) {
             let thrown = bodySet.members().get(m);
             if (this.caughtBefore(thrown, clauseTypes, index)) {
@@ -786,11 +837,21 @@ class ModuleExceptions {
             this.reporter.report("Call to '{callNameOf(call)}' can throw "
                 + "{nameList(contract, this.names)}. Prefix it with 'try', and either catch it with a "
                 + "'catch' clause or mark this function 'throws'.", call.span());
+        } else if (contract.hasUnresolved() && !tried && this.targetsMarkedThrows(call)) {
+            this.reporter.report("Call to '{callNameOf(call)}' can throw, because it is "
+                + "marked 'throws'. Prefix it with 'try', and either catch it with a 'catch' clause "
+                + "or mark this function 'throws'.", call.span());
         }
-        if (contract.isEmpty() && tried) {
+        if (contract.raisesNothing() && tried) {
             this.reporter.report("'try' is not needed here: '{callNameOf(call)}' cannot "
                 + "throw. Remove 'try'.", triedAt);
         }
+    }
+
+    // True when the call's static target is marked 'throws'.
+    targetsMarkedThrows(CallExpressionNode call) -> bool {
+        let target = this.calleeSignatureOf(call);
+        return target != null && target.declaresThrows();
     }
 
     // What this call may raise at its caller. A generic callee's contract is read with the
@@ -807,16 +868,24 @@ class ModuleExceptions {
             return contract;
         }
         let substituted = new ThrowSet();
+        if (contract.hasUnresolved()) {
+            substituted.addUnresolved();
+        }
         for (long i = 0; i < contract.members().length(); i++) {
             substituted.add(this.store.substitute(contract.members().get(i), owner, arguments));
         }
         return substituted;
     }
 
+    // The types a call with no static target raises. A call through a function value raises
+    // what the value's type lists. A call that did not resolve raises an unresolved type.
     calleeFunctionThrownTypes(CallExpressionNode call) -> Type[] {
         let calleeType = this.result.typeOf(call.callee().green());
         if (calleeType != null && calleeType is FunctionType) {
             return calleeType.thrownTypes();
+        }
+        if (calleeType is ErrorType || this.result.typeOf(call.green()) is ErrorType) {
+            return [this.store.errorType()];
         }
         return [];
     }
@@ -854,7 +923,7 @@ class ModuleExceptions {
             return;
         }
         if (signature.declaresThrows()) {
-            if (outward.isEmpty() && item.declaration.body() != null) {
+            if (outward.raisesNothing() && item.declaration.body() != null) {
                 Span at = signature.nameSpan();
                 let throwsClause = item.declaration.throwsClause();
                 if (throwsClause != null) {
@@ -933,7 +1002,7 @@ class ModuleExceptions {
             return;
         }
         let bodySet = this.bodyThrows(declaration);
-        if (bodySet.isEmpty()) {
+        if (bodySet.raisesNothing()) {
             this.reporter.report("'{item.signature.name()}' has 'catch' clauses but its body "
                 + "cannot throw; remove them.",
                 declaration.catchClauses(0).catchKeyword().span());

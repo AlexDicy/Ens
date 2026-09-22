@@ -117,9 +117,6 @@ The plain null-check suggestion, `Check it for null first ('if (value != null)')
 `assertMentions` has 332 call sites across 15 files in `selfhost/sema/tests`, and the combination of an excluded stage, a substring and no count pin is what hid eight `new Error(...)` sites and four unasserted diagnostics found on 2026-09-22.
 A pass over those sites, giving each test that excludes a stage a count pin on it and exact-equality pins, is queued and wants its own context.
 
-An unresolved type in a `throws` list leaves the function reading as non-throwing, so one misspelled, private or wrongly spelled entry also reports the body's own throw as unnamed, every `try` on a call to it as not needed, and every caller's `catch` clauses as unreachable (measured 2026-09-22 across three shapes, all predating the one-way-per-kind change).
-Rule 12 wants one message for the one problem, so the entry that failed to resolve should leave the function raising the error type rather than raising nothing, which is a change to the exceptions phase and to how a signature treats an error entry in its list.
-
 ## The language server's replacement
 
 The current C++ server is temporary; these are carried to its replacement rather than fixed in it.

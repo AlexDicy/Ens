@@ -313,3 +313,229 @@ test "a thrown type parameter must be declared or listed like any other exceptio
     try assertOne(mislisted, "'forward' can throw 'E', which its 'throws' list does not name. Add "
     + "it to the list, or catch it with a 'catch' clause.");
 }
+
+// A caller holding the 'try' and the 'catch' that a call to the callee would need.
+unresolvedCaller(string callee) -> string {
+    return "caller() -> int \{\n"
+        + "    return try {callee}();\n"
+        + "\} catch (Error e) \{\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return caller();\n"
+        + "\}\n";
+}
+
+// The diagnostics of the signatures stage, after every other stage accepted the program.
+signatureProblems(FakeFileLoader loader) -> FileDiagnostic[] throws {
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Signatures]);
+    return analysis.signatureDiagnostics();
+}
+
+test "a misspelled throws entry is the one problem reported" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main.ens", "class Failure extends Error \{\n"
+        + "    protected constructor(string m) \{ super(m); \}\n"
+        + "\}\n"
+        + "misspelled() -> int throws Unknwon \{\n"
+        + "    throw new Failure(\"f\");\n"
+        + "\}\n"
+        + unresolvedCaller("misspelled"));
+    let reported = try signatureProblems(loader);
+    try testing.assertEqual(reported.length, 1L);
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "Unknown type 'Unknwon'. Check the spelling, or import the module that declares it.");
+}
+
+test "a module-qualified throws entry is the one problem reported" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/parts.ens", "public class Failure extends Error \{\n"
+        + "    public constructor(string m) \{ super(m); \}\n"
+        + "\}\n");
+    loader.add("/proj/src/main.ens", "import parts;\n"
+        + "class Other extends Error \{\n"
+        + "    protected constructor(string m) \{ super(m); \}\n"
+        + "\}\n"
+        + "qualified() -> int throws parts.Failure \{\n"
+        + "    throw new Other(\"o\");\n"
+        + "\}\n"
+        + unresolvedCaller("qualified"));
+    let reported = try signatureProblems(loader);
+    try testing.assertEqual(reported.length, 1L);
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "'parts.Failure' reaches a type through its module, and a module name reaches only "
+        + "functions. Write 'import Failure from parts;' and use 'Failure'.");
+}
+
+test "a throws entry naming another module's private type raises no exceptions problem" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/parts.ens", "class Hidden extends Error \{\n"
+        + "    protected constructor(string m) \{ super(m); \}\n"
+        + "\}\n");
+    loader.add("/proj/src/main.ens", "import Hidden from parts;\n"
+        + "class Other extends Error \{\n"
+        + "    protected constructor(string m) \{ super(m); \}\n"
+        + "\}\n"
+        + "guarded() -> int throws Hidden \{\n"
+        + "    throw new Other(\"o\");\n"
+        + "\}\n"
+        + unresolvedCaller("guarded"));
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Link, Stage.Signatures]);
+    let refused = analysis.linkDiagnostics();
+    try testing.assertEqual(refused.length, 1L);
+    try sema_support.assertDiagnostic(refused, 0, "/proj/src/main.ens",
+        "Type 'Hidden' is private to module 'parts', so only that file can use it. Mark it "
+        + "'public' to use it from other modules in the package.");
+    let unresolved = analysis.signatureDiagnostics();
+    try testing.assertEqual(unresolved.length, 1L);
+    try sema_support.assertDiagnostic(unresolved, 0, "/proj/src/main.ens",
+        "Unknown type 'Hidden'. Check the spelling, or import the module that declares it.");
+}
+
+test "a body throw is named by a throws list with an unresolved entry, whose other entries stay checked" {
+    string errors = "class IoError extends Error \{\n"
+        + "    protected constructor(string m) \{ super(m); \}\n"
+        + "\}\n"
+        + "class NetError extends Error \{\n"
+        + "    protected constructor(string m) \{ super(m); \}\n"
+        + "\}\n";
+    let covered = new FakeFileLoader();
+    covered.add("/proj/src/main.ens", errors
+        + "fetch() -> int throws Unknwon, IoError \{\n"
+        + "    throw new NetError(\"n\");\n"
+        + "\}\n"
+        + "caller() -> int \{\n"
+        + "    return try fetch();\n"
+        + "\} catch (IoError e) \{\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return caller();\n"
+        + "\}\n");
+    let reported = try signatureProblems(covered);
+    try testing.assertEqual(reported.length, 1L);
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "Unknown type 'Unknwon'. Check the spelling, or import the module that declares it.");
+    let repeated = new FakeFileLoader();
+    repeated.add("/proj/src/main.ens", errors
+        + "fetch() -> int throws Unknwon, IoError, IoError \{\n"
+        + "    throw new NetError(\"n\");\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return try fetch();\n"
+        + "\} catch (Error e) \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(repeated, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Signatures, Stage.Checks]);
+    let unresolved = analysis.signatureDiagnostics();
+    try testing.assertEqual(unresolved.length, 1L);
+    try sema_support.assertDiagnostic(unresolved, 0, "/proj/src/main.ens",
+        "Unknown type 'Unknwon'. Check the spelling, or import the module that declares it.");
+    let checked = analysis.checkDiagnostics();
+    try testing.assertEqual(checked.length, 1L);
+    try sema_support.assertDiagnostic(checked, 0, "/proj/src/main.ens",
+        "Declared throws type 'IoError' overlaps with another type in the list; list each "
+        + "exception once.");
+}
+
+test "a call through a function value whose throws list did not resolve needs its try" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main.ens", "class Failure extends Error \{\n"
+        + "    protected constructor(string m) \{ super(m); \}\n"
+        + "\}\n"
+        + "run((() -> void throws Unknwon) body) \{\n"
+        + "    try body();\n"
+        + "\} catch (Failure e) \{\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = try signatureProblems(loader);
+    try testing.assertEqual(reported.length, 1L);
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "Unknown type 'Unknwon'. Check the spelling, or import the module that declares it.");
+}
+
+// A function whose 'throws' list does not resolve, and whose body throws a declared 'Failure'.
+misspelledThrower() -> string {
+    return "class Failure extends Error \{\n"
+        + "    protected constructor(string m) \{ super(m); \}\n"
+        + "\}\n"
+        + "misspelled() -> int throws Unknwon \{\n"
+        + "    throw new Failure(\"f\");\n"
+        + "\}\n";
+}
+
+// The one exceptions diagnostic of a program whose only other problem is the unknown type
+// 'Unknwon'.
+exceptionBesideUnknwon(string text) -> FileDiagnostic throws {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main.ens", text);
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Signatures, Stage.Exceptions]);
+    let unresolved = analysis.signatureDiagnostics();
+    try testing.assertEqual(unresolved.length, 1L);
+    try sema_support.assertDiagnostic(unresolved, 0, "/proj/src/main.ens",
+        "Unknown type 'Unknwon'. Check the spelling, or import the module that declares it.");
+    let reported = analysis.exceptionDiagnostics();
+    try testing.assertEqual(reported.length, 1L);
+    return reported[0];
+}
+
+test "a catch of Error handles a call whose throws list did not resolve" {
+    let tried = try exceptionBesideUnknwon(misspelledThrower()
+        + "caller() -> int \{\n"
+        + "    return try misspelled();\n"
+        + "\} catch (Error e) \{\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return try caller();\n"
+        + "\}\n");
+    try testing.assertEqual(tried.message(),
+        "'try' is not needed here: 'caller' cannot throw. Remove 'try'.");
+    let marked = try exceptionBesideUnknwon(misspelledThrower()
+        + "caller() -> int throws \{\n"
+        + "    return try misspelled();\n"
+        + "\} catch (Error e) \{\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try testing.assertEqual(marked.message(),
+        "'caller' is marked 'throws' but cannot throw; remove 'throws'.");
+}
+
+test "a call to a function marked throws needs try when its throws list did not resolve" {
+    let reported = try exceptionBesideUnknwon(misspelledThrower()
+        + "main() -> int \{\n"
+        + "    return misspelled();\n"
+        + "\}\n");
+    try testing.assertEqual(reported.message(),
+        "Call to 'misspelled' can throw, because it is marked 'throws'. Prefix it with 'try', "
+        + "and either catch it with a 'catch' clause or mark this function 'throws'.");
+}
+
+test "a call to an undefined function is the one problem reported" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main.ens", "class Failure extends Error \{\n"
+        + "    protected constructor(string m) \{ super(m); \}\n"
+        + "\}\n"
+        + "caller() \{\n"
+        + "    try nope();\n"
+        + "\} catch (Failure e) \{\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Bodies]);
+    let reported = analysis.bodyDiagnostics();
+    try testing.assertEqual(reported.length, 1L);
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "Undefined function 'nope'. Check the spelling, or import the module that declares it.");
+}
