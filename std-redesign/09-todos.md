@@ -116,8 +116,12 @@ This is a nullability item rather than a safe-navigation one: a plain nullable l
 "The compiler does not support assigning to this target yet." is written at two sites in `selfhost/codegen/src/lower/assignments.ens`, and rule 16 applies to one of them and maybe not the other, so neither is reworded until they are told apart.
 The site in `lower` is now reachable from no program sema accepts, since sema admits only an identifier, a field, or an array element as a write target, which would make it a bug-catcher that takes the `Internal:` prefix; the site in `lowerThroughAddress` fires when an address cannot be computed for a field or an array element, which sema does accept, and no program reaching it has been found (2026-09-21).
 
-The sema test suite's stand-in `@std.core` declares `Error.message` without `const`, while `libs/std/src/core.ens` declares it `export const string message` on an abstract class.
-So a test program that assigns that field through a subclass constructor is clean against the stand-in and refused against the real library, which is how a fixture carried a second problem nobody saw until it was checked against `libs` (2026-09-21).
+`checkStaticInstanceCollision` (`selfhost/sema/src/phases/members.ens:733-772`) walks the base chain for fields and not for methods, so a subclass static const may not share a name with an inherited instance field while a subclass static method may share one with an inherited instance method (2026-09-22).
+The field half is what "statics are not inherited" predicts, since the subclass inherits the instance member and the static collides with it, so the method half is the one that disagrees with the rule.
+Making it refuse turns away programs that compile today, which is why it waits on a ruling.
+
+`assertMentions` has 332 call sites across 15 files in `selfhost/sema/tests`, and the combination of an excluded stage, a substring and no count pin is what hid eight `new Error(...)` sites and four unasserted diagnostics found on 2026-09-22.
+A pass over those sites, giving each test that excludes a stage a count pin on it and exact-equality pins, is queued and wants its own context.
 
 ## The language server's replacement
 
