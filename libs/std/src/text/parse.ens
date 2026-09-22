@@ -152,18 +152,105 @@ final class LongRange {
 
 // The nearest `double` to the number the text spells, with one rounding at the end. A number
 // written in source and the same number read here are therefore one value. The text has already
-// been found to spell a number, and anything else is zero. A magnitude past the range is
-// as an infinity and one below it as zero or a subnormal, so this never fails. Underscores and a
+// been found to spell a number, and anything else is zero. A magnitude past the range reads as an
+// infinity and one below it as zero or a subnormal, so this never fails. Underscores and a
 // trailing 'f', 'F', 'd' or 'D' are ignored, the way a literal carries them.
 export nearestDouble(string text) -> double {
-    let reading = new Reading();
-    let digits = read(text, reading);
-    double magnitude = magnitudeOf(digits);
-    if (reading.negative) {
+    long start = 0;
+    bool negative = false;
+    if (text.length > 0 && (text.byteAt(0) == '-' || text.byteAt(0) == '+')) {
+        negative = text.byteAt(0) == '-';
+        start = 1;
+    }
+    double magnitude = magnitudeFrom(text, start);
+    if (negative) {
         // Multiplied rather than subtracted from zero, so a negative zero stays negative.
         return magnitude * minusOne();
     }
     return magnitude;
+}
+
+// The magnitude the text spells from `start`, the sign already taken off the front. One
+// multiplication or one division reads a short number, and a buffer of digits reads every other
+// one. Both round once to the nearest double, so a number reads the same either way.
+magnitudeFrom(string text, long start) -> double {
+    let magnitude = shortMagnitude(text, start);
+    if (magnitude != null) {
+        return magnitude;
+    }
+    return magnitudeOf(read(text, start));
+}
+
+// The magnitude one multiplication reaches, or null for text the digit buffer has to read. The
+// text has to spell a mantissa a double holds exactly, and the decimal exponent has to stay
+// inside the powers of ten a double holds exactly. One multiplication or one division of two such
+// values is then the only rounding, and it lands on the nearest double.
+shortMagnitude(string text, long start) -> double? {
+    // A mantissa past the last whole step, or at it with a digit past what is left, would carry
+    // the value past what a double holds exactly.
+    long step = Bounds.exactMantissa / 10;
+    long lastDigit = Bounds.exactMantissa % 10;
+    // An exponent larger than this leaves `scale` out of range whichever sign it carries, since a
+    // fraction has at most one digit per byte of text.
+    long exponentCeiling = Bounds.exactPowerOfTen + text.length;
+    long mantissa = 0;
+    long fractionDigits = 0;
+    long exponent = 0;
+    bool exponentNegative = false;
+    bool seenPoint = false;
+    bool inExponent = false;
+    for (long i = start; i < text.length; i++) {
+        byte value = text.byteAt(i);
+        if (value >= '0' && value <= '9') {
+            long digit = value - '0';
+            if (inExponent) {
+                if (exponent > exponentCeiling) {
+                    return null;
+                }
+                exponent = exponent * 10 + digit;
+                continue;
+            }
+            if (mantissa > step || (mantissa == step && digit > lastDigit)) {
+                return null;
+            }
+            mantissa = mantissa * 10 + digit;
+            if (seenPoint) {
+                fractionDigits = fractionDigits + 1;
+            }
+            continue;
+        }
+        if (value == '.') {
+            seenPoint = true;
+            continue;
+        }
+        if (value == 'e' || value == 'E') {
+            inExponent = true;
+            continue;
+        }
+        if (value == '-') {
+            if (!inExponent) {
+                return null;
+            }
+            exponentNegative = true;
+            continue;
+        }
+        if (value == '_' || value == '+' || value == 'f' || value == 'F' || value == 'd'
+                || value == 'D') {
+            continue;
+        }
+        return null;
+    }
+    if (exponentNegative) {
+        exponent = 0 - exponent;
+    }
+    long scale = exponent - fractionDigits;
+    if (scale > Bounds.exactPowerOfTen || scale < 0 - Bounds.exactPowerOfTen) {
+        return null;
+    }
+    if (scale < 0) {
+        return (mantissa as double) / powerOfTen(0 - scale);
+    }
+    return (mantissa as double) * powerOfTen(scale);
 }
 
 // Scales the digits into [0.5, 1) while counting the power of two that takes them back. The
@@ -252,6 +339,16 @@ powerOfTwo(long exponent) -> double {
     return result;
 }
 
+// Ten to a power, by multiplying from one, which is exact for every power of ten a double holds
+// exactly. Its one caller stays inside that range.
+powerOfTen(long exponent) -> double {
+    double result = 1.0;
+    for (long i = 0; i < exponent; i++) {
+        result = result * 10.0;
+    }
+    return result;
+}
+
 infinity() -> double {
     return powerOfTwo(Bounds.largest);
 }
@@ -260,36 +357,26 @@ minusOne() -> double {
     return 0.0 - 1.0;
 }
 
-// The sign at the front of the text, which the digits themselves never carry.
-final class Reading {
-    protected bool negative;
-
-    protected constructor() {
-        this.negative = false;
-    }
-}
-
-// The digits and the decimal exponent the text spells. A leading zero counts only against the
-// exponent, and a digit after the first significant one is placed by its position.
-read(string text, Reading reading) -> Digits {
+// The digits and the decimal exponent the text spells from `start`, the sign already taken off
+// the front. A leading zero counts only against the exponent, and a digit after the first
+// significant one is placed by its position.
+read(string text, long start) -> Digits {
     let digits = new Digits();
-    byte[] raw = text.toBytes();
     bool seenPoint = false;
     bool inExponent = false;
     bool exponentNegative = false;
     bool anyDigit = false;
     long leadingZeros = 0;
     long exponent = 0;
-    for (long i = 0; i < raw.length; i++) {
-        byte value = raw[i];
-        if (value == '_' || value == 'f' || value == 'F' || value == 'd' || value == 'D' || value == '+') {
+    for (long i = start; i < text.length; i++) {
+        byte value = text.byteAt(i);
+        if (value == '_' || value == 'f' || value == 'F' || value == 'd' || value == 'D'
+                || value == '+') {
             continue;
         }
         if (value == '-') {
             if (inExponent) {
                 exponentNegative = true;
-            } else {
-                reading.negative = true;
             }
             continue;
         }
@@ -566,4 +653,10 @@ final class Bounds {
 
     // The bits a normal double's mantissa holds.
     protected static const long mantissaBits = 53;
+
+    // The largest mantissa a double holds exactly along with every integer below it, and the
+    // largest exponent of ten a double holds exactly. A magnitude read in one multiplication
+    // stays inside both.
+    protected static const long exactMantissa = 9007199254740992;
+    protected static const long exactPowerOfTen = 22;
 }
