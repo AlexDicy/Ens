@@ -178,6 +178,14 @@ class LocalName extends NameResolution {
     protected constructor(this.binding);
 }
 
+// The type parameter in scope under the name, which takes that name for the whole of the
+// declaration introducing it, ahead of everything the file declares or imports under it.
+class TypeParameterName extends NameResolution {
+    protected TypeParamType parameter;
+
+    protected constructor(this.parameter);
+}
+
 // The entries a call to this name could reach, and the prelude match they came from when they
 // came from there rather than from the module's own function table.
 class FunctionName extends NameResolution {
@@ -1176,27 +1184,31 @@ class BodyChecker implements NoreturnCalls {
         return this.lookupCapture(name);
     }
 
-    // Unqualified name resolution: local scopes innermost-first, then the module's functions,
-    // then a type this file declares, then the file's imports, then the prelude's functions,
-    // then the implicit exception base class.
+    // Unqualified name resolution, innermost declaration first: local scopes, then a type
+    // parameter in scope, then the module's functions, then a type this file declares, then the
+    // file's imports, then the prelude's functions, then the implicit exception base class.
     resolveName(string name) -> NameResolution? {
         let binding = this.lookupBinding(name);
         if (binding != null) {
             return new LocalName(binding);
         }
+        let parameter = this.resolver.typeParameterNamed(name);
+        if (parameter != null) {
+            return new TypeParameterName(parameter);
+        }
+        return this.resolveNameOutsideTypeParameters(name);
+    }
+
+    // What the name means to the file, with the type parameters in scope left out. A refused
+    // type parameter reads this to name the meaning it took the name from.
+    resolveNameOutsideTypeParameters(string name) -> NameResolution? {
         let entries = this.context.functions().entriesNamed(name);
         if (entries != null && entries.length() > 0) {
             return new FunctionName(entries, null);
         }
-        // A type parameter in scope shadows this file's own types and the prelude under the same
-        // name, as it does in a type position. The callers that read a name as a type head
-        // resolve the parameter themselves.
-        bool shadowedByTypeParameter = this.resolver.typeParameterNamed(name) != null;
-        if (!shadowedByTypeParameter) {
-            let declared = this.store.findDeclared(this.modulePath, name);
-            if (declared != null) {
-                return new TypeName(declared);
-            }
+        let declared = this.store.findDeclared(this.modulePath, name);
+        if (declared != null) {
+            return new TypeName(declared);
         }
         let imported = this.context.linkTable().binding(name);
         if (imported is ImportedType) {
@@ -1206,7 +1218,7 @@ class BodyChecker implements NoreturnCalls {
             return new NamespaceName(imported.modulePath());
         }
         let offered = this.preludeScope.match(name, this.modulePath, this.packagePrefix);
-        if (offered != null && !shadowedByTypeParameter) {
+        if (offered != null) {
             return new FunctionName(offered.entries(), offered);
         }
         if (name == "Error") {
@@ -3379,12 +3391,6 @@ class BodyChecker implements NoreturnCalls {
                     + "'{ownerName}'; write '{ownerName}.{name}'.", node.name().span());
                 return this.store.errorType();
             }
-            let parameter = this.resolver.typeParameterNamed(name);
-            if (parameter != null) {
-                this.reportTypeParameterRefusal("'{name}' is a type parameter, not a value.",
-                    parameter, node.name().span());
-                return this.store.errorType();
-            }
             this.reporter.report("Undefined name '{name}'. Check the spelling, or declare it "
                 + "before it is used.", node.name().span());
             return this.store.errorType();
@@ -3405,6 +3411,11 @@ class BodyChecker implements NoreturnCalls {
             },
             is TypeName named -> {
                 this.reportTypeAsValue(name, named.target, node.name().span());
+                return this.store.errorType();
+            },
+            is TypeParameterName held -> {
+                this.reportTypeParameterRefusal("'{name}' is a type parameter, not a value.",
+                    held.parameter, node.name().span());
                 return this.store.errorType();
             },
             is NamespaceName module -> {
@@ -3455,8 +3466,93 @@ class BodyChecker implements NoreturnCalls {
     // type at each use, so a value declared with it is the only route the message offers.
     reportTypeParameterRefusal(string refusal, TypeParamType parameter, Span at) {
         string name = parameter.name();
-        this.reporter.report("{refusal} Use a value of type '{name}', such as a parameter "
-            + "declared '{name} value'.", at);
+        this.reporter.report(this.typeParameterMessage(parameter, "{refusal} Use a value of "
+            + "type '{name}', such as a parameter declared '{name} value'."), at);
+    }
+
+    // What a refused type parameter reads: the collision where it took the name from another
+    // meaning of the file, and 'plain' where the name means nothing else there.
+    typeParameterMessage(TypeParamType parameter, string plain) -> string {
+        let asStatic = this.shadowedStaticMessage(parameter);
+        if (asStatic != null) {
+            return asStatic;
+        }
+        string name = parameter.name();
+        // 'obligationOwnerName' is the generic declaration whose body is being checked, which
+        // is the one whose header introduced the parameter.
+        string genericOwner = this.obligationOwnerName;
+        let taken = this.shadowedMeaning(name);
+        if (taken == null || genericOwner.length == 0) {
+            return plain;
+        }
+        return "'{name}' is the type parameter of '{genericOwner}' here, not {taken}, because "
+            + "a type parameter takes the name for the whole of '{genericOwner}'. Rename one of "
+            + "the two.";
+    }
+
+    // A static of the enclosing type under the refused name, or null where it declares none. A
+    // static const is read through the plain type name, while a static method of a generic type
+    // needs the type arguments that only such a call itself could otherwise determine.
+    shadowedStaticMessage(TypeParamType parameter) -> string? {
+        let owner = this.enclosingOwner;
+        if (owner == null) {
+            return null;
+        }
+        let authority = types.authorityOf(owner);
+        if (authority == null) {
+            return null;
+        }
+        string name = parameter.name();
+        string ownerName = authority.name();
+        if (members.findField(types.staticFieldsOf(owner), name) != null) {
+            return "'{name}' is the type parameter of '{ownerName}' here, not the static const "
+                + "it declares. Write '{ownerName}.{name}' to read the static.";
+        }
+        if (members.findMethodNamed(types.staticMethodsOf(owner), name) != null) {
+            return "'{name}' is the type parameter of '{ownerName}' here, not the static method "
+                + "it declares. Write '{this.names.of(owner)}.{name}(...)' to call the static.";
+        }
+        return null;
+    }
+
+    // The meaning a type parameter took its name from, as the refusal names it, or null where
+    // the name means nothing else in the file.
+    shadowedMeaning(string name) -> string? {
+        let outside = this.resolveNameOutsideTypeParameters(name);
+        if (outside == null) {
+            return null;
+        }
+        switch (outside) {
+            is TypeName named -> {
+                return this.declaringPhrase(types.kindWordOf(named.target),
+                    named.target.modulePath());
+            },
+            is FunctionName functions -> {
+                let offered = functions.fromPrelude;
+                if (offered == null) {
+                    return this.declaringPhrase("function", this.modulePath);
+                }
+                string[] paths = offered.modulePaths();
+                if (paths.length != 1) {
+                    return null;
+                }
+                return this.declaringPhrase("function", paths[0]);
+            },
+            is NamespaceName module -> {
+                return "the module '{module.targetModulePath}' this file imports";
+            },
+            default -> {
+                return null;
+            },
+        }
+    }
+
+    // Where a shadowed meaning is declared, as the refusal names it.
+    declaringPhrase(string kindWord, string modulePath) -> string {
+        if (modulePath == this.modulePath) {
+            return "the {kindWord} this file declares";
+        }
+        return "the {kindWord} declared in module '{modulePath}'";
     }
 
     // How this file writes a value of the type, then how it reaches a static member of it. A
@@ -5434,7 +5530,7 @@ class BodyChecker implements NoreturnCalls {
                 return this.analyzeNamespaceMemberValue(resolution.targetModulePath, objectName,
                     name, node.member().span(), position);
             }
-            let enumType = this.enumTypeNamed(objectName, resolution);
+            let enumType = this.enumTypeNamed(resolution);
             if (enumType != null) {
                 this.result.setType(object.green(), enumType);
                 long ordinal = enumOrdinal(enumType, name);
@@ -5707,16 +5803,8 @@ class BodyChecker implements NoreturnCalls {
         return true;
     }
 
-    // The enum a member access's head names, or null where the head names anything else. A head
-    // name a type parameter shadows still reads as this file's enum of the same name.
-    enumTypeNamed(string objectName, NameResolution? resolution) -> EnumType? {
-        if (resolution == null) {
-            let found = this.store.findDeclared(this.modulePath, objectName);
-            if (found is EnumType) {
-                return found;
-            }
-            return null;
-        }
+    // The enum a member access's head names, or null where the head names anything else.
+    enumTypeNamed(NameResolution? resolution) -> EnumType? {
         if (resolution is TypeName) {
             let target = resolution.target;
             if (target is EnumType) {
@@ -5749,8 +5837,8 @@ class BodyChecker implements NoreturnCalls {
 
     // The type a bare head name stands for: a primitive's own keyword names the primitive, and
     // unqualified resolution decides the rest, so a local or a module function of that name
-    // leaves no type head. A type parameter stands for itself where nothing else claims the
-    // name. Enums stay with the enum-member path.
+    // leaves no type head. A type parameter in scope stands for itself. Enums stay with the
+    // enum-member path.
     staticHeadNamed(string name) -> Type? {
         if (name.length == 0) {
             return null;
@@ -5760,8 +5848,8 @@ class BodyChecker implements NoreturnCalls {
             return primitive;
         }
         let resolution = this.resolveName(name);
-        if (resolution == null) {
-            return this.resolver.typeParameterNamed(name);
+        if (resolution is TypeParameterName) {
+            return resolution.parameter;
         }
         if (resolution is TypeName && !(resolution.target is EnumType)) {
             return resolution.target;
@@ -5808,10 +5896,10 @@ class BodyChecker implements NoreturnCalls {
     }
 
     reportTypeParameterHead(TypeParamType parameter, Span at) {
-        this.reporter.report("Statics cannot be reached through a type parameter: "
-            + "'{parameter.name()}' is a different type each time it is used, so "
-            + "'{parameter.name()}.member' names nothing fixed. Write the type's own name "
-            + "instead.", at);
+        string name = parameter.name();
+        this.reporter.report(this.typeParameterMessage(parameter, "Statics cannot be reached "
+            + "through a type parameter: '{name}' is a different type each time it is used, so "
+            + "'{name}.member' names nothing fixed. Write the type's own name instead."), at);
     }
 
     // A member read whose head is a type name: a static const resolves to its constant value, a
@@ -6630,23 +6718,10 @@ class BodyChecker implements NoreturnCalls {
         }
         let resolution = this.resolveName(name);
         if (resolution == null) {
-            // A name a type parameter shadows still calls this file's struct constructor of the
-            // same name.
-            let declared = this.store.findDeclared(this.modulePath, name);
-            if (declared != null && types.isStructLike(declared)) {
-                return this.analyzeStructConstructorCall(node, declared, name);
-            }
             let ownerName = this.staticSuggestionOwner(name);
             if (ownerName != null) {
                 this.reporter.report("Statics are called through the type name, even inside "
                     + "'{ownerName}'; write '{ownerName}.{name}(...)'.", identifier.span());
-                this.analyzeArgumentsOnly(node.arguments());
-                return this.store.errorType();
-            }
-            let parameter = this.resolver.typeParameterNamed(name);
-            if (parameter != null) {
-                this.reportTypeParameterRefusal("'{name}' is a type parameter, not a function.",
-                    parameter, identifier.span());
                 this.analyzeArgumentsOnly(node.arguments());
                 return this.store.errorType();
             }
@@ -6679,6 +6754,12 @@ class BodyChecker implements NoreturnCalls {
                     return this.analyzeStructConstructorCall(node, named.target, name);
                 }
                 this.reportTypeAsCall(name, named.target, true, identifier.span());
+                this.analyzeArgumentsOnly(node.arguments());
+                return this.store.errorType();
+            },
+            is TypeParameterName held -> {
+                this.reportTypeParameterRefusal("'{name}' is a type parameter, not a function.",
+                    held.parameter, identifier.span());
                 this.analyzeArgumentsOnly(node.arguments());
                 return this.store.errorType();
             },

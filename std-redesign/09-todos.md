@@ -102,8 +102,10 @@ An enum constant reached the same way, `renderer.Kind.Large`, reports that same 
 A static-as-value message on a bare generic head can spell its fix only as `Holder.make(...)`, which fails when the call cannot infer the type arguments, while `Holder<T>.make(...)` would name a type parameter the use site does not have in scope.
 The type-as-value refusal therefore names a generic type's static const, which needs no type argument, and never its static method (2026-09-22).
 
-Which name wins where a type parameter and a type of the same name collide depends on the position.
-A bare `Tag` and a `Tag.member` static head both read the type parameter and are refused, while `Made(3)` reaches the file's own struct constructor, `Kind.Large` names the file's own enum constant, and an imported `Widget` keeps its statics (2026-09-22).
+A type parameter in scope wins its name in every position, so inside `class Bin<Kind>` the name `Kind` is the parameter whether it is written as a type, as `Kind.Large`, as `Made(3)`, or as a static head (ruled 2026-09-22).
+The file's own class, struct, interface or enum of that name, a type or a module it imports, a function it declares, and a function an implicitly imported module declares are all unreachable under that name inside the declaration; only a local declared further in takes the name back.
+A class header declares the parameter inside the file's own declarations, an inner declaration wins for the whole of its scope, and resolving by position instead would let one name mean two things with nothing in the source marking where the meaning switches.
+It leaves one rule with no exceptions, which the divergent cases it replaced did not, and a type parameter can be neither constructed nor called and has no constants or statics of its own, so nothing is lost by refusing every use of it as a value.
 
 One shape still reports that a left side must be a variable, field, or array element where it is one.
 Parentheses inside a target rather than around it, `(point).x = 2;` on a struct local, keep that sentence, while `(held).value = 1;` on a class and `(slots)[0] = 5;` on an array are accepted, so what the message can say waits on whether the struct shape should be refused at all.
