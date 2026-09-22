@@ -106,7 +106,13 @@ It leaves one rule with no exceptions, which the divergent cases it replaced did
 
 `++`, `--` and a compound assignment on a nullable name the type and stop there: `x++` on an `int?` reports "The '++' operator works only on numbers, and this value has type 'int?'. Use it on an integer or a floating-point variable, for example 'count++'.", and `x += 1` reports "'+=' needs numbers on both sides, got 'int?' and 'int'.", neither of which mentions the null check that makes the line work (2026-09-21).
 This is a nullability item rather than a safe-navigation one: a plain nullable local reads the same as `maybe?.value++`, whose text is pinned so a change has to move the pin.
-`counter++` on a narrowed `int?` clears the narrowing through `invalidateForWrite`, so a second `counter++` on the same local reports that same numbers text and a following `counter += 1` its `'+='` twin, although an increment stores a present value and could re-establish the narrowing the way an assignment does (2026-09-22).
+Since narrowing applies to stable places only (2026-09-22), arithmetic on a checked mutable field, `this.count + 1` after `if (this.count != null)`, reaches the same three texts, and none of them carries the local-copy advice the null-use texts now give.
+
+A `lazy const` reached through its type name, `Settings.label` on a `lazy const string?`, is a stable place under the 2026-09-22 ruling but has no narrowing root, so a null check on it proves nothing and the read after it gets the generic null-use text (a nullable `static const` cannot exist, since a static const is a primitive, `char`, `bool` or `string`).
+The plain null-check suggestion, `Check it for null first ('if (value != null)')`, names a placeholder where rule 1 wants the real name; it is pinned as it stands in the sema test "unsound reads stay rejected" so the fix moves that pin (2026-09-22).
+`t.label + 1` on a `string?` takes the numeric branch, because the string branch tests the type rather than what is under its `?`, so it reports `'+' needs numbers on both sides, got 'string?' and 'int'.` where a string and a number concatenate, and `t.label < word` on a `string?` reports `'<' compares numbers, got 'string?' and 'string'.` without the `compareTo` hint the plain `string` case gets (2026-09-23).
+
+`tests/native_conflict_error` names `native_pkga` or `native_pkgb` first depending on the folder the tree sits in rather than on the compiler that runs, so the order of that report depends on the path; its `@expect-error` pins a prefix, so no run notices (2026-09-23).
 
 `assertMentions` has 332 call sites across 15 files in `selfhost/sema/tests`, and the combination of an excluded stage, a substring and no count pin is what hid eight `new Error(...)` sites and four unasserted diagnostics found on 2026-09-22.
 A pass over those sites, giving each test that excludes a stage a count pin on it and exact-equality pins, is queued and wants its own context.
@@ -136,6 +142,7 @@ It checks no duplicate struct field, so a struct that declares one name twice is
 Its own copies of three of the messages rewritten on 2026-09-21 keep the weaker wording, the `this.field` shorthand refusal at `lsp/frontend/semantic/Analyzer.cpp:2537` and the cross-package member and constructor refusals at lines 5391 and 5634.
 It accepts a module-qualified type name in every type position, resolving `ns.Name` through `lookupTypeByName` at `lsp/frontend/semantic/Analyzer.cpp:3381-3415` for a head its parser admits at `Parser.cpp:1047` and `1278`, and as a value at `Analyzer.cpp:7181-7187`, all of which the compiler refuses as of 2026-09-22; its own diagnostics also still spell a type reached through a module alias as `alias.Type`.
 It refuses `(x) = 1;` with "Left side of assignment must be an assignable expression", because its own `isLValue` at `lsp/frontend/semantic/Analyzer.cpp:8767` has no parenthesized arm, while the compiler accepts parentheses around any place as of 2026-09-22.
+Its own `buildNarrowingPath` at `lsp/frontend/semantic/Analyzer.cpp:4051` still has member and subscript arms, so the editor narrows a mutable field or an array element after a null check where the compiler, as of 2026-09-22, narrows stable places only.
 
 ## Reminders
 

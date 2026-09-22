@@ -1308,57 +1308,38 @@ class BodyChecker implements NoreturnCalls {
 
     // ---- Narrowing ----
 
-    // The storage path an expression names, or null when the expression is not a narrowable
-    // location. 'allowAnyIndex' admits every other index form as an AnyIndex hop, for
-    // write-invalidation queries only. A 'weak' field never joins a path, because its value can
-    // become null whenever the referent loses its last strong reference, so fact collection,
-    // proven-type lookup, and invalidation all agree that nothing is ever proven through one.
-    buildNarrowingPath(Expression expression, bool allowAnyIndex, bool byName = false) -> NarrowingPath? {
+    // The path of a stable place, or null when the expression names none. A check or a write on
+    // an expression narrows only the path this builds for it.
+    buildNarrowingPath(Expression expression) -> NarrowingPath? {
         let segments = new List<PathSegment>();
-        let root = this.collectPathSegments(expression, allowAnyIndex, byName, segments);
+        let root = this.collectPathSegments(expression, segments);
         if (root == null) {
             return null;
         }
         return new NarrowingPath(root, segments);
     }
 
-    // 'byName' resolves each root and identifier index by name against the current scope rather
-    // than by the analyzed side table, for the loop-entry pre-clear whose body nodes are not yet
-    // analyzed.
-    collectPathSegments(Expression expression, bool allowAnyIndex, bool byName,
-                                List<PathSegment> segments) -> LocalBinding? {
+    // A stable place is a local, a parameter or 'this', or a 'const' field reached through a
+    // stable place. Any other field, and any array element, can be written through another
+    // reference between a check and a use, so neither joins a path.
+    collectPathSegments(Expression expression, List<PathSegment> segments) -> LocalBinding? {
         Expression core = unwrapParentheses(expression);
         switch (core) {
             is IdentifierExpressionNode identifier -> {
-                if (byName) {
-                    return this.lookupBinding(identifier.name().text());
-                }
                 return this.result.bindingOf(identifier.green());
             },
             is ThisExpressionNode ignored -> {
                 return this.thisBinding;
             },
             is MemberExpressionNode member -> {
-                let root = this.collectPathSegments(member.object(), allowAnyIndex, byName,
-                    segments);
+                let root = this.collectPathSegments(member.object(), segments);
                 if (root == null) {
                     return null;
                 }
-                if (this.readsWeakField(member)) {
+                if (!this.readsConstField(member)) {
                     return null;
                 }
                 segments.push(narrow.fieldSegment(member.member().text()));
-                return root;
-            },
-            is SubscriptExpressionNode subscript -> {
-                let root = this.collectPathSegments(subscript.object(), allowAnyIndex, byName,
-                    segments);
-                if (root == null) {
-                    return null;
-                }
-                if (!this.collectIndexSegment(subscript.index(), allowAnyIndex, byName, segments)) {
-                    return null;
-                }
                 return root;
             },
             default -> {
@@ -1367,43 +1348,41 @@ class BodyChecker implements NoreturnCalls {
         }
     }
 
-    // Appends the subscript hop for an index expression; false rejects the whole path.
-    collectIndexSegment(Expression index, bool allowAnyIndex, bool byName,
-                                List<PathSegment> segments) -> bool {
-        Expression core = unwrapParentheses(index);
-        let literal = integerLiteralOf(core, true);
-        if (literal != null) {
-            let magnitude = literalvalues.integerMagnitude(literal.value().text());
-            if (magnitude != null) {
-                long value = magnitude as long;
-                if (isNegativeLiteral(core)) {
-                    value = 0 - value;
+    // The outermost step that keeps a value from being a stable place, which is an array element
+    // or a field that is not 'const'. Null when the value reads neither.
+    unstableStep(Expression expression) -> Expression? {
+        Expression core = unwrapParentheses(expression);
+        switch (core) {
+            is MemberExpressionNode member -> {
+                if (!this.readsConstField(member)) {
+                    return member;
                 }
-                segments.push(narrow.literalIndexSegment(value));
-                return true;
-            }
-        } else if (core is IdentifierExpressionNode) {
-            LocalBinding? binding = null;
-            if (byName) {
-                binding = this.lookupBinding(core.name().text());
-            } else {
-                binding = this.result.bindingOf(core.green());
-            }
-            if (binding != null) {
-                segments.push(narrow.bindingIndexSegment(binding));
-                return true;
-            }
+                return this.unstableStep(member.object());
+            },
+            is SubscriptExpressionNode subscript -> {
+                return subscript;
+            },
+            default -> {
+                return null;
+            },
         }
-        if (allowAnyIndex) {
-            segments.push(narrow.anyIndexSegment());
-            return true;
-        }
-        return false;
     }
 
-    // Whether the member access reads a 'weak' field. In by-name mode the object carries no
-    // analyzed type yet, so this reads false there; that is harmless, because a weak path is
-    // never stored and a pre-clear query over one has nothing to erase.
+    // Whether the member access reads a 'const' field, either an instance field or a static or
+    // lazy one reached through its type. False when the object has no analyzed type.
+    readsConstField(MemberExpressionNode member) -> bool {
+        if (this.result.staticConstFieldOf(member.green()) != null) {
+            return true;
+        }
+        let objectType = this.result.typeOf(member.object().green());
+        if (objectType == null) {
+            return false;
+        }
+        let field = types.inheritedOrOwnField(objectType, member.member().text());
+        return field != null && field.isConst();
+    }
+
+    // Whether the member access reads a 'weak' field.
     readsWeakField(MemberExpressionNode member) -> bool {
         let objectType = this.result.typeOf(member.object().green());
         if (objectType == null) {
@@ -1413,35 +1392,181 @@ class BodyChecker implements NoreturnCalls {
         return field != null && field.isWeak();
     }
 
-    // The weak-field explanation for a value that may be null, or null when the value does
-    // not read a 'weak' field: why a null check on it cannot carry to the use, and the
-    // strong-local copy that does.
-    weakFieldGuidance(Expression value) -> string? {
-        Expression core = unwrapParentheses(value);
-        if (!(core is MemberExpressionNode)) {
+    // Why a null check on the value does not carry to a later use, and the local copy that does.
+    // Null when the value reads no array element and no field that is not 'const'.
+    unstablePlaceGuidance(Expression value) -> string? {
+        return this.unstableGuidance(value, "null check", "check", false);
+    }
+
+    // Why a type test on the value does not carry to a later use, and the local copy that does.
+    // Null when the value reads no array element and no field that is not 'const'.
+    unstableTestGuidance(Expression value) -> string? {
+        return this.unstableGuidance(value, "type test", "test", false);
+    }
+
+    // unstablePlaceGuidance for a value an operator changes, whose fix also stores the result
+    // back into the place the local was copied from.
+    unstableWriteGuidance(Expression value) -> string? {
+        return this.unstableGuidance(value, "null check", "check", true);
+    }
+
+    // The guidance names the outermost step that keeps the value from being stable, because a
+    // local holding that step makes the rest of the value stable.
+    unstableGuidance(Expression value, string check, string verb, bool writesBack) -> string? {
+        let step = this.unstableStep(value);
+        if (step == null) {
             return null;
         }
-        if (!this.readsWeakField(core)) {
+        string subject = "This value";
+        string kind = "an array element";
+        string change = "change";
+        string place = "the element";
+        switch (step) {
+            is MemberExpressionNode member -> {
+                subject = "'{member.member().text()}'";
+                kind = "a field";
+                place = "the field";
+                if (this.readsWeakField(member)) {
+                    kind = "a 'weak' field";
+                    change = "become null";
+                }
+            },
+            is SubscriptExpressionNode element -> {
+                let spelling = simpleSpelling(element);
+                if (spelling != null) {
+                    subject = "'{spelling}'";
+                }
+            },
+            default -> {
+                return null;
+            },
+        }
+        let spelling = simpleSpelling(step);
+        if (spelling != null) {
+            place = "'{spelling}'";
+        }
+        string copy = "Copy it into a local first ('{this.localCopyExample(step)}')";
+        string fix = "{copy} and {verb} the local.";
+        if (writesBack && this.namesStorage(step)) {
+            fix = "{copy}, {verb} the local, and write the result back to {place}.";
+        }
+        return "{subject} is {kind}, so it can {change} at any time, and a {check} on it does not "
+            + "carry to a later use. {fix}";
+    }
+
+    // The guidance for a binary operator refused because an operand is optional, when 'accepted'
+    // says the operator takes both sides once every '?' is removed. The left side goes first, and
+    // a compound assignment writes its result back to it.
+    binaryGuidance(Expression leftNode, Expression rightNode, Type left, Type right, bool accepted,
+                   bool compound) -> string? {
+        if (!accepted) {
             return null;
         }
-        string name = core.member().text();
-        string example = "let {name} = ...;";
-        let receiver = simpleSpelling(core.object());
-        if (receiver != null) {
-            example = "let {name} = {receiver}.{name};";
+        if (left is OptionalType) {
+            string? guidance = this.unstablePlaceGuidance(leftNode);
+            if (compound) {
+                guidance = this.unstableWriteGuidance(leftNode);
+            }
+            if (guidance != null) {
+                return guidance;
+            }
         }
-        return "'{name}' is a 'weak' field, so it can become null at any time, and a null "
-            + "check on it does not carry to the next line. Copy it into a local first "
-            + "('{example}') and check the local.";
+        if (right is OptionalType) {
+            return this.unstablePlaceGuidance(rightNode);
+        }
+        return null;
+    }
+
+    // The guidance for a prefix operator refused because its operand is optional, when 'accepted'
+    // says the operator takes the operand once every '?' is removed.
+    unaryGuidance(Expression operand, Type type, bool accepted) -> string? {
+        if (!accepted || !(type is OptionalType)) {
+            return null;
+        }
+        return this.unstablePlaceGuidance(operand);
+    }
+
+    // Whether the expression reads storage a write can reach, which a call's result is not.
+    namesStorage(Expression expression) -> bool {
+        Expression core = unwrapParentheses(expression);
+        switch (core) {
+            is IdentifierExpressionNode ignored -> {
+                return true;
+            },
+            is ThisExpressionNode ignored -> {
+                return true;
+            },
+            is MemberExpressionNode member -> {
+                return this.namesStorage(member.object());
+            },
+            is SubscriptExpressionNode element -> {
+                return this.namesStorage(element.object());
+            },
+            default -> {
+                return false;
+            },
+        }
+    }
+
+    // The refusal followed by the guidance, or the refusal alone when there is no guidance.
+    withGuidance(string refusal, string? guidance) -> string {
+        if (guidance == null) {
+            return refusal;
+        }
+        return refusal + " " + guidance;
+    }
+
+    // Whether a class extending the type, however far down, has a member of this name, which a
+    // type test on the value would have let a use reach.
+    subclassHasMember(Type type, string name) -> bool {
+        if (!(type is ClassType)) {
+            return false;
+        }
+        let subclasses = type.directSubclasses();
+        for (long i = 0; i < subclasses.length(); i++) {
+            let subclass = subclasses.get(i);
+            if (!(this.lookupMember(subclass, name) is MissingMember)) {
+                return true;
+            }
+            if (this.subclassHasMember(subclass, name)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // The declaration that copies an unstable step into a local, named after the field it reads
+    // or 'value' for an element, spelled in full where the step is short enough to quote.
+    localCopyExample(Expression step) -> string {
+        switch (step) {
+            is MemberExpressionNode member -> {
+                string name = member.member().text();
+                let receiver = simpleSpelling(member.object());
+                if (receiver == null) {
+                    return "let {name} = ...;";
+                }
+                return "let {name} = {receiver}.{name};";
+            },
+            is SubscriptExpressionNode element -> {
+                let spelling = simpleSpelling(element);
+                if (spelling == null) {
+                    return "let value = ...;";
+                }
+                return "let value = {spelling};";
+            },
+            default -> {
+                return "let value = ...;";
+            },
+        }
     }
 
     // assignabilityHint with the mismatched value in hand: a possibly-null value read from a
-    // 'weak' field gets the weak explanation instead of the plain check suggestion.
+    // place a null check cannot narrow gets the local copy instead of the plain check suggestion.
     valueAssignabilityHint(Type target, Type source, Expression? value) -> string {
         if (value != null && !(target is ErrorType) && !(target is OptionalType)
                 && source is OptionalType
                 && convert.isAssignableStrict(target, source.inner())) {
-            let guidance = this.weakFieldGuidance(value);
+            let guidance = this.unstablePlaceGuidance(value);
             if (guidance != null) {
                 return " The value may be null here. {guidance}";
             }
@@ -1475,7 +1600,7 @@ class BodyChecker implements NoreturnCalls {
         if (!(checkedType is OptionalType)) {
             return null;
         }
-        let path = this.buildNarrowingPath(checked, false);
+        let path = this.buildNarrowingPath(checked);
         if (path == null) {
             return null;
         }
@@ -1500,7 +1625,7 @@ class BodyChecker implements NoreturnCalls {
         if (target == null || target is OptionalType || !types.isClassLike(target)) {
             return null;
         }
-        let path = this.buildNarrowingPath(test.value(), false);
+        let path = this.buildNarrowingPath(test.value());
         if (path == null) {
             return null;
         }
@@ -2099,104 +2224,71 @@ class BodyChecker implements NoreturnCalls {
         return declared;
     }
 
-    // Assigning a value to a binding of optional declared type narrows the binding to the
-    // deepest level the value's own static type proves present: a bare value proves every
-    // wrapped level, a 'T?' assigned to a 'T??' proves the outer one. Declaration initializers
-    // come through here too.
-    establishAssignmentNarrowing(LocalBinding binding, Type value) {
-        let declared = binding.type();
+    // The deepest level a stored value proves present in storage of optional declared type. A
+    // bare value proves every wrapped level, and a 'T?' stored into a 'T??' proves the outer one.
+    // Null when the store proves nothing, so the storage keeps its declared type.
+    provenByStore(Type declared, Type stored) -> Type? {
         if (!(declared is OptionalType)) {
-            return;
+            return null;
         }
-        if (value is ErrorType || value is NullType) {
-            return;
+        if (stored is ErrorType || stored is NullType) {
+            return null;
         }
         Type proven = declared;
-        while (proven is OptionalType && convert.isAssignableStrict(proven.inner(), value)) {
+        while (proven is OptionalType && convert.isAssignableStrict(proven.inner(), stored)) {
             proven = proven.inner();
         }
         if (proven == declared) {
+            return null;
+        }
+        return proven;
+    }
+
+    // Narrows a binding to what its initializer proves, for a declaration, whose name is bound
+    // here rather than written as an expression.
+    establishAssignmentNarrowing(LocalBinding binding, Type value) {
+        let proven = this.provenByStore(binding.type(), value);
+        if (proven == null) {
             return;
         }
         this.narrowing.narrow(narrow.bindingPath(binding), proven);
     }
 
-    // A write into the storage an expression names drops every narrowing the write could
-    // reach: the whole root for a binding write (and every path indexed through it), and the
-    // may-alias cone for a member or subscript write.
+    // Narrows the place a write stored into, after invalidateForWrite has dropped what the place
+    // held before. Only a local, a parameter, 'this' and a 'const' field reached through one have
+    // a path, so a write to any other place narrows nothing.
+    establishWriteNarrowing(Expression target, Type stored) {
+        let declared = this.declaredSlotType(target);
+        if (declared == null) {
+            return;
+        }
+        let proven = this.provenByStore(declared, stored);
+        if (proven == null) {
+            return;
+        }
+        let path = this.buildNarrowingPath(target);
+        if (path == null) {
+            return;
+        }
+        this.narrowing.narrow(path, proven);
+    }
+
+    // A write drops the narrowings of the storage it replaces. A binding write drops every path
+    // from that binding, and a member write drops every path that starts with the written one.
     invalidateForWrite(Expression target) {
         if (target is IdentifierExpressionNode) {
             let binding = this.result.bindingOf(target.green());
             if (binding != null) {
                 this.narrowing.clearForRoot(binding);
-                this.narrowing.clearForIndexBinding(binding);
                 return;
             }
         }
-        if (target is MemberExpressionNode || target is SubscriptExpressionNode) {
-            let path = this.buildNarrowingPath(target, true);
+        if (target is MemberExpressionNode) {
+            let path = this.buildNarrowingPath(target);
             if (path != null) {
-                this.narrowing.clearMayAlias(path);
+                this.narrowing.clearPrefixedBy(path);
             }
         }
-    }
-
-    // A call drops every member-path narrowing rooted at a value it touches - the receiver
-    // and each class or array argument - since the callee may mutate the state reachable from
-    // them. A plain binding's own narrowing survives: no callee can reassign the caller's
-    // binding, and the binding's reference keeps the narrowed object alive.
-    clearNarrowingsForCall(CallExpressionNode node) {
-        switch (node.callee()) {
-            is MemberExpressionNode member -> {
-                this.dropTouchedByCall(member.object());
-            },
-            is SafeMemberExpressionNode member -> {
-                this.dropTouchedByCall(member.object());
-            },
-            default -> { },
-        }
-        this.clearNarrowingsForArguments(node.arguments());
-    }
-
-    // Only class or array references expose mutable state; struct and primitive arguments are
-    // passed by value, so the call cannot mutate through them. A constructor call ('new T(...)')
-    // reaches its arguments the same way, so both a call and a 'new' route through here.
-    clearNarrowingsForArguments(ArgumentListNode? arguments) {
-        if (arguments == null) {
-            return;
-        }
-        for (long i = 0; i < arguments.argumentsCount(); i++) {
-            Expression? value = null;
-            switch (arguments.arguments(i)) {
-                is NamedArgumentNode named -> {
-                    value = named.value();
-                },
-                is OutArgumentNode ignored -> { },
-                is Expression plain -> {
-                    value = plain;
-                },
-                default -> { },
-            }
-            if (value == null) {
-                continue;
-            }
-            let argumentType = this.result.typeOf(value.green());
-            if (argumentType == null) {
-                continue;
-            }
-            Type core = convert.coreOf(argumentType);
-            if (types.isClassLike(core) || core is ArrayType) {
-                this.dropTouchedByCall(value);
-            }
-        }
-    }
-
-    dropTouchedByCall(Expression touched) {
-        let path = this.buildNarrowingPath(touched, false);
-        if (path == null) {
-            return;
-        }
-        this.narrowing.clearForRootMembers(path.root());
     }
 
     // Loop-entry pre-clearing: before the loop body is analyzed, drop every narrowing whose
@@ -2225,23 +2317,7 @@ class BodyChecker implements NoreturnCalls {
                 let binding = this.lookupBinding(outArgument.name().text());
                 if (binding != null) {
                     this.narrowing.clearForRoot(binding);
-                    this.narrowing.clearForIndexBinding(binding);
                 }
-            },
-            is CallExpressionNode call -> {
-                switch (call.callee()) {
-                    is MemberExpressionNode member -> {
-                        this.preClearTouch(member.object());
-                    },
-                    is SafeMemberExpressionNode member -> {
-                        this.preClearTouch(member.object());
-                    },
-                    default -> { },
-                }
-                this.preClearTouchedArguments(call.arguments());
-            },
-            is NewExpressionNode created -> {
-                this.preClearTouchedArguments(created.arguments());
             },
             default -> { },
         }
@@ -2250,47 +2326,15 @@ class BodyChecker implements NoreturnCalls {
         }
     }
 
-    preClearTouchedArguments(ArgumentListNode? arguments) {
-        if (arguments == null) {
-            return;
-        }
-        for (long i = 0; i < arguments.argumentsCount(); i++) {
-            switch (arguments.arguments(i)) {
-                is NamedArgumentNode named -> {
-                    this.preClearTouch(named.value());
-                },
-                is OutArgumentNode ignored -> { },
-                is Expression plain -> {
-                    this.preClearTouch(plain);
-                },
-                default -> { },
-            }
-        }
-    }
-
-    // Parentheses name the place they hold, so a write through them is pre-cleared the same way.
+    // Only a local or a parameter can be written in a loop and hold a narrowing, since a 'const'
+    // field takes no write there and nothing else narrows. Parentheses name the place they hold.
     preClearWrite(Expression target) {
         Expression written = unwrapParentheses(target);
         if (written is IdentifierExpressionNode) {
             let binding = this.lookupBinding(written.name().text());
             if (binding != null) {
                 this.narrowing.clearForRoot(binding);
-                this.narrowing.clearForIndexBinding(binding);
             }
-            return;
-        }
-        if (written is MemberExpressionNode || written is SubscriptExpressionNode) {
-            let path = this.buildNarrowingPath(written, true, true);
-            if (path != null) {
-                this.narrowing.clearMayAlias(path);
-            }
-        }
-    }
-
-    preClearTouch(Expression value) {
-        let path = this.buildNarrowingPath(value, false, true);
-        if (path != null) {
-            this.narrowing.clearForRootMembers(path.root());
         }
     }
 
@@ -4099,9 +4143,13 @@ class BodyChecker implements NoreturnCalls {
                 return this.store.errorType();
             }
             if (!convert.isBoolType(shortLeft) || !convert.isBoolType(shortRight)) {
-                this.reporter.report("'{node.operator().text()}' needs 'bool' on both sides, "
-                    + "got '{this.names.of(shortLeft)}' and '{this.names.of(shortRight)}'.",
-                    node.span());
+                bool accepted = convert.isBoolType(convert.coreOf(shortLeft))
+                    && convert.isBoolType(convert.coreOf(shortRight));
+                let guidance = this.binaryGuidance(node.left(), node.right(), shortLeft, shortRight,
+                    accepted, false);
+                this.reporter.report(this.withGuidance("'{node.operator().text()}' needs 'bool' on "
+                    + "both sides, got '{this.names.of(shortLeft)}' and "
+                    + "'{this.names.of(shortRight)}'.", guidance), node.span());
             }
             return this.store.primitive(PrimitiveKind.Bool);
         }
@@ -4135,7 +4183,7 @@ class BodyChecker implements NoreturnCalls {
                 return this.analyzeBitwise(span, operatorText, leftNode, rightNode, left, right);
             },
             LessLess, GreaterGreater, GreaterGreaterGreater -> {
-                return this.analyzeShift(span, operatorText, rightNode, left, right);
+                return this.analyzeShift(span, operatorText, leftNode, rightNode, left, right);
             },
             default -> {
                 this.reporter.report("Internal: unsupported binary operator "
@@ -4167,21 +4215,30 @@ class BodyChecker implements NoreturnCalls {
 
     analyzeArithmetic(Span span, SyntaxKind operator, string operatorText, Expression leftNode,
                               Expression rightNode, Type left, Type right) -> Type {
+        Type coreLeft = convert.coreOf(left);
+        Type coreRight = convert.coreOf(right);
+        bool accepted = convert.isNumericType(coreLeft) && convert.isNumericType(coreRight);
+        if (operator == SyntaxKind.Plus && (coreLeft is StringType || coreRight is StringType)) {
+            accepted = isStringable(coreLeft) && isStringable(coreRight);
+        }
+        // A compound assignment's operator is the binary one followed by '='.
+        let guidance = this.binaryGuidance(leftNode, rightNode, left, right, accepted,
+            operatorText.endsWith("="));
         if (operator == SyntaxKind.Plus && (left is StringType || right is StringType)) {
             if (isStringable(left) && isStringable(right)) {
                 return this.store.stringType();
             }
-            Type other = left;
-            if (left is StringType) {
-                other = right;
+            string refusal = "Cannot add a value of type '{this.names.of(right)}' to a string;";
+            if (right is StringType) {
+                refusal = "Cannot add a string to a value of type '{this.names.of(left)}';";
             }
-            this.reporter.report("Cannot add a value of type '{this.names.of(other)}' to a "
-                + "string; only a string, a number and a 'bool' can be added.", span);
+            refusal = refusal + " only a string, a number and a 'bool' can be added.";
+            this.reporter.report(this.withGuidance(refusal, guidance), span);
             return this.store.errorType();
         }
         if (!convert.isNumericType(left) || !convert.isNumericType(right)) {
-            this.reporter.report("'{operatorText}' needs numbers on both sides, "
-                + "got '{this.names.of(left)}' and '{this.names.of(right)}'.", span);
+            this.reporter.report(this.withGuidance("'{operatorText}' needs numbers on both sides, "
+                + "got '{this.names.of(left)}' and '{this.names.of(right)}'.", guidance), span);
             return this.store.errorType();
         }
         Type[] adapted = this.adaptOperands(leftNode, rightNode, left, right);
@@ -4275,8 +4332,11 @@ class BodyChecker implements NoreturnCalls {
             return this.store.primitive(PrimitiveKind.Bool);
         }
         if (!convert.isNumericType(left) || !convert.isNumericType(right)) {
-            this.reporter.report("'{operatorText}' compares numbers, got "
-                + "'{this.names.of(left)}' and '{this.names.of(right)}'.", span);
+            bool accepted = convert.isNumericType(convert.coreOf(left))
+                && convert.isNumericType(convert.coreOf(right));
+            let guidance = this.binaryGuidance(leftNode, rightNode, left, right, accepted, false);
+            this.reporter.report(this.withGuidance("'{operatorText}' compares numbers, got "
+                + "'{this.names.of(left)}' and '{this.names.of(right)}'.", guidance), span);
             return this.store.primitive(PrimitiveKind.Bool);
         }
         Type[] adapted = this.adaptOperands(leftNode, rightNode, left, right);
@@ -4294,8 +4354,12 @@ class BodyChecker implements NoreturnCalls {
     analyzeBitwise(Span span, string operatorText, Expression leftNode, Expression rightNode,
                            Type left, Type right) -> Type {
         if (!convert.isIntegerType(left) || !convert.isIntegerType(right)) {
-            this.reporter.report("'{operatorText}' needs integers on both sides, got "
-                + "'{this.names.of(left)}' and '{this.names.of(right)}'.", span);
+            bool accepted = convert.isIntegerType(convert.coreOf(left))
+                && convert.isIntegerType(convert.coreOf(right));
+            let guidance = this.binaryGuidance(leftNode, rightNode, left, right, accepted,
+                operatorText.endsWith("="));
+            this.reporter.report(this.withGuidance("'{operatorText}' needs integers on both sides, "
+                + "got '{this.names.of(left)}' and '{this.names.of(right)}'.", guidance), span);
             return this.store.errorType();
         }
         Type[] adapted = this.adaptOperands(leftNode, rightNode, left, right);
@@ -4312,15 +4376,20 @@ class BodyChecker implements NoreturnCalls {
     }
 
     // The shifted value alone decides the result type, so only the distance adapts.
-    analyzeShift(Span span, string operatorText, Expression rightNode, Type left, Type right) -> Type {
+    analyzeShift(Span span, string operatorText, Expression leftNode, Expression rightNode,
+                 Type left, Type right) -> Type {
+        bool accepted = convert.isIntegerType(convert.coreOf(left))
+            && convert.isIntegerType(convert.coreOf(right));
+        let guidance = this.binaryGuidance(leftNode, rightNode, left, right, accepted,
+            operatorText.endsWith("="));
         if (!convert.isIntegerType(left)) {
-            this.reporter.report("'{operatorText}' shifts an integer, got "
-                + "'{this.names.of(left)}'.", span);
+            this.reporter.report(this.withGuidance("'{operatorText}' shifts an integer, got "
+                + "'{this.names.of(left)}'.", guidance), span);
             return this.store.errorType();
         }
         if (!convert.isIntegerType(right)) {
-            this.reporter.report("'{operatorText}' needs an integer shift distance, got "
-                + "'{this.names.of(right)}'.", span);
+            this.reporter.report(this.withGuidance("'{operatorText}' needs an integer shift "
+                + "distance, got '{this.names.of(right)}'.", guidance), span);
             return this.store.errorType();
         }
         this.adaptIntegerLiteral(rightNode, left);
@@ -4356,24 +4425,30 @@ class BodyChecker implements NoreturnCalls {
         switch (node.operator().kind()) {
             Minus, Plus -> {
                 if (!convert.isNumericType(core)) {
-                    this.reporter.report("Unary '{node.operator().text()}' needs a number, "
-                        + "got '{this.names.of(operand)}'.", node.span());
+                    let guidance = this.unaryGuidance(node.operand(), operand,
+                        convert.isNumericType(convert.coreOf(operand)));
+                    this.reporter.report(this.withGuidance("Unary '{node.operator().text()}' needs "
+                        + "a number, got '{this.names.of(operand)}'.", guidance), node.span());
                     return this.store.errorType();
                 }
                 return core;
             },
             Exclamation -> {
                 if (!convert.isBoolType(core)) {
-                    this.reporter.report("'!' negates a 'bool', got "
-                        + "'{this.names.of(operand)}'.", node.span());
+                    let guidance = this.unaryGuidance(node.operand(), operand,
+                        convert.isBoolType(convert.coreOf(operand)));
+                    this.reporter.report(this.withGuidance("'!' negates a 'bool', got "
+                        + "'{this.names.of(operand)}'.", guidance), node.span());
                     return this.store.errorType();
                 }
                 return core;
             },
             Tilde -> {
                 if (!convert.isIntegerType(core)) {
-                    this.reporter.report("'~' flips the bits of an integer, got "
-                        + "'{this.names.of(operand)}'.", node.span());
+                    let guidance = this.unaryGuidance(node.operand(), operand,
+                        convert.isIntegerType(convert.coreOf(operand)));
+                    this.reporter.report(this.withGuidance("'~' flips the bits of an integer, got "
+                        + "'{this.names.of(operand)}'.", guidance), node.span());
                     return this.store.errorType();
                 }
                 return core;
@@ -4419,9 +4494,15 @@ class BodyChecker implements NoreturnCalls {
             example = "{operator}count";
         }
         if (!convert.isNumericType(operandType)) {
-            this.reporter.report("The '{operator}' operator works only on numbers, and this "
-                + "value has type '{this.names.of(operandType)}'. Use it on an integer or a "
-                + "floating-point variable, for example '{example}'.", span);
+            string advice = "Use it on an integer or a floating-point variable, for example '{example}'.";
+            if (operandType is OptionalType && convert.isNumericType(convert.coreOf(operandType))) {
+                let guidance = this.unstableWriteGuidance(operand);
+                if (guidance != null) {
+                    advice = guidance;
+                }
+            }
+            this.reporter.report("The '{operator}' operator works only on numbers, and this value "
+                + "has type '{this.names.of(operandType)}'. {advice}", span);
             return operandType;
         }
         // Parentheses around the operand name the same storage, so every rule below reads
@@ -4477,6 +4558,7 @@ class BodyChecker implements NoreturnCalls {
             }
         }
         this.invalidateForWrite(changed);
+        this.establishWriteNarrowing(changed, operandType);
         return operandType;
     }
 
@@ -4674,13 +4756,11 @@ class BodyChecker implements NoreturnCalls {
             this.result.setType(node.target().green(), assignTarget);
         }
         this.invalidateForWrite(writtenTarget);
+        this.establishWriteNarrowing(writtenTarget, storedType);
         if (writtenTarget is IdentifierExpressionNode) {
             let binding = this.result.bindingOf(writtenTarget.green());
-            if (binding != null) {
-                this.establishAssignmentNarrowing(binding, storedType);
-                if (this.unconditionalPosition) {
-                    this.markAssigned(binding);
-                }
+            if (binding != null && this.unconditionalPosition) {
+                this.markAssigned(binding);
             }
         } else if (writtenTarget is MemberExpressionNode) {
             let objectType = this.result.typeOf(writtenTarget.object().green());
@@ -5029,7 +5109,11 @@ class BodyChecker implements NoreturnCalls {
             return this.store.errorType();
         }
         if (objectType is OptionalType && convert.coreOf(objectType) is ArrayType) {
-            if (objectType.inner() is OptionalType) {
+            let guidance = this.unstablePlaceGuidance(node.object());
+            if (guidance != null) {
+                this.reporter.report("Cannot index '{this.names.of(objectType)}' because it may "
+                    + "be null. {guidance}", node.span());
+            } else if (objectType.inner() is OptionalType) {
                 this.reporter.report("Cannot index '{this.names.of(objectType)}' because it "
                     + "may be null at more than one level. Unwrap one level with a null check "
                     + "('if (value != null)') or a fallback ('value ?? null'), then index the "
@@ -5043,17 +5127,7 @@ class BodyChecker implements NoreturnCalls {
         }
         if (objectType is ArrayType) {
             this.checkIndexIsInteger(indexType, node.index().span());
-            Type element = objectType.element();
-            if (element is OptionalType || types.isClassLike(element)) {
-                let path = this.buildNarrowingPath(node, false);
-                if (path != null) {
-                    let proven = this.narrowing.provenType(path);
-                    if (proven != null) {
-                        return proven;
-                    }
-                }
-            }
-            return element;
+            return objectType.element();
         }
         this.reporter.report("Cannot index '{this.names.of(objectType)}'; only arrays "
             + "support [] indexing.", node.span());
@@ -5355,7 +5429,6 @@ class BodyChecker implements NoreturnCalls {
                 && this.reportUnmetConstraintCall(allConstructors, constructors, arguments,
                     node.span())) {
             this.analyzeArgumentsOnly(arguments);
-            this.clearNarrowingsForArguments(arguments);
             return target;
         }
         if (constructors.length() == 0) {
@@ -5387,7 +5460,6 @@ class BodyChecker implements NoreturnCalls {
                     this.checkResolvedArguments(built, resolved, node.green());
                 }
             }
-            this.clearNarrowingsForArguments(arguments);
             return target;
         }
         let structConstructor = constructors.get(0);
@@ -5395,7 +5467,6 @@ class BodyChecker implements NoreturnCalls {
         this.result.setMethod(node.green(), structConstructor);
         this.checkDirectArguments("Constructor", name, structConstructor.signature(),
             arguments, node.span());
-        this.clearNarrowingsForArguments(arguments);
         return target;
     }
 
@@ -5724,7 +5795,7 @@ class BodyChecker implements NoreturnCalls {
             return this.store.errorType();
         }
         if (objectType is OptionalType) {
-            let guidance = this.weakFieldGuidance(object);
+            let guidance = this.unstablePlaceGuidance(object);
             if (guidance != null) {
                 this.reporter.report("Cannot read a member of '{this.names.of(objectType)}' "
                     + "because it may be null here. {guidance}", node.span());
@@ -5786,7 +5857,7 @@ class BodyChecker implements NoreturnCalls {
                 }
                 Type fieldType = found.field.type();
                 if (fieldType is OptionalType || types.isClassLike(fieldType)) {
-                    let path = this.buildNarrowingPath(node, false);
+                    let path = this.buildNarrowingPath(node);
                     if (path != null) {
                         let proven = this.narrowing.provenType(path);
                         if (proven != null) {
@@ -5815,8 +5886,14 @@ class BodyChecker implements NoreturnCalls {
                 if (this.reportUnmetConstraintMember(core, name, node.member().span())) {
                     return this.store.errorType();
                 }
-                this.reporter.report("No field or method '{name}' on type "
-                    + "'{this.names.of(core)}'.", node.member().span());
+                string refusal = "No field or method '{name}' on type '{this.names.of(core)}'.";
+                if (this.subclassHasMember(core, name)) {
+                    let guidance = this.unstableTestGuidance(node.object());
+                    if (guidance != null) {
+                        refusal = refusal + " " + guidance;
+                    }
+                }
+                this.reporter.report(refusal, node.member().span());
                 return this.store.errorType();
             },
         }
@@ -6799,12 +6876,6 @@ class BodyChecker implements NoreturnCalls {
     // ---- Calls ----
 
     analyzeCall(CallExpressionNode node, Type? expected) -> Type {
-        Type analyzed = this.analyzeCallInner(node, expected);
-        this.clearNarrowingsForCall(node);
-        return analyzed;
-    }
-
-    analyzeCallInner(CallExpressionNode node, Type? expected) -> Type {
         switch (node.callee()) {
             is MemberExpressionNode member -> {
                 return this.analyzeMemberCall(node, member, expected);
@@ -6855,9 +6926,13 @@ class BodyChecker implements NoreturnCalls {
             if (calleeName.length > 0) {
                 check = "if ({calleeName} != null)";
             }
+            string advice = "Check it for null first ('{check}'), or supply a fallback with '??'.";
+            let guidance = this.unstablePlaceGuidance(node.callee());
+            if (guidance != null) {
+                advice = guidance;
+            }
             this.reporter.report("{subject} has type '{this.names.of(calleeType)}', which may be "
-                + "null here. Check it for null first ('{check}'), or supply a fallback with "
-                + "'??'.", calleeSpan);
+                + "null here. {advice}", calleeSpan);
             this.analyzeArgumentsOnly(node.arguments());
             return this.store.errorType();
         }
@@ -7393,9 +7468,13 @@ class BodyChecker implements NoreturnCalls {
         // 'hash' reads through the wrapper here.
         if (core is OptionalType) {
             if (name == "slice" && core.inner() is ArrayType) {
+                string advice = "Check it for null first ('if (value != null)').";
+                let guidance = this.unstablePlaceGuidance(object);
+                if (guidance != null) {
+                    advice = guidance;
+                }
                 this.reporter.report("Cannot call 'slice' on '{this.names.of(core)}' because "
-                    + "it may be null. Check it for null first ('if (value != null)').",
-                    node.span());
+                    + "it may be null. {advice}", node.span());
                 this.analyzeArgumentsOnly(arguments);
                 return this.store.errorType();
             }
@@ -7787,7 +7866,6 @@ class BodyChecker implements NoreturnCalls {
         // 'out' lets the callee write the caller's variable directly, so it drops even the
         // binding's own narrowing.
         this.narrowing.clearForRoot(binding);
-        this.narrowing.clearForIndexBinding(binding);
     }
 
     analyzeExtraExternalArgument(Argument argument) {
@@ -7858,7 +7936,6 @@ class BodyChecker implements NoreturnCalls {
             if (arguments != null) {
                 this.analyzeArgumentsOnly(arguments);
             }
-            this.clearNarrowingsForArguments(arguments);
             return t;
         }
         if (allConstructors.length() == 0) {
@@ -7874,7 +7951,6 @@ class BodyChecker implements NoreturnCalls {
                     if (arguments != null) {
                         this.analyzeArgumentsOnly(arguments);
                     }
-                    this.clearNarrowingsForArguments(arguments);
                     return t;
                 }
             }
@@ -7929,7 +8005,6 @@ class BodyChecker implements NoreturnCalls {
                 this.analyzeArgumentsOnly(arguments);
             }
         }
-        this.clearNarrowingsForArguments(arguments);
         return t;
     }
 

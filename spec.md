@@ -984,7 +984,9 @@ long size = name?.length ?? 0;
 listener?.notify();                 // runs only when listener is present
 ```
 
-Inside `if (x != null) { ... }` the `x` is considered as the non-nullable form for the rest of the block, so you can use `.` directly. The same narrowing applies to the `else` branch of `if (x == null) { ... } else { ... }`. Reassigning `x` inside the block drops the narrowing from that point on.
+Inside `if (x != null) { ... }` the `x` is considered as the non-nullable form for the rest of the block, so you can use `.` directly.
+The same narrowing applies to the `else` branch of `if (x == null) { ... } else { ... }`.
+Reassigning `x` inside the block replaces the narrowing with what the new value proves, as the next paragraph describes.
 
 A binding also narrows without an explicit check.
 Assigning a value whose type is non-nullable to a plain local variable or parameter of nullable declared type narrows it to the non-nullable form from that point on, and a declaration initializer behaves the same way.
@@ -997,8 +999,12 @@ s.length;        // s is treated as non-nullable 'string' here
 string? t = "x"; // starts narrowed from its initializer
 ```
 
-This refinement is deliberately limited.
-Writing through a member or element path never refines it: `this.field = x` and `arr[0] = x` leave the path nullable, because another reference could write null through the same storage.
+Narrowing, by a check and by a write alike, applies to stable places only.
+A stable place is a local variable, a parameter, `this`, or a `const` field reached through a stable place, however long the chain of them is.
+A mutable field and any array element are never stable places, because another reference can write that storage between the check and the use.
+A null check on one stays legal but proves nothing for the reads after it, and a write through one refines nothing: `this.field = x` and `arr[0] = x` leave the place nullable.
+The idiom is to read the value into a local and check the local, as in `let door = room.door; if (door != null) { door.open(); }`.
+
 Assigning in only one branch of an `if` refines the value below only when every other branch proves it non-null too (see the join rule below): `if (ready) { x = fallback(); }` leaves `x` nullable below, because the path that skips the assignment learns nothing from `ready`.
 
 Because narrowing governs only the reads, `== null`, `!= null`, `??`, `?.`, and `?[` on a binding whose declared type is nullable stay legal even where the value has already been proven non-null; the redundant check is simply constant at runtime.
@@ -1008,7 +1014,7 @@ Narrowing also follows the short-circuit operators and conditions: `x != null &&
 
 ```ens
 if (a != null && a.b != null) {
-    a.b.use();                    // both links narrowed by the condition
+    a.b.use();                    // both links narrowed, 'b' being a const field
 }
 
 while (cursor != null) {
@@ -1045,24 +1051,21 @@ for (let cursor in nodes) {
 }
 ```
 
-Narrowing extends to **member chains** (`this.field`, `obj.field`, `a.b.c`) and to **array subscripts** (`arr[K]` for an integer-literal index, `arr[i]` for a plain identifier index, arithmetic and call indices are not narrowed). The same `!= null` / `== null` patterns work; the narrowed form holds for as long as nothing invalidates it.
+Narrowing extends to **chains of `const` fields** (`this.limit`, `obj.limit`, `a.b.c` where every field is `const`), with the same `!= null` and `== null` patterns, and the narrowed form holds for as long as nothing invalidates it.
+A mutable field or an array element anywhere in the chain keeps it from narrowing, so such a value is read through a local copy.
 
 ```ens
-if (this.shape != null) {
-    return this.shape.area;       // this.shape is non-nullable here
+if (this.limit != null) {
+    return this.limit.length;     // 'limit' is a const field, so the check holds
 }
 
-if (xs[0] != null) {
-    xs[0].method();               // literal-index subscript narrows
-}
-
-int i = 2;
-if (ys[i] != null) {
-    ys[i].method();               // identifier-index subscript narrows
+let first = xs[0];                // an element never narrows, so copy it
+if (first != null) {
+    first.method();
 }
 ```
 
-A `weak` field never narrows, and no narrowing is established through a path that passes through one: the field can become null whenever the object it refers to loses its last strong reference, so a null check proves nothing about a later read.
+A `weak` field is never a stable place either, and for a reason of its own: the field can become null whenever the object it refers to loses its last strong reference, so a null check proves nothing about a later read.
 Comparing a weak field against null stays legal as an ordinary boolean expression; it simply narrows nothing.
 The idiom is the strong-local copy: reading a weak field yields a strong reference, so a local holding it keeps the object alive for the local's scope and narrows by the ordinary rules.
 
@@ -1078,27 +1081,23 @@ if (target != null) {
 ```
 
 Narrowing is dropped when the analyzer can't prove the narrowed value is still non-null. Specifically:
-- Writing to the narrowed path or any deeper part of it (`r.door = null`, `xs[0] = null`).
-  Writing through a subscript also drops the narrowing of any element it could alias: `xs[j] = null` drops `xs[0]` because `j` could be `0`, and `xs[0] = null` drops `xs[i]`.
-  Elements narrowed at a different literal index are kept: `xs[2] = null` leaves `xs[0]` and `xs[1]` narrowed.
-- Reassigning the root variable or, for subscripts, the index variable.
-- Any function or method call whose receiver path or class/array-typed argument could touch the narrowed root. Calls that don't touch the relevant root (e.g. `print("hi")`) leave the narrowing intact.
-  A constructor call `new T(...)` reaches its class/array arguments the same way an ordinary call does, so it drops the member-path narrowings rooted at them too.
-  A call never drops the own narrowing of a plain local variable (or parameter), whether the binding is the call's receiver (`x.method()`) or an argument (`use(x)`): a callee cannot reassign the caller's binding, and the binding's own reference keeps the narrowed object alive.
-  What a call does drop is any member-path narrowing (`this.field`, `a.b`) rooted at a value it touches, since the callee may mutate those fields; touching a member chain such as `r.door` therefore drops the paths under `r` but keeps `r`'s own narrowing.
-  Passing the local as an `out` argument is the sole exception: `out` lets the callee write the caller's variable directly, so it drops the binding's own narrowing too.
+- Reassigning the narrowed local or parameter, or the one at the root of a narrowed chain.
+- Inside a constructor, assigning a narrowed `const` field or one on its chain.
+- Passing the local as an `out` argument, which lets the callee write the caller's variable directly.
+
+A call drops nothing that a stable place proved, whether the place is the call's receiver (`x.method()`, `r.door.open()`), one of its arguments (`use(x)`), or an argument of a constructor (`new T(x)`).
+A callee cannot reassign the caller's binding, the binding's own reference keeps the narrowed object alive, and no callee can write a `const` field.
 
 Inside a loop a narrowing must hold on every iteration, so a narrowing established before the loop is dropped at the loop's entry when any statement in the body (or a `for` update) could write its path: a later write would otherwise leave an earlier read in the body using a value that is already stale on the next pass.
 A narrowing the loop condition or an in-body guard clause re-establishes on each iteration is unaffected, so `while (x != null)` loops and guard-narrowed loops keep working.
 
-A write through a narrowed path is checked against the declared field or element type, not the narrowed one.
-Nulling out a just-checked field (`r.door = null`) or storing a base value over an `is`-narrowed one (`c.shape = new Shape()`) is therefore allowed; the write drops the narrowing, and reading the path again requires a new check.
+A write to a narrowed local is checked against its declared type, not the narrowed one, so nulling out a just-checked local (`x = null`) or storing a base value over an `is`-narrowed one is allowed, and the local keeps only what the write proves.
 
 ```ens
-if (room.door != null) {
+if (room.door != null) {   // 'door' is a const field
     room.door.code;        // ok
-    room.door.open();      // call's receiver is rooted at `room`,
-    room.door.code;        // error - narrowing dropped
+    room.door.open();      // a call cannot write 'door'
+    room.door.code;        // still ok after the call
 }
 ```
 
@@ -1210,7 +1209,7 @@ An interface scrutinee may be tested against any class or interface target; the 
 A type parameter may be the target of `is`, `as?`, and a switch `is`-arm, and the test is judged per instantiation against the concrete type argument, following every rule above.
 So `value is T` narrows `value` to `T` where it matches, an instantiation whose argument makes the test vacuous or impossible is a compile error where that argument was written, and one whose argument is not a class or an interface is refused the same way.
 
-`if (x is Derived)` narrows `x` to `Derived` inside the branch, following the same rules as null narrowing above: the same paths narrow (locals, member chains, subscripts), `x is Derived && x.derivedMethod()` narrows the right side of `&&`, conjunctions narrow the branch, a loop condition narrows the body, and the same writes and calls drop the narrowing.
+`if (x is Derived)` narrows `x` to `Derived` inside the branch, following the same rules as null narrowing above: the same places narrow (locals, parameters, `this`, and chains of `const` fields), `x is Derived && x.derivedMethod()` narrows the right side of `&&`, conjunctions narrow the branch, a loop condition narrows the body, and the same writes drop the narrowing.
 Failing the test proves nothing about the value's type, so the plain else branch of a positive `is` does not narrow.
 
 Negating a check flips what it proves, so the fact that survives is the negated test and a negative guard narrows.
