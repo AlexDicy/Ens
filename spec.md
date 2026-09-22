@@ -219,6 +219,8 @@ A default reads those fields and assigns none of them, so `int b = (a = 5);` is 
 `super.method(...)` calls the base class's implementation, bypassing any override. A constructor may call `super(...)` as its first statement to run the base constructor; if it does not, the base class must be constructible with no arguments. `protected` members (see above) are reachable from subclasses.
 
 Class fields may declare default values just like struct fields. Defaults are applied when an instance is created, in declaration order and before the constructor body runs, so constructor assignments overwrite them.
+A field default and a parameter default may name the enclosing declaration's type parameters, and each runs with the type arguments written where the instance was created or the call was made.
+So inside `class Box<Tag>` a field may read `List<Tag> items = new List<Tag>();`, and a method may declare `takes(List<Tag> more = new List<Tag>())`.
 
 A field whose type has no default value, such as a class, a string, an array, or a struct without one, and that is not made nullable, must be definitely assigned on every path through each constructor.
 A `this.field` parameter, a declared field default, and a `this.field = ...` assignment in the body all count, and assigning the field in every branch of an `if` or `switch` satisfies the rule exactly as a single unconditional assignment does.
@@ -252,7 +254,7 @@ A `static const` field is a type-level constant with a mandatory initializer: `s
 There are no mutable static fields, so `static` on a field requires `const`.
 The initializer is a compile-time constant: literals, unary `+` and `-`, arithmetic with `+`, `-`, `*`, `/`, and `%`, string concatenation with `+`, and reads of other static consts through their type name.
 A cycle between static const initializers is an error, and so are function calls, `new`, aggregate literals, and array literals inside one.
-A static const's type is therefore a primitive, `char`, `bool`, or `string`, and on a generic type it cannot mention the type's parameters, so every instantiation shares one value.
+A static const's type is therefore a primitive, `char`, `bool`, or `string`, and on a generic type neither it nor its initializer can mention the type's parameters, so every instantiation shares one value.
 Reads go through the type name, as in `Path.separator`, and each read compiles to the constant's value; assigning to a static const, or applying `++` or `--` to one, is an error.
 
 A `lazy const` field is a type-level value with a written type and a mandatory initializer: `export lazy const BufferedReader input = makeInput();`.
@@ -260,7 +262,7 @@ The initializer runs on the first read and the value is kept for the rest of the
 It may not throw, which is what keeps a read from needing `try`.
 A lazy const is read through the type name, as in `Streams.input`, and it is type-level already, so writing `static` beside `lazy` is an error.
 The value's destructor never runs, because the program holds the value to the end.
-On a generic type a lazy const's type cannot mention the type's parameters, so every instantiation shares one value.
+On a generic type a lazy const's type and its initializer cannot mention the type's parameters, so every instantiation shares one value.
 Assigning to a lazy const, or applying `++` or `--` to one, is an error.
 A cycle between two lazy const initializers is a compile error where the initializers read each other directly; one that closes through a function call stops the program on the read that closes it, naming the value.
 
@@ -332,6 +334,9 @@ Speaker? quiet = null;     // nullable interface reference
 
 Classes, structs, and functions may be generic: they declare type parameters in angle brackets and work uniformly over any type argument. A type parameter can be used as a field type, a parameter or return type, a local type, and as the element type of an array.
 A method does not declare type parameters of its own; a type-parameter list on a member constrains the enclosing type's parameters instead, as described under conditional members below.
+A type parameter takes its name for the whole of the declaration that introduces it, so that name is the parameter in a bound, in a member's signature, in a field or parameter default, and in a body alike.
+A class, struct, interface, enum, function, or module of that name declared or imported outside is unreachable under that name inside, while a parameter or a local of that name declared inside takes the name back for the values written after it.
+A type parameter is a type and never a value, so reading `T` as a value, calling `T()`, and writing `new T()` are each an error.
 
 ```ens
 class List<T> {
