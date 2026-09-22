@@ -217,16 +217,25 @@ class NarrowingFact {
     protected constructor(this.path, this.proven, this.narrowsWhenTrue);
 }
 
+// An assignment to one field of 'this', kept with the place that wrote it, so a second
+// assignment to a 'const' field can point back at an earlier one.
+class FieldWrite {
+    protected Field field;
+    protected Span span;
+
+    protected constructor(this.field, this.span);
+}
+
 // A snapshot of definite-assignment state at one program point: the locals and this-fields
-// assigned so far, the this-fields that may have been assigned on some path reaching it, and
+// assigned so far, the this-field assignments that may have run on some path reaching it, and
 // whether the path has already left through a return, throw, break, continue, or panic.
 class AssignmentFlow {
     protected List<LocalBinding> assigned;
     protected List<Field> assignedFields;
-    protected List<Field> maybeAssignedFields;
+    protected List<FieldWrite> maybeAssignedWrites;
     protected bool terminated;
 
-    protected constructor(this.assigned, this.assignedFields, this.maybeAssignedFields, this.terminated);
+    protected constructor(this.assigned, this.assignedFields, this.maybeAssignedWrites, this.terminated);
 }
 
 // A numeric literal whose value its own default type cannot hold. The report waits until the
@@ -342,6 +351,14 @@ enum MemberPosition {
     Covered,
 }
 
+// Where a refused name stands in the expression it was written in, which decides what route to a
+// static of the enclosing type the refusal can offer.
+enum NamePosition {
+    Value,
+    Call,
+    MemberHead,
+}
+
 // The message a method's name written where a value belongs is refused with. A read cannot hold
 // it and a write cannot assign it. 'subject' names the method and its owner, and 'call' is how
 // the file writes a call to it.
@@ -412,15 +429,16 @@ class BodyChecker implements NoreturnCalls {
 
     // The class whose constructor body is being analyzed, or null outside a constructor.
     // assignedThisFields is the current flow's set of own fields definitely assigned, and
-    // ctorSeededThisFields is the entry state each catch clause resets to on the exception path.
-    // maybeAssignedThisFields is the fields assigned on at least one path here, which is what
-    // holds a 'const' field to one write. ctorEscapedMaybeFields accumulates that set wherever an
+    // ctorSeededThisWrites is the entry state each catch clause resets to on the exception path.
+    // maybeAssignedThisWrites is the assignments that may have run on some path reaching here,
+    // which is what holds a 'const' field to one write and names the earlier place a second
+    // assignment is reported against. ctorEscapedMaybeWrites accumulates that set wherever an
     // exception can leave the body, so a catch clause has what may already be written.
     Type? ctorFieldOwner;
     List<Field> assignedThisFields;
-    List<Field> ctorSeededThisFields;
-    List<Field> maybeAssignedThisFields;
-    List<Field> ctorEscapedMaybeFields;
+    List<FieldWrite> ctorSeededThisWrites;
+    List<FieldWrite> maybeAssignedThisWrites;
+    List<FieldWrite> ctorEscapedMaybeWrites;
 
     Set<GreenNode> fillProvenNews;
     Map<GreenNode, string> arrayNewNames;
@@ -464,9 +482,9 @@ class BodyChecker implements NoreturnCalls {
         this.assignmentTarget = null;
         this.ctorFieldOwner = null;
         this.assignedThisFields = new List<Field>();
-        this.ctorSeededThisFields = new List<Field>();
-        this.maybeAssignedThisFields = new List<Field>();
-        this.ctorEscapedMaybeFields = new List<Field>();
+        this.ctorSeededThisWrites = new List<FieldWrite>();
+        this.maybeAssignedThisWrites = new List<FieldWrite>();
+        this.ctorEscapedMaybeWrites = new List<FieldWrite>();
         this.fillProvenNews = new Set<GreenNode>();
         this.arrayNewNames = new Map<GreenNode, string>();
         this.deferredObligations = context.obligations();
@@ -930,7 +948,7 @@ class BodyChecker implements NoreturnCalls {
         }
         if (!flow.blockTerminates(body, ExitScope.Function, this)) {
             this.reporter.report("Function '{signature.name()}' can reach the end of its body "
-                + "without returning a value; add a 'return' on every path.",
+                + "without returning a value. Add a 'return' on every path.",
                 signature.nameSpan());
             return;
         }
@@ -938,7 +956,7 @@ class BodyChecker implements NoreturnCalls {
             let clause = node.catchClauses(i);
             if (!flow.blockTerminates(clause.body(), ExitScope.Function, this)) {
                 this.reporter.report("Function '{signature.name()}' can reach the end of its "
-                    + "body without returning a value; add a 'return' on every path.",
+                    + "'catch' clause without returning a value. Add a 'return' on every path.",
                     clause.span());
             }
         }
@@ -1030,12 +1048,12 @@ class BodyChecker implements NoreturnCalls {
         // be assigned is the opposite union: everything written before any point the body could
         // have thrown from.
         this.assignedLocals = new List<LocalBinding>();
-        this.assignedThisFields = this.copyFields(this.ctorSeededThisFields);
-        this.maybeAssignedThisFields = this.copyFields(this.ctorSeededThisFields);
-        for (long i = 0; i < this.ctorEscapedMaybeFields.length(); i++) {
-            let escaped = this.ctorEscapedMaybeFields.get(i);
-            if (!this.fieldsContain(this.maybeAssignedThisFields, escaped)) {
-                this.maybeAssignedThisFields.push(escaped);
+        this.assignedThisFields = this.writtenFields(this.ctorSeededThisWrites);
+        this.maybeAssignedThisWrites = this.copyWrites(this.ctorSeededThisWrites);
+        for (long i = 0; i < this.ctorEscapedMaybeWrites.length(); i++) {
+            let escaped = this.ctorEscapedMaybeWrites.get(i);
+            if (!this.writesContain(this.maybeAssignedThisWrites, escaped.field)) {
+                this.maybeAssignedThisWrites.push(escaped);
             }
         }
         this.breakFlows = new List<List<AssignmentFlow>>();
@@ -1651,9 +1669,9 @@ class BodyChecker implements NoreturnCalls {
         this.assignmentTarget = null;
         this.ctorFieldOwner = null;
         this.assignedThisFields = new List<Field>();
-        this.ctorSeededThisFields = new List<Field>();
-        this.maybeAssignedThisFields = new List<Field>();
-        this.ctorEscapedMaybeFields = new List<Field>();
+        this.ctorSeededThisWrites = new List<FieldWrite>();
+        this.maybeAssignedThisWrites = new List<FieldWrite>();
+        this.ctorEscapedMaybeWrites = new List<FieldWrite>();
     }
 
     bindingsContain(List<LocalBinding> set, LocalBinding binding) -> bool {
@@ -1701,6 +1719,37 @@ class BodyChecker implements NoreturnCalls {
         return copy;
     }
 
+    copyWrites(List<FieldWrite> set) -> List<FieldWrite> {
+        let copy = new List<FieldWrite>();
+        for (long i = 0; i < set.length(); i++) {
+            copy.push(set.get(i));
+        }
+        return copy;
+    }
+
+    writesContain(List<FieldWrite> set, Field field) -> bool {
+        return this.writeTo(set, field) != null;
+    }
+
+    // The recorded assignment to this field, or null where the set holds none.
+    writeTo(List<FieldWrite> set, Field field) -> FieldWrite? {
+        for (long i = 0; i < set.length(); i++) {
+            if (set.get(i).field == field) {
+                return set.get(i);
+            }
+        }
+        return null;
+    }
+
+    // The fields a set of assignments names, in the order they were recorded.
+    writtenFields(List<FieldWrite> set) -> List<Field> {
+        let fields = new List<Field>();
+        for (long i = 0; i < set.length(); i++) {
+            fields.push(set.get(i).field);
+        }
+        return fields;
+    }
+
     // Records the this-field shorthand parameters as assigned before the body runs, so a
     // constructor whose only initialization is 'constructor(this.field)' starts complete.
     // A shorthand parameter is a write, so it meets the same const rule and the same
@@ -1735,10 +1784,10 @@ class BodyChecker implements NoreturnCalls {
             }
             if (!this.fieldsContain(this.assignedThisFields, field)) {
                 this.assignedThisFields.push(field);
+                this.ctorSeededThisWrites.push(new FieldWrite(field, parameter.span()));
             }
         }
-        this.ctorSeededThisFields = this.copyFields(this.assignedThisFields);
-        this.maybeAssignedThisFields = this.copyFields(this.assignedThisFields);
+        this.maybeAssignedThisWrites = this.copyWrites(this.ctorSeededThisWrites);
     }
 
     markThisFieldAssigned(Field field) {
@@ -1750,12 +1799,12 @@ class BodyChecker implements NoreturnCalls {
         }
     }
 
-    markThisFieldMaybeAssigned(Field field) {
+    markThisFieldMaybeAssigned(Field field, Span at) {
         if (this.flowTerminated || this.ctorFieldOwner == null) {
             return;
         }
-        if (!this.fieldsContain(this.maybeAssignedThisFields, field)) {
-            this.maybeAssignedThisFields.push(field);
+        if (!this.writesContain(this.maybeAssignedThisWrites, field)) {
+            this.maybeAssignedThisWrites.push(new FieldWrite(field, at));
         }
     }
 
@@ -1766,10 +1815,10 @@ class BodyChecker implements NoreturnCalls {
         if (this.flowTerminated || this.ctorFieldOwner == null || this.inCatchClause) {
             return;
         }
-        for (long i = 0; i < this.maybeAssignedThisFields.length(); i++) {
-            let field = this.maybeAssignedThisFields.get(i);
-            if (!this.fieldsContain(this.ctorEscapedMaybeFields, field)) {
-                this.ctorEscapedMaybeFields.push(field);
+        for (long i = 0; i < this.maybeAssignedThisWrites.length(); i++) {
+            let write = this.maybeAssignedThisWrites.get(i);
+            if (!this.writesContain(this.ctorEscapedMaybeWrites, write.field)) {
+                this.ctorEscapedMaybeWrites.push(write);
             }
         }
     }
@@ -1872,19 +1921,19 @@ class BodyChecker implements NoreturnCalls {
     snapshotAssignment() -> AssignmentFlow {
         return new AssignmentFlow(this.copyBindings(this.assignedLocals),
             this.copyFields(this.assignedThisFields),
-            this.copyFields(this.maybeAssignedThisFields), this.flowTerminated);
+            this.copyWrites(this.maybeAssignedThisWrites), this.flowTerminated);
     }
 
     restoreAssignment(AssignmentFlow flow) {
         this.assignedLocals = this.copyBindings(flow.assigned);
         this.assignedThisFields = this.copyFields(flow.assignedFields);
-        this.maybeAssignedThisFields = this.copyFields(flow.maybeAssignedFields);
+        this.maybeAssignedThisWrites = this.copyWrites(flow.maybeAssignedWrites);
         this.flowTerminated = flow.terminated;
     }
 
-    unionFieldsInto(List<Field> target, List<Field> source) {
+    unionWritesInto(List<FieldWrite> target, List<FieldWrite> source) {
         for (long i = 0; i < source.length(); i++) {
-            if (!this.fieldsContain(target, source.get(i))) {
+            if (!this.writesContain(target, source.get(i).field)) {
                 target.push(source.get(i));
             }
         }
@@ -1898,14 +1947,14 @@ class BodyChecker implements NoreturnCalls {
     joinAssignment(List<AssignmentFlow> flows) -> AssignmentFlow {
         let result = new List<LocalBinding>();
         let resultFields = new List<Field>();
-        let resultMaybeFields = new List<Field>();
+        let resultMaybeWrites = new List<FieldWrite>();
         bool anySurvivor = false;
         for (long i = 0; i < flows.length(); i++) {
             let flow = flows.get(i);
             if (flow.terminated) {
                 continue;
             }
-            this.unionFieldsInto(resultMaybeFields, flow.maybeAssignedFields);
+            this.unionWritesInto(resultMaybeWrites, flow.maybeAssignedWrites);
             if (!anySurvivor) {
                 result = this.copyBindings(flow.assigned);
                 resultFields = this.copyFields(flow.assignedFields);
@@ -1940,10 +1989,10 @@ class BodyChecker implements NoreturnCalls {
                         resultFields.push(flow.assignedFields.get(j));
                     }
                 }
-                this.unionFieldsInto(resultMaybeFields, flow.maybeAssignedFields);
+                this.unionWritesInto(resultMaybeWrites, flow.maybeAssignedWrites);
             }
         }
-        return new AssignmentFlow(result, resultFields, resultMaybeFields, !anySurvivor);
+        return new AssignmentFlow(result, resultFields, resultMaybeWrites, !anySurvivor);
     }
 
     conditionIsAlwaysTrue(Expression condition) -> bool {
@@ -3472,7 +3521,7 @@ class BodyChecker implements NoreturnCalls {
             },
             is TypeParameterName held -> {
                 this.reportTypeParameterRefusal("'{name}' is a type parameter, not a value.",
-                    held.parameter, node.name().span());
+                    held.parameter, node.name().span(), NamePosition.Value);
                 return this.store.errorType();
             },
             is NamespaceName module -> {
@@ -3522,7 +3571,8 @@ class BodyChecker implements NoreturnCalls {
     // 'refusal' is the sentence the position writes, followed by how this position reaches a
     // value of the parameter's type. Only a parameter holds one, so the route names one in
     // reach, else the one a callable's body can declare, and a default reaches neither.
-    reportTypeParameterRefusal(string refusal, TypeParamType parameter, Span at) {
+    reportTypeParameterRefusal(string refusal, TypeParamType parameter, Span at,
+                               NamePosition position) {
         string name = parameter.name();
         string written = refusal;
         let inReach = this.parameterOfType(parameter);
@@ -3532,7 +3582,7 @@ class BodyChecker implements NoreturnCalls {
             written = "{refusal} Use a value of type '{name}', such as a parameter declared "
                 + "'{name} value'.";
         }
-        this.reporter.report(this.typeParameterMessage(parameter, written), at);
+        this.reporter.report(this.typeParameterMessage(parameter, written, position), at);
     }
 
     // The parameter in reach whose type is this one, innermost first, or null where none is. A
@@ -3550,8 +3600,8 @@ class BodyChecker implements NoreturnCalls {
     // What a refused type parameter reads: the collision where it took the name from another
     // meaning of the file, the refusal of a position that can use no type parameter at all, and
     // 'plain' where the name means nothing else there.
-    typeParameterMessage(TypeParamType parameter, string plain) -> string {
-        let asStatic = this.shadowedStaticMessage(parameter);
+    typeParameterMessage(TypeParamType parameter, string plain, NamePosition position) -> string {
+        let asStatic = this.shadowedStaticMessage(parameter, position);
         if (asStatic != null) {
             return asStatic;
         }
@@ -3570,8 +3620,9 @@ class BodyChecker implements NoreturnCalls {
 
     // A static of the enclosing type under the refused name, or null where it declares none. A
     // static const is read through the plain type name, while a static method of a generic type
-    // needs the type arguments that only such a call itself could otherwise determine.
-    shadowedStaticMessage(TypeParamType parameter) -> string? {
+    // needs the type arguments that only such a call itself could otherwise determine. Where the
+    // name was written as a call, reading the static const also means dropping the arguments.
+    shadowedStaticMessage(TypeParamType parameter, NamePosition position) -> string? {
         let owner = this.enclosingOwner;
         if (owner == null) {
             return null;
@@ -3583,6 +3634,11 @@ class BodyChecker implements NoreturnCalls {
         string name = parameter.name();
         string ownerName = authority.name();
         if (members.findField(types.staticFieldsOf(owner), name) != null) {
+            if (position == NamePosition.Call) {
+                return "'{name}' is the type parameter of '{ownerName}' here, not the static "
+                    + "const it declares, and neither one can be called. Remove the arguments "
+                    + "and write '{ownerName}.{name}' to read the static.";
+            }
             return "'{name}' is the type parameter of '{ownerName}' here, not the static const "
                 + "it declares. Write '{ownerName}.{name}' to read the static.";
         }
@@ -4618,7 +4674,7 @@ class BodyChecker implements NoreturnCalls {
                         this.checkConstFieldWrite(node, field, throughThis, simpleAssign);
                     }
                     if (simpleAssign && throughThis) {
-                        this.markThisFieldMaybeAssigned(field);
+                        this.markThisFieldMaybeAssigned(field, node.span());
                         if (this.unconditionalPosition) {
                             this.markThisFieldAssigned(field);
                         }
@@ -4665,9 +4721,11 @@ class BodyChecker implements NoreturnCalls {
                 node.span());
             return;
         }
-        if (this.fieldsContain(this.maybeAssignedThisFields, field)) {
+        let earlier = this.writeTo(this.maybeAssignedThisWrites, field);
+        if (earlier != null) {
             this.reporter.report("Field '{name}' is 'const' and may already be assigned when "
-                + "this line runs. Remove one of the assignments.", node.span());
+                + "this line runs. Remove one of the assignments.", node.span(), earlier.span,
+                "'{name}' is assigned here");
         }
     }
 
@@ -6019,7 +6077,8 @@ class BodyChecker implements NoreturnCalls {
         string name = parameter.name();
         this.reporter.report(this.typeParameterMessage(parameter, "Statics cannot be reached "
             + "through a type parameter: '{name}' is a different type each time it is used, so "
-            + "'{name}.member' names nothing fixed. Write the type's own name instead."), at);
+            + "'{name}.member' names nothing fixed. Write the type's own name instead.",
+            NamePosition.MemberHead), at);
     }
 
     // A member read whose head is a type name: a static const resolves to its constant value, a
@@ -6879,7 +6938,7 @@ class BodyChecker implements NoreturnCalls {
             },
             is TypeParameterName held -> {
                 this.reportTypeParameterRefusal("'{name}' is a type parameter, not a function.",
-                    held.parameter, identifier.span());
+                    held.parameter, identifier.span(), NamePosition.Call);
                 this.analyzeArgumentsOnly(node.arguments());
                 return this.store.errorType();
             },
