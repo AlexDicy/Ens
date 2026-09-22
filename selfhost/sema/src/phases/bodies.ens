@@ -344,6 +344,19 @@ methodAsValueMessage(string subject, string call, MemberPosition position) -> st
     return subject + ", and a method's name is not a value. Call it as '{call}(...)'.";
 }
 
+// A call an example can write to the signature, carrying the 'try' the call needs. Null where the
+// signature is generic, and where it throws what only its body decides.
+callExample(string spelling, Signature signature) -> string? {
+    Type[] thrown = signature.throwsTypes();
+    if (signature.isGeneric() || (signature.declaresThrows() && thrown.length == 0)) {
+        return null;
+    }
+    if (thrown.length > 0) {
+        return "try {spelling}(...)";
+    }
+    return "{spelling}(...)";
+}
+
 class BodyChecker implements NoreturnCalls {
     ModuleContext context;
     Map<string, ModuleContext> contextsByPath;
@@ -3355,8 +3368,9 @@ class BodyChecker implements NoreturnCalls {
         if (name.length == 0) {
             return this.store.errorType();
         }
-        if (types.primitiveNamed(this.store, name) != null) {
-            this.reportTypeAsValue(name, node.name().span());
+        let primitive = types.primitiveNamed(this.store, name);
+        if (primitive != null) {
+            this.reportTypeAsValue(name, primitive, node.name().span());
             return this.store.errorType();
         }
         let resolution = this.resolveName(name);
@@ -3386,27 +3400,238 @@ class BodyChecker implements NoreturnCalls {
                 return this.store.errorType();
             },
             is TypeName named -> {
-                this.reportTypeAsValue(name, node.name().span());
+                this.reportTypeAsValue(name, named.target, node.name().span());
                 return this.store.errorType();
             },
-            is NamespaceName ignored -> {
-                this.reportModuleAsValue(name, node.name().span());
+            is NamespaceName module -> {
+                this.reportModuleAsValue(name, module.targetModulePath, node.name().span());
                 return this.store.errorType();
             },
         }
     }
 
-    reportTypeAsValue(string name, Span at) {
-        this.reporter.report("'{name}' is a type, not a value. A type name reaches a static "
-            + "member, as in '{name}.member(...)'; to work with an instance, construct one or "
-            + "name one.", at);
+    // 'named' is the type the refused name stands for, and 'spelling' is how this file writes
+    // that name.
+    reportTypeAsValue(string spelling, Type named, Span at) {
+        this.reporter.report(this.typeAsValueMessage(spelling, named, true), at);
     }
 
-    // A type reached through a module name, spelled with the head this file writes. The bare
-    // refusal's static route is left out, because no module-qualified spelling reaches a static.
-    reportQualifiedTypeAsValue(string spelling, Span at) {
-        this.reporter.report("'{spelling}' is a type, not a value. To work with an instance, "
-            + "construct one or name one.", at);
+    // A type reached through a module name, spelled with the head this file writes. Nothing
+    // written after such a head resolves, so the routes that need the type's own name are left
+    // out.
+    reportQualifiedTypeAsValue(string spelling, Type named, Span at) {
+        this.reporter.report(this.typeAsValueMessage(spelling, named, false), at);
+    }
+
+    // The message a type name written where a value belongs is refused with. 'bareSpelling' is
+    // true where 'spelling' is the type's own name, and false where a module name qualifies it.
+    typeAsValueMessage(string spelling, Type named, bool bareSpelling) -> string {
+        string refusal = "'{spelling}' is a type, not a value.";
+        string fix = this.typeAsValueFix(spelling, named, bareSpelling);
+        if (fix.length == 0) {
+            return refusal;
+        }
+        return "{refusal} {fix}.";
+    }
+
+    // How this file writes a value of the type, then how it reaches a static member of it. A
+    // route this file cannot spell is left out, and the fix is empty where it can spell neither.
+    typeAsValueFix(string spelling, Type named, bool bareSpelling) -> string {
+        string value = this.valueRoute(spelling, named, bareSpelling);
+        string? staticMember = null;
+        if (bareSpelling) {
+            staticMember = this.staticMemberExample(spelling, named);
+        }
+        if (staticMember == null) {
+            return value;
+        }
+        if (value.length == 0) {
+            return "Write '{staticMember}' to reach a static member";
+        }
+        return "{value}, or write '{staticMember}' to reach a static member";
+    }
+
+    // The way a value of the type is written where the refused name stands, or empty where this
+    // file can spell none. A primitive's values are its literals, which the refusal leaves to
+    // the reader.
+    valueRoute(string spelling, Type named, bool bareSpelling) -> string {
+        let authority = types.authorityOf(named);
+        if (authority == null) {
+            return "";
+        }
+        switch (authority) {
+            is InterfaceType ignored -> {
+                return "Use a value of a class that implements it";
+            },
+            is EnumType enumType -> {
+                string[] constants = enumType.memberNames();
+                if (!bareSpelling || constants.length == 0) {
+                    return "";
+                }
+                return "Write '{spelling}.{constants[0]}' to name one of its constants";
+            },
+            is ClassType classType -> {
+                if (classType.isAbstract()) {
+                    return "Use a value of a subclass that is not abstract";
+                }
+                // Constructing a generic class needs type arguments, and an example cannot put
+                // one there that the use site has a name for.
+                if (classType.isGeneric()) {
+                    return "";
+                }
+                let arguments = this.classConstructionArguments(classType);
+                if (arguments == null) {
+                    return "";
+                }
+                return "Write 'new {spelling}{arguments}' to construct one";
+            },
+            is StructType structType -> {
+                // A generic struct needs type arguments in its constructor call and in the
+                // literal alike, and an example cannot name one.
+                if (structType.isGeneric()) {
+                    return "";
+                }
+                return this.structValueRoute(spelling, structType, bareSpelling);
+            },
+            default -> {
+                return "";
+            },
+        }
+    }
+
+    // How a struct value is written: a constructor call, or an aggregate literal where this file
+    // can reach no constructor. A constructor is called through the struct's own name, so a
+    // module-qualified spelling has the literal alone.
+    structValueRoute(string spelling, Type structType, bool bareSpelling) -> string {
+        if (bareSpelling) {
+            let arguments = this.reachableConstructorArguments(structType);
+            if (arguments != null) {
+                return "Write '{spelling}{arguments}' to construct one";
+            }
+        }
+        let literal = this.structLiteralExample(spelling, structType);
+        if (literal == null) {
+            return "";
+        }
+        return "Write '{literal}' to build one";
+    }
+
+    // A declaration that builds the struct from an aggregate literal, naming every field the
+    // literal has to set. Null where a field it has to set cannot be set from this file.
+    structLiteralExample(string spelling, Type structType) -> string? {
+        let fields = types.fieldsOf(structType);
+        if (fields == null) {
+            return null;
+        }
+        let listed = new StringBuilder();
+        for (long i = 0; i < fields.length(); i++) {
+            let field = fields.get(i);
+            if (field.hasDefault()) {
+                continue;
+            }
+            if (!this.isAccessAllowed(field.visibility(), field.definingType())) {
+                return null;
+            }
+            if (!listed.isEmpty()) {
+                listed.append(", ");
+            }
+            listed.append("{field.name()}: ...");
+        }
+        return "{spelling} value = \{{listed.toString()}\};";
+    }
+
+    // The argument list a 'new' of the class writes, or null where this file can reach no
+    // constructor of it.
+    classConstructionArguments(Type classType) -> string? {
+        if (constructorsOf(classType).length() > 0) {
+            return this.reachableConstructorArguments(classType);
+        }
+        if (this.reachesImplicitConstruction(classType)) {
+            return "()";
+        }
+        return null;
+    }
+
+    // '()' where a constructor this file can reach takes no argument, '(...)' where the ones it
+    // can reach take arguments, and null where it can reach none.
+    reachableConstructorArguments(Type record) -> string? {
+        let constructors = constructorsOf(record);
+        bool anyReachable = false;
+        for (long i = 0; i < constructors.length(); i++) {
+            let candidate = constructors.get(i);
+            if (!this.resolver.memberExists(candidate)
+                    || !this.isAccessAllowed(candidate.visibility(), candidate.definingType())) {
+                continue;
+            }
+            if (calls.requiredArgumentCount(candidate.signature()) == 0) {
+                return "()";
+            }
+            anyReachable = true;
+        }
+        if (anyReachable) {
+            return "(...)";
+        }
+        return null;
+    }
+
+    // Whether a class that declares no constructor of its own is constructed with no arguments.
+    // The nearest base class declaring constructors must have one this file can call with no
+    // arguments; a chain that declares none anywhere takes no arguments either.
+    reachesImplicitConstruction(Type classType) -> bool {
+        let seen = new Set<Type>();
+        Type? current = types.baseOf(classType);
+        while (current != null && seen.add(current)) {
+            let constructors = constructorsOf(current);
+            if (constructors.length() > 0) {
+                for (long i = 0; i < constructors.length(); i++) {
+                    let candidate = constructors.get(i);
+                    if (this.resolver.memberExists(candidate)
+                            && calls.requiredArgumentCount(candidate.signature()) == 0
+                            && this.isAccessAllowed(candidate.visibility(),
+                                candidate.definingType())) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            current = types.baseOf(current);
+        }
+        return true;
+    }
+
+    // One static member of the type this file can reach, written after 'spelling'. A type-level
+    // const reads as a value on its own and a static method reads as a call.
+    staticMemberExample(string spelling, Type named) -> string? {
+        let fields = types.staticFieldsOf(named);
+        if (fields != null) {
+            for (long i = 0; i < fields.length(); i++) {
+                let field = fields.get(i);
+                if (this.isAccessAllowed(field.visibility(), field.definingType())) {
+                    return "{spelling}.{field.name()}";
+                }
+            }
+        }
+        let authority = types.authorityOf(named);
+        // A static method of a generic type may need type arguments that only the arguments of
+        // the call itself determine.
+        if (authority != null && authority.isGeneric()) {
+            return null;
+        }
+        let methods = types.staticMethodsOf(named);
+        if (methods == null) {
+            return null;
+        }
+        for (long i = 0; i < methods.length(); i++) {
+            let method = methods.get(i);
+            if (!this.isAccessAllowed(method.visibility(), method.definingType())) {
+                continue;
+            }
+            let call = callExample("{spelling}.{method.name()}", method.signature());
+            if (call != null) {
+                return call;
+            }
+        }
+        return null;
     }
 
     // 'spelling' is how this file writes the function's name, which is 'module.name' where a
@@ -3422,9 +3647,45 @@ class BodyChecker implements NoreturnCalls {
         this.reporter.report(message + ", as in '{example}'.", at);
     }
 
-    reportModuleAsValue(string name, Span at) {
-        this.reporter.report("'{name}' names a module, not a value. A module name reaches what "
-            + "the module declares, as in '{name}.member(...)'.", at);
+    // 'name' is how this file writes the module. The example calls a function the module
+    // declares, because a type it declares is refused in a value position too.
+    reportModuleAsValue(string name, string targetPath, Span at) {
+        string refusal = "'{name}' names a module, not a value.";
+        let called = this.moduleFunctionExample(name, targetPath);
+        if (called == null) {
+            this.reporter.report(refusal, at);
+            return;
+        }
+        this.reporter.report(refusal + " A module name reaches what the module declares, as in "
+            + "'{called}'.", at);
+    }
+
+    // A call this file can write to a function the module declares, or null where it can write
+    // none. The module's declaration order decides which function that is, and the functions the
+    // language provides in every module are not among them.
+    moduleFunctionExample(string name, string targetPath) -> string? {
+        let target = this.contextsByPath.get(targetPath);
+        if (target == null) {
+            return null;
+        }
+        string targetPackagePrefix = target.module().packagePrefix();
+        let entries = target.functions().all();
+        for (long i = 0; i < entries.length(); i++) {
+            let entry = entries.get(i);
+            if (entry.isBuiltin()) {
+                continue;
+            }
+            if (!types.isVisibleFrom(entry.visibility(), targetPath, targetPackagePrefix,
+                    this.modulePath, this.packagePrefix)) {
+                continue;
+            }
+            let signature = entry.signature();
+            let call = callExample("{name}.{signature.name()}", signature);
+            if (call != null) {
+                return call;
+            }
+        }
+        return null;
     }
 
     // A declaration holding a lambda that calls the named function, or null when the name has no
@@ -4646,8 +4907,9 @@ class BodyChecker implements NoreturnCalls {
         for (long i = 0; i < node.fieldsCount(); i++) {
             this.analyzeExpression(node.fields(i).value());
         }
-        this.reporter.report("Cannot tell which struct this '\{...\}' literal builds. Declare "
-            + "the target's type, for example 'Point p = \{x: 1, y: 2\};'.", node.span());
+        this.reporter.report("Cannot tell which struct this '\{...\}' literal builds. Write it "
+            + "where a declared type names the struct: a variable, a field, a parameter, an "
+            + "array element, or a return value.", node.span());
         return this.store.errorType();
     }
 
@@ -4721,6 +4983,54 @@ class BodyChecker implements NoreturnCalls {
         return structType;
     }
 
+    // The head this file writes for a struct a diagnostic offers to build, or null where it has
+    // no spelling for it. An instantiation keeps its type arguments, which its literal and its
+    // constructor call both need.
+    structHead(Type structType, string written) -> string? {
+        if (!(structType is InstantiationType)) {
+            return written;
+        }
+        if (!this.names.canSpell(structType)) {
+            return null;
+        }
+        return this.names.of(structType);
+    }
+
+    // A struct built by a call it has no constructor for. The literal is left out where this
+    // file cannot set every field the literal has to set.
+    reportStructWithoutConstructor(CallExpressionNode node, Type structType, string name) {
+        string refusal = "Struct '{name}' has no constructor to call.";
+        let head = this.structHead(structType, name);
+        string? literal = null;
+        if (head != null) {
+            literal = this.structLiteralExample(head, structType);
+        }
+        if (literal == null) {
+            this.reporter.report(refusal + " Add a 'constructor(...)' to it.", node.span());
+            return;
+        }
+        this.reporter.report(refusal + " Build it with a literal, for example '{literal}', or "
+            + "add a 'constructor(...)'.", node.span());
+    }
+
+    // 'new' written on a struct, which a constructor call or an aggregate literal builds instead.
+    // 'written' is the head the 'new' carries, and a constructor is called through the struct's
+    // own name, so a module-qualified head leaves the literal.
+    reportNewOnStruct(NewExpressionNode node, nodes.Type created, Type structType,
+                      string written) {
+        string refusal = "'new' builds a class, and '{written}' is a struct.";
+        let head = this.structHead(structType, written);
+        string route = "";
+        if (head != null) {
+            route = this.structValueRoute(head, structType, !isModuleQualified(created));
+        }
+        if (route.length == 0) {
+            this.reporter.report(refusal + " Add a 'constructor(...)' to it.", node.span());
+            return;
+        }
+        this.reporter.report("{refusal} {route}.", node.span());
+    }
+
     // 'StructName(args)': a by-value struct built through its constructor. Resolution mirrors
     // class-constructor resolution (overloads, named and optional arguments) with no allocation.
     analyzeStructConstructorCall(CallExpressionNode node, Type structType, string name)
@@ -4753,9 +5063,7 @@ class BodyChecker implements NoreturnCalls {
             return target;
         }
         if (constructors.length() == 0) {
-            this.reporter.report("Struct '{name}' has no constructor to call. Build it with a "
-                + "literal, for example '{name} value = \{x: 1, y: 2\};', or add a "
-                + "'constructor(...)'.", node.span());
+            this.reportStructWithoutConstructor(node, target, name);
             this.analyzeArgumentsOnly(arguments);
             return target;
         }
@@ -5318,7 +5626,7 @@ class BodyChecker implements NoreturnCalls {
                 found.modulePath(), found.packagePrefix(), this.packagePrefix), span);
             return this.store.errorType();
         }
-        this.reportQualifiedTypeAsValue("{head}.{name}", span);
+        this.reportQualifiedTypeAsValue("{head}.{name}", found, span);
         return this.store.errorType();
     }
 
@@ -7180,8 +7488,7 @@ class BodyChecker implements NoreturnCalls {
         string shownName = writtenTypeName(created, t, this.names);
         if (!types.isClassLike(t)) {
             if (types.isStructLike(t)) {
-                this.reporter.report("'new' builds a class, and '{shownName}' is a struct. "
-                    + "Declare it directly, as '{shownName} value;'.", node.span());
+                this.reportNewOnStruct(node, created, t, shownName);
             } else {
                 this.reporter.report("'new' requires a class type, got '{this.names.of(t)}'.",
                     node.span());
@@ -8503,11 +8810,21 @@ quotedList(List<string> names) -> string {
     return joined;
 }
 
+// The head a 'new' writes for its type, with the module qualifier it carries.
 writtenTypeName(nodes.Type created, Type resolved, TypeNames names) -> string {
     if (created is NamedTypeNode) {
+        let qualifier = created.qualifier();
+        if (qualifier != null) {
+            return "{qualifier.module().text()}.{created.name().text()}";
+        }
         return created.name().text();
     }
     return names.of(resolved);
+}
+
+// Whether a written type carries a module qualifier, through which no constructor call resolves.
+isModuleQualified(nodes.Type created) -> bool {
+    return created is NamedTypeNode && created.qualifier() != null;
 }
 
 // The literal an untyped integer adaptation applies to: the literal itself, or one behind a

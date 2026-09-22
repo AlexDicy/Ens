@@ -97,10 +97,10 @@ When `@std.time` is designed, `Metadata.modifiedMillis` and `wait(long timeoutMi
 The remedy when it matters is a fast path in front of the same rounding for the short inputs that need no buffer, and a buffer the conversion reuses.
 
 Two questions about a name used as a value are open.
-A static reached through a module-qualified type name, `renderer.Maker.build()`, reports "'renderer.Maker' is a type, not a value." since such a head became a refusal on 2026-09-21, so whether a module-qualified static head is supported at all is undecided.
-An enum constant reached the same way, `renderer.Kind.Large`, reports that same refusal, so the question covers every type a module declares.
+A static reached through a module-qualified type name, `renderer.Maker.build()`, reports `renderer.Maker` as a type rather than a value, since such a head became a refusal on 2026-09-21, so whether a module-qualified static head is supported at all is undecided.
+An enum constant reached the same way, `renderer.Kind.Large`, reports that same refusal, so the question covers every type a module declares; until it is answered that refusal names no constant of its own, while the bare one does (2026-09-22).
 A static-as-value message on a bare generic head can spell its fix only as `Holder.make(...)`, which fails when the call cannot infer the type arguments, while `Holder<T>.make(...)` would name a type parameter the use site does not have in scope.
-Both the bare and the module-qualified type-as-value refusal end with "construct one or name one", which does not apply when the type is an enum, since an enum's constants are named rather than constructed, and a message that told the two apart would need the report site to know the type's kind (2026-09-21).
+The type-as-value refusal therefore names a generic type's static const, which needs no type argument, and never its static method (2026-09-22).
 
 One shape still reports that a left side must be a variable, field, or array element where it is one.
 Parentheses inside a target rather than around it, `(point).x = 2;` on a struct local, keep that sentence, while `(held).value = 1;` on a class and `(slots)[0] = 5;` on an array are accepted, so what the message can say waits on whether the struct shape should be refused at all.
