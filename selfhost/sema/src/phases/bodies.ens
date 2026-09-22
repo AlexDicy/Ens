@@ -3379,6 +3379,12 @@ class BodyChecker implements NoreturnCalls {
                     + "'{ownerName}'; write '{ownerName}.{name}'.", node.name().span());
                 return this.store.errorType();
             }
+            let parameter = this.resolver.typeParameterNamed(name);
+            if (parameter != null) {
+                this.reportTypeParameterRefusal("'{name}' is a type parameter, not a value.",
+                    parameter, node.name().span());
+                return this.store.errorType();
+            }
             this.reporter.report("Undefined name '{name}'. Check the spelling, or declare it "
                 + "before it is used.", node.name().span());
             return this.store.errorType();
@@ -3424,12 +3430,33 @@ class BodyChecker implements NoreturnCalls {
     // The message a type name written where a value belongs is refused with. 'bareSpelling' is
     // true where 'spelling' is the type's own name, and false where a module name qualifies it.
     typeAsValueMessage(string spelling, Type named, bool bareSpelling) -> string {
-        string refusal = "'{spelling}' is a type, not a value.";
+        return this.typeRefusalMessage("'{spelling}' is a type, not a value.", spelling, named,
+            bareSpelling);
+    }
+
+    // A type name written as the callee of a call. The routes are the ones a value position
+    // offers, since a type name reaches no call of its own.
+    reportTypeAsCall(string spelling, Type named, bool bareSpelling, Span at) {
+        this.reporter.report(this.typeRefusalMessage("'{spelling}' is a type, not a function.",
+            spelling, named, bareSpelling), at);
+    }
+
+    // The refusal sentence the position writes, then the routes to a value of the type this
+    // file can spell.
+    typeRefusalMessage(string refusal, string spelling, Type named, bool bareSpelling) -> string {
         string fix = this.typeAsValueFix(spelling, named, bareSpelling);
         if (fix.length == 0) {
             return refusal;
         }
         return "{refusal} {fix}.";
+    }
+
+    // 'refusal' is the sentence the position writes. A type parameter stands for a different
+    // type at each use, so a value declared with it is the only route the message offers.
+    reportTypeParameterRefusal(string refusal, TypeParamType parameter, Span at) {
+        string name = parameter.name();
+        this.reporter.report("{refusal} Use a value of type '{name}', such as a parameter "
+            + "declared '{name} value'.", at);
     }
 
     // How this file writes a value of the type, then how it reaches a static member of it. A
@@ -3645,10 +3672,19 @@ class BodyChecker implements NoreturnCalls {
         this.reporter.report(message + ", as in '{example}'.", at);
     }
 
-    // 'name' is how this file writes the module. The example calls a function the module
-    // declares, because a type it declares is refused in a value position too.
     reportModuleAsValue(string name, string targetPath, Span at) {
-        string refusal = "'{name}' names a module, not a value.";
+        this.reportModuleRefusal("'{name}' names a module, not a value.", name, targetPath, at);
+    }
+
+    reportModuleAsCall(string name, string targetPath, Span at) {
+        this.reportModuleRefusal("'{name}' names a module, not a function.", name, targetPath,
+            at);
+    }
+
+    // 'refusal' is the sentence the position writes, and 'name' is how this file writes the
+    // module. The example calls a function the module declares, because a type it declares is
+    // refused in a value position too.
+    reportModuleRefusal(string refusal, string name, string targetPath, Span at) {
         let called = this.moduleFunctionExample(name, targetPath);
         if (called == null) {
             this.reporter.report(refusal, at);
@@ -5396,7 +5432,7 @@ class BodyChecker implements NoreturnCalls {
             let resolution = this.resolveName(objectName);
             if (resolution is NamespaceName) {
                 return this.analyzeNamespaceMemberValue(resolution.targetModulePath, objectName,
-                    name, node.member().span());
+                    name, node.member().span(), position);
             }
             let enumType = this.enumTypeNamed(objectName, resolution);
             if (enumType != null) {
@@ -5610,9 +5646,11 @@ class BodyChecker implements NoreturnCalls {
         }
     }
 
-    // A module-qualified name written where a value belongs, with 'head' the module as this file
-    // writes it. A module declares only types and functions, so every name here is refused.
-    analyzeNamespaceMemberValue(string targetPath, string head, string name, Span span) -> Type {
+    // A module-qualified name written where a value or a call belongs, with 'head' the module as
+    // this file writes it. A module declares only types and functions, so every name here is
+    // refused.
+    analyzeNamespaceMemberValue(string targetPath, string head, string name, Span span,
+                                        MemberPosition position) -> Type {
         let found = this.store.findDeclared(targetPath, name);
         if (found == null) {
             this.reportNamespaceMember(targetPath, head, name, span);
@@ -5624,7 +5662,11 @@ class BodyChecker implements NoreturnCalls {
                 found.modulePath(), found.packagePrefix(), this.packagePrefix), span);
             return this.store.errorType();
         }
-        this.reportQualifiedTypeAsValue("{head}.{name}", found, span);
+        if (position == MemberPosition.Covered) {
+            this.reportTypeAsCall("{head}.{name}", found, false, span);
+        } else {
+            this.reportQualifiedTypeAsValue("{head}.{name}", found, span);
+        }
         return this.store.errorType();
     }
 
@@ -6580,6 +6622,12 @@ class BodyChecker implements NoreturnCalls {
     analyzeFunctionCall(CallExpressionNode node, IdentifierExpressionNode identifier)
             -> Type {
         string name = identifier.name().text();
+        let primitive = types.primitiveNamed(this.store, name);
+        if (primitive != null) {
+            this.reportTypeAsCall(name, primitive, true, identifier.span());
+            this.analyzeArgumentsOnly(node.arguments());
+            return this.store.errorType();
+        }
         let resolution = this.resolveName(name);
         if (resolution == null) {
             // A name a type parameter shadows still calls this file's struct constructor of the
@@ -6592,6 +6640,13 @@ class BodyChecker implements NoreturnCalls {
             if (ownerName != null) {
                 this.reporter.report("Statics are called through the type name, even inside "
                     + "'{ownerName}'; write '{ownerName}.{name}(...)'.", identifier.span());
+                this.analyzeArgumentsOnly(node.arguments());
+                return this.store.errorType();
+            }
+            let parameter = this.resolver.typeParameterNamed(name);
+            if (parameter != null) {
+                this.reportTypeParameterRefusal("'{name}' is a type parameter, not a function.",
+                    parameter, identifier.span());
                 this.analyzeArgumentsOnly(node.arguments());
                 return this.store.errorType();
             }
@@ -6608,35 +6663,45 @@ class BodyChecker implements NoreturnCalls {
             this.analyzeArgumentsOnly(node.arguments());
             return this.store.errorType();
         }
-        if (resolution is FunctionName) {
-            let offered = resolution.fromPrelude;
-            if (offered != null && offered.isAmbiguous()) {
-                this.reporter.report(prelude.ambiguousMessage(name, offered.modulePaths()),
-                    identifier.span());
+        switch (resolution) {
+            is FunctionName functions -> {
+                let offered = functions.fromPrelude;
+                if (offered != null && offered.isAmbiguous()) {
+                    this.reporter.report(prelude.ambiguousMessage(name, offered.modulePaths()),
+                        identifier.span());
+                    this.analyzeArgumentsOnly(node.arguments());
+                    return this.store.errorType();
+                }
+                return this.dispatchFunctionCall(node, identifier, name, functions.entries);
+            },
+            is TypeName named -> {
+                if (types.isStructLike(named.target)) {
+                    return this.analyzeStructConstructorCall(node, named.target, name);
+                }
+                this.reportTypeAsCall(name, named.target, true, identifier.span());
                 this.analyzeArgumentsOnly(node.arguments());
                 return this.store.errorType();
-            }
-            return this.dispatchFunctionCall(node, identifier, name, resolution.entries);
+            },
+            is LocalName ignored -> {
+                Type calleeType = this.analyzeExpression(identifier);
+                if (convert.coreOf(calleeType) is FunctionType) {
+                    return this.analyzeFunctionValueCall(node, calleeType, name,
+                        identifier.span());
+                }
+                if (!(calleeType is ErrorType)) {
+                    this.reporter.report("'{name}' has type '{this.names.of(calleeType)}', "
+                        + "which is not a function type, so it cannot be called.",
+                        identifier.span());
+                }
+                this.analyzeArgumentsOnly(node.arguments());
+                return this.store.errorType();
+            },
+            is NamespaceName module -> {
+                this.reportModuleAsCall(name, module.targetModulePath, identifier.span());
+                this.analyzeArgumentsOnly(node.arguments());
+                return this.store.errorType();
+            },
         }
-        if (resolution is TypeName && types.isStructLike(resolution.target)) {
-            return this.analyzeStructConstructorCall(node, resolution.target, name);
-        }
-        if (resolution is LocalName) {
-            Type calleeType = this.analyzeExpression(identifier);
-            if (convert.coreOf(calleeType) is FunctionType) {
-                return this.analyzeFunctionValueCall(node, calleeType, name, identifier.span());
-            }
-            if (!(calleeType is ErrorType)) {
-                this.reporter.report("'{name}' has type '{this.names.of(calleeType)}', which is "
-                    + "not a function type, so it cannot be called.", identifier.span());
-            }
-            this.analyzeArgumentsOnly(node.arguments());
-            return this.store.errorType();
-        }
-        this.reporter.report("'{name}' is not a function and cannot be called.",
-            identifier.span());
-        this.analyzeArgumentsOnly(node.arguments());
-        return this.store.errorType();
     }
 
     dispatchFunctionCall(CallExpressionNode node, IdentifierExpressionNode identifier,

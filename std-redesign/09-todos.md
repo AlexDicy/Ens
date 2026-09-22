@@ -102,6 +102,9 @@ An enum constant reached the same way, `renderer.Kind.Large`, reports that same 
 A static-as-value message on a bare generic head can spell its fix only as `Holder.make(...)`, which fails when the call cannot infer the type arguments, while `Holder<T>.make(...)` would name a type parameter the use site does not have in scope.
 The type-as-value refusal therefore names a generic type's static const, which needs no type argument, and never its static method (2026-09-22).
 
+Which name wins where a type parameter and a type of the same name collide depends on the position.
+A bare `Tag` and a `Tag.member` static head both read the type parameter and are refused, while `Made(3)` reaches the file's own struct constructor, `Kind.Large` names the file's own enum constant, and an imported `Widget` keeps its statics (2026-09-22).
+
 One shape still reports that a left side must be a variable, field, or array element where it is one.
 Parentheses inside a target rather than around it, `(point).x = 2;` on a struct local, keep that sentence, while `(held).value = 1;` on a class and `(slots)[0] = 5;` on an array are accepted, so what the message can say waits on whether the struct shape should be refused at all.
 
