@@ -126,6 +126,71 @@ public notVisibleMessage(string kindWord, string name, Visibility visibility,
         + "use it. " + fix;
 }
 
+// The refusal a type written under a module name reads, with 'spelling' the name as the file
+// wrote it. A module name reaches that module's functions, so the fix is the name this file
+// already has for the type, or the import that would bind one.
+public moduleQualifiedTypeMessage(string spelling, DeclaredType found, TypeNames names)
+        -> string {
+    string refusal = "'{spelling}' reaches a type through its module, and a module name reaches "
+        + "only functions.";
+    let already = names.nameFor(found);
+    if (already != null) {
+        return "{refusal} This file already names it '{already}', so write that.";
+    }
+    string bound = freeNameFor(found, names);
+    string binding = found.name();
+    if (bound != found.name()) {
+        binding = "{found.name()} as {bound}";
+    }
+    return "{refusal} Write 'import {binding} from {names.importPathOf(found)};' and use "
+        + "'{bound}'.";
+}
+
+// The name an import of this type binds in the file: the type's own name, or that name behind as
+// much of the module path as it takes for the file not to have the name already.
+freeNameFor(DeclaredType found, TypeNames names) -> string {
+    if (!names.bindsTypeName(found.name())) {
+        return found.name();
+    }
+    string[] segments = found.modulePath().split(".");
+    string candidate = found.name();
+    for (long i = segments.length - 1; i >= 0; i--) {
+        candidate = capitalizedAscii(segments[i]) + candidate;
+        if (!names.bindsTypeName(candidate)) {
+            return candidate;
+        }
+    }
+    return candidate;
+}
+
+capitalizedAscii(string text) -> string {
+    if (text.length == 0) {
+        return text;
+    }
+    return text.substring(0, 1).toUpperAscii() + text.substring(1);
+}
+
+// The refusal a name a type parameter took reads, with 'taken' naming the meaning the parameter
+// took it from. A type parameter takes its name for the whole of the declaration that
+// introduces it, so nothing else of that name is reachable inside it.
+public typeParameterTookNameMessage(string name, string ownerName, string taken) -> string {
+    return "'{name}' is the type parameter of '{ownerName}' here, not {taken}, because a type "
+        + "parameter takes the name for the whole of '{ownerName}'. Rename one of the two.";
+}
+
+// Where a meaning a refusal names is declared, read from the module the refusal is reported in.
+public declaringPhrase(string kindWord, string modulePath, string readingModulePath) -> string {
+    if (modulePath == readingModulePath) {
+        return "the {kindWord} this file declares";
+    }
+    return "the {kindWord} declared in module '{modulePath}'";
+}
+
+// A module the file imports, as a refusal names it.
+public importedModulePhrase(string modulePath) -> string {
+    return "the module '{modulePath}' this file imports";
+}
+
 // The declaration keyword a diagnostic should use when it names a declared type's owner.
 public kindWordOf(DeclaredType declared) -> string {
     return declared.kindWord();
@@ -991,17 +1056,29 @@ export class TypeParamType extends Type {
     GreenNode owningDeclaration;
     long parameterIndex;
     string parameterName;
+    string owningName;
     Type[] parameterBounds;
 
     protected constructor(GreenNode owner, long index, string name) {
         this.owningDeclaration = owner;
         this.parameterIndex = index;
         this.parameterName = name;
+        this.owningName = "";
         this.parameterBounds = [];
     }
 
     export owner() -> GreenNode {
         return this.owningDeclaration;
+    }
+
+    // The name of the declaration that introduced the parameter, which a refusal names it by, or
+    // empty for a parameter built with no declaration resolved for it.
+    export ownerName() -> string {
+        return this.owningName;
+    }
+
+    public setOwnerName(string name) {
+        this.owningName = name;
     }
 
     export index() -> long {
@@ -1237,6 +1314,8 @@ export class TypeStore {
     Map<Type, ArrayType> arrays;
     Map<FunctionTypeKey, FunctionType> functions;
     Map<DeclaredTypeKey, DeclaredType> declaredTypes;
+    Set<string> declaredNames;
+    Set<string> repeatedDeclaredNames;
     Map<TypeParamKey, TypeParamType> typeParameters;
     Map<InstantiationKey, InstantiationType> instantiations;
     List<InstantiationType> pendingFills;
@@ -1252,6 +1331,8 @@ export class TypeStore {
         this.arrays = new Map<Type, ArrayType>();
         this.functions = new Map<FunctionTypeKey, FunctionType>();
         this.declaredTypes = new Map<DeclaredTypeKey, DeclaredType>();
+        this.declaredNames = new Set<string>();
+        this.repeatedDeclaredNames = new Set<string>();
         this.typeParameters = new Map<TypeParamKey, TypeParamType>();
         this.instantiations = new Map<InstantiationKey, InstantiationType>();
         this.pendingFills = new List<InstantiationType>();
@@ -1559,6 +1640,12 @@ export class TypeStore {
         return this.declaredTypes.contains(new DeclaredTypeKey(modulePath, name));
     }
 
+    // Whether two or more modules of this program declare a type under the name, so the name on
+    // its own does not say which of them a diagnostic is about.
+    export isRepeatedName(string name) -> bool {
+        return this.repeatedDeclaredNames.contains(name);
+    }
+
     public addClass(string name, string modulePath, string packagePrefix, string filePath,
              GreenNode declaration, Visibility visibility, string[] typeParameters,
              bool isAbstract, bool isFinal, bool isSealed) -> ClassType {
@@ -1631,6 +1718,9 @@ export class TypeStore {
                 + "'{created.modulePath()}'");
         }
         this.declaredTypes.set(key, created);
+        if (!this.declaredNames.add(created.name())) {
+            let ignored = this.repeatedDeclaredNames.add(created.name());
+        }
     }
 }
 
@@ -1715,9 +1805,9 @@ referencesTemplate(Type type, DeclaredType template) -> bool {
 }
 
 // The names one file has for the program's declared types: what it declares, what its imports
-// bind, the modules its imports let it qualify with, and the modules whose types it names with
-// no import written. A diagnostic reported in that file spells every type it names through
-// these, so a fix it suggests is spelled as the file can write it.
+// bind, and the modules whose types it names with no import written. A diagnostic reported in
+// that file spells every type it names through these, so a fix it suggests is spelled as the
+// file can write it.
 export final class TypeNames {
     string namingFilePath;
     string namingModulePath;
@@ -1728,20 +1818,20 @@ export final class TypeNames {
     // reads them. Empty for names that belong to no file, which name no type at all.
     string[] implicitModulePaths;
     Map<DeclaredType, string> importedNames;
-    Map<string, string> namespaceAliases;
     Set<string> boundTypeNames;
+    Set<string> boundModuleNames;
 
     public constructor(string filePath, string modulePath, string packagePrefix, TypeStore store,
                 string[] implicitPaths, Map<DeclaredType, string> imported,
-                Map<string, string> aliases, Set<string> boundNames) {
+                Set<string> boundTypes, Set<string> boundModules) {
         this.namingFilePath = filePath;
         this.namingModulePath = modulePath;
         this.namingPackagePrefix = packagePrefix;
         this.namingStore = store;
         this.implicitModulePaths = implicitPaths;
         this.importedNames = imported;
-        this.namespaceAliases = aliases;
-        this.boundTypeNames = boundNames;
+        this.boundTypeNames = boundTypes;
+        this.boundModuleNames = boundModules;
     }
 
     // The file these names belong to, which is the file a diagnostic spelled with them lands in.
@@ -1750,7 +1840,8 @@ export final class TypeNames {
     }
 
     // The type as it reads in a diagnostic in this file, spelled the way the language writes it:
-    // 'int', 'Box<string>?', 'Sort[]', 'kinds.Kind[]', '(Sort) -> bool', '((int) -> bool)?'.
+    // 'int', 'Box<string>?', 'Sort[]', 'Kind (from engine.kinds)', '(Sort) -> bool',
+    // '((int) -> bool)?'.
     export of(Type type) -> string {
         return spelled(type, this);
     }
@@ -1764,19 +1855,38 @@ export final class TypeNames {
     }
 
     // The name this file has for a declared type, without the type parameters its own spelling
-    // carries: the name the file declares or imports it under, 'alias.Type' where an imported
-    // module is what reaches it, and the module-qualified name where the file has no name for it.
+    // carries, and with the module it comes from after it where the name alone does not say
+    // which type it is.
     public nameOf(DeclaredType declared) -> string {
-        return this.nameFor(declared) ?? "{declared.modulePath()}.{declared.name()}";
+        return this.plainNameOf(declared) + this.moduleNoteOf(declared);
     }
 
-    // The name this file writes for a declared type, or null when no declaration, import or
-    // module alias of this file reaches it.
-    nameFor(DeclaredType declared) -> string? {
+    // What this file calls a declared type, or the type's own name where it calls it nothing.
+    public plainNameOf(DeclaredType declared) -> string {
+        return this.nameFor(declared) ?? declared.name();
+    }
+
+    // The module a diagnostic names after a type, as ' (from engine.sizing)', where this file
+    // has no name for the type and that name alone does not say which type it is. Empty
+    // everywhere else, so a type the reader can write reads as they would write it.
+    public moduleNoteOf(DeclaredType declared) -> string {
+        if (this.nameFor(declared) != null) {
+            return "";
+        }
+        if (this.bindsTypeName(declared.name())
+                || this.namingStore.isRepeatedName(declared.name())) {
+            return " (from {declared.modulePath()})";
+        }
+        return "";
+    }
+
+    // The name this file writes for a declared type, or null when no declaration or import of
+    // this file binds it.
+    public nameFor(DeclaredType declared) -> string? {
         if (declared is PrimitiveBinding) {
             return declared.name();
         }
-        if (declared.filePath() == this.namingFilePath) {
+        if (declared.modulePath() == this.namingModulePath) {
             return declared.name();
         }
         let imported = this.importedNames.get(declared);
@@ -1786,16 +1896,42 @@ export final class TypeNames {
         if (this.bareNameResolvesTo(declared)) {
             return declared.name();
         }
-        let alias = this.namespaceAliases.get(declared.modulePath());
-        if (alias != null && this.reaches(declared)) {
-            return "{alias}.{declared.name()}";
-        }
         return null;
     }
 
+    // Whether this file already gives the name a meaning of its own, through a declaration, an
+    // import, or an implicitly imported module. An import that binds another type under that
+    // name needs an alias, and a diagnostic naming that other type says which module it is in.
+    public bindsTypeName(string name) -> bool {
+        if (this.namingStore.findDeclared(this.namingModulePath, name) != null) {
+            return true;
+        }
+        if (this.boundTypeNames.contains(name) || this.boundModuleNames.contains(name)) {
+            return true;
+        }
+        return this.implicitlyImportedType(name) != null;
+    }
+
+    // The path an import written in this file spells for the type's module, with the '@' a
+    // module in another package takes.
+    public importPathOf(DeclaredType declared) -> string {
+        string packageName = declared.packagePrefix();
+        if (packageName.length == 0) {
+            return declared.modulePath();
+        }
+        if (packageName != this.namingPackagePrefix) {
+            return "@{declared.modulePath()}";
+        }
+        string inside = "{packageName}.";
+        if (declared.modulePath().startsWith(inside)) {
+            return declared.modulePath().substring(inside.length);
+        }
+        return declared.modulePath();
+    }
+
     // Whether this file can write the type, which a diagnostic offering code to paste has to
-    // know. A declared type the file has no name for reads module-qualified, and that spelling
-    // resolves in no file.
+    // know. A declared type the file has no name for reads by its own name, which resolves to
+    // something else here or to nothing at all.
     public canSpell(Type type) -> bool {
         switch (type) {
             is OptionalType optional -> {
@@ -1883,8 +2019,8 @@ export final class TypeNames {
 
 // The names every file of one program has for its types, for a diagnostic built outside the file
 // it lands in. A file this program never linked names nothing but the primitive bindings, whose
-// names are keywords, and spells every other declared type module-qualified however it is
-// visible, because nothing records what that file could write.
+// names are keywords, and spells every other declared type by its own name, because nothing
+// records what that file could write.
 export final class TypeNameDirectory {
     Map<string, TypeNames> namesByFile;
     TypeNames unnamedFile;
@@ -1895,7 +2031,7 @@ export final class TypeNameDirectory {
             this.namesByFile.set(names.filePath(), names);
         }
         this.unnamedFile = new TypeNames("", "", "", store, [],
-            new Map<DeclaredType, string>(), new Map<string, string>(), new Set<string>());
+            new Map<DeclaredType, string>(), new Set<string>(), new Set<string>());
     }
 
     // The names of the file at this path.
@@ -1973,6 +2109,7 @@ spelled(Type type, TypeNames? names) -> string {
                 builder.append(spelled(arguments[i], names));
             }
             builder.append(">");
+            builder.append(moduleNoteIn(instantiation.template(), names));
             return builder.toString();
         },
     }
@@ -1982,7 +2119,7 @@ spelled(Type type, TypeNames? names) -> string {
 spelledDeclared(DeclaredType declared, TypeNames? names) -> string {
     string[] parameters = declared.typeParameters();
     if (parameters.length == 0) {
-        return nameIn(declared, names);
+        return nameIn(declared, names) + moduleNoteIn(declared, names);
     }
     let builder = new StringBuilder();
     builder.append(nameIn(declared, names));
@@ -1994,6 +2131,7 @@ spelledDeclared(DeclaredType declared, TypeNames? names) -> string {
         builder.append(parameters[i]);
     }
     builder.append(">");
+    builder.append(moduleNoteIn(declared, names));
     return builder.toString();
 }
 
@@ -2001,7 +2139,16 @@ nameIn(DeclaredType declared, TypeNames? names) -> string {
     if (names == null) {
         return declared.name();
     }
-    return names.nameOf(declared);
+    return names.plainNameOf(declared);
+}
+
+// The module a spelling names after a type, which follows the type arguments the type carries
+// so that a generic reads 'Box<int> (from engine.boxes)'.
+moduleNoteIn(DeclaredType declared, TypeNames? names) -> string {
+    if (names == null) {
+        return "";
+    }
+    return names.moduleNoteOf(declared);
 }
 
 // A type under a '?' or '[]' suffix. A function type takes parentheses there, because the

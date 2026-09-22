@@ -1,7 +1,7 @@
 // Type reference resolution for one module, over its own declared types, its import table, the
 // implicitly imported modules, and the type parameters the current declaration pushed. Every
 // resolved reference lands in the module's SemaResult, and a failure resolves to the error type.
-import @ens.frontend.syntax.generated.nodes;
+import Type as TypeNode from @ens.frontend.syntax.generated.nodes;
 import NamedTypeNode from @ens.frontend.syntax.generated.nodes;
 import TypeArgumentListNode from @ens.frontend.syntax.generated.nodes;
 import ArrayTypeNode from @ens.frontend.syntax.generated.nodes;
@@ -14,6 +14,7 @@ import TypeParameterListNode from @ens.frontend.syntax.generated.nodes;
 import BoundsClauseNode from @ens.frontend.syntax.generated.nodes;
 import GreenNode from @ens.frontend.syntax.green;
 import Span from @ens.frontend.support.source;
+import @ens.frontend.support.source;
 import FileDiagnostic from support.diagnostics;
 import ModuleLinkTable from phases.link;
 import ImportedType from phases.link;
@@ -93,7 +94,7 @@ public class TypeResolver {
 
     // A trailing 'throws' on a bare function type here could also belong to the declaration, so
     // the parenthesization report names both spellings.
-    public resolveReturnType(nodes.Type reference) -> Type {
+    public resolveReturnType(TypeNode reference) -> Type {
         this.inReturnPosition = true;
         Type resolved = this.resolveType(reference);
         this.inReturnPosition = false;
@@ -217,13 +218,13 @@ public class TypeResolver {
 
     // Resolves a written type reference to its interned type, recording the result for the
     // reference node and every nested reference.
-    public resolveType(nodes.Type reference) -> Type {
+    public resolveType(TypeNode reference) -> Type {
         Type resolved = this.resolveTypeInner(reference);
         this.semaResult.setType(reference.green(), resolved);
         return resolved;
     }
 
-    resolveTypeInner(nodes.Type reference) -> Type {
+    resolveTypeInner(TypeNode reference) -> Type {
         switch (reference) {
             is NamedTypeNode named -> {
                 return this.resolveNamed(named);
@@ -671,9 +672,19 @@ public class TypeResolver {
         }
     }
 
+    // Every qualified type name is refused here. A module name reaches only that module's
+    // functions, and a type parameter takes the head for the whole of the declaration that
+    // introduces it. The refusal covers the head and the name, which together have to change.
     lookupQualified(TypeQualifierNode qualifier, string name, Span nameSpan) -> Type {
-        string alias = qualifier.module().text();
-        let binding = this.moduleImports.binding(alias);
+        string head = qualifier.module().text();
+        Span written = source.makeSpan(qualifier.span().start,
+            nameSpan.end() - qualifier.span().start);
+        let parameter = this.typeParameterNamed(head);
+        if (parameter != null) {
+            this.report(this.headTookByParameterMessage(parameter, head, name), written);
+            return this.store.errorType();
+        }
+        let binding = this.moduleImports.binding(head);
         if (binding is ImportedNamespace) {
             string target = binding.modulePath();
             let found = this.store.findDeclared(target, name);
@@ -689,11 +700,50 @@ public class TypeResolver {
                     nameSpan);
                 return this.store.errorType();
             }
-            return found;
+            this.report(types.moduleQualifiedTypeMessage("{head}.{name}", found, this.names()),
+                written);
+            return this.store.errorType();
         }
-        this.report("'{alias}' is not an imported module, so it cannot qualify a type "
-            + "name.", qualifier.module().span());
+        this.report("'{head}' is not an imported module, so '{head}.{name}' names no type. "
+            + "Import '{name}' from the module that declares it, then write '{name}'.", written);
         return this.store.errorType();
+    }
+
+    // The refusal a qualified type name reads where a type parameter took its head. It names
+    // both meanings where the file gives the name another one, and what a type parameter
+    // qualifies where it does not.
+    headTookByParameterMessage(TypeParamType parameter, string head, string name) -> string {
+        let taken = this.shadowedHeadMeaning(head);
+        if (taken != null && parameter.ownerName().length > 0) {
+            return types.typeParameterTookNameMessage(head, parameter.ownerName(), taken);
+        }
+        return "A type name cannot be reached through a type parameter: '{head}' is a different "
+            + "type each time it is used, so '{head}.{name}' names nothing fixed. Write the "
+            + "type's own name instead.";
+    }
+
+    // The meaning a type parameter took the head name from, as the refusal names it, or null
+    // where the name means nothing else in this file.
+    shadowedHeadMeaning(string head) -> string? {
+        let declared = this.store.findDeclared(this.resolverModulePath, head);
+        if (declared != null) {
+            return types.declaringPhrase(types.kindWordOf(declared), declared.modulePath(),
+                this.resolverModulePath);
+        }
+        let binding = this.moduleImports.binding(head);
+        if (binding is ImportedNamespace) {
+            return types.importedModulePhrase(binding.modulePath());
+        }
+        if (binding is ImportedType) {
+            return types.declaringPhrase(types.kindWordOf(binding.target()),
+                binding.target().modulePath(), this.resolverModulePath);
+        }
+        let offered = this.implicitBinding(head);
+        if (offered != null) {
+            return types.declaringPhrase(types.kindWordOf(offered), offered.modulePath(),
+                this.resolverModulePath);
+        }
+        return null;
     }
 
     primitiveNamed(string name) -> Type? {
@@ -717,15 +767,19 @@ public class TypeResolver {
     }
 
     // The whole list is in scope while its bounds resolve, so a bound may name the parameter it
-    // constrains or a sibling. Call once per declaration; the interned parameters keep their
-    // bounds.
-    public resolveTypeParameters(GreenNode owner, TypeParameterListNode? list) -> TypeParamType[] {
+    // constrains or a sibling. 'ownerName' is the declaration the list belongs to, which a
+    // refusal names the parameter by. Call once per declaration; the interned parameters keep
+    // their bounds.
+    public resolveTypeParameters(GreenNode owner, string ownerName, TypeParameterListNode? list)
+            -> TypeParamType[] {
         if (list == null) {
             return [];
         }
         let interned = new List<TypeParamType>();
         for (long i = 0; i < list.parametersCount(); i++) {
-            interned.push(this.store.typeParameter(owner, i, list.parameters(i).name().text()));
+            let parameter = this.store.typeParameter(owner, i, list.parameters(i).name().text());
+            parameter.setOwnerName(ownerName);
+            interned.push(parameter);
         }
         TypeParamType[] parameters = interned.toArray();
         this.pushTypeParameters(parameters);

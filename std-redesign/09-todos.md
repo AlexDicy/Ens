@@ -67,10 +67,10 @@ A "not a user frame" flag in the symbol table, registered for the internal routi
 That is why a bounds, byte or range guard captures its trace itself and keeps the message it built live across the call, which costs one callee-saved register in every function holding such a guard: moving the capture into the routine that writes the text is free, and was measured putting a spurious innermost line in the traces of `tests/stack_trace_panic` and `tests/binding_intrinsics_range_abort`.
 
 `ens check libs/std` cannot check the standard library in any invocation, because the checker loads std as an ordinary package beside the implicit `@std` (2026-09-19).
-With `--stdlib libs` that reports 32 problems, 31 of them naming a type against itself, `expected 'Path', got 'Path'` and once the same of `Platform`, since `Path` is loaded twice.
+With `--stdlib libs` that reports 32 problems, 31 of them naming a type against itself, `expected 'Path (from std.fs)', got 'Path'` and once the same of `Platform`, since `Path` is loaded twice.
 Without it there are 199, of which 126 are cross-package visibility refusals, since the `public` names of `@std.system` and `@std.collections.rawarray` are then read across a package boundary, and the other 73 follow from them (both counts measured 2026-09-19).
 So a standard-library change has no sema gate faster than `ens test libs/std`, which takes about nine seconds.
-The two loads of one file spell alike in that message because the per-file names read a type declared in the reporting file bare, which is truthful for one declaration and unreadable for two loads of it.
+The two loads spell apart since 2026-09-22, because a name declared more than once in a program carries its module in a message, and the count is unchanged.
 
 Reachability-based emission gates function bodies and object files and not module counts: a module the program reaches no body in writes no object at all, and the descriptors it owns are defined in the core module's object instead, so a hello-world writes 8 of the 14 modules it loads (measured 2026-09-22 at -O2 on windows-x64, 39,022 bytes of objects against 40,993 before, and the same 166,400-byte executable).
 Moving the module count means gating descriptors and therefore reachable types, which needs a ruling on how a call dispatched through a hierarchy roots its slot, and re-rooting the monomorphization closure, which `mono/requests.ens` cannot do today because it collects only generic calls.
@@ -94,9 +94,6 @@ A call through a function value held in a field retains and releases the closure
 Escape analysis in code generation elides both (ratified 2026-09-04 as a post-redesign pass); until then `SortedMap` reads `this.order` at every step and recurses in its lookup rather than looping, since a loop retains and releases every node it moves onto.
 When `@std.time` is designed, `Metadata.modifiedMillis` and `wait(long timeoutMillis)` take a proper duration or instant type; the names carry the unit until then.
 
-Two questions about a name used as a value are open.
-A static reached through a module-qualified type name, `renderer.Maker.build()`, reports `renderer.Maker` as a type rather than a value, since such a head became a refusal on 2026-09-21, so whether a module-qualified static head is supported at all is undecided.
-An enum constant reached the same way, `renderer.Kind.Large`, reports that same refusal, so the question covers every type a module declares; until it is answered that refusal names no constant of its own, while the bare one does (2026-09-22).
 A static-as-value message on a bare generic head can spell its fix only as `Holder.make(...)`, which fails when the call cannot infer the type arguments, while `Holder<T>.make(...)` would name a type parameter the use site does not have in scope.
 The type-as-value refusal therefore names a generic type's static const, which needs no type argument, and never its static method (2026-09-22).
 A static const initializer that names what the generic type declares both as a type parameter and as a static const is reported by the constants phase as `Statics are read through the type name even inside 'Consts'; write 'Consts.first'.`, while a body reports the same collision as `'Limit' is the type parameter of 'Constant' here, not the static const it declares. Write 'Constant.Limit' to read the static.` (2026-09-22).
@@ -115,6 +112,9 @@ This is a nullability item rather than a safe-navigation one: a plain nullable l
 
 `assertMentions` has 332 call sites across 15 files in `selfhost/sema/tests`, and the combination of an excluded stage, a substring and no count pin is what hid eight `new Error(...)` sites and four unasserted diagnostics found on 2026-09-22.
 A pass over those sites, giving each test that excludes a stage a count pin on it and exact-equality pins, is queued and wants its own context.
+
+An unresolved type in a `throws` list leaves the function reading as non-throwing, so one misspelled, private or wrongly spelled entry also reports the body's own throw as unnamed, every `try` on a call to it as not needed, and every caller's `catch` clauses as unreachable (measured 2026-09-22 across three shapes, all predating the one-way-per-kind change).
+Rule 12 wants one message for the one problem, so the entry that failed to resolve should leave the function raising the error type rather than raising nothing, which is a change to the exceptions phase and to how a signature treats an error entry in its list.
 
 ## The language server's replacement
 
@@ -136,7 +136,7 @@ It runs no `checkMemberAccess` on that path, though it has one at line 5378 for 
 Its remaining `findFieldIndex` call sites carry no private-base-field exemption, so hover, go-to-definition and rename (`lsp/server/LanguageServer.cpp`) can resolve a name to a private base field that a subclass member shadows, though the sites that report a diagnostic now carry the exemption (2026-09-21).
 It checks no duplicate struct field, so a struct that declares one name twice is reported by the compiler alone, which says "Field 'y' is already declared in 'Pixel'"; its struct field loop at `lsp/frontend/semantic/Analyzer.cpp:1495-1515` pushes every field without the `findFieldIndex` check the class loop makes at line 2023 (2026-09-21).
 Its own copies of three of the messages rewritten on 2026-09-21 keep the weaker wording, the `this.field` shorthand refusal at `lsp/frontend/semantic/Analyzer.cpp:2537` and the cross-package member and constructor refusals at lines 5391 and 5634.
-It accepts a module-qualified type name as a value at `lsp/frontend/semantic/Analyzer.cpp:7181-7187`, recording the type as the expression's own, which the compiler refuses as of 2026-09-21.
+It accepts a module-qualified type name in every type position, resolving `ns.Name` through `lookupTypeByName` at `lsp/frontend/semantic/Analyzer.cpp:3381-3415` for a head its parser admits at `Parser.cpp:1047` and `1278`, and as a value at `Analyzer.cpp:7181-7187`, all of which the compiler refuses as of 2026-09-22; its own diagnostics also still spell a type reached through a module alias as `alias.Type`.
 
 ## Reminders
 

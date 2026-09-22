@@ -538,13 +538,15 @@ report(long[] values, long threshold) {
 
 ---
 
-Imports are based on paths and qualified by default. Imports are file-local.
+Imports are based on paths, and each form brings one kind of name into scope.
+A module import qualifies the module's functions with the module's name, and a name import brings one of its types into scope under that name.
+Imports are file-local.
 
 ```ens
 import engine.renderer;
 ```
 
-This allows usage like `new renderer.Renderer();`
+This allows usage like `renderer.configure();`
 
 Or:
 
@@ -563,14 +565,16 @@ import engine.renderer as gfx;
 import Renderer as Canvas from engine.renderer;
 ```
 
-The first binds the module to `gfx`, so its declarations are reached as `gfx.Renderer` and `gfx.configure()`, and that import binds nothing under `renderer`.
+The first binds the module to `gfx`, so its functions are called as `gfx.configure()`, and that import binds nothing under `renderer`.
 The second binds the type to `Canvas`, and that import binds nothing under `Renderer`.
 An alias is an ordinary identifier, so it may not be a keyword, and it collides with the file's other imports and declarations exactly as the name it replaces would.
 Aliasing is how one file uses two modules that share a last segment, or two types that share a name: `import ErrorKind as IoErrorKind from @std.io.streams;` beside `import ErrorKind as FileErrorKind from @std.fs.error;` gives the file both.
 An alias may be written whether or not a conflict exists, an alias equal to the name it replaces changes nothing, and one file may alias the same module more than once.
 A function cannot be imported by name with an alias any more than without one.
 
-A diagnostic names a type the way the file it is reported in can name it: the alias where an import bound one, `alias.Type` where a module alias is what reaches it, and the module-qualified name where the file has no name for it at all.
+A diagnostic names a type the way the file it is reported in can name it, which is the name that file declares or imports it under.
+A type the file has no name for is named on its own.
+Where the file gives that name another meaning, or another module declares a type of the same name, the module it comes from follows the name, as in `Ruler (from engine.sizing)`.
 So a type a message suggests writing can be written exactly as the message spells it.
 
 A file and a folder with the same name may sit side by side: `io.ens` next to an `io/` folder makes `import io;` resolve to the file, while `import io.streams;` resolves to `streams.ens` inside the folder.
@@ -579,7 +583,8 @@ Source files are UTF-8 text.
 A byte order mark at the very start of a file is accepted and skipped; the same bytes anywhere else in the file are an error.
 
 A module's private declarations never leave its file; `public` declarations are visible to every module in the same package, and `export` declarations also to the packages that consume it.
-Types (classes and structs) may be brought into scope by name as above, but free functions are always called through their module namespace, never imported by name: write `import engine.renderer;` then call `renderer.configure()`.
+A type is reached only by the name the file binds to it, its own declaration or an import, so a module name never qualifies a type: after `import engine.renderer;` the spelling `renderer.Renderer` is an error that names the import to write.
+Free functions are the other way round, always called through their module name and never imported by name: write `import engine.renderer;` then call `renderer.configure()`.
 Importing a function by name (`import configure from engine.renderer;`) is an error.
 The implicitly imported modules described below are the one exception: no import is written for them at all, so their exported functions are called unqualified.
 
