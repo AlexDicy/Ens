@@ -113,10 +113,6 @@ Parentheses inside a target rather than around it, `(point).x = 2;` on a struct 
 `++`, `--` and a compound assignment on a nullable name the type and stop there: `x++` on an `int?` reports "The '++' operator works only on numbers, and this value has type 'int?'. Use it on an integer or a floating-point variable, for example 'count++'.", and `x += 1` reports "'+=' needs numbers on both sides, got 'int?' and 'int'.", neither of which mentions the null check that makes the line work (2026-09-21).
 This is a nullability item rather than a safe-navigation one: a plain nullable local reads the same as `maybe?.value++`, whose text is pinned so a change has to move the pin.
 
-`checkStaticInstanceCollision` (`selfhost/sema/src/phases/members.ens:733-772`) walks the base chain for fields and not for methods, so a subclass static const may not share a name with an inherited instance field while a subclass static method may share one with an inherited instance method (2026-09-22).
-The field half is what "statics are not inherited" predicts, since the subclass inherits the instance member and the static collides with it, so the method half is the one that disagrees with the rule.
-Making it refuse turns away programs that compile today, which is why it waits on a ruling.
-
 `assertMentions` has 332 call sites across 15 files in `selfhost/sema/tests`, and the combination of an excluded stage, a substring and no count pin is what hid eight `new Error(...)` sites and four unasserted diagnostics found on 2026-09-22.
 A pass over those sites, giving each test that excludes a stage a count pin on it and exact-equality pins, is queued and wants its own context.
 

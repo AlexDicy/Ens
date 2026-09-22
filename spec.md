@@ -242,7 +242,8 @@ A static member is reached only through the declaring type's name, never through
 Statics are not inherited: a static declared by a base class is reached through the base class's own name, and naming it through a subclass is an error that names the declaring class.
 The rule is uniform, so even inside the declaring type a static is called through the type name, and `this` cannot appear inside a static method, because a static has no instance.
 A static method may be `throws`, which is what makes static factories useful where a constructor cannot throw, and it may be `noreturn`.
-A static and an instance member cannot share a name, and `abstract`, `override`, and `final` do not apply to a static, which never takes part in dispatch.
+A static and an instance member cannot share a name, and the instance members of a type include the ones it inherits, so a static may not take the name of a base class's field or method either.
+`abstract`, `override`, and `final` do not apply to a static, which never takes part in dispatch.
 Static methods may overload each other under the ordinary overload rules.
 Interfaces, enums, and external types cannot declare statics; the error names where statics belong.
 A static cannot be reached through a type parameter: `T.create()` is an error, because `T` stands for a different type in every instantiation.
