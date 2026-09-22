@@ -214,6 +214,7 @@ Like a `toString` on a struct, one written `override` follows its class's visibi
 
 Inside a method, a constructor, or a destructor, a struct's or a class's own fields and methods are reached through `this`, as in `this.width` and `this.area()`, because a bare name there is a local, a parameter, or a top-level declaration and never a member.
 A field's default value is the one place a member is named on its own: a default may read the fields declared before it, as `string name = "{width}x{height}";` does.
+A default reads those fields and assigns none of them, so `int b = (a = 5);` is an error where `a` is a sibling field.
 
 `super.method(...)` calls the base class's implementation, bypassing any override. A constructor may call `super(...)` as its first statement to run the base constructor; if it does not, the base class must be constructible with no arguments. `protected` members (see above) are reachable from subclasses.
 
@@ -479,6 +480,7 @@ Reading a local, a parameter, or `this` inside the body captures it: the closure
 A local a lambda captures must already be assigned where the lambda is created.
 A capture takes the local's declared type, not what the surrounding code narrowed it to, so a local proved non-null outside the lambda is nullable again inside its body and is checked there on its own.
 Assigning to a captured local inside the lambda is an error, because the write would land on the copy and leave the local outside it unchanged; return the value the lambda computes instead, or keep the value in an object the lambda can reach.
+A field of a captured struct is part of that copy, so writing `point.x = 1;` inside the lambda is the same error.
 The lambda's own parameters and locals are ordinary storage and may be written freely.
 
 `this` is captured like any other reference, so a lambda inside a class's method may read the object's fields, write them, and call its methods.

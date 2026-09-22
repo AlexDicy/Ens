@@ -409,6 +409,8 @@ class BodyChecker implements NoreturnCalls {
     // True while a callable's body is being checked, and false in a field default, a parameter
     // default, or a lazy const's initializer, none of which declares a parameter.
     bool inCallableBody;
+    // The name of the field whose default is being checked, and null outside a field default.
+    string? fieldDefaultName;
     // The parameters in reach of the expression being checked, in declaration order, with an
     // enclosing callable's ahead of a lambda's own, for a diagnostic that names a value of a
     // type. Empty where the position has none.
@@ -468,6 +470,7 @@ class BodyChecker implements NoreturnCalls {
         this.enclosingOwner = null;
         this.inStaticMethod = false;
         this.inCallableBody = false;
+        this.fieldDefaultName = null;
         this.parametersInReach = new List<LocalBinding>();
         this.currentNoreturn = false;
         this.inConstructor = false;
@@ -1099,8 +1102,8 @@ class BodyChecker implements NoreturnCalls {
                 let sink = this.scope;
                 if (sink != null) {
                     sink.define(new LocalBinding(member.name().text(),
-                        this.fieldTypeOrError(fields, member.name().text()), BindingKind.Variable,
-                        false, member.name().span()));
+                        this.fieldTypeOrError(fields, member.name().text()),
+                        BindingKind.SiblingField, false, member.name().span()));
                 }
             }
         }
@@ -1111,6 +1114,7 @@ class BodyChecker implements NoreturnCalls {
                 if (defaultValue != null) {
                     Type expected = this.fieldTypeOrError(fields, member.name().text());
                     let value = defaultValue.value();
+                    this.fieldDefaultName = member.name().text();
                     Type actual = this.analyzeExpressionAdapt(value, expected);
                     if (!(expected is ErrorType) && !(actual is ErrorType)
                             && !convert.isAssignableStrict(expected, actual)) {
@@ -1122,6 +1126,7 @@ class BodyChecker implements NoreturnCalls {
                 }
             }
         }
+        this.fieldDefaultName = null;
         this.scope = null;
         this.resolver.popTypeParameters(pushed);
     }
@@ -3195,6 +3200,52 @@ class BodyChecker implements NoreturnCalls {
         return true;
     }
 
+    // Reports a write refused for where it stands rather than for what it names; true when it
+    // reported. 'action' names what the write would do, so '=' and '++' read naturally.
+    reportRefusedWrite(LocalBinding binding, string action, Span at) -> bool {
+        if (this.reportCapturedWrite(binding, action, at)) {
+            return true;
+        }
+        return this.reportSiblingFieldWrite(binding, at);
+    }
+
+    // The binding a write to a member chain changes, or null where the chain changes another
+    // object instead. A struct field lives in the value that holds it, so a chain of them
+    // changes what stands at its root, while a class reference or an array element anywhere
+    // along it leads to storage of its own.
+    writtenChainRoot(Expression target) -> LocalBinding? {
+        Expression root = target;
+        while (root is MemberExpressionNode) {
+            let objectType = this.result.typeOf(root.object().green());
+            if (objectType == null || !types.isStructLike(objectType)) {
+                return null;
+            }
+            root = root.object();
+        }
+        if (root is IdentifierExpressionNode) {
+            return this.result.bindingOf(root.green());
+        }
+        return null;
+    }
+
+    // Reports a write to a sibling field inside a field default; true when it reported. A
+    // default is the value of the field it belongs to, so it reads its siblings and writes none
+    // of them. A default naming its own field is refused by the checks phase instead.
+    reportSiblingFieldWrite(LocalBinding binding, Span at) -> bool {
+        if (binding.kind() != BindingKind.SiblingField) {
+            return false;
+        }
+        let defaulted = this.fieldDefaultName;
+        if (defaulted == null || defaulted == binding.name()) {
+            return false;
+        }
+        this.reporter.report("Field '{binding.name()}' cannot be assigned inside the default of "
+            + "'{defaulted}'. A default gives its own field a value and reads earlier ones, so "
+            + "give '{binding.name()}' its value in its own default, or assign both fields in a "
+            + "constructor.", at);
+        return true;
+    }
+
     // Retypes an untyped integer literal to the integer target its value fits, and rejects the
     // literal outright when the value does not fit.
     adaptIntegerLiteral(Expression node, Type target) {
@@ -4413,7 +4464,7 @@ class BodyChecker implements NoreturnCalls {
         }
         if (changed is IdentifierExpressionNode) {
             let binding = this.result.bindingOf(changed.green());
-            if (binding != null && this.reportCapturedWrite(binding, "change", span)) {
+            if (binding != null && this.reportRefusedWrite(binding, "change", span)) {
                 return operandType;
             }
             if (binding != null && binding.isConst()) {
@@ -4430,6 +4481,10 @@ class BodyChecker implements NoreturnCalls {
                     + "'{staticConstDisplay(staticField, this.names)}': a "
                     + "{members.typeLevelFieldWord(staticField)} keeps the value its "
                     + "initializer gives it.", span);
+                return operandType;
+            }
+            let root = this.writtenChainRoot(changed);
+            if (root != null && this.reportRefusedWrite(root, "change", span)) {
                 return operandType;
             }
             let objectType = this.result.typeOf(changed.object().green());
@@ -4764,7 +4819,7 @@ class BodyChecker implements NoreturnCalls {
                 if (binding == null) {
                     return analyzed;
                 }
-                if (this.reportCapturedWrite(binding, "assign a new value to",
+                if (this.reportRefusedWrite(binding, "assign a new value to",
                         identifier.span())) {
                     return binding.type();
                 }
@@ -4776,6 +4831,10 @@ class BodyChecker implements NoreturnCalls {
                 return binding.type();
             },
             is MemberExpressionNode member -> {
+                let root = this.writtenChainRoot(member);
+                if (root != null) {
+                    this.reportRefusedWrite(root, "change", member.span());
+                }
                 let objectType = this.result.typeOf(member.object().green());
                 if (objectType != null) {
                     let field = types.inheritedOrOwnField(objectType, member.member().text());
