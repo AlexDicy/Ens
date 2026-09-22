@@ -101,6 +101,8 @@ A static reached through a module-qualified type name, `renderer.Maker.build()`,
 An enum constant reached the same way, `renderer.Kind.Large`, reports that same refusal, so the question covers every type a module declares; until it is answered that refusal names no constant of its own, while the bare one does (2026-09-22).
 A static-as-value message on a bare generic head can spell its fix only as `Holder.make(...)`, which fails when the call cannot infer the type arguments, while `Holder<T>.make(...)` would name a type parameter the use site does not have in scope.
 The type-as-value refusal therefore names a generic type's static const, which needs no type argument, and never its static method (2026-09-22).
+A static const initializer that names what the generic type declares both as a type parameter and as a static const is reported by the constants phase as `Statics are read through the type name even inside 'Consts'; write 'Consts.first'.`, while a body reports the same collision as `'Limit' is the type parameter of 'Constant' here, not the static const it declares. Write 'Constant.Limit' to read the static.` (2026-09-22).
+Both offer the same fix, so whether the constants phase should carry the collision wording is open.
 
 A type parameter in scope wins its name in every position, so inside `class Bin<Kind>` the name `Kind` is the parameter whether it is written as a type, as `Kind.Large`, as `Made(3)`, or as a static head (ruled 2026-09-22).
 The file's own class, struct, interface or enum of that name, a type or a module it imports, a function it declares, and a function an implicitly imported module declares are all unreachable under that name inside the declaration; only a local declared further in takes the name back.

@@ -389,6 +389,13 @@ class BodyChecker implements NoreturnCalls {
     // rules judge private and protected members from here. Null outside member bodies.
     Type? enclosingOwner;
     bool inStaticMethod;
+    // True while a callable's body is being checked, and false in a field default, a parameter
+    // default, or a lazy const's initializer, none of which declares a parameter.
+    bool inCallableBody;
+    // The parameters in reach of the expression being checked, in declaration order, with an
+    // enclosing callable's ahead of a lambda's own, for a diagnostic that names a value of a
+    // type. Empty where the position has none.
+    List<LocalBinding> parametersInReach;
     Type? currentReturnType;
     bool currentNoreturn;
     bool inConstructor;
@@ -442,6 +449,8 @@ class BodyChecker implements NoreturnCalls {
         this.thisBinding = null;
         this.enclosingOwner = null;
         this.inStaticMethod = false;
+        this.inCallableBody = false;
+        this.parametersInReach = new List<LocalBinding>();
         this.currentNoreturn = false;
         this.inConstructor = false;
         this.sawSuperCall = false;
@@ -635,6 +644,8 @@ class BodyChecker implements NoreturnCalls {
         this.thisType = null;
         this.enclosingOwner = null;
         this.inStaticMethod = false;
+        this.inCallableBody = true;
+        this.parametersInReach = new List<LocalBinding>();
         this.currentReturnType = this.store.primitive(PrimitiveKind.Void);
         this.currentNoreturn = false;
         this.inConstructor = false;
@@ -666,6 +677,7 @@ class BodyChecker implements NoreturnCalls {
             }
         }
         long pushed = this.pushCallableTypeParameters(signature, owner);
+        this.inCallableBody = true;
         // Inside a conditional member, the constrained parameters carry the member's extra
         // bounds: lookups, bound checks, and existence checks all read the scope.
         bool pushedConstraints = false;
@@ -695,10 +707,12 @@ class BodyChecker implements NoreturnCalls {
 
         Parameter[] parameters = signature.parameters();
         let parameterList = node.parameters();
+        this.parametersInReach = new List<LocalBinding>();
         for (long i = 0; i < parameters.length; i++) {
             let parameter = parameters[i];
             let binding = new LocalBinding(parameter.name(), parameter.type(),
                 BindingKind.Parameter, false, parameter.span());
+            this.parametersInReach.push(binding);
             let owner = this.parameterScope;
             if (owner != null && !owner.define(binding)) {
                 this.reporter.report("Duplicate parameter name '{parameter.name()}'; rename "
@@ -740,6 +754,8 @@ class BodyChecker implements NoreturnCalls {
         this.thisType = null;
         this.enclosingOwner = null;
         this.inStaticMethod = false;
+        this.inCallableBody = false;
+        this.parametersInReach = new List<LocalBinding>();
         this.currentReturnType = null;
         this.currentNoreturn = false;
         this.inConstructor = false;
@@ -758,11 +774,21 @@ class BodyChecker implements NoreturnCalls {
             this.resolver.pushTypeParameters(signature.typeParameters());
             pushed = pushed + signature.typeParameters().length;
         }
-        if (owner is DeclaredType && owner.isGeneric()) {
-            this.resolver.pushTypeParameters(owner.typeParameterTypes());
-            pushed = pushed + owner.typeParameterTypes().length;
+        if (owner is DeclaredType) {
+            pushed = pushed + this.pushOwnerTypeParameters(owner);
         }
         return pushed;
+    }
+
+    // How many of the declaration's own type parameters went into scope, for the caller to
+    // pop on its way back out.
+    pushOwnerTypeParameters(DeclaredType owner) -> long {
+        if (!owner.isGeneric()) {
+            return 0;
+        }
+        TypeParamType[] parameters = owner.typeParameterTypes();
+        this.resolver.pushTypeParameters(parameters);
+        return parameters.length;
     }
 
     // A constructor must chain to its base when the base has constructors but none that is
@@ -1031,8 +1057,13 @@ class BodyChecker implements NoreturnCalls {
     // the ones declared earlier: which of them a default may name is one rule with one precise
     // message, and the checks phase owns it, so a default that names itself or a later field is typed
     // here without being reported a second time as an undefined name.
+    // The owner's type parameters are in scope too, because a default is built once per
+    // instantiation, where each of them stands for one written type argument.
     checkFieldDefaults(DeclaredType owner, MemberListNode body) {
         let fields = types.fieldsOf(owner);
+        long pushed = this.pushOwnerTypeParameters(owner);
+        this.inCallableBody = false;
+        this.parametersInReach = new List<LocalBinding>();
         this.parameterScope = null;
         this.scope = new Scope(null);
         this.narrowing = new NarrowingState();
@@ -1074,11 +1105,17 @@ class BodyChecker implements NoreturnCalls {
             }
         }
         this.scope = null;
+        this.resolver.popTypeParameters(pushed);
     }
 
     // A lazy const's initializer types against the declared type at module scope. It runs on the
     // first read with no instance in reach, so neither 'this' nor a sibling field is visible.
+    // The owner's type parameters are in scope so that a use of one is refused as the type
+    // parameter it is rather than as an unknown name.
     checkLazyInitializers(DeclaredType owner, MemberListNode body) {
+        long pushed = this.pushOwnerTypeParameters(owner);
+        this.inCallableBody = false;
+        this.parametersInReach = new List<LocalBinding>();
         this.parameterScope = null;
         this.scope = new Scope(null);
         this.narrowing = new NarrowingState();
@@ -1104,7 +1141,9 @@ class BodyChecker implements NoreturnCalls {
                 expected = this.store.errorType();
             }
             let value = initializer.value();
+            this.resolver.pushTypeParameterRefusal(this.lazyTypeParameterRefusal(owner, field));
             Type actual = this.analyzeExpressionAdapt(value, expected);
+            this.resolver.popTypeParameterRefusal();
             if (!(expected is ErrorType) && !(actual is ErrorType)
                     && !convert.isAssignableStrict(expected, actual)) {
                 this.reporter.report("The initializer of lazy const "
@@ -1114,6 +1153,14 @@ class BodyChecker implements NoreturnCalls {
             }
         }
         this.scope = null;
+        this.resolver.popTypeParameters(pushed);
+    }
+
+    // The refusal a type parameter written anywhere inside a lazy const's initializer reads.
+    lazyTypeParameterRefusal(DeclaredType owner, Field field) -> string {
+        return "The initializer of lazy const '{this.names.nameOf(owner)}.{field.name()}' "
+            + "cannot use a type parameter, because one value is shared by every type "
+            + "argument. Remove 'lazy const' to give each instance its own '{field.name()}'.";
     }
 
     fieldTypeOrError(List<Field>? fields, string name) -> Type {
@@ -1126,7 +1173,12 @@ class BodyChecker implements NoreturnCalls {
 
     // Parameter defaults type against the declared parameter type, at module scope: neither
     // the other parameters nor 'this' are visible inside a default.
+    // The type parameters of the callable and of its owner are in scope, because a default is
+    // built in the instantiation the call reaches.
     checkParameterDefaults(Signature signature, FunctionDeclarationNode node) {
+        long pushed = this.pushCallableTypeParameters(signature, this.enclosingOwner);
+        this.inCallableBody = false;
+        this.parametersInReach = new List<LocalBinding>();
         this.parameterScope = null;
         this.scope = new Scope(null);
         this.narrowing = new NarrowingState();
@@ -1155,6 +1207,7 @@ class BodyChecker implements NoreturnCalls {
             }
         }
         this.scope = null;
+        this.resolver.popTypeParameters(pushed);
     }
 
     // ---- Scopes and names ----
@@ -2945,6 +2998,7 @@ class BodyChecker implements NoreturnCalls {
         bool outerTerminated = this.flowTerminated;
         bool outerUnconditional = this.unconditionalPosition;
         let outerAssignmentTarget = this.assignmentTarget;
+        let outerParametersInReach = this.parametersInReach;
 
         this.lambdaFrames.push(frame);
         this.scope = new Scope(null);
@@ -2962,10 +3016,12 @@ class BodyChecker implements NoreturnCalls {
 
         Parameter[] parameters = signature.parameters();
         let lambdaScope = this.scope;
+        this.parametersInReach = this.copyBindings(outerParametersInReach);
         for (long i = 0; i < parameters.length; i++) {
             let parameter = parameters[i];
             let binding = new LocalBinding(parameter.name(), parameter.type(),
                 BindingKind.Parameter, false, parameter.span());
+            this.parametersInReach.push(binding);
             if (lambdaScope != null && !lambdaScope.define(binding)) {
                 this.reporter.report("Duplicate parameter name '{parameter.name()}' in this "
                     + "lambda; rename one of the parameters.", parameter.span());
@@ -2992,6 +3048,7 @@ class BodyChecker implements NoreturnCalls {
         this.flowTerminated = outerTerminated;
         this.unconditionalPosition = outerUnconditional;
         this.assignmentTarget = outerAssignmentTarget;
+        this.parametersInReach = outerParametersInReach;
         return frame.result();
     }
 
@@ -3462,16 +3519,37 @@ class BodyChecker implements NoreturnCalls {
         return "{refusal} {fix}.";
     }
 
-    // 'refusal' is the sentence the position writes. A type parameter stands for a different
-    // type at each use, so a value declared with it is the only route the message offers.
+    // 'refusal' is the sentence the position writes, followed by how this position reaches a
+    // value of the parameter's type. Only a parameter holds one, so the route names one in
+    // reach, else the one a callable's body can declare, and a default reaches neither.
     reportTypeParameterRefusal(string refusal, TypeParamType parameter, Span at) {
         string name = parameter.name();
-        this.reporter.report(this.typeParameterMessage(parameter, "{refusal} Use a value of "
-            + "type '{name}', such as a parameter declared '{name} value'."), at);
+        string written = refusal;
+        let inReach = this.parameterOfType(parameter);
+        if (inReach != null) {
+            written = "{refusal} Use a value of type '{name}', such as '{inReach.name()}'.";
+        } else if (this.inCallableBody) {
+            written = "{refusal} Use a value of type '{name}', such as a parameter declared "
+                + "'{name} value'.";
+        }
+        this.reporter.report(this.typeParameterMessage(parameter, written), at);
+    }
+
+    // The parameter in reach whose type is this one, innermost first, or null where none is. A
+    // local is left out, because naming one would need it to be assigned where it is named.
+    parameterOfType(Type type) -> LocalBinding? {
+        for (long i = this.parametersInReach.length() - 1; i >= 0; i--) {
+            let binding = this.parametersInReach.get(i);
+            if (binding.type() == type) {
+                return binding;
+            }
+        }
+        return null;
     }
 
     // What a refused type parameter reads: the collision where it took the name from another
-    // meaning of the file, and 'plain' where the name means nothing else there.
+    // meaning of the file, the refusal of a position that can use no type parameter at all, and
+    // 'plain' where the name means nothing else there.
     typeParameterMessage(TypeParamType parameter, string plain) -> string {
         let asStatic = this.shadowedStaticMessage(parameter);
         if (asStatic != null) {
@@ -3483,7 +3561,7 @@ class BodyChecker implements NoreturnCalls {
         string genericOwner = this.obligationOwnerName;
         let taken = this.shadowedMeaning(name);
         if (taken == null || genericOwner.length == 0) {
-            return plain;
+            return this.resolver.typeParameterRefusal() ?? plain;
         }
         return "'{name}' is the type parameter of '{genericOwner}' here, not {taken}, because "
             + "a type parameter takes the name for the whole of '{genericOwner}'. Rename one of "
