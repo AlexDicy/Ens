@@ -104,11 +104,9 @@ The file's own class, struct, interface or enum of that name, a type or a module
 A class header declares the parameter inside the file's own declarations, an inner declaration wins for the whole of its scope, and resolving by position instead would let one name mean two things with nothing in the source marking where the meaning switches.
 It leaves one rule with no exceptions, which the divergent cases it replaced did not, and a type parameter can be neither constructed nor called and has no constants or statics of its own, so nothing is lost by refusing every use of it as a value.
 
-One shape still reports that a left side must be a variable, field, or array element where it is one.
-Parentheses inside a target rather than around it, `(point).x = 2;` on a struct local, keep that sentence, while `(held).value = 1;` on a class and `(slots)[0] = 5;` on an array are accepted, so what the message can say waits on whether the struct shape should be refused at all.
-
 `++`, `--` and a compound assignment on a nullable name the type and stop there: `x++` on an `int?` reports "The '++' operator works only on numbers, and this value has type 'int?'. Use it on an integer or a floating-point variable, for example 'count++'.", and `x += 1` reports "'+=' needs numbers on both sides, got 'int?' and 'int'.", neither of which mentions the null check that makes the line work (2026-09-21).
 This is a nullability item rather than a safe-navigation one: a plain nullable local reads the same as `maybe?.value++`, whose text is pinned so a change has to move the pin.
+`counter++` on a narrowed `int?` clears the narrowing through `invalidateForWrite`, so a second `counter++` on the same local reports that same numbers text and a following `counter += 1` its `'+='` twin, although an increment stores a present value and could re-establish the narrowing the way an assignment does (2026-09-22).
 
 `assertMentions` has 332 call sites across 15 files in `selfhost/sema/tests`, and the combination of an excluded stage, a substring and no count pin is what hid eight `new Error(...)` sites and four unasserted diagnostics found on 2026-09-22.
 A pass over those sites, giving each test that excludes a stage a count pin on it and exact-equality pins, is queued and wants its own context.
@@ -137,6 +135,7 @@ Its remaining `findFieldIndex` call sites carry no private-base-field exemption,
 It checks no duplicate struct field, so a struct that declares one name twice is reported by the compiler alone, which says "Field 'y' is already declared in 'Pixel'"; its struct field loop at `lsp/frontend/semantic/Analyzer.cpp:1495-1515` pushes every field without the `findFieldIndex` check the class loop makes at line 2023 (2026-09-21).
 Its own copies of three of the messages rewritten on 2026-09-21 keep the weaker wording, the `this.field` shorthand refusal at `lsp/frontend/semantic/Analyzer.cpp:2537` and the cross-package member and constructor refusals at lines 5391 and 5634.
 It accepts a module-qualified type name in every type position, resolving `ns.Name` through `lookupTypeByName` at `lsp/frontend/semantic/Analyzer.cpp:3381-3415` for a head its parser admits at `Parser.cpp:1047` and `1278`, and as a value at `Analyzer.cpp:7181-7187`, all of which the compiler refuses as of 2026-09-22; its own diagnostics also still spell a type reached through a module alias as `alias.Type`.
+It refuses `(x) = 1;` with "Left side of assignment must be an assignable expression", because its own `isLValue` at `lsp/frontend/semantic/Analyzer.cpp:8767` has no parenthesized arm, while the compiler accepts parentheses around any place as of 2026-09-22.
 
 ## Reminders
 
