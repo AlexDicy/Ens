@@ -1,7 +1,11 @@
 import Path from @std.fs;
 import @std.testing;
 import StringBuilder from @std.text.stringbuilder;
+import List from @std.collections.list;
 import program.graph;
+import GraphResult from program.graph;
+import program.workspace;
+import FileDiagnostic from support.diagnostics;
 import FakeFileLoader from sema_support;
 import sema_support;
 
@@ -208,4 +212,268 @@ test "a byte-order mark and well-formed multi-byte characters are accepted" {
 
     try testing.assertEqual(result.diagnostics().length, 0L);
     try sema_support.assertModulePaths(result, ["main"]);
+}
+
+// A workspace whose app depends on one package per declaration, 'demo.pkga' declaring the first,
+// with the members, dependencies and imports all written in the reverse of name order.
+nativesAmong(FakeFileLoader loader, string root, string[] declarations) -> GraphResult {
+    string[] letters = ["a", "b", "c", "d"];
+    let members = new StringBuilder();
+    let dependencies = new StringBuilder();
+    let imports = new StringBuilder();
+    for (long i = declarations.length - 1; i >= 0; i--) {
+        string letter = letters[i];
+        members.append("    member \"pkg{letter}\";\n");
+        dependencies.append("    dependency demo.pkg{letter};\n");
+        imports.append("import @demo.pkg{letter}.tag{letter};\n");
+        loader.add("{root}/pkg{letter}/ens.package", "package demo.pkg{letter} \{\n"
+            + "    ens \"0.1\";\n"
+            + "    {declarations[i]}\n"
+            + "\}\n");
+        loader.add("{root}/pkg{letter}/src/tag{letter}.ens", "");
+    }
+    loader.add("{root}/ens.package", "workspace \{\n"
+        + "    member \"app\";\n"
+        + members.toString()
+        + "\}\n");
+    loader.add("{root}/app/ens.package", "package demo.app \{\n"
+        + "    ens \"0.1\";\n"
+        + dependencies.toString()
+        + "\}\n");
+    loader.add("{root}/app/src/main.ens", imports.toString());
+    return graph.buildGraph(loader, Path("{root}/app/src"), Path(""), Path("/stdlib"), ["main.ens"]);
+}
+
+// The note lines of the one diagnostic, as "<file>: <note>" in the order they are read.
+notesOf(FileDiagnostic[] diagnostics) -> string[] throws {
+    try testing.assertEqual(diagnostics.length, 1L);
+    let notes = new List<string>();
+    for (let related in diagnostics[0].related()) {
+        notes.push("{related.file()}: {related.note()}");
+    }
+    return notes.toArray();
+}
+
+test "a native library declared differently is reported in package name order wherever it sits" {
+    for (let root in ["/a", "/b", "/c/d", "/work/tree", "/z"]) {
+        let result = nativesAmong(new FakeFileLoader(), root,
+            ["native zlib;", "native zlib \{ windows \"zlib1\"; linux \"z\"; \}"]);
+        let diagnostics = result.diagnostics();
+        try testing.assertEqual(diagnostics.length, 1L);
+        try sema_support.assertDiagnostic(diagnostics, 0, "{root}/pkgb/ens.package",
+            "Native library 'zlib' is declared in two different ways. Package 'demo.pkga' declares "
+                + "it as 'native zlib;'. Package 'demo.pkgb' declares it as 'native zlib \{ windows "
+                + "\"zlib1\"; linux \"z\"; \}'. A build links each native library one way for all of "
+                + "its packages, so every package must declare it the same way. Change the "
+                + "declaration in the manifest of 'demo.pkgb' to 'native zlib;'.");
+        let notes = try notesOf(diagnostics);
+        try testing.assertEqual(notes.length, 1L);
+        try testing.assertEqual(notes[0],
+            "{root}/pkga/ens.package: package 'demo.pkga' declares native library 'zlib' here");
+        try testing.assertEqual(result.natives().length, 1L);
+        try testing.assertTrue(!result.natives()[0].hasBindingBlock(),
+            "the declaration of the kept way, from 'demo.pkga', stands for 'zlib'");
+    }
+}
+
+test "a system library with a binding block is refused in its own manifest only" {
+    let result = nativesAmong(new FakeFileLoader(), "/ws",
+        ["native zlib;", "native zlib system \{ linux \"z\"; \}"]);
+    let diagnostics = result.diagnostics();
+    try testing.assertEqual(diagnostics.length, 1L);
+    try sema_support.assertDiagnostic(diagnostics, 0, "/ws/pkgb/ens.package",
+        "Native library 'zlib' is marked 'system', so it is linked by platform defaults and "
+            + "cannot carry a binding block.");
+}
+
+test "three packages declaring a native library two ways are one report naming the smaller way to change" {
+    string windows = "native zlib \{ windows \"zlib1\"; \}";
+    let result = nativesAmong(new FakeFileLoader(), "/ws", [windows, windows, "native zlib;"]);
+    let diagnostics = result.diagnostics();
+    try sema_support.assertDiagnostic(diagnostics, 0, "/ws/pkgc/ens.package",
+        "Native library 'zlib' is declared in two different ways. Packages 'demo.pkga' and "
+            + "'demo.pkgb' declare it as 'native zlib \{ windows \"zlib1\"; \}'. Package 'demo.pkgc' "
+            + "declares it as 'native zlib;'. A build links each native library one way for all of "
+            + "its packages, so every package must declare it the same way. Change the declaration "
+            + "in the manifest of 'demo.pkgc' to 'native zlib \{ windows \"zlib1\"; \}'.");
+    let notes = try notesOf(diagnostics);
+    try testing.assertEqual(notes.length, 2L);
+    try testing.assertEqual(notes[0],
+        "/ws/pkga/ens.package: package 'demo.pkga' declares native library 'zlib' here");
+    try testing.assertEqual(notes[1],
+        "/ws/pkgb/ens.package: package 'demo.pkgb' declares native library 'zlib' here");
+    try testing.assertTrue(result.natives()[0].hasBindingBlock(), "the kept way stands for 'zlib'");
+}
+
+test "on a tie the way whose first package sorts later is the way to change" {
+    string windows = "native zlib \{ windows \"zlib1\"; \}";
+    let result = nativesAmong(new FakeFileLoader(), "/ws",
+        ["native zlib;", windows, windows, "native zlib;"]);
+    let diagnostics = result.diagnostics();
+    try sema_support.assertDiagnostic(diagnostics, 0, "/ws/pkgb/ens.package",
+        "Native library 'zlib' is declared in two different ways. Packages 'demo.pkga' and "
+            + "'demo.pkgd' declare it as 'native zlib;'. Packages 'demo.pkgb' and 'demo.pkgc' "
+            + "declare it as 'native zlib \{ windows \"zlib1\"; \}'. A build links each native "
+            + "library one way for all of its packages, so every package must declare it the same "
+            + "way. Change the declarations in the manifests of 'demo.pkgb' and 'demo.pkgc' to "
+            + "'native zlib;'.");
+    let notes = try notesOf(diagnostics);
+    try testing.assertEqual(notes.length, 3L);
+    try testing.assertEqual(notes[0],
+        "/ws/pkga/ens.package: package 'demo.pkga' declares native library 'zlib' here");
+    try testing.assertEqual(notes[1],
+        "/ws/pkgc/ens.package: package 'demo.pkgc' declares native library 'zlib' here");
+    try testing.assertEqual(notes[2],
+        "/ws/pkgd/ens.package: package 'demo.pkgd' declares native library 'zlib' here");
+}
+
+test "a native library declared three ways names every package outside the largest way to change" {
+    string windows = "native zlib \{ windows \"zlib1\"; \}";
+    let result = nativesAmong(new FakeFileLoader(), "/ws",
+        ["native zlib;", windows, "native zlib system;", windows]);
+    let diagnostics = result.diagnostics();
+    try sema_support.assertDiagnostic(diagnostics, 0, "/ws/pkga/ens.package",
+        "Native library 'zlib' is declared in three different ways. Package 'demo.pkga' "
+            + "declares it as 'native zlib;'. Packages 'demo.pkgb' and 'demo.pkgd' declare it as "
+            + "'native zlib \{ windows \"zlib1\"; \}'. Package 'demo.pkgc' declares it as 'native "
+            + "zlib system;'. A build links each native library one way for all of its packages, so "
+            + "every package must declare it the same way. Change the declarations in the "
+            + "manifests of 'demo.pkga' and 'demo.pkgc' to 'native zlib \{ windows \"zlib1\"; \}'.");
+    let notes = try notesOf(diagnostics);
+    try testing.assertEqual(notes.length, 3L);
+    try testing.assertEqual(notes[0],
+        "/ws/pkgb/ens.package: package 'demo.pkgb' declares native library 'zlib' here");
+    try testing.assertEqual(notes[1],
+        "/ws/pkgc/ens.package: package 'demo.pkgc' declares native library 'zlib' here");
+    try testing.assertEqual(notes[2],
+        "/ws/pkgd/ens.package: package 'demo.pkgd' declares native library 'zlib' here");
+}
+
+test "a package declaring a native library unlike the standard library is the one to change" {
+    let loader = new FakeFileLoader();
+    loader.add("/stdlib/std/ens.package", "package std \{\n"
+        + "    ens \"0.1\";\n"
+        + "    native libc system;\n"
+        + "\}\n");
+    let result = nativesAmong(loader, "/ws", ["native libc;"]);
+    let diagnostics = result.diagnostics();
+    try sema_support.assertDiagnostic(diagnostics, 0, "/ws/pkga/ens.package",
+        "Native library 'libc' is declared in two different ways. Package 'demo.pkga' declares "
+            + "it as 'native libc;'. The standard library declares it as 'native libc system;'. A "
+            + "build links each native library one way for all of its packages, so every package "
+            + "must declare it the same way. Change the declaration in the manifest of 'demo.pkga' "
+            + "to 'native libc system;', which is how the standard library declares it.");
+    let notes = try notesOf(diagnostics);
+    try testing.assertEqual(notes.length, 1L);
+    try testing.assertEqual(notes[0],
+        "/stdlib/std/ens.package: the standard library declares native library 'libc' here");
+    try testing.assertTrue(result.natives()[0].isSystem(), "the standard library's way stands");
+}
+
+test "the standard library's way is kept even when more packages declare another" {
+    let loader = new FakeFileLoader();
+    loader.add("/stdlib/std/ens.package", "package std \{\n"
+        + "    ens \"0.1\";\n"
+        + "    native libc system;\n"
+        + "\}\n");
+    let result = nativesAmong(loader, "/ws", ["native libc;", "native libc;"]);
+    let diagnostics = result.diagnostics();
+    try sema_support.assertDiagnostic(diagnostics, 0, "/ws/pkga/ens.package",
+        "Native library 'libc' is declared in two different ways. Packages 'demo.pkga' and "
+            + "'demo.pkgb' declare it as 'native libc;'. The standard library declares it as "
+            + "'native libc system;'. A build links each native library one way for all of its "
+            + "packages, so every package must declare it the same way. Change the declarations in "
+            + "the manifests of 'demo.pkga' and 'demo.pkgb' to 'native libc system;', which is how "
+            + "the standard library declares it.");
+    let notes = try notesOf(diagnostics);
+    try testing.assertEqual(notes.length, 2L);
+    try testing.assertEqual(notes[0],
+        "/ws/pkgb/ens.package: package 'demo.pkgb' declares native library 'libc' here");
+    try testing.assertEqual(notes[1],
+        "/stdlib/std/ens.package: the standard library declares native library 'libc' here");
+}
+
+test "a native library whose platforms are listed in another order is declared one way" {
+    let result = nativesAmong(new FakeFileLoader(), "/ws",
+        ["native zlib \{ windows \"zlib1\"; linux \"z\"; \}",
+            "native zlib \{ linux \"z\"; windows \"zlib1\"; \}"]);
+    try sema_support.assertNoDiagnostics(result.diagnostics());
+    try testing.assertEqual(result.natives().length, 1L);
+}
+
+test "base names listed in another order within one platform are another way to declare it" {
+    let result = nativesAmong(new FakeFileLoader(), "/ws",
+        ["native zlib \{ windows \"zlib1\" \"zstat\"; \}",
+            "native zlib \{ windows \"zstat\" \"zlib1\"; \}"]);
+    let diagnostics = result.diagnostics();
+    try sema_support.assertDiagnostic(diagnostics, 0, "/ws/pkgb/ens.package",
+        "Native library 'zlib' is declared in two different ways. Package 'demo.pkga' declares "
+            + "it as 'native zlib \{ windows \"zlib1\" \"zstat\"; \}'. Package 'demo.pkgb' declares it "
+            + "as 'native zlib \{ windows \"zstat\" \"zlib1\"; \}'. A build links each native library "
+            + "one way for all of its packages, so every package must declare it the same way. "
+            + "Change the declaration in the manifest of 'demo.pkgb' to 'native zlib \{ windows "
+            + "\"zlib1\" \"zstat\"; \}'.");
+    let notes = try notesOf(diagnostics);
+    try testing.assertEqual(notes.length, 1L);
+    try testing.assertEqual(notes[0],
+        "/ws/pkga/ens.package: package 'demo.pkga' declares native library 'zlib' here");
+}
+
+// Only the manifest's own error is reported, whichever of the two packages holds the refused
+// declaration, and the other declaration stands for the library.
+assertOnlyRefusal(string refused, string message) throws {
+    string windows = "native zlib \{ windows \"zlib1\"; \}";
+    for (long refusedIndex = 0; refusedIndex < 2; refusedIndex++) {
+        string[] declarations = [refused, windows];
+        string file = "/ws/pkga/ens.package";
+        if (refusedIndex == 1) {
+            declarations = [windows, refused];
+            file = "/ws/pkgb/ens.package";
+        }
+        let result = nativesAmong(new FakeFileLoader(), "/ws", declarations);
+        let diagnostics = result.diagnostics();
+        try testing.assertEqual(diagnostics.length, 1L);
+        try sema_support.assertDiagnostic(diagnostics, 0, file, message);
+        try testing.assertEqual(result.natives().length, 1L);
+        try testing.assertEqual(workspace.nativeDeclarationText(result.natives()[0]), windows);
+    }
+}
+
+test "a platform bound twice leaves its declaration out of the comparison" {
+    try assertOnlyRefusal("native zlib \{ windows \"zlib1\"; windows \"zlib1\"; \}",
+        "Platform 'windows' is bound twice for native library 'zlib'; remove the duplicate.");
+}
+
+test "an unknown platform leaves its declaration out of the comparison" {
+    try assertOnlyRefusal("native zlib \{ windoze \"zlib1\"; \}",
+        "Unknown platform 'windoze' in native library 'zlib'; bindings use 'windows', 'linux', "
+            + "or 'macos'.");
+}
+
+test "an empty base name leaves its declaration out of the comparison" {
+    try assertOnlyRefusal("native zlib \{ windows \"\"; \}",
+        "A library base name for native library 'zlib' cannot be empty.");
+}
+
+test "a package declaring a native library the way the standard library does is named beside it" {
+    let loader = new FakeFileLoader();
+    loader.add("/stdlib/std/ens.package", "package std \{\n"
+        + "    ens \"0.1\";\n"
+        + "    native libc system;\n"
+        + "\}\n");
+    let result = nativesAmong(loader, "/ws", ["native libc system;", "native libc;"]);
+    let diagnostics = result.diagnostics();
+    try sema_support.assertDiagnostic(diagnostics, 0, "/ws/pkgb/ens.package",
+        "Native library 'libc' is declared in two different ways. The standard library and "
+            + "package 'demo.pkga' declare it as 'native libc system;'. Package 'demo.pkgb' "
+            + "declares it as 'native libc;'. A build links each native library one way for all of "
+            + "its packages, so every package must declare it the same way. Change the declaration "
+            + "in the manifest of 'demo.pkgb' to 'native libc system;', which is how the standard "
+            + "library declares it.");
+    let notes = try notesOf(diagnostics);
+    try testing.assertEqual(notes.length, 2L);
+    try testing.assertEqual(notes[0],
+        "/ws/pkga/ens.package: package 'demo.pkga' declares native library 'libc' here");
+    try testing.assertEqual(notes[1],
+        "/stdlib/std/ens.package: the standard library declares native library 'libc' here");
 }

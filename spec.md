@@ -732,6 +732,8 @@ A platform may instead bind a prebuilt artifact: `windows artifact "https://exam
 An artifact is a single library file for its platform.
 Artifact bindings and their hashes are recorded in `ens.lock`, so the exact native code a build links is reviewable in one place.
 When two packages in one build declare the same native library, the declarations must be identical; identical declarations are linked once.
+Two declarations of a native library are identical when they have the same form (bare, `system`, or a binding block) and, for a block, name the same platforms with the same bindings in any platform order.
+Within one platform the base names must be in the same order, because they are linked in that order.
 
 ---
 

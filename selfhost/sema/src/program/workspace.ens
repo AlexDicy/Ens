@@ -197,14 +197,16 @@ export class NativeInfo {
     bool blockPresent;
     NativeBindingInfo[] nativeBindings;
     Span nativeSpan;
+    bool refusedInManifest;
 
     protected constructor(string name, bool isSystem, bool hasBindingBlock,
-                NativeBindingInfo[] bindings, Span span) {
+                NativeBindingInfo[] bindings, Span span, bool refused) {
         this.nativeName = name;
         this.systemLibrary = isSystem;
         this.blockPresent = hasBindingBlock;
         this.nativeBindings = bindings;
         this.nativeSpan = span;
+        this.refusedInManifest = refused;
     }
 
     export name() -> string {
@@ -226,10 +228,17 @@ export class NativeInfo {
     public span() -> Span {
         return this.nativeSpan;
     }
+
+    // True when the manifest reported a problem inside this declaration, such as a platform
+    // bound twice or an empty base name.
+    public isRefused() -> bool {
+        return this.refusedInManifest;
+    }
 }
 
 // True when the two declarations bind the same logical library identically, so a build may
-// dedupe them; anything else is a conflict.
+// dedupe them; anything else is a conflict. The platform lines of a block may come in any order,
+// while the base names within one platform keep theirs.
 public sameNative(NativeInfo first, NativeInfo second) -> bool {
     if (first.isSystem() != second.isSystem() || first.hasBindingBlock() != second.hasBindingBlock()) {
         return false;
@@ -239,8 +248,19 @@ public sameNative(NativeInfo first, NativeInfo second) -> bool {
     if (firstBindings.length != secondBindings.length) {
         return false;
     }
-    for (long i = 0; i < firstBindings.length; i++) {
-        if (!sameBinding(firstBindings[i], secondBindings[i])) {
+    return everyBindingIn(firstBindings, secondBindings) && everyBindingIn(secondBindings, firstBindings);
+}
+
+everyBindingIn(NativeBindingInfo[] bindings, NativeBindingInfo[] others) -> bool {
+    for (let binding in bindings) {
+        bool found = false;
+        for (let other in others) {
+            if (sameBinding(binding, other)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
             return false;
         }
     }
@@ -263,6 +283,43 @@ sameBinding(NativeBindingInfo first, NativeBindingInfo second) -> bool {
         }
     }
     return true;
+}
+
+// The declaration on one line, the way a manifest writes it, such as 'native zlib;' or
+// 'native llvm { windows "LLVM-C"; linux "LLVM-18"; }'.
+public nativeDeclarationText(NativeInfo native) -> string {
+    let text = new StringBuilder();
+    text.append("native ");
+    text.append(native.name());
+    if (native.isSystem()) {
+        text.append(" system");
+    }
+    if (!native.hasBindingBlock()) {
+        text.append(";");
+        return text.toString();
+    }
+    text.append(" \{");
+    for (let binding in native.bindings()) {
+        text.append(" ");
+        text.append(bindingText(binding));
+    }
+    text.append(" \}");
+    return text.toString();
+}
+
+bindingText(NativeBindingInfo binding) -> string {
+    if (binding.isArtifact()) {
+        return "{binding.platform()} artifact \"{binding.url()}\" hash \"{binding.checksum()}\";";
+    }
+    let text = new StringBuilder();
+    text.append(binding.platform());
+    for (let baseName in binding.baseNames()) {
+        text.append(" \"");
+        text.append(baseName);
+        text.append("\"");
+    }
+    text.append(";");
+    return text.toString();
 }
 
 enum ManifestForm {
@@ -1140,7 +1197,7 @@ public class WorkspaceLoader {
             }
         }
         data.natives.push(new NativeInfo(name, isSystem, block != null, bindings.toArray(),
-            node.span()));
+            node.span(), this.reportedWithin(file, node.span())));
     }
 
     checkPlatform(Path file, string nativeName, string platform, Span span, Set<string> platforms) {
@@ -1208,6 +1265,22 @@ public class WorkspaceLoader {
     // this boundary and nowhere else.
     report(Path file, Span span, string message) {
         this.collected.push(new FileDiagnostic(file.toString(), message, span));
+    }
+
+    // True when a problem has been reported in the file at a position inside the span, or at its
+    // end for a problem such as a missing ';'.
+    reportedWithin(Path file, Span span) -> bool {
+        string path = file.toString();
+        for (long i = 0; i < this.collected.length(); i++) {
+            let reported = this.collected.get(i);
+            long start = reported.span().start;
+            bool inside = start >= span.start && start < span.start + span.length;
+            bool atEnd = reported.span().length == 0 && start == span.start + span.length;
+            if (reported.file() == path && (inside || atEnd)) {
+                return true;
+            }
+        }
+        return false;
     }
 }
 

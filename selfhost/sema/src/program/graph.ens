@@ -14,6 +14,7 @@ import TopLevelItem from @ens.frontend.syntax.generated.nodes;
 import FileLoader from support.loader;
 import FileError from support.loader;
 import FileDiagnostic from support.diagnostics;
+import RelatedLocation from support.diagnostics;
 import support.diagnostics;
 import Workspace from program.workspace;
 import WorkspaceLoader from program.workspace;
@@ -168,7 +169,8 @@ export class GraphResult {
 
     // Every native library the resolved packages declare, one entry per name in name order, so a
     // driver links what the graph's manifests declared. Conflicting declarations of one name are
-    // diagnosed during the build, so the first seen declaration stands for its name here.
+    // diagnosed, and the declaration of the kept way stands for the name here. A declaration its
+    // own manifest refused is left out.
     export natives() -> NativeInfo[] {
         return this.graphNatives;
     }
@@ -231,6 +233,7 @@ class GraphBuilder {
     WorkspaceLoader workspaceLoader;
     Workspace rootWorkspace;
     Map<Path, Workspace> workspacesByFolder;
+    List<Workspace> reachedWorkspaces;
 
     Set<string> queuedPaths;
     List<WorkItem> workItems;
@@ -255,6 +258,8 @@ class GraphBuilder {
         this.rootWorkspace = this.workspaceLoader.loadRoot(sourceRoot, testsRoot, overridesFolder);
         this.workspacesByFolder = new Map<Path, Workspace>();
         this.workspacesByFolder.set(this.rootWorkspace.root(), this.rootWorkspace);
+        this.reachedWorkspaces = new List<Workspace>();
+        this.reachedWorkspaces.push(this.rootWorkspace);
     }
 
     protected build(string[] seedFiles) -> GraphResult {
@@ -326,23 +331,20 @@ class GraphBuilder {
             natives, this.workspaceLoader.notices());
     }
 
-    // The natives of every resolved workspace, one entry per name in name order. The same
-    // logical native library declared with different bindings anywhere in the resolved package
-    // graph is a hard error; identical declarations dedupe at link time.
+    // The natives of every resolved workspace, one entry per name in name order. Identical
+    // declarations of a library become one entry, and a library declared in more than one way is
+    // one error. Packages are compared in package name order, so a conflict is reported the same
+    // way wherever the packages sit on disk.
     collectNatives() -> NativeInfo[] {
+        let standardLibrary = this.workspacesByFolder.get(this.stdlibRoot.join("std"));
         let names = new List<string>();
-        let firstDeclarations = new List<NativeInfo>();
-        let firstManifests = new List<string>();
-        let workspaces = new List<Workspace>();
-        for (let folder in this.workspacesByFolder.keys()) {
-            let loaded = this.workspacesByFolder.get(folder);
-            if (loaded != null) {
-                workspaces.push(loaded);
-            }
-        }
-        for (long w = 0; w < workspaces.length(); w++) {
-            let owner = workspaces.get(w);
+        let declarationsByName = new List<List<DeclaredNative>>();
+        for (let owner in inPackageNameOrder(this.reachedWorkspaces)) {
             for (let native in owner.natives()) {
+                // A declaration its own manifest refused already has an error of its own.
+                if (native.isRefused()) {
+                    continue;
+                }
                 long existing = -1;
                 for (long i = 0; i < names.length(); i++) {
                     if (names.get(i) == native.name()) {
@@ -352,19 +354,22 @@ class GraphBuilder {
                 }
                 if (existing < 0) {
                     names.push(native.name());
-                    firstDeclarations.push(native);
-                    firstManifests.push(owner.manifestPath().toString());
-                    continue;
+                    declarationsByName.push(new List<DeclaredNative>());
+                    existing = names.length() - 1;
                 }
-                if (!workspace.sameNative(firstDeclarations.get(existing), native)) {
-                    this.report(owner.manifestPath(), native.span(),
-                        "Native library '{native.name()}' is declared with different bindings "
-                        + "by {firstManifests.get(existing)} and {owner.manifestPath()}; every "
-                        + "package must agree on a native library's binding.");
-                }
+                let declared = new DeclaredNative(owner, native, owner == standardLibrary);
+                declarationsByName.get(existing).push(declared);
             }
         }
-        NativeInfo[] collected = firstDeclarations.toArray();
+        let kept = new List<NativeInfo>();
+        for (long i = 0; i < names.length(); i++) {
+            let ways = new NativeWays(declarationsByName.get(i).toArray());
+            kept.push(ways.keptDeclaration());
+            if (ways.count() > 1) {
+                this.collected.push(ways.conflict());
+            }
+        }
+        NativeInfo[] collected = kept.toArray();
         for (long i = 1; i < collected.length; i++) {
             let current = collected[i];
             long j = i - 1;
@@ -561,6 +566,7 @@ class GraphBuilder {
         }
         let loaded = this.workspaceLoader.loadPackage(folder, packagePrefix);
         this.workspacesByFolder.set(folder, loaded);
+        this.reachedWorkspaces.push(loaded);
         return loaded;
     }
 
@@ -585,6 +591,212 @@ class GraphBuilder {
             this.collected.push(item);
         }
     }
+}
+
+// The workspaces sorted by package name, keeping the order they were reached in among equal names.
+inPackageNameOrder(List<Workspace> reached) -> Workspace[] {
+    Workspace[] ordered = reached.toArray();
+    for (long i = 1; i < ordered.length; i++) {
+        let current = ordered[i];
+        long j = i - 1;
+        while (j >= 0 && ordered[j].packageName().compareTo(current.packageName()) > 0) {
+            ordered[j + 1] = ordered[j];
+            j--;
+        }
+        ordered[j + 1] = current;
+    }
+    return ordered;
+}
+
+// One package's declaration of a native library.
+class DeclaredNative {
+    protected Workspace owner;
+    protected NativeInfo native;
+    protected bool standard;
+
+    protected constructor(this.owner, this.native, this.standard);
+
+    // Whose declaration this is, the way a diagnostic names it.
+    protected declarer() -> string {
+        if (this.standard) {
+            return "the standard library";
+        }
+        return "package '{this.owner.packageName()}'";
+    }
+}
+
+// The declarations of one native library in package name order, grouped into the ways they are
+// written. The kept way is the standard library's when it declares the library, and otherwise the
+// way most packages write, the earliest on a tie. The declarations written another way are the
+// ones to change.
+class NativeWays {
+    DeclaredNative[] declarations;
+    long[] wayOf;
+    long[] firstOfWay;
+    long keptWay;
+
+    protected constructor(DeclaredNative[] declarations) {
+        let firsts = new List<long>();
+        long[] ways = new long[declarations.length];
+        for (long i = 0; i < declarations.length; i++) {
+            long way = -1;
+            for (long w = 0; w < firsts.length(); w++) {
+                if (workspace.sameNative(declarations[firsts.get(w)].native, declarations[i].native)) {
+                    way = w;
+                    break;
+                }
+            }
+            if (way < 0) {
+                way = firsts.length();
+                firsts.push(i);
+            }
+            ways[i] = way;
+        }
+        this.declarations = declarations;
+        this.wayOf = ways;
+        this.firstOfWay = firsts.toArray();
+        this.keptWay = keptWayOf(declarations, ways, this.firstOfWay.length);
+    }
+
+    protected count() -> long {
+        return this.firstOfWay.length;
+    }
+
+    protected keptDeclaration() -> NativeInfo {
+        return this.declarations[this.firstOfWay[this.keptWay]].native;
+    }
+
+    // The one error for the library, reported at the first declaration to change, with a note at
+    // every other declaration.
+    protected conflict() -> FileDiagnostic {
+        string library = this.declarations[0].native.name();
+        let described = new StringBuilder();
+        for (long w = 0; w < this.count(); w++) {
+            described.append(" ");
+            described.append(this.waySentence(w));
+        }
+        let changed = new List<string>();
+        long site = -1;
+        for (long i = 0; i < this.declarations.length; i++) {
+            if (this.wayOf[i] != this.keptWay) {
+                if (site < 0) {
+                    site = i;
+                }
+                changed.push("'{this.declarations[i].owner.packageName()}'");
+            }
+        }
+        let notes = new List<RelatedLocation>();
+        for (long i = 0; i < this.declarations.length; i++) {
+            let declared = this.declarations[i];
+            if (i != site) {
+                notes.push(new RelatedLocation(declared.owner.manifestPath().toString(),
+                    declared.native.span(),
+                    "{declared.declarer()} declares native library '{library}' here"));
+            }
+        }
+        string message = "Native library '{library}' is declared in {countWord(this.count())} "
+            + "different ways.{described.toString()} A build links each native library one way for "
+            + "all of its packages, so every package must declare it the same way. "
+            + "{this.advice(changed.toArray())}.";
+        let reported = this.declarations[site];
+        return new FileDiagnostic(reported.owner.manifestPath().toString(), message,
+            reported.native.span(), notes.toArray());
+    }
+
+    // The sentence naming every manifest to change and what to change it to.
+    advice(string[] changed) -> string {
+        string kept = workspace.nativeDeclarationText(this.keptDeclaration());
+        string advice = "Change the declaration in the manifest of {changed[0]} to '{kept}'";
+        if (changed.length > 1) {
+            advice = "Change the declarations in the manifests of {andJoined(changed)} to '{kept}'";
+        }
+        if (this.keptHasStandard()) {
+            advice = advice + ", which is how the standard library declares it";
+        }
+        return advice;
+    }
+
+    keptHasStandard() -> bool {
+        for (long i = 0; i < this.declarations.length; i++) {
+            if (this.wayOf[i] == this.keptWay && this.declarations[i].standard) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // The sentence saying who writes the way and how, such as "Package 'a' declares it as
+    // 'native zlib;'." or "The standard library declares it as 'native libc system;'."
+    waySentence(long way) -> string {
+        bool standard = false;
+        let packages = new List<string>();
+        for (long i = 0; i < this.declarations.length; i++) {
+            if (this.wayOf[i] != way) {
+                continue;
+            }
+            if (this.declarations[i].standard) {
+                standard = true;
+            } else {
+                packages.push("'{this.declarations[i].owner.packageName()}'");
+            }
+        }
+        string text = workspace.nativeDeclarationText(this.declarations[this.firstOfWay[way]].native);
+        if (standard && packages.length() == 0) {
+            return "The standard library declares it as '{text}'.";
+        }
+        string named = "packages {andJoined(packages.toArray())}";
+        if (packages.length() == 1) {
+            named = "package {packages.get(0)}";
+        }
+        if (standard) {
+            return "The standard library and {named} declare it as '{text}'.";
+        }
+        if (packages.length() == 1) {
+            return "Package {packages.get(0)} declares it as '{text}'.";
+        }
+        return "Packages {andJoined(packages.toArray())} declare it as '{text}'.";
+    }
+}
+
+// The kept way, which is the standard library's way or else the largest, the earliest on a tie.
+keptWayOf(DeclaredNative[] declarations, long[] wayOf, long count) -> long {
+    long[] sizes = new long[count];
+    for (long i = 0; i < declarations.length; i++) {
+        if (declarations[i].standard) {
+            return wayOf[i];
+        }
+        sizes[wayOf[i]]++;
+    }
+    long kept = 0;
+    for (long w = 1; w < count; w++) {
+        if (sizes[w] > sizes[kept]) {
+            kept = w;
+        }
+    }
+    return kept;
+}
+
+// "two", "three", and so on, for a count of at least two.
+countWord(long count) -> string {
+    string[] words = ["two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"];
+    if (count >= 2 && count <= 10) {
+        return words[count - 2];
+    }
+    return "{count}";
+}
+
+// "'a'", "'a' and 'b'", or "'a', 'b' and 'c'".
+andJoined(string[] items) -> string {
+    let text = new StringBuilder();
+    for (long i = 0; i < items.length; i++) {
+        if (i > 0 && i == items.length - 1) {
+            text.append(" and ");
+        } else if (i > 0) {
+            text.append(", ");
+        }
+        text.append(items[i]);
+    }
+    return text.toString();
 }
 
 segmentTexts(ImportPathNode path) -> string[] {
