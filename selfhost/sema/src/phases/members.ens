@@ -417,34 +417,65 @@ public checkFunctionModifiers(Reporter reporter, FunctionDeclarationNode declara
         declarationSubject("Function", declaration.name()), DeclarationShape.Function);
 }
 
-// A member's visibility: the given default when unmarked, 'protected' as written, and an
-// over-marked member capped at its owner's visibility after a diagnostic. Protected is exempt
-// from the ladder: its guaranteed reach never exceeds the declaring file.
-public memberVisibility(MemberModifiers modifiers, Visibility defaultVisibility,
-                        DeclaredType owner, string memberKindWord, string memberName,
-                        Reporter reporter, TypeNames names) -> Visibility {
-    let mark = writtenVisibilityMark(modifiers, memberName, reporter);
+// A member's visibility as its modifiers write it. A member with no mark has the visibility
+// 'types.unmarkedMemberVisibility' computes for its owner. The kind word, such as 'Field' or
+// 'Constructor', names the member in a diagnostic.
+public memberVisibility(MemberModifiers modifiers, DeclaredType owner, string memberKindWord,
+                        string memberName, Reporter reporter, TypeNames names) -> Visibility {
+    Visibility unmarked = types.unmarkedMemberVisibility(owner.visibility());
+    return markedVisibility(modifiers, unmarked, owner, memberKindWord, memberName, reporter, names);
+}
+
+// A member's visibility with the given default for an unmarked member. A member marked wider than
+// its owner is reported and capped at the owner's reach. A 'protected' mark is never refused here.
+// It sits beside the ladder, and the leakage checks hold it to its own rule.
+markedVisibility(MemberModifiers modifiers, Visibility defaultVisibility, DeclaredType owner,
+                 string memberKindWord, string memberName, Reporter reporter, TypeNames names) -> Visibility {
+    let mark = writtenVisibilityMark(modifiers, memberName, defaultVisibility, owner, reporter,
+        names);
     if (mark == null || mark.marked == Visibility.Private) {
         return defaultVisibility;
     }
     Visibility declared = mark.marked;
     if (declared != Visibility.Protected
             && types.visibilityTier(declared) > types.visibilityTier(owner.visibility())) {
-        reporter.report("{memberKindWord} '{memberName}' cannot be "
-            + "'{types.visibilityWord(declared)}' while '{names.nameOf(owner)}' is "
-            + "{ownerReachPhrase(owner)}; "
-            + "a member is never more visible than the type that holds it. Raise "
-            + "'{names.nameOf(owner)}' to '{types.visibilityWord(declared)}', or lower "
-            + "'{memberName}'.", mark.markSpan);
-        return owner.visibility();
+        string subject = "{memberKindWord} '{memberName}'";
+        if (memberKindWord == "Constructor") {
+            subject = "The constructor of '{names.nameOf(owner)}'";
+        }
+        reporter.report(overMarkedMessage(subject, declared, owner, names), mark.markSpan);
+        return types.followedMemberVisibility(owner.visibility());
     }
     return declared;
 }
 
+// The refusal of a member marked more visible than its owner, with the fixes that compile. A member
+// of a file-private owner drops its mark. A member of a 'public' owner is marked 'public' instead,
+// or the owner is raised to the written mark.
+overMarkedMessage(string subject, Visibility declared, DeclaredType owner, TypeNames names) -> string {
+    string ownerName = names.nameOf(owner);
+    string declaredWord = types.visibilityWord(declared);
+    string problem = overMarkedProblem(subject, declared, owner, names);
+    if (owner.visibility() == Visibility.Private) {
+        return "{problem} Remove '{declaredWord}'. An unmarked member of '{ownerName}' already "
+            + "reaches its whole file.";
+    }
+    string ownerWord = types.visibilityWord(owner.visibility());
+    return "{problem} Replace '{declaredWord}' with '{ownerWord}', or mark '{ownerName}' "
+        + "'{declaredWord}' too.";
+}
+
+// The sentence refusing a member marked more visible than its owner.
+overMarkedProblem(string subject, Visibility declared, DeclaredType owner, TypeNames names) -> string {
+    return "{subject} cannot be '{types.visibilityWord(declared)}' while '{names.nameOf(owner)}' "
+        + "is {ownerReachPhrase(owner)}, because a member is never more visible than the type that holds it.";
+}
+
 // The first visibility mark written on a member, or null when it carries none. Every mark after
-// the first and a written 'private' are reported here, once for every kind of member.
-writtenVisibilityMark(MemberModifiers modifiers, string memberName, Reporter reporter)
-        -> MemberVisibilityMark? {
+// the first and a written 'private' are reported here, once for every kind of member. 'unmarked'
+// is the visibility the member has with no mark.
+writtenVisibilityMark(MemberModifiers modifiers, string memberName, Visibility unmarked,
+                      DeclaredType owner, Reporter reporter, TypeNames names) -> MemberVisibilityMark? {
     let marks = modifiers.visibilityMarks;
     if (marks.length() == 0) {
         return null;
@@ -455,10 +486,30 @@ writtenVisibilityMark(MemberModifiers modifiers, string memberName, Reporter rep
     }
     let mark = marks.get(0);
     if (mark.marked == Visibility.Private) {
-        reporter.report("A member is private to its type unless it is marked, so 'private' is "
-            + "never written. Remove it from '{memberName}'.", mark.markSpan);
+        reporter.report(privateMarkMessage(memberName, unmarked, owner, names), mark.markSpan);
     }
     return mark;
+}
+
+// The refusal of a written 'private', with how far the member reaches unmarked. A constructor's
+// member name is 'constructor', its keyword.
+privateMarkMessage(string memberName, Visibility unmarked, DeclaredType owner,
+                   TypeNames names) -> string {
+    string ownerName = names.nameOf(owner);
+    string target = "'{memberName}'";
+    if (memberName == "constructor") {
+        target = "the constructor of '{ownerName}'";
+    }
+    if (owner.visibility() == Visibility.Private) {
+        return "A member of '{ownerName}' always reaches the whole file '{ownerName}' is declared "
+            + "in, so 'private' is never written. Remove it from {target}.";
+    }
+    if (unmarked != Visibility.Private) {
+        return "'{memberName}' takes the visibility of '{ownerName}', so 'private' is never written. "
+            + "Remove it.";
+    }
+    return "A member is private to its type unless it is marked, so 'private' is never written. "
+        + "Remove it from {target}.";
 }
 
 // How far a type lets its members reach, as a diagnostic names it.
@@ -470,7 +521,8 @@ ownerReachPhrase(DeclaredType owner) -> string {
 }
 
 // An override of a base class method writes the visibility of the method it replaces, capped at
-// what its own class can hold, so the two declarations read alike wherever they are compared.
+// what its own class can hold. In a file-private class the override may also stay unmarked.
+// An unmarked member there already reaches as far as the cap.
 public overrideVisibility(MemberModifiers modifiers, DeclaredType owner, Method overridden,
                           string memberName, Span nameSpan, Reporter reporter,
                           TypeNames names) -> Visibility {
@@ -481,30 +533,53 @@ public overrideVisibility(MemberModifiers modifiers, DeclaredType owner, Method 
         required = reach;
     }
     string requiredWord = types.visibilityWord(required);
-    string baseName = names.of(overridden.definingType());
-    let mark = writtenVisibilityMark(modifiers, memberName, reporter);
+    Visibility unmarked = types.unmarkedMemberVisibility(owner.visibility());
+    let mark = writtenVisibilityMark(modifiers, memberName, unmarked, owner, reporter, names);
     if (mark == null) {
-        reporter.report("Override '{memberName}' must carry the visibility of the "
-            + "'{memberName}' it overrides in '{baseName}'. Mark it '{requiredWord}'.",
-            nameSpan);
+        if (required == unmarked) {
+            return required;
+        }
+        string problem = overrideRequirement(memberName, overridden, required, owner, names);
+        reporter.report("{problem} Mark it '{requiredWord}'.", nameSpan);
         return required;
     }
     if (mark.marked == Visibility.Private || mark.marked == required) {
         return required;
     }
     string written = types.visibilityWord(mark.marked);
-    string inheritedWord = types.visibilityWord(inherited);
-    if (required == inherited) {
-        reporter.report("Override '{memberName}' is marked '{written}', but the '{memberName}' "
-            + "it overrides in '{baseName}' is '{inheritedWord}'. An override carries the same "
-            + "visibility, so mark it '{requiredWord}'.", mark.markSpan);
+    string subject = "Override '{memberName}'";
+    if (owner.visibility() == Visibility.Private) {
+        reporter.report(overMarkedMessage(subject, mark.marked, owner, names), mark.markSpan);
+    } else if (types.visibilityTier(mark.marked) > types.visibilityTier(owner.visibility())) {
+        string problem = overMarkedProblem(subject, mark.marked, owner, names);
+        if (inherited == mark.marked) {
+            reporter.report("{problem} Replace '{written}' with '{requiredWord}', or mark "
+                + "'{names.nameOf(owner)}' '{written}' too.", mark.markSpan);
+        } else {
+            reporter.report("{problem} Replace '{written}' with '{requiredWord}', the visibility of "
+                + "the '{memberName}' it overrides in '{names.of(overridden.definingType())}'.",
+                mark.markSpan);
+        }
     } else {
-        reporter.report("Override '{memberName}' is marked '{written}', but "
-            + "'{names.nameOf(owner)}' is {ownerReachPhrase(owner)}, so an override in "
-            + "'{names.nameOf(owner)}' reaches at most '{requiredWord}'. Mark it "
-            + "'{requiredWord}'.", mark.markSpan);
+        string problem = overrideRequirement(memberName, overridden, required, owner, names);
+        reporter.report("{problem} Replace '{written}' with '{requiredWord}'.", mark.markSpan);
     }
     return required;
+}
+
+// The sentence naming the visibility an override must carry and where that requirement comes
+// from. The requirement is the overridden method's visibility, or the owner's cap below it.
+overrideRequirement(string memberName, Method overridden, Visibility required, DeclaredType owner,
+                    TypeNames names) -> string {
+    string requiredWord = types.visibilityWord(required);
+    string baseName = names.of(overridden.definingType());
+    if (overridden.visibility() == required) {
+        return "Override '{memberName}' must be '{requiredWord}', the visibility of the "
+            + "'{memberName}' it overrides in '{baseName}'.";
+    }
+    return "Override '{memberName}' must be '{requiredWord}', because the '{memberName}' it "
+        + "overrides in '{baseName}' is '{types.visibilityWord(overridden.visibility())}' and "
+        + "'{names.nameOf(owner)}' is {ownerReachPhrase(owner)}.";
 }
 
 // The behavior a member takes over from the language, or null for an ordinary member. The three
@@ -556,8 +631,7 @@ public builtinReplacementVisibility(MemberModifiers modifiers, DeclaredType owne
     }
     let mark = marks.get(0);
     bool overMarked = types.visibilityTier(mark.marked) > types.visibilityTier(owner.visibility());
-    Visibility written = memberVisibility(modifiers, required, owner, "Method", memberName,
-        reporter, names);
+    Visibility written = markedVisibility(modifiers, required, owner, "Method", memberName, reporter, names);
     if (!overMarked && written != required) {
         reporter.report("Method '{memberName}' replaces the built-in {behavior} of "
             + "{types.kindWordOf(owner)} '{names.nameOf(owner)}', so it must be as visible as "
@@ -583,12 +657,12 @@ public topLevelVisibility(MemberModifiers modifiers) -> Visibility {
 
 // Reads one field declaration; the owner-specific weak rules stay with the caller.
 public readField(TypeResolver resolver, Reporter reporter, FieldDeclarationNode declaration,
-                 DeclaredType owner, Visibility defaultVisibility, TypeNames names) -> Field {
+                 DeclaredType owner, TypeNames names) -> Field {
     checkFieldModifiers(reporter, declaration);
     let modifiers = fieldModifiers(declaration);
     Type fieldType = resolver.resolveType(declaration.declaredType());
-    Visibility visibility = memberVisibility(modifiers, defaultVisibility, owner, "Field",
-        declaration.name().text(), reporter, names);
+    Visibility visibility = memberVisibility(modifiers, owner, "Field", declaration.name().text(),
+        reporter, names);
     return new Field(declaration.name().text(), fieldType, visibility,
         modifiers.declaresWeak, modifiers.declaresConst, modifiers.declaresStatic,
         modifiers.declaresLazy, declaration.defaultValue() != null, declaration.name().span(),
@@ -793,8 +867,7 @@ public collectStaticMethod(TypeResolver resolver, Reporter reporter, DeclaredTyp
     if (constraints.length > 0) {
         resolver.popMemberConstraints();
     }
-    Visibility visibility = memberVisibility(modifiers, Visibility.Private, owner, "Method",
-        methodName, reporter, names);
+    Visibility visibility = memberVisibility(modifiers, owner, "Method", methodName, reporter, names);
     checkStaticMethodMarkers(reporter, modifiers, methodName, false, false, nameSpan);
     checkThrowsPlacement(reporter, member, false, modifiers.declaresAbstract);
     checkNoreturnPlacement(reporter, member, false, false, modifiers.declaresNoreturn);

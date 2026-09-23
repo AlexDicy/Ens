@@ -8,26 +8,32 @@ Write `c as double` where the number behind the character is what is wanted.
 
 Visibility has three tiers, `private` < `public` < `export`, with `protected` alongside them.
 Everything is private by default.
-An unmarked top-level declaration is visible only within its file, and an unmarked class or struct member, including a constructor, is visible only within its type.
+An unmarked top-level declaration is visible only within its file.
+An unmarked member of a `public` or `export` class or struct, including a constructor, is visible only within its type.
+An unmarked member of a file-private class or struct, including a constructor, is visible throughout the type's file, which is exactly as far as the type itself reaches.
+A class that is not `abstract` and declares no constructor can be built with `new` and no arguments wherever the class itself is visible.
 `public` makes a declaration visible to every module in the same package; other packages cannot see it.
 `export` makes a declaration visible to the packages that consume this one through `@` imports, including programs using `@std`.
 `protected` keeps its own meaning for class and struct members: the declaring file, plus subclasses in the case of classes.
 Top-level `protected` is not allowed.
-Members never follow the type that contains them, whether that type is a class or a struct: they stay private unless marked.
-`private` is therefore never written; a member or a top-level declaration is already private with no modifier on it, and writing the word is an error.
-A private member belongs to its own type alone, so it is not inherited: a subclass cannot call it, cannot override it, and may declare a method of its own under the same name with no relation to the base's.
-The same holds for a field: a subclass may declare a field whose name a private base field uses, the two hold storage of their own, and each class's code reaches the one it declared.
-Overriding a base method therefore requires that method to be at least `protected`, and an abstract method must be at least `protected` too, since a subclass has to implement it.
+A `public` or `export` class or struct never passes its visibility on to its members: they stay private to the type unless marked.
+`protected` on a member of a file-private type reaches the same places as no marker at all.
+`private` is never written; an unmarked declaration already has the narrowest visibility its place allows, and writing the word is an error.
+A member private to its type belongs to that type alone, so it is not inherited: a subclass cannot call it, cannot override it, and may declare a method of its own under the same name with no relation to the base's.
+The same holds for a field: a subclass may declare a field whose name a base field private to its type uses, the two hold storage of their own, and each class's code reaches the one it declared.
+An unmarked member of a file-private class is not private to it, so a subclass, which shares its file, inherits that member: it may override such a method, and it may not declare a field under such a field's name.
+Overriding a base method therefore requires that method to reach its subclasses, by being `protected` or wider or by being unmarked in a file-private class, and an abstract method must reach them the same way, since a subclass has to implement it.
 A method that provides an interface requirement must be as visible as its own class, because anyone who can hold one of its values as the interface can call it through the interface.
-A method that overrides a base class method writes the visibility of the method it overrides, capped at what its own class can hold (`protected` in a file-private class, `public` in a `public` one), and an override with no marker or a different one is an error naming the required marker.
+A method that overrides a base class method writes the visibility of the method it overrides, capped at what its own class can hold (`protected` in a file-private class, `public` in a `public` one), and any other marker is an error.
+An override with no marker is an error too, except in a file-private class, where an unmarked member already reaches as far as `protected` does.
 One kind of method follows its type's visibility instead of the default: a method that replaces a behavior the language already provides, meaning a struct's or a class's `toString`, `hash`, and `equals`, where the `toString` is one that takes no parameters.
 The language calls such a method wherever the type is used, so it may not be marked less visible than its type either.
 Interface members carry no visibility of their own: they always follow the interface, and writing a visibility modifier on an interface member is an error.
 Enum cases follow their enum.
-A member may not be declared more visible than the type that contains it: an `export` method on a `public` class is an error, never a silent cap.
+A member may not be declared more visible than the type that contains it: an `export` method on a `public` class, or a `public` field of a file-private class, is an error, never a silent cap.
 A declaration's signature may not mention a type less visible than the declaration itself; this covers parameter types, the return type, declared thrown types, field types, a base class, implemented interfaces, and generic arguments and bounds.
 A protected member is held to the same rule at the widest scope its class can be subclassed from: the file for a `final`, `sealed`, or file-private class, the package for an open `public` class, and everywhere for an open `export` class, whose external subclassers must be able to name every type its protected members mention.
-A `test` declaration sees its file's private top-level declarations like any other code in the file, but not the private members of types.
+A `test` declaration sees its file's private top-level declarations and the unmarked members of its file-private types like any other code in the file, but not a member private to its type.
 
 ```ens
 public calculateArea(uint width, uint height) -> uint {
@@ -80,7 +86,7 @@ A struct value is built with a context-typed aggregate literal or a constructor 
 An aggregate literal `{field: value, field: value}` names each field it sets, and takes its type from the surrounding context: the declared type of a variable, a parameter, a return type, an assignment target, or an array element.
 Every field that has no declared default must be listed; a field that has a default may be omitted to accept that default.
 Naming a field the struct does not have, listing the same field twice, leaving out a required field, or giving a value that is not assignable to the field's type are each errors.
-A field's visibility is respected: a private field can only be set from inside the struct that declares it, the same rule as a direct field assignment.
+A field's visibility is respected: a literal sets a field only where the field is visible, the same rule as a direct field assignment.
 A literal with no context to infer its type from, such as `let p = {x: 1};`, is an error; annotate the target or use a constructor.
 
 A struct may declare a `constructor` with the same keyword and shorthand as a class, and it is invoked by writing the struct's name followed by arguments, for example `Point(1, 2)`.
