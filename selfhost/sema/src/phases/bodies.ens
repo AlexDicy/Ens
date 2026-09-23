@@ -812,70 +812,56 @@ class BodyChecker implements NoreturnCalls {
         return parameters.length;
     }
 
-    // A constructor must chain to its base when the base has constructors but none that is
-    // callable with zero arguments.
+    // A constructor that does not call 'super(...)' runs the base constructor its class's implicit
+    // chain chooses, so that chain must choose one that exists here.
     checkConstructorChainsToBase(Signature signature, FunctionDeclarationNode node) {
         if (!this.inConstructor || this.sawSuperCall) {
             return;
         }
         let receiver = this.thisType;
-        if (receiver == null) {
+        if (receiver != null) {
+            this.checkImplicitBaseChain(receiver, signature, node.body() != null, signature.nameSpan());
+        }
+    }
+
+    // The implicit chain of the receiver's class runs the base constructor it chooses. A chosen
+    // constructor that the receiver's type arguments exclude is refused here. A chain that chooses
+    // none is refused here only when the receiver's class makes the choice. Otherwise a base class
+    // with no constructor makes it, and that class is refused where it is declared.
+    checkImplicitBaseChain(Type receiver, Signature? declared, bool declaredHasBody, Span at) {
+        let current = types.authorityOf(receiver);
+        if (!(current is ClassType)) {
             return;
         }
-        let current = types.authorityOf(receiver);
-        if (current is ClassType) {
-            let base = current.base();
-            if (base == null) {
-                return;
-            }
-            let baseAuthority = types.authorityOf(base);
-            if (baseAuthority == null) {
-                return;
-            }
-            bool anyConstructor = false;
-            bool anyZeroArgument = false;
-            let baseMethods = types.methodsOf(base);
-            if (baseMethods == null) {
-                return;
-            }
-            for (long i = 0; i < baseMethods.length(); i++) {
-                let candidate = baseMethods.get(i);
-                if (!candidate.isConstructor()) {
-                    continue;
-                }
-                anyConstructor = true;
-                if (!this.resolver.memberExists(candidate)) {
-                    continue;
-                }
-                if (calls.requiredArgumentCount(candidate.signature()) == 0
-                        && this.isAccessAllowed(candidate.visibility(),
-                            candidate.definingType())) {
-                    anyZeroArgument = true;
-                }
-            }
-            if (!anyConstructor) {
-                return;
-            }
-            // The implicit chain runs one specific constructor, chosen over the declared list
-            // in declaration order; when this receiver's arguments exclude that winner, no
-            // implicit chain can run, whatever else the base declares.
-            let winner = types.implicitConstructorChoice(base);
-            if (winner != null && !this.resolver.memberExists(winner)) {
-                string clause = this.excludedConstructorClause(winner,
-                    "Constrain this constructor the same way");
-                if (clause.length > 0) {
-                    this.reporter.report("Constructor of '{this.names.nameOf(current)}' cannot initialize "
-                        + "base class '{this.names.of(base)}': " + clause,
-                        signature.nameSpan());
-                    return;
-                }
-            }
-            if (!anyZeroArgument) {
-                this.reporter.report("Constructor of '{this.names.nameOf(current)}' must call 'super(...)', "
-                    + "because base class '{this.names.nameOf(baseAuthority)}' has no zero-argument "
-                    + "constructor this code can reach.", signature.nameSpan());
-            }
+        let chain = types.implicitBaseConstructor(receiver);
+        let owner = chain.owner();
+        if (owner == null) {
+            return;
         }
+        let chosen = chain.chosen();
+        if (chosen != null) {
+            if (this.resolver.memberExists(chosen)) {
+                return;
+            }
+            string clause = this.excludedConstructorClause(chosen, "Constrain this constructor the same way");
+            if (clause.length > 0) {
+                string baseText = "base class '{this.names.of(owner)}'";
+                let direct = types.baseOf(receiver);
+                if (direct != null && direct != owner) {
+                    baseText = "base class '{this.names.of(direct)}', which declares no constructor and "
+                        + "so runs the zero-argument constructor of '{this.names.of(owner)}'";
+                }
+                this.reporter.report("Constructor of '{this.names.nameOf(current)}' cannot initialize "
+                    + baseText + ": " + clause, at);
+            }
+            return;
+        }
+        if (declared == null || chain.chooser() != receiver) {
+            return;
+        }
+        string opening = "Constructor of '{this.names.nameOf(current)}' does not call 'super(...)'";
+        this.reporter.report(types.implicitBaseRefusal(opening, chain, declared, declaredHasBody, "",
+            this.names), at);
     }
 
     // How an excluded conditional base constructor explains itself: the constraint, then either
@@ -893,7 +879,7 @@ class BodyChecker implements NoreturnCalls {
         Type argument = types.typeArgumentsOf(excluded.definingType())[failed.parameterIndex()];
         string shownArgument = this.names.of(argument);
         if (argument is TypeParamType) {
-            return "the constructor of '{templateShown}' exists only when '{parameterName}' "
+            return "the zero-argument constructor of '{templateShown}' exists only when '{parameterName}' "
                 + "satisfies '{declaredBound}', and here nothing constrains '{shownArgument}' "
                 + "to satisfy it. {constrainAdvice}, as in '<{shownArgument}: "
                 + "{this.names.of(failed.boundHere())}>', or add the bound where "
@@ -905,32 +891,22 @@ class BodyChecker implements NoreturnCalls {
             failurePhrase = "which is not '{this.names.of(failed.boundHere())}' or a subclass "
                 + "of it";
         }
-        return "the constructor of '{templateShown}' exists only when '{parameterName}' "
+        return "the zero-argument constructor of '{templateShown}' exists only when '{parameterName}' "
             + "satisfies '{declaredBound}', and in "
             + "'{this.names.of(excluded.definingType())}', '{parameterName}' is "
-            + "'{shownArgument}', {failurePhrase}. Give '{this.names.nameOf(template)}' a constructor that "
-            + "exists for every type argument, or use a type argument that satisfies the "
+            + "'{shownArgument}', {failurePhrase}. Give '{this.names.nameOf(template)}' a zero-argument "
+            + "constructor that exists for every type argument, or use a type argument that satisfies the "
             + "bound.";
     }
 
-    // The implicit chain a class with no constructor of its own runs at construction: the
-    // nearest base with an implicit-constructor choice, exactly as code generation walks it.
-    // When this instantiation excludes that winner, construction cannot run it, whatever else
-    // the base declares, because the choice never consults existence.
+    // The base constructor a class with no constructor of its own runs, when this instantiation
+    // excludes it. It is null when that constructor exists or the chain runs none.
     excludedImplicitBaseConstructor(Type classType) -> Method? {
-        let seen = new Set<Type>();
-        Type? current = types.baseOf(classType);
-        while (current != null && seen.add(current)) {
-            let winner = types.implicitConstructorChoice(current);
-            if (winner != null) {
-                if (this.resolver.memberExists(winner)) {
-                    return null;
-                }
-                return winner;
-            }
-            current = types.baseOf(current);
+        let chosen = types.implicitBaseConstructor(classType).chosen();
+        if (chosen == null || this.resolver.memberExists(chosen)) {
+            return null;
         }
-        return null;
+        return chosen;
     }
 
     // A non-void callable must exit on every path: through its body and through each catch
@@ -3904,7 +3880,7 @@ class BodyChecker implements NoreturnCalls {
     // The argument list a 'new' of the class writes, or null where this file can reach no
     // constructor of it.
     classConstructionArguments(Type classType) -> string? {
-        if (constructorsOf(classType).length() > 0) {
+        if (types.constructorsOf(classType).length() > 0) {
             return this.reachableConstructorArguments(classType);
         }
         if (this.reachesImplicitConstruction(classType)) {
@@ -3916,7 +3892,7 @@ class BodyChecker implements NoreturnCalls {
     // '()' where a constructor this file can reach takes no argument, '(...)' where the ones it
     // can reach take arguments, and null where it can reach none.
     reachableConstructorArguments(Type record) -> string? {
-        let constructors = constructorsOf(record);
+        let constructors = types.constructorsOf(record);
         bool anyReachable = false;
         for (long i = 0; i < constructors.length(); i++) {
             let candidate = constructors.get(i);
@@ -3936,28 +3912,14 @@ class BodyChecker implements NoreturnCalls {
     }
 
     // Whether a class that declares no constructor of its own is constructed with no arguments.
-    // The nearest base class declaring constructors must have one this file can call with no
-    // arguments; a chain that declares none anywhere takes no arguments either.
+    // Its implicit chain must run a base constructor that exists here, or none at all.
     reachesImplicitConstruction(Type classType) -> bool {
-        let seen = new Set<Type>();
-        Type? current = types.baseOf(classType);
-        while (current != null && seen.add(current)) {
-            let constructors = constructorsOf(current);
-            if (constructors.length() > 0) {
-                for (long i = 0; i < constructors.length(); i++) {
-                    let candidate = constructors.get(i);
-                    if (this.resolver.memberExists(candidate)
-                            && calls.requiredArgumentCount(candidate.signature()) == 0
-                            && this.isAccessAllowed(candidate.visibility(),
-                                candidate.definingType())) {
-                        return true;
-                    }
-                }
-                return false;
-            }
-            current = types.baseOf(current);
+        let chain = types.implicitBaseConstructor(classType);
+        if (chain.owner() == null) {
+            return true;
         }
-        return true;
+        let chosen = chain.chosen();
+        return chosen != null && this.resolver.memberExists(chosen);
     }
 
     // One static member of the type this file can reach, written after 'spelling'. A type-level
@@ -5442,7 +5404,7 @@ class BodyChecker implements NoreturnCalls {
             }
         }
         this.result.setType(node.green(), target);
-        let allConstructors = constructorsOf(target);
+        let allConstructors = types.constructorsOf(target);
         let constructors = this.existingOnly(allConstructors);
         if (constructors.length() < allConstructors.length()
                 && this.reportUnmetConstraintCall(allConstructors, constructors, arguments,
@@ -5740,8 +5702,9 @@ class BodyChecker implements NoreturnCalls {
     }
 
     // Constructor calls run through the same accessibility rules as any other member; only the
-    // wording is constructor-specific.
-    checkConstructorAccess(Type ownerType, Method chosenConstructor, Span span) {
+    // wording is constructor-specific. 'fromSubclass' marks a 'super(...)' call, which a
+    // 'protected' constructor serves.
+    checkConstructorAccess(Type ownerType, Method chosenConstructor, Span span, bool fromSubclass = false) {
         if (this.isAccessAllowed(chosenConstructor.visibility(),
                 chosenConstructor.definingType())) {
             return;
@@ -5753,12 +5716,14 @@ class BodyChecker implements NoreturnCalls {
         }
         let authority = types.authorityOf(chosenConstructor.definingType());
         if (chosenConstructor.visibility() == Visibility.Private) {
-            string fix = "export";
-            if (authority != null && authority.packagePrefix() == this.packagePrefix) {
-                fix = "public";
+            string fix = "Mark it 'export' to construct '{name}' here.";
+            if (fromSubclass) {
+                fix = "Mark it 'protected' to call it from a subclass.";
+            } else if (authority != null && authority.packagePrefix() == this.packagePrefix) {
+                fix = "Mark it 'public' to construct '{name}' here.";
             }
             this.reporter.report("The constructor of '{name}' is private, so only code inside "
-                + "'{name}' can call it. Mark it '{fix}' to construct '{name}' here.", span);
+                + "'{name}' can call it. {fix}", span);
         } else if (chosenConstructor.visibility() == Visibility.Public) {
             string packageName = "its own package";
             string inModule = "";
@@ -7431,7 +7396,7 @@ class BodyChecker implements NoreturnCalls {
         if (baseAuthority != null) {
             baseName = baseAuthority.name();
         }
-        let allConstructors = constructorsOf(base);
+        let allConstructors = types.constructorsOf(base);
         let constructors = this.existingOnly(allConstructors);
         let arguments = node.arguments();
         if (constructors.length() < allConstructors.length()
@@ -7444,6 +7409,8 @@ class BodyChecker implements NoreturnCalls {
             if (arguments.argumentsCount() > 0) {
                 this.reporter.report("Base class '{baseName}' has no constructor, so "
                     + "'super(...)' takes no arguments.", node.span());
+            } else if (this.inConstructor && receiver != null && allConstructors.length() == 0) {
+                this.checkImplicitBaseChain(receiver, null, false, node.span());
             }
             this.analyzeArgumentsOnly(arguments);
             return voidType;
@@ -7467,7 +7434,7 @@ class BodyChecker implements NoreturnCalls {
                 let chosenMethod = chosen.method();
                 if (chosenMethod != null) {
                     if (!chosen.isAccessible()) {
-                        this.checkConstructorAccess(base, chosenMethod, node.span());
+                        this.checkConstructorAccess(base, chosenMethod, node.span(), true);
                     }
                     this.result.setMethod(chained.green(), chosenMethod);
                 }
@@ -7476,7 +7443,7 @@ class BodyChecker implements NoreturnCalls {
             return voidType;
         }
         let baseConstructor = constructors.get(0);
-        this.checkConstructorAccess(base, baseConstructor, node.span());
+        this.checkConstructorAccess(base, baseConstructor, node.span(), true);
         this.result.setMethod(chained.green(), baseConstructor);
         this.checkDirectArguments("Base constructor", baseName, baseConstructor.signature(),
             arguments, node.span());
@@ -7971,7 +7938,7 @@ class BodyChecker implements NoreturnCalls {
                 + "Create one of a subclass that is not abstract.", node.span());
             uninstantiable = true;
         }
-        let allConstructors = constructorsOf(t);
+        let allConstructors = types.constructorsOf(t);
         let constructors = this.existingOnly(allConstructors);
         if (constructors.length() < allConstructors.length()
                 && this.reportUnmetConstraintCall(allConstructors, constructors, arguments,
@@ -7987,10 +7954,15 @@ class BodyChecker implements NoreturnCalls {
                 string clause = this.excludedConstructorClause(blocked,
                     "Constrain the enclosing member the same way");
                 if (clause.length > 0) {
+                    string owner = this.names.of(blocked.definingType());
+                    string needs = "so it needs the zero-argument constructor of its base class '{owner}'";
+                    let direct = types.baseOf(t);
+                    if (direct != null && direct != blocked.definingType()) {
+                        needs = "and neither does its base class '{this.names.of(direct)}', so it needs "
+                            + "the zero-argument constructor of '{owner}'";
+                    }
                     this.reporter.report("Cannot construct '{shownName}': it declares no "
-                        + "constructor, so it needs the zero-argument constructor of its base "
-                        + "class '{this.names.of(blocked.definingType())}', but "
-                        + clause, node.span());
+                        + "constructor, {needs}, but " + clause, node.span());
                     if (arguments != null) {
                         this.analyzeArgumentsOnly(arguments);
                     }
@@ -8866,19 +8838,6 @@ structDisplayName(Type structType, TypeNames names) -> string {
         return authority.name();
     }
     return names.of(structType);
-}
-
-constructorsOf(Type record) -> List<Method> {
-    let found = new List<Method>();
-    let methods = types.methodsOf(record);
-    if (methods != null) {
-        for (long i = 0; i < methods.length(); i++) {
-            if (methods.get(i).isConstructor()) {
-                found.push(methods.get(i));
-            }
-        }
-    }
-    return found;
 }
 
 // The receivers member lookup walks: a declaration's own members, or the members the standard

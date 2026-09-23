@@ -1936,6 +1936,17 @@ export final class TypeNames {
         return declared.modulePath();
     }
 
+    // These names with one more import, which binds the type under 'bound'. A diagnostic that
+    // suggests writing the import spells its code with them.
+    public importing(DeclaredType declared, string bound) -> TypeNames {
+        let imported = this.importedNames.copy();
+        imported.set(declared, bound);
+        let boundTypes = this.boundTypeNames.copy();
+        boundTypes.add(bound);
+        return new TypeNames(this.namingFilePath, this.namingModulePath, this.namingPackagePrefix,
+            this.namingStore, this.implicitModulePaths, imported, boundTypes, this.boundModuleNames);
+    }
+
     // Whether this file can write the type, which a diagnostic offering code to paste has to
     // know. A declared type the file has no name for reads by its own name, which resolves to
     // something else here or to nothing at all.
@@ -2576,30 +2587,336 @@ export requiredParameterCount(Signature signature) -> long {
     return required;
 }
 
-// The constructor an implicit zero-argument construction binds on one type, or null when it
-// declares none that takes no arguments: the first zero-parameter constructor in declaration
-// order, else the first whose parameters all take defaults. The one home for the choice: code
-// generation runs the winner, and sema checks whether that same winner exists on the
-// instantiation, so the two can never latch onto different constructors.
-export implicitConstructorChoice(Type classType) -> Method? {
-    Method? fallback = null;
+// The constructors a class declares, in declaration order.
+public constructorsOf(Type classType) -> List<Method> {
+    let found = new List<Method>();
     let methods = methodsOf(classType);
-    if (methods == null) {
-        return null;
+    if (methods != null) {
+        for (long i = 0; i < methods.length(); i++) {
+            if (methods.get(i).isConstructor()) {
+                found.push(methods.get(i));
+            }
+        }
     }
-    for (long i = 0; i < methods.length(); i++) {
-        let method = methods.get(i);
-        if (!method.isConstructor()) {
+    return found;
+}
+
+// The base constructor a class's constructor runs when no 'super(...)' names one. It belongs to
+// the nearest base class that declares constructors.
+export final class ImplicitBaseConstructor {
+    Type? declaringBase;
+    Type choosingClass;
+    Method? chosenConstructor;
+    Method? firstReachable;
+    Method? firstUnreachable;
+
+    protected constructor(this.declaringBase, this.choosingClass, this.chosenConstructor,
+                          this.firstReachable, this.firstUnreachable);
+
+    // The nearest base class that declares constructors, or null when no base class declares one.
+    export owner() -> Type? {
+        return this.declaringBase;
+    }
+
+    // The class whose own constructor calls the chosen one, directly below the owner. It is the
+    // class asked about, or a base of it that declares no constructor. With no owner, it is the
+    // last class of the chain.
+    public chooser() -> Type {
+        return this.choosingClass;
+    }
+
+    // The constructor that runs, or null when the owner has none the chooser can call with no arguments.
+    export chosen() -> Method? {
+        return this.chosenConstructor;
+    }
+
+    // The owner's first constructor the chooser can call, whatever arguments it takes.
+    public reachable() -> Method? {
+        return this.firstReachable;
+    }
+
+    // The owner's first constructor that takes no arguments and that the chooser cannot call.
+    public unreachable() -> Method? {
+        return this.firstUnreachable;
+    }
+}
+
+// The base constructor the constructor of 'classType' runs when no 'super(...)' names one. The
+// owner's first zero-parameter constructor that the chooser can call wins, else its first one that
+// the chooser can call whose parameters all take defaults. Code generation runs the winner and
+// sema checks the same one, so the two never latch onto different constructors.
+export implicitBaseConstructor(Type classType) -> ImplicitBaseConstructor {
+    Type chooser = classType;
+    let seen = new Set<Type>();
+    Type? current = baseOf(classType);
+    while (current != null && seen.add(current)) {
+        let constructors = constructorsOf(current);
+        if (constructors.length() > 0) {
+            return chooseBaseConstructor(chooser, current, constructors);
+        }
+        chooser = current;
+        current = baseOf(current);
+    }
+    return new ImplicitBaseConstructor(null, chooser, null, null, null);
+}
+
+// The implicit choice among the constructors that 'owner' declares, judged from 'chooser'.
+chooseBaseConstructor(Type chooser, Type owner, List<Method> constructors) -> ImplicitBaseConstructor {
+    Method? zeroParameter = null;
+    Method? defaulted = null;
+    Method? reachable = null;
+    Method? unreachable = null;
+    for (long i = 0; i < constructors.length(); i++) {
+        let candidate = constructors.get(i);
+        bool takesNoArguments = requiredParameterCount(candidate.signature()) == 0;
+        if (!reachesConstructor(chooser, owner, candidate)) {
+            if (takesNoArguments && unreachable == null) {
+                unreachable = candidate;
+            }
             continue;
         }
-        if (method.signature().parameters().length == 0) {
-            return method;
+        if (reachable == null) {
+            reachable = candidate;
         }
-        if (fallback == null && requiredParameterCount(method.signature()) == 0) {
-            fallback = method;
+        if (!takesNoArguments) {
+            continue;
+        }
+        if (candidate.signature().parameters().length == 0) {
+            if (zeroParameter == null) {
+                zeroParameter = candidate;
+            }
+        } else if (defaulted == null) {
+            defaulted = candidate;
         }
     }
-    return fallback;
+    return new ImplicitBaseConstructor(owner, chooser, zeroParameter ?? defaulted, reachable, unreachable);
+}
+
+// Whether code in 'chooser' may call a constructor that 'owner' declares.
+reachesConstructor(Type chooser, Type owner, Method candidate) -> bool {
+    let site = authorityOf(chooser);
+    let defining = authorityOf(owner);
+    if (site == null || defining == null) {
+        return true;
+    }
+    return memberAccessAllowed(candidate.visibility(), defining, site, site.modulePath(),
+        site.packagePrefix());
+}
+
+// The refusal for a chain whose owner has no constructor its chooser can call with no arguments.
+// 'opening' names what runs the chain. 'declared' is the constructor that leaves out 'super(...)'.
+// It is null for a class that declares no constructor, and the fix then declares one marked
+// 'marker'. The text is empty for a chain with no owner.
+public implicitBaseRefusal(string opening, ImplicitBaseConstructor chain, Signature? declared,
+                           bool declaredHasBody, string marker, TypeNames names) -> string {
+    let owner = chain.owner();
+    if (owner == null) {
+        return "";
+    }
+    string baseName = names.of(owner);
+    string text = "{opening}, so it would run the zero-argument constructor of its base class "
+        + "'{baseName}', ";
+    let unreachable = chain.unreachable();
+    if (unreachable == null) {
+        text = text + "which declares none.";
+    } else if (unreachable.visibility() == Visibility.Private) {
+        text = text + "which is private to '{baseName}'.";
+    } else {
+        text = text + "which is public inside package '{packageOf(owner)}' but not exported.";
+    }
+    let reachable = chain.reachable();
+    if (reachable != null) {
+        return "{text} {superCallFix(reachable, declared, declaredHasBody, marker, names, true)}.";
+    }
+    Method marked = unreachable ?? constructorsOf(owner).get(0);
+    string widened = "'protected' so a subclass can call it";
+    if (marked.visibility() == Visibility.Public) {
+        widened = "'export' so a subclass in another package can call it";
+    }
+    string markFix = "{text} Mark '{constructorDisplay(marked, names)}' in '{baseName}' as {widened}";
+    if (unreachable != null) {
+        return markFix + ".";
+    }
+    return "{markFix}, then {superCallFix(marked, declared, declaredHasBody, marker, names, false)}.";
+}
+
+// The package a declared type belongs to, or empty for a type that belongs to none.
+packageOf(Type type) -> string {
+    let declared = authorityOf(type);
+    if (declared == null) {
+        return "";
+    }
+    return declared.packagePrefix();
+}
+
+// A constructor as a diagnostic names it: 'constructor(int, string)'.
+constructorDisplay(Method method, TypeNames names) -> string {
+    let builder = new StringBuilder();
+    builder.append("constructor(");
+    Parameter[] parameters = method.signature().parameters();
+    for (long i = 0; i < parameters.length; i++) {
+        if (i > 0) {
+            builder.append(", ");
+        }
+        builder.append(names.of(parameters[i].type()));
+    }
+    builder.append(")");
+    return builder.toString();
+}
+
+// The fix that passes 'target' its parameters without defaults through 'super(...)'. With no
+// 'declared' constructor, the fix declares one marked 'marker'. A declared constructor starts its
+// body with the call, or gains a body that does, and takes the parameters it lacks. A name it
+// already uses for something else gets a number after it. Each type this file has no name for
+// comes with an import.
+superCallFix(Method target, Signature? declared, bool declaredHasBody, string marker,
+             TypeNames names, bool opensSentence) -> string {
+    let taken = new Set<string>();
+    if (declared != null) {
+        for (let parameter in declared.parameters()) {
+            taken.add(parameter.name());
+        }
+    }
+    let passed = new List<string>();
+    let addedTypes = new List<Type>();
+    let addedNames = new List<string>();
+    Parameter[] parameters = target.signature().parameters();
+    long required = requiredParameterCount(target.signature());
+    for (long i = 0; i < required; i++) {
+        let wanted = parameters[i];
+        if (declared != null && takesParameter(declared, wanted)) {
+            passed.push(wanted.name());
+            continue;
+        }
+        string name = freeParameterName(wanted.name(), taken);
+        taken.add(name);
+        passed.push(name);
+        addedTypes.push(wanted.type());
+        addedNames.push(name);
+    }
+    let unnamed = new List<DeclaredType>();
+    for (long i = 0; i < addedTypes.length(); i++) {
+        collectUnnamed(addedTypes.get(i), names, unnamed);
+    }
+    TypeNames spelling = names;
+    let imports = new List<string>();
+    for (long i = 0; i < unnamed.length(); i++) {
+        let imported = unnamed.get(i);
+        string bound = freeNameFor(imported, spelling);
+        string binding = imported.name();
+        if (bound != imported.name()) {
+            binding = "{imported.name()} as {bound}";
+        }
+        imports.push("'import {binding} from {names.importPathOf(imported)};'");
+        spelling = spelling.importing(imported, bound);
+    }
+    let listed = new StringBuilder();
+    for (long i = 0; i < addedTypes.length(); i++) {
+        if (i > 0) {
+            listed.append(", ");
+        }
+        listed.append("{spelling.of(addedTypes.get(i))} {addedNames.get(i)}");
+    }
+    string arguments = string.joined(passed.toArray(), ", ");
+    string call = "super({arguments});";
+    string fix = "";
+    if (declared == null) {
+        string prefix = "";
+        if (marker.length > 0) {
+            prefix = marker + " ";
+        }
+        fix = "declare a constructor that calls 'super(...)', as in "
+            + "'{prefix}constructor({listed.toString()}) \{ {call} \}'";
+    } else {
+        fix = "start this constructor's body with '{call}'";
+        if (!declaredHasBody) {
+            fix = "give this constructor a body that starts with '{call}'";
+        }
+        if (addedTypes.length() > 0) {
+            fix = fix + " and add '{listed.toString()}' to its parameters";
+        }
+    }
+    if (imports.length() > 0) {
+        fix = fix + ", with {sentenceList(imports)} at the top of the file";
+    }
+    if (opensSentence) {
+        return capitalizedAscii(fix);
+    }
+    return fix;
+}
+
+// The name itself when the constructor does not use it yet, else the name with the first number
+// from 2 up that it does not use.
+freeParameterName(string name, Set<string> taken) -> string {
+    if (!taken.contains(name)) {
+        return name;
+    }
+    long suffix = 2;
+    while (taken.contains("{name}{suffix}")) {
+        suffix++;
+    }
+    return "{name}{suffix}";
+}
+
+// The items as they read in a sentence: 'a, b, and c', or 'a and b' for two.
+sentenceList(List<string> items) -> string {
+    let builder = new StringBuilder();
+    for (long i = 0; i < items.length(); i++) {
+        if (i > 0 && i + 1 < items.length()) {
+            builder.append(", ");
+        } else if (i > 1) {
+            builder.append(", and ");
+        } else if (i > 0) {
+            builder.append(" and ");
+        }
+        builder.append(items.get(i));
+    }
+    return builder.toString();
+}
+
+// Whether the constructor already takes a parameter of this name and type that its body can pass
+// on. A 'this.field' parameter sets a field instead.
+takesParameter(Signature declared, Parameter wanted) -> bool {
+    for (let parameter in declared.parameters()) {
+        if (!parameter.bindsField() && parameter.name() == wanted.name()
+                && parameter.type() == wanted.type()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Adds each declared type the type mentions that this file has no name for, once.
+collectUnnamed(Type type, TypeNames names, List<DeclaredType> found) {
+    switch (type) {
+        is OptionalType optional -> {
+            collectUnnamed(optional.inner(), names, found);
+        },
+        is ArrayType array -> {
+            collectUnnamed(array.element(), names, found);
+        },
+        is FunctionType functionType -> {
+            for (let parameter in functionType.parameterTypes()) {
+                collectUnnamed(parameter, names, found);
+            }
+            for (let thrown in functionType.thrownTypes()) {
+                collectUnnamed(thrown, names, found);
+            }
+            collectUnnamed(functionType.returnType(), names, found);
+        },
+        is InstantiationType instantiation -> {
+            collectUnnamed(instantiation.template(), names, found);
+            for (let argument in instantiation.arguments()) {
+                collectUnnamed(argument, names, found);
+            }
+        },
+        is DeclaredType declared -> {
+            if (names.nameFor(declared) == null && !found.contains(declared)) {
+                found.push(declared);
+            }
+        },
+        default -> { },
+    }
 }
 
 // A struct's own text form, or null when it declares none. Both an explicit '.toString()' and an
