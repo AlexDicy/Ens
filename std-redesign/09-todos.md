@@ -128,6 +128,9 @@ Rule 2 gives no next step in "Function 'area' has no parameter named 'depth'.", 
 Also: "A value of type 'Dog' is always a 'Animal'" fixes the article; "Use 'Widget.make(...)'; a static belongs to the type, not to an instance." gives the fix before what happened; "Literal 3.5e38f is too large for 'float'" does not say to drop the `f`; the private-constructor refusal at a subclass's `super()` call says 'public' where 'protected' is the fix that reaches a subclass; "Struct literal for 'Point' does not set the field 'y'. Add 'y: ...'" suggests writing a private field; "Duplicate 'null' label." and "Duplicate switch label 'Red'; ..." differ in shape (rule 14); `/proj/ens.package` and `(src/main.ens)` appear unquoted (rule 14); "C symbols cannot be overloaded" uses a word from outside Ens (rule 8); "Constructor 'constructor' cannot be 'public'" names a placeholder where its sibling reads "Constructor of class 'Registry'".
 An unmarked `abstract` method on a `public` class is reported twice, once as the abstract-method refusal on the class and once as "Cannot override 'go' ..." on the subclass (rule 12); the duplicate-modifier text "'greet' already has a visibility modifier; remove 'protected'." puts its fix after a semicolon (rule 13) and reads "'constructor' already has ..." for a constructor (rule 1); the protected-constructor refusal in `checkConstructorAccess` gives no fix, and the private-constructor refusal at a `super(...)` call says 'public' where 'protected' reaches a subclass (found 2026-09-23 landing the file-private member rule).
 
+A user's `LINK` or `_LINK_` environment variable, meant for Microsoft's `link.exe`, reaches every in-process lld-link run (`LINK=/threads:0 ens build x.ens` fails with lld-link's own error); `/lldignoreenv` in the COFF argument vector would keep the link deterministic, and belongs with the link policy in `selfhost/link/` (2026-09-23).
+Unloading `ens-lld` with `FreeLibrary` after a single-threaded link crashes at process exit inside `rpmalloc_initialize` from an unloaded page; `ens` never unloads the bridge, so nothing reaches it (2026-09-23).
+
 ## The language server's replacement
 
 The current C++ server is temporary; these are carried to its replacement rather than fixed in it.
@@ -152,6 +155,7 @@ It accepts a module-qualified type name in every type position, resolving `ns.Na
 It refuses `(x) = 1;` with "Left side of assignment must be an assignable expression", because its own `isLValue` at `lsp/frontend/semantic/Analyzer.cpp:8767` has no parenthesized arm, while the compiler accepts parentheses around any place as of 2026-09-22.
 Its own `buildNarrowingPath` at `lsp/frontend/semantic/Analyzer.cpp:4051` still has member and subscript arms, so the editor narrows a mutable field or an array element after a null check where the compiler, as of 2026-09-22, narrows stable places only.
 Its analyzer at `lsp/frontend/semantic/Analyzer.cpp:249-258` (calls at `:1467` and `:1501`) still makes every unmarked member private to its type, so the editor refuses the file-private member uses the compiler accepts since 2026-09-23.
+Its constructor-chain check near `lsp/frontend/semantic/Analyzer.cpp:3649` looks only at the immediate base, so a class with no constructor over a constructor-less middle class whose base needs arguments, which the compiler refuses since 2026-09-23, passes in the editor.
 
 ## Reminders
 
