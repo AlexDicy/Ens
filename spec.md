@@ -484,7 +484,8 @@ A parameter's type may also be written, as in `(int a, int b) -> a - b`, and the
 A lambda copies the values it reads from around it, and only those.
 Reading a local, a parameter, or `this` inside the body captures it: the closure keeps its own copy from the moment it is created, and a class reference it captured stays alive for as long as the closure does.
 A local a lambda captures must already be assigned where the lambda is created.
-A capture takes the local's declared type, not what the surrounding code narrowed it to, so a local proved non-null outside the lambda is nullable again inside its body and is checked there on its own.
+A capture takes the local's declared type, not what the surrounding code narrowed it to.
+A narrowing made outside a lambda never reaches its body, so the body checks a place again on its own.
 Assigning to a captured local inside the lambda is an error, because the write would land on the copy and leave the local outside it unchanged; return the value the lambda computes instead, or keep the value in an object the lambda can reach.
 A field of a captured struct is part of that copy, so writing `point.x = 1;` inside the lambda is the same error.
 The lambda's own parameters and locals are ordinary storage and may be written freely.
@@ -1000,7 +1001,7 @@ string? t = "x"; // starts narrowed from its initializer
 ```
 
 Narrowing, by a check and by a write alike, applies to stable places only.
-A stable place is a local variable, a parameter, `this`, or a `const` field reached through a stable place, however long the chain of them is.
+A stable place is a local variable, a parameter, `this`, a `lazy const` read through its type name, or a `const` field reached through a stable place, however long the chain of them is.
 A mutable field and any array element are never stable places, because another reference can write that storage between the check and the use.
 A null check on one stays legal but proves nothing for the reads after it, and a write through one refines nothing: `this.field = x` and `arr[0] = x` leave the place nullable.
 The idiom is to read the value into a local and check the local, as in `let door = room.door; if (door != null) { door.open(); }`.

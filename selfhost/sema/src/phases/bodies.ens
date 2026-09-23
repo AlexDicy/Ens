@@ -107,7 +107,6 @@ import phases.members;
 import model.narrow;
 import NarrowingPath from model.narrow;
 import NarrowingState from model.narrow;
-import PathSegment from model.narrow;
 import model.types;
 import Type from model.types;
 import ErrorType from model.types;
@@ -1308,39 +1307,39 @@ class BodyChecker implements NoreturnCalls {
 
     // ---- Narrowing ----
 
-    // The path of a stable place, or null when the expression names none. A check or a write on
-    // an expression narrows only the path this builds for it.
+    // The path of a stable place, or null when the expression names none. A stable place is a
+    // local, a parameter, 'this', a static or lazy const read through its type, or a 'const' field
+    // reached through a stable place.
     buildNarrowingPath(Expression expression) -> NarrowingPath? {
-        let segments = new List<PathSegment>();
-        let root = this.collectPathSegments(expression, segments);
-        if (root == null) {
-            return null;
-        }
-        return new NarrowingPath(root, segments);
-    }
-
-    // A stable place is a local, a parameter or 'this', or a 'const' field reached through a
-    // stable place. Any other field, and any array element, can be written through another
-    // reference between a check and a use, so neither joins a path.
-    collectPathSegments(Expression expression, List<PathSegment> segments) -> LocalBinding? {
         Expression core = unwrapParentheses(expression);
         switch (core) {
             is IdentifierExpressionNode identifier -> {
-                return this.result.bindingOf(identifier.green());
-            },
-            is ThisExpressionNode ignored -> {
-                return this.thisBinding;
-            },
-            is MemberExpressionNode member -> {
-                let root = this.collectPathSegments(member.object(), segments);
-                if (root == null) {
+                let binding = this.result.bindingOf(identifier.green());
+                if (binding == null) {
                     return null;
                 }
+                return narrow.bindingPath(binding);
+            },
+            is ThisExpressionNode ignored -> {
+                let receiver = this.thisBinding;
+                if (receiver == null) {
+                    return null;
+                }
+                return narrow.bindingPath(receiver);
+            },
+            is MemberExpressionNode member -> {
                 if (!this.readsConstField(member)) {
                     return null;
                 }
-                segments.push(narrow.fieldSegment(member.member().text()));
-                return root;
+                let typeLevel = this.result.staticConstFieldOf(member.green());
+                if (typeLevel != null) {
+                    return narrow.typeLevelPath(typeLevel);
+                }
+                let object = this.buildNarrowingPath(member.object());
+                if (object == null) {
+                    return null;
+                }
+                return object.extended(narrow.fieldSegment(member.member().text()));
             },
             default -> {
                 return null;
@@ -1348,12 +1347,28 @@ class BodyChecker implements NoreturnCalls {
         }
     }
 
+    // The type narrowing proved for a field read here, or the field's declared type when it proved none.
+    narrowedFieldType(MemberExpressionNode read, Type declared) -> Type {
+        if (!(declared is OptionalType) && !types.isClassLike(declared)) {
+            return declared;
+        }
+        let path = this.buildNarrowingPath(read);
+        if (path == null) {
+            return declared;
+        }
+        return this.narrowing.provenType(path) ?? declared;
+    }
+
     // The outermost step that keeps a value from being a stable place, which is an array element
-    // or a field that is not 'const'. Null when the value reads neither.
+    // or an instance field that is not 'const'. Null when the value reads neither. A field read
+    // through its type name is never the step. Its declaration is refused without 'const'.
     unstableStep(Expression expression) -> Expression? {
         Expression core = unwrapParentheses(expression);
         switch (core) {
             is MemberExpressionNode member -> {
+                if (this.result.staticConstFieldOf(member.green()) != null) {
+                    return null;
+                }
                 if (!this.readsConstField(member)) {
                     return member;
                 }
@@ -1371,8 +1386,9 @@ class BodyChecker implements NoreturnCalls {
     // Whether the member access reads a 'const' field, either an instance field or a static or
     // lazy one reached through its type. False when the object has no analyzed type.
     readsConstField(MemberExpressionNode member) -> bool {
-        if (this.result.staticConstFieldOf(member.green()) != null) {
-            return true;
+        let typeLevel = this.result.staticConstFieldOf(member.green());
+        if (typeLevel != null) {
+            return typeLevel.isConst();
         }
         let objectType = this.result.typeOf(member.object().green());
         if (objectType == null) {
@@ -1744,10 +1760,14 @@ class BodyChecker implements NoreturnCalls {
         return result;
     }
 
-    // Whether a path's root binding is still nameable after the merge, so a proof on a binding
-    // local to one branch does not leak out when that branch is the only survivor.
+    // Whether a path's root is still nameable after the merge, so a proof on a binding local to
+    // one branch does not leak out when that branch is the only survivor. A type-level field is
+    // nameable everywhere.
     pathRootInScope(NarrowingPath path) -> bool {
         let root = path.root();
+        if (root == null) {
+            return true;
+        }
         if (this.thisBinding != null && root == this.thisBinding) {
             return true;
         }
@@ -2179,6 +2199,10 @@ class BodyChecker implements NoreturnCalls {
                 return this.thisType;
             },
             is MemberExpressionNode member -> {
+                let typeLevel = this.result.staticConstFieldOf(member.green());
+                if (typeLevel != null) {
+                    return typeLevel.type();
+                }
                 let objectType = this.result.typeOf(member.object().green());
                 if (objectType == null) {
                     return null;
@@ -2255,8 +2279,7 @@ class BodyChecker implements NoreturnCalls {
     }
 
     // Narrows the place a write stored into, after invalidateForWrite has dropped what the place
-    // held before. Only a local, a parameter, 'this' and a 'const' field reached through one have
-    // a path, so a write to any other place narrows nothing.
+    // held before. Only a stable place has a path, so a write to any other place narrows nothing.
     establishWriteNarrowing(Expression target, Type stored) {
         let declared = this.declaredSlotType(target);
         if (declared == null) {
@@ -4730,15 +4753,11 @@ class BodyChecker implements NoreturnCalls {
                 }
             },
         }
-        if (writtenTarget is MemberExpressionNode) {
-            let staticTarget = this.result.staticConstFieldOf(writtenTarget.green());
-            if (staticTarget != null) {
-                this.reporter.report("Cannot assign to "
-                    + "'{staticConstDisplay(staticTarget, this.names)}': a "
-                    + "{members.typeLevelFieldWord(staticTarget)} keeps the value its "
-                    + "initializer gives it. Change the initializer, or use an instance "
-                    + "field.", node.span());
-            }
+        let staticTarget = this.result.staticConstFieldOf(writtenTarget.green());
+        if (staticTarget != null) {
+            this.reporter.report("Cannot assign to '{staticConstDisplay(staticTarget, this.names)}': "
+                + "a {members.typeLevelFieldWord(staticTarget)} keeps the value its initializer "
+                + "gives it. Change the initializer, or use an instance field.", node.span());
         }
         Type assignTarget = this.declaredTargetType(writtenTarget, targetType);
         Type valueType = this.analyzeExpressionAdapt(node.value(), assignTarget);
@@ -4761,8 +4780,11 @@ class BodyChecker implements NoreturnCalls {
         if (assignTarget != targetType) {
             this.result.setType(node.target().green(), assignTarget);
         }
-        this.invalidateForWrite(writtenTarget);
-        this.establishWriteNarrowing(writtenTarget, storedType);
+        // A refused write to a static or lazy const changes no narrowing.
+        if (staticTarget == null) {
+            this.invalidateForWrite(writtenTarget);
+            this.establishWriteNarrowing(writtenTarget, storedType);
+        }
         if (writtenTarget is IdentifierExpressionNode) {
             let binding = this.result.bindingOf(writtenTarget.green());
             if (binding != null && this.unconditionalPosition) {
@@ -4883,14 +4905,7 @@ class BodyChecker implements NoreturnCalls {
                 if (root != null) {
                     this.reportRefusedWrite(root, "change", member.span());
                 }
-                let objectType = this.result.typeOf(member.object().green());
-                if (objectType != null) {
-                    let field = types.inheritedOrOwnField(objectType, member.member().text());
-                    if (field != null) {
-                        return field.type();
-                    }
-                }
-                return analyzed;
+                return this.declaredSlotType(member) ?? analyzed;
             },
             is SubscriptExpressionNode subscript -> {
                 let objectType = this.result.typeOf(subscript.object().green());
@@ -5858,17 +5873,7 @@ class BodyChecker implements NoreturnCalls {
                         found.field.definingType(), node.member().span())) {
                     this.result.markMemberAccessDenied(node.green());
                 }
-                Type fieldType = found.field.type();
-                if (fieldType is OptionalType || types.isClassLike(fieldType)) {
-                    let path = this.buildNarrowingPath(node);
-                    if (path != null) {
-                        let proven = this.narrowing.provenType(path);
-                        if (proven != null) {
-                            return proven;
-                        }
-                    }
-                }
-                return fieldType;
+                return this.narrowedFieldType(node, found.field.type());
             },
             is MethodMember found -> {
                 if (found.candidates.length() <= 1) {
@@ -6204,7 +6209,7 @@ class BodyChecker implements NoreturnCalls {
             this.checkMemberAccess(name, field.visibility(), field.definingType(),
                 node.member().span());
             this.result.setStaticConstField(node.green(), field);
-            return field.type();
+            return this.narrowedFieldType(node, field.type());
         }
         if (this.availableStatics(head, name).length() > 0) {
             // A head written with type arguments keeps them, so the call this names resolves

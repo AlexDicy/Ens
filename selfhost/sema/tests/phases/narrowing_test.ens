@@ -16,6 +16,8 @@ import model.types;
 import Type from model.types;
 import TypeStore from model.types;
 import PrimitiveKind from model.types;
+import Field from model.types;
+import Visibility from model.types;
 import List from @std.collections.list;
 
 binding(string name, Type type) -> LocalBinding {
@@ -669,4 +671,233 @@ test "uses of a checked weak field are rejected with the weak explanation" {
     try sema_support.assertDiagnostic(reported, 3, "/proj/src/main.ens",
         memberRead + weakAdvice("let target = c.holder.target;"));
     try testing.assertEqual(reported.length, 4L);
+}
+
+typeLevelField(string name, Type type) -> Field {
+    return new Field(name, type, Visibility.Public, false, true, false, true, true,
+        source.makeSpan(0, 0), type);
+}
+
+test "a type-level root compares by field identity and clears only its own paths" {
+    let store = new TypeStore();
+    let optionalInt = store.optionalOf(store.primitive(PrimitiveKind.Int));
+    let intType = store.primitive(PrimitiveKind.Int);
+    let label = typeLevelField("label", optionalInt);
+    let other = typeLevelField("label", optionalInt);
+    let local = binding("label", optionalInt);
+
+    try testing.assertTrue(narrow.typeLevelPath(label) == narrow.typeLevelPath(label),
+        "two reads of one field should be one path");
+    try testing.assertTrue(narrow.typeLevelPath(label).hash() == narrow.typeLevelPath(label).hash(),
+        "equal type-level paths should hash equally");
+    try testing.assertTrue(narrow.typeLevelPath(label) != narrow.typeLevelPath(other),
+        "two fields of one name should be two paths");
+    try testing.assertTrue(narrow.typeLevelPath(label) != narrow.bindingPath(local),
+        "a field root should differ from a binding of the same name");
+
+    let name = narrow.fieldSegment("name");
+    try testing.assertTrue(narrow.typeLevelPath(label).extended(name)
+        == narrow.typeLevelPath(label).extended(narrow.fieldSegment("name")),
+        "an extended path should compare by its segments");
+    try testing.assertTrue(narrow.typeLevelPath(label).extended(name) != narrow.typeLevelPath(label),
+        "an extended path should differ from its root");
+
+    let state = new NarrowingState();
+    state.narrow(narrow.typeLevelPath(label).extended(name), intType);
+    state.narrow(narrow.typeLevelPath(other).extended(name), intType);
+    state.clearPrefixedBy(narrow.typeLevelPath(other));
+    state.clearForRoot(local);
+    try testing.assertTrue(state.provenType(narrow.typeLevelPath(label).extended(name)) == intType,
+        "clearing another field or a binding should keep this field's path");
+    try testing.assertTrue(state.provenType(narrow.typeLevelPath(other).extended(name)) == null,
+        "clearing a field should drop the paths it prefixes");
+}
+
+test "a lazy const read through its type narrows like a local" {
+    let analysis = try analyzeBody("class Holder \{ protected const string? name; "
+        + "protected constructor(this.name = null); \}\n"
+        + "class Shape \{ protected constructor(); \}\n"
+        + "class Circle extends Shape \{ protected int radius; protected constructor(this.radius = 0); \}\n"
+        + "class Box<T> \{ protected lazy const string? tag = pick(); protected constructor(); \}\n"
+        + "class Settings \{\n"
+        + "    protected lazy const string? label = pick();\n"
+        + "    protected lazy const Holder holder = new Holder(\"holder\");\n"
+        + "    protected lazy const Holder? maybeHolder = new Holder(\"maybe\");\n"
+        + "    protected lazy const Shape shape = new Circle(3);\n"
+        + "\}\n"
+        + "pick() -> string? \{ return \"label\"; \}\n"
+        + "checked() -> long \{\n"
+        + "    if (Settings.label != null) \{ return Settings.label.length; \}\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "guarded() -> long \{\n"
+        + "    if (Settings.label == null) \{ return 0; \}\n"
+        + "    return Settings.label.length;\n"
+        + "\}\n"
+        + "looped() -> long \{\n"
+        + "    long total = 0;\n"
+        + "    while (Settings.label != null && total < 10) \{ total = total + Settings.label.length; \}\n"
+        + "    return total;\n"
+        + "\}\n"
+        + "shortCircuits() -> bool \{\n"
+        + "    bool both = Settings.label != null && Settings.label.length > 0;\n"
+        + "    return both || Settings.label == null || Settings.label.length > 0;\n"
+        + "\}\n"
+        + "negated() -> long \{\n"
+        + "    if (!(Settings.label == null)) \{ return (Settings.label).length; \}\n"
+        + "    return Settings.label != null ? Settings.label.length : 0;\n"
+        + "\}\n"
+        + "tested() -> int \{\n"
+        + "    if (Settings.shape is Circle) \{ return Settings.shape.radius; \}\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "chained() -> long \{\n"
+        + "    if (Settings.holder.name != null) \{ return Settings.holder.name.length; \}\n"
+        + "    if (Settings.maybeHolder != null && Settings.maybeHolder.name != null) \{\n"
+        + "        return Settings.maybeHolder.name.length;\n"
+        + "    \}\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "insideLambda() -> long \{\n"
+        + "    () -> long measure = () -> \{\n"
+        + "        if (Settings.label != null) \{ return Settings.label.length; \}\n"
+        + "        return 0;\n"
+        + "    \};\n"
+        + "    return measure();\n"
+        + "\}\n"
+        + "shared() -> long \{\n"
+        + "    if (Box<int>.tag != null) \{ return Box<string>.tag.length; \}\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    long total = checked() + guarded() + looped() + negated() + tested() + chained()\n"
+        + "        + insideLambda() + shared();\n"
+        + "    if (shortCircuits()) \{ return total as int; \}\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+}
+
+test "a lazy const narrowing stays outside a lambda, and a mutable field under one never narrows" {
+    let analysis = try analyzeBody("class Tally \{ protected int? count; protected string? note; "
+        + "protected constructor(this.count = null, this.note = null); \}\n"
+        + "class Settings \{\n"
+        + "    protected lazy const string? label = pick();\n"
+        + "    protected lazy const Tally tally = new Tally(1, \"a\");\n"
+        + "\}\n"
+        + "pick() -> string? \{ return \"label\"; \}\n"
+        + "unchecked() -> long \{\n"
+        + "    return Settings.label.length;\n"
+        + "\}\n"
+        + "outsideLambda() -> long \{\n"
+        + "    if (Settings.label != null) \{\n"
+        + "        () -> long measure = () -> Settings.label.length;\n"
+        + "        return measure();\n"
+        + "    \}\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "mutableField() -> long \{\n"
+        + "    if (Settings.tally.note != null) \{ return Settings.tally.note.length; \}\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "compound() \{\n"
+        + "    if (Settings.tally.count != null) \{ Settings.tally.count += 1; \}\n"
+        + "\}\n"
+        + "refusedWrite() -> long \{\n"
+        + "    if (Settings.label != null) \{\n"
+        + "        Settings.label = null;\n"
+        + "        return Settings.label.length;\n"
+        + "    \}\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    compound();\n"
+        + "    return (unchecked() + outsideLambda() + mutableField() + refusedWrite()) as int;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string unchecked = "Cannot read a member of 'string?' because it may be null here. Check it "
+        + "for null first ('if (value != null)'), read it with '?.' to get a nullable result, or "
+        + "supply a fallback with '??'.";
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens", unchecked);
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens", unchecked);
+    try sema_support.assertDiagnostic(reported, 2, "/proj/src/main.ens",
+        "Cannot read a member of 'string?' because it may be null here. 'note' is a field, so it "
+        + "can change at any time, and a null check on it does not carry to a later use. Copy it "
+        + "into a local first ('let note = Settings.tally.note;') and check the local.");
+    try sema_support.assertDiagnostic(reported, 3, "/proj/src/main.ens",
+        "'+=' needs numbers on both sides, got 'int?' and 'int'. 'count' is a field, so it can "
+        + "change at any time, and a null check on it does not carry to a later use. Copy it into "
+        + "a local first ('let count = Settings.tally.count;'), check the local, and write the "
+        + "result back to 'Settings.tally.count'.");
+    try sema_support.assertDiagnostic(reported, 4, "/proj/src/main.ens",
+        "Cannot assign to 'Settings.label': a lazy const keeps the value its initializer gives "
+        + "it. Change the initializer, or use an instance field.");
+    try testing.assertEqual(reported.length, 5L);
+}
+
+test "a static or lazy field without 'const' never narrows" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main.ens", "class Counters \{\n"
+        + "    protected static int? counter;\n"
+        + "    protected lazy string? loose = pick();\n"
+        + "\}\n"
+        + "pick() -> string? \{ return \"loose\"; \}\n"
+        + "counted() -> int \{\n"
+        + "    if (Counters.counter != null) \{ return Counters.counter + 1; \}\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "measured() -> long \{\n"
+        + "    if (Counters.loose != null) \{ return Counters.loose.length; \}\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "main() -> int \{ return counted() + measured() as int; \}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Layout, Stage.Bodies]);
+    let declared = analysis.layoutDiagnostics();
+    try sema_support.assertDiagnostic(declared, 0, "/proj/src/main.ens",
+        "A 'static' field must also be 'const'. Write 'static const int? counter = ...', or make "
+        + "'counter' an instance field.");
+    try sema_support.assertDiagnostic(declared, 1, "/proj/src/main.ens",
+        "Static const 'counter' needs its value on the declaration, because nothing else ever "
+        + "assigns it: write 'static const int? counter = ...'.");
+    try sema_support.assertDiagnostic(declared, 2, "/proj/src/main.ens",
+        "Static const 'counter' has type 'int?', and a static const holds a constant, whose type "
+        + "must be a primitive, 'char', 'bool', or 'string'.");
+    try sema_support.assertDiagnostic(declared, 3, "/proj/src/main.ens",
+        "A 'lazy' field must also be 'const'; its value is built once on the first read and never "
+        + "changes. Write 'lazy const string? loose = ...', or make 'loose' an instance field.");
+    try testing.assertEqual(declared.length, 4L);
+    let reported = analysis.bodyDiagnostics();
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "'+' needs numbers on both sides, got 'int?' and 'int'.");
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
+        "Cannot read a member of 'string?' because it may be null here. Check it for null first "
+        + "('if (value != null)'), read it with '?.' to get a nullable result, or supply a "
+        + "fallback with '??'.");
+    try testing.assertEqual(reported.length, 2L);
+}
+
+test "a type-level path and a binding path never prefix each other" {
+    let store = new TypeStore();
+    let optionalInt = store.optionalOf(store.primitive(PrimitiveKind.Int));
+    let intType = store.primitive(PrimitiveKind.Int);
+    let label = typeLevelField("label", optionalInt);
+    let local = binding("label", optionalInt);
+    let name = narrow.fieldSegment("name");
+    let state = new NarrowingState();
+
+    state.narrow(narrow.typeLevelPath(label).extended(name), intType);
+    state.narrow(narrow.bindingPath(local).extended(name), intType);
+    state.clearPrefixedBy(narrow.bindingPath(local));
+    try testing.assertTrue(state.provenType(narrow.typeLevelPath(label).extended(name)) == intType,
+        "a write to a binding should keep a type-level path under a field of the same name");
+    try testing.assertTrue(state.provenType(narrow.bindingPath(local).extended(name)) == null,
+        "a write to a binding should drop the paths it prefixes");
+
+    state.narrow(narrow.bindingPath(local).extended(name), intType);
+    state.clearPrefixedBy(narrow.typeLevelPath(label));
+    try testing.assertTrue(state.provenType(narrow.bindingPath(local).extended(name)) == intType,
+        "clearing a type-level path should keep a binding path of the same name");
+    try testing.assertTrue(state.provenType(narrow.typeLevelPath(label).extended(name)) == null,
+        "clearing a type-level path should drop the paths it prefixes");
 }
