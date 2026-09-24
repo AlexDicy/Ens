@@ -1,0 +1,905 @@
+// Resolves a module's structs, primitive bindings, interfaces and enums, and the bases of its classes.
+import StructDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import ClassDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import InterfaceDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import PrimitiveDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import EnumDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import Expression from @ens.frontend.syntax.generated.nodes;
+import LiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
+import PrefixExpressionNode from @ens.frontend.syntax.generated.nodes;
+import FunctionDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import FieldDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import SyntaxKind from @ens.frontend.syntax.generated.kind;
+import Span from @ens.frontend.support.source;
+import ClassItem from context;
+import SignatureCollector from phases.signatures;
+import phases.layout;
+import phases.members;
+import model.types;
+import Type from model.types;
+import ErrorType from model.types;
+import OptionalType from model.types;
+import ArrayType from model.types;
+import ClassType from model.types;
+import StructType from model.types;
+import InterfaceType from model.types;
+import EnumType from model.types;
+import PrimitiveBinding from model.types;
+import TypeParamType from model.types;
+import DeclaredType from model.types;
+import InstantiationType from model.types;
+import model.literalvalues;
+import Field from model.types;
+import Method from model.types;
+import Visibility from model.types;
+import List from @std.collections.list;
+import StringBuilder from @std.text.stringbuilder;
+
+structFor(SignatureCollector collector, StructDeclarationNode node) -> StructType? {
+    let found = collector.resolver().typeStore().findDeclared(collector.modulePath(), node.name().text());
+    if (found is StructType && found.declaration() == node.green()) {
+        return found;
+    }
+    return null;
+}
+
+classFor(SignatureCollector collector, ClassDeclarationNode node) -> ClassType? {
+    let found = collector.resolver().typeStore().findDeclared(collector.modulePath(), node.name().text());
+    if (found is ClassType && found.declaration() == node.green()) {
+        return found;
+    }
+    return null;
+}
+
+interfaceFor(SignatureCollector collector, InterfaceDeclarationNode node) -> InterfaceType? {
+    let found = collector.resolver().typeStore().findDeclared(collector.modulePath(), node.name().text());
+    if (found is InterfaceType && found.declaration() == node.green()) {
+        return found;
+    }
+    return null;
+}
+
+enumFor(SignatureCollector collector, EnumDeclarationNode node) -> EnumType? {
+    let found = collector.resolver().typeStore().findDeclared(collector.modulePath(), node.name().text());
+    if (found is EnumType && found.declaration() == node.green()) {
+        return found;
+    }
+    return null;
+}
+
+// Struct fields resolve for every struct before any struct method does, so constructor
+// 'this.field' parameters always have the full field list.
+public collectStructFields(SignatureCollector collector) {
+    for (long s = 0; s < collector.structDeclarations().length(); s++) {
+        let node = collector.structDeclarations().get(s);
+        let found = structFor(collector, node);
+        if (found == null) {
+            continue;
+        }
+        let extendsClause = node.extendsClause();
+        if (extendsClause != null) {
+            collector.reporter().report("Only classes can use 'extends'; structs do not support "
+                + "inheritance.", extendsClause.extendsKeyword().span());
+        }
+        let parameters = found.typeParameterTypes();
+        collector.resolver().pushTypeParameters(parameters);
+        resolveStructInterfaces(collector, found, node);
+        let body = node.body();
+        for (long i = 0; i < body.membersCount(); i++) {
+            let member = body.members(i);
+            if (member is FieldDeclarationNode) {
+                let field = members.readField(collector.resolver(), collector.reporter(), member, found,
+                    collector.names());
+                if (field.isStatic() || field.isLazy()) {
+                    collectTypeLevelField(collector, found, member, field);
+                    continue;
+                }
+                if (field.isWeak()) {
+                    collector.reporter().report("'weak' fields are not allowed on structs.",
+                        field.nameSpan());
+                }
+                if (field.name().length > 0) {
+                    if (members.findField(found.fields(), field.name()) != null) {
+                        collector.reporter().report("Field '{field.name()}' is already declared "
+                            + "in '{collector.names().nameOf(found)}'.", field.nameSpan());
+                        continue;
+                    }
+                    members.checkStaticInstanceCollision(collector.reporter(), found,
+                        field.name(), false, field.nameSpan(), collector.names());
+                }
+                found.fields().push(field);
+            }
+        }
+        collector.resolver().popTypeParameters(parameters.length);
+    }
+}
+
+// A struct's declared conformances, which a generic bound reads. Whether they hold is a
+// whole-program question and waits for the declaration checks.
+resolveStructInterfaces(SignatureCollector collector, StructType structType, StructDeclarationNode node) {
+    let implementsClause = node.implementsClause();
+    if (implementsClause == null) {
+        return;
+    }
+    let accepted = new List<Type>();
+    for (long i = 0; i < implementsClause.interfacesCount(); i++) {
+        let reference = implementsClause.interfaces(i);
+        Type resolved = collector.resolver().resolveType(reference);
+        if (acceptInterface(collector, structType, accepted, resolved, reference.span())) {
+            accepted.push(resolved);
+        }
+    }
+    structType.setInterfaces(accepted.toArray());
+}
+
+// Resolves the methods of every struct this module declares, then marks its members complete.
+public collectStructMethods(SignatureCollector collector) {
+    for (long s = 0; s < collector.structDeclarations().length(); s++) {
+        let node = collector.structDeclarations().get(s);
+        let structType = structFor(collector, node);
+        if (structType == null) {
+            continue;
+        }
+        let parameters = structType.typeParameterTypes();
+        collector.resolver().pushTypeParameters(parameters);
+        let body = node.body();
+        for (long i = 0; i < body.membersCount(); i++) {
+            let member = body.members(i);
+            if (member is FunctionDeclarationNode) {
+                collectStructMethod(collector, structType, member);
+            }
+        }
+        collector.resolver().popTypeParameters(parameters.length);
+        structType.setMembersComplete();
+        members.checkHashEqualsPairing(collector.reporter(), structType, node.name().span(),
+            collector.names());
+    }
+}
+
+// One static const or lazy const field of a struct; the class twin is in the layout phase. The
+// shape checks and the shared-namespace collision rules are one home in phases.members.
+collectTypeLevelField(SignatureCollector collector, StructType structType,
+                      FieldDeclarationNode declaration, Field field) {
+    if (field.isLazy()) {
+        members.checkLazyFieldShape(collector.reporter(), declaration, field, collector.names());
+    } else {
+        members.checkStaticFieldShape(collector.reporter(), declaration, field, collector.names());
+    }
+    if (field.name().length > 0) {
+        if (members.findField(structType.staticFields(), field.name()) != null) {
+            collector.reporter().report("{members.typeLevelFieldNoun(field)} '{field.name()}' is "
+                + "already declared in '{collector.names().nameOf(structType)}'.", field.nameSpan());
+            return;
+        }
+        members.checkStaticInstanceCollision(collector.reporter(), structType, field.name(), true,
+            field.nameSpan(), collector.names(), field);
+    }
+    structType.staticFields().push(field);
+}
+
+collectStructMethod(SignatureCollector collector, StructType structType, FunctionDeclarationNode member) {
+    let introducer = member.introducer();
+    bool isConstructor = false;
+    Span nameSpan = member.span();
+    if (introducer != null) {
+        if (introducer.kind() == SyntaxKind.DestructorKeyword) {
+            collector.reporter().report("A struct cannot declare a destructor; destructors are "
+                + "only allowed on classes.", introducer.span());
+            return;
+        }
+        isConstructor = true;
+        nameSpan = introducer.span();
+    }
+    string rawName = "";
+    let nameToken = member.name();
+    if (nameToken != null) {
+        rawName = nameToken.text();
+        nameSpan = nameToken.span();
+    }
+    if (!isConstructor) {
+        if (rawName.length == 0) {
+            return;
+        }
+        if (rawName == structType.name()) {
+            collector.reporter().report("To declare a constructor, use the 'constructor' keyword. "
+                + "A method cannot be named after its struct '{collector.names().nameOf(structType)}'.",
+                nameSpan);
+            return;
+        }
+    }
+    string methodName = rawName;
+    if (isConstructor) {
+        methodName = "constructor";
+    }
+    let modifiers = members.functionModifiers(member);
+    members.checkMemberModifiers(collector.reporter(), member);
+    if (modifiers.declaresStatic && !isConstructor) {
+        members.collectStaticMethod(collector.resolver(), collector.reporter(), structType,
+            structType.staticMethods(), member, methodName, nameSpan, modifiers,
+            collector.names());
+        return;
+    }
+    members.checkStaticMethodMarkers(collector.reporter(), modifiers, methodName, isConstructor,
+        false, nameSpan);
+    string memberKindWord = "Method";
+    if (isConstructor) {
+        memberKindWord = "Constructor";
+    }
+    string constraintSubject = "{memberKindWord} '{methodName}' of '{collector.names().nameOf(structType)}'";
+    if (isConstructor) {
+        constraintSubject = "A constructor of '{collector.names().nameOf(structType)}'";
+    }
+    let constraints = members.readMemberConstraints(collector.resolver(), collector.reporter(),
+        structType, member, constraintSubject, collector.names());
+    if (constraints.length > 0) {
+        collector.resolver().pushMemberConstraints(structType.declaration(), constraints);
+    }
+    let signature = members.buildSignature(collector.resolver(), collector.reporter(), member, methodName,
+        nameSpan, isConstructor, false, isConstructor || modifiers.declaresAbstract,
+        modifiers.declaresNoreturn, structType, collector.names(), []);
+    if (constraints.length > 0) {
+        collector.resolver().popMemberConstraints();
+    }
+    let behavior = members.builtinBehaviorReplaced(structType, methodName, signature);
+    Visibility visibility = Visibility.Private;
+    if (behavior != null) {
+        visibility = members.builtinReplacementVisibility(modifiers, structType, methodName,
+            behavior, collector.reporter(), collector.names());
+    } else {
+        visibility = members.memberVisibility(modifiers, structType, memberKindWord, methodName,
+            collector.reporter(), collector.names());
+    }
+    members.checkFieldMethodCollision(collector.reporter(), structType, methodName,
+        isConstructor, nameSpan, collector.names());
+    if (!isConstructor) {
+        members.checkStaticInstanceCollision(collector.reporter(), structType, methodName, false,
+            nameSpan, collector.names());
+    }
+    members.checkThrowsPlacement(collector.reporter(), member, isConstructor,
+        modifiers.declaresAbstract);
+    members.checkNoreturnPlacement(collector.reporter(), member, isConstructor, false,
+        modifiers.declaresNoreturn);
+    members.checkHashSignature(collector.reporter(), member, signature, isConstructor);
+    members.checkEqualsSignature(collector.reporter(), member, signature, structType, isConstructor,
+        collector.names());
+    members.checkToStringSignature(collector.reporter(), member, signature, isConstructor);
+    members.checkStructOverrideMarker(collector.reporter(), structType, methodName, signature,
+        modifiers, isConstructor, behavior, collector.names());
+    members.checkStructAbstractMarker(collector.reporter(), structType, methodName, signature,
+        modifiers, isConstructor, collector.names());
+    if (!isConstructor) {
+        members.checkConditionalMarkers(collector.reporter(), constraints, modifiers, methodName,
+            structType, nameSpan, collector.names());
+    }
+    if (members.findSameSignature(structType.methods(), methodName, signature) != null) {
+        collector.reporter().report("Method '{methodName}' of '{collector.names().nameOf(structType)}' "
+            + "is already declared with the same parameter types; overloads must differ in parameter "
+            + "count or types.", nameSpan);
+        return;
+    }
+    structType.methods().push(new Method(signature, visibility, isConstructor,
+        false, modifiers.declaresOverride, modifiers.declaresFinal,
+        modifiers.declaresAbstract, false, member.body() != null, constraints, structType));
+}
+
+// The binding whose members this declaration writes, or null when the link phase refused it.
+bindingFor(SignatureCollector collector, PrimitiveDeclarationNode node) -> PrimitiveBinding? {
+    let primitive = types.primitiveNamed(collector.resolver().typeStore(), node.name().text());
+    if (primitive == null) {
+        return null;
+    }
+    let binding = types.bindingOf(primitive);
+    if (binding != null && binding.declaration() == node.green()) {
+        return binding;
+    }
+    return null;
+}
+
+// A primitive binding's declared conformances and members. The binding owns the member rules,
+// and the primitive is what each member is declared on, so a diagnostic and a stack trace
+// both read 'string'. Whether the conformances are actually satisfied is a whole-program
+// question and waits for the declaration checks.
+public collectPrimitiveBindings(SignatureCollector collector) {
+    for (long n = 0; n < collector.primitiveDeclarations().length(); n++) {
+        let node = collector.primitiveDeclarations().get(n);
+        let binding = bindingFor(collector, node);
+        if (binding == null) {
+            continue;
+        }
+        let implementsClause = node.implementsClause();
+        if (implementsClause != null) {
+            let resolved = new List<Type>();
+            for (long i = 0; i < implementsClause.interfacesCount(); i++) {
+                let reference = implementsClause.interfaces(i);
+                Type declared = collector.resolver().resolveType(reference);
+                if (acceptBindingInterface(collector, binding, declared, reference.span())) {
+                    resolved.push(declared);
+                }
+            }
+            binding.setInterfaces(resolved.toArray());
+        }
+        let body = node.body();
+        for (long i = 0; i < body.membersCount(); i++) {
+            switch (body.members(i)) {
+                is FieldDeclarationNode field -> {
+                    reportBindingField(collector, binding, field);
+                },
+                is FunctionDeclarationNode method -> {
+                    collectPrimitiveMember(collector, binding, method);
+                },
+                default -> { },
+            }
+        }
+        binding.setMembersComplete();
+    }
+}
+
+acceptBindingInterface(SignatureCollector collector, PrimitiveBinding binding, Type declared,
+                       Span span) -> bool {
+    if (declared is ErrorType) {
+        return false;
+    }
+    if (!types.isInterfaceLike(declared)) {
+        collector.reporter().report("'{binding.name()}' can only implement an interface, and "
+            + "'{collector.names().of(declared)}' is not one. A binding never extends a class.",
+            span);
+        return false;
+    }
+    return true;
+}
+
+// A primitive stores nothing of its own, so no member of a binding is a field. A 'static
+// const' would put a constant under a name the language owns, which is a different thing
+// from declaring what a value can do.
+reportBindingField(SignatureCollector collector, PrimitiveBinding binding, FieldDeclarationNode declaration) {
+    let modifiers = members.fieldModifiers(declaration);
+    string name = declaration.name().text();
+    if (modifiers.declaresStatic) {
+        collector.reporter().report("A binding for '{binding.name()}' cannot declare a static "
+            + "const; it declares only what a value of type '{binding.name()}' can do. "
+            + "Declare '{name}' on a class or a struct of this module instead.",
+            declaration.name().span());
+        return;
+    }
+    if (modifiers.declaresLazy) {
+        collector.reporter().report("A binding for '{binding.name()}' cannot declare a lazy "
+            + "const; it declares only what a value of type '{binding.name()}' can do. "
+            + "Declare '{name}' on a class or a struct of this module instead.",
+            declaration.name().span());
+        return;
+    }
+    collector.reporter().report("A binding for '{binding.name()}' cannot declare a field: "
+        + "'{name}' would need room in every value of type '{binding.name()}', and a "
+        + "primitive has none. Declare methods here, and keep the field on a class or a "
+        + "struct that holds one.", declaration.name().span());
+}
+
+collectPrimitiveMember(SignatureCollector collector, PrimitiveBinding binding,
+                       FunctionDeclarationNode member) {
+    let introducer = member.introducer();
+    if (introducer != null) {
+        if (introducer.kind() == SyntaxKind.DestructorKeyword) {
+            collector.reporter().report("A binding for '{binding.name()}' cannot declare a "
+                + "destructor; a value of type '{binding.name()}' is copied, never "
+                + "destroyed.", introducer.span());
+        } else {
+            collector.reporter().report("A binding for '{binding.name()}' cannot declare a "
+                + "constructor; a value of type '{binding.name()}' is written as a "
+                + "literal, never built with 'new'. Declare a static that returns one "
+                + "instead.", introducer.span());
+        }
+        return;
+    }
+    let nameToken = member.name();
+    if (nameToken == null || nameToken.text().length == 0) {
+        return;
+    }
+    string name = nameToken.text();
+    Span nameSpan = nameToken.span();
+    let modifiers = members.functionModifiers(member);
+    members.checkMemberModifiers(collector.reporter(), member);
+    if (modifiers.declaresStatic) {
+        members.collectStaticMethod(collector.resolver(), collector.reporter(), binding,
+            binding.staticMethods(), member, name, nameSpan, modifiers, collector.names(), true);
+        if (!modifiers.declaresAbstract) {
+            markIntrinsic(collector, binding, binding.staticMethods(), member, name, nameSpan,
+                true);
+        }
+        return;
+    }
+    if (modifiers.declaresAbstract) {
+        collector.reporter().report("Method '{name}' of the '{binding.name()}' binding cannot be "
+            + "'abstract'; a primitive has no subclass to give it a body.",
+            modifiers.abstractModifierSpan(nameSpan));
+    }
+    if (modifiers.declaresFinal) {
+        collector.reporter().report("Method '{name}' of the '{binding.name()}' binding cannot be "
+            + "'final'; a primitive has no subclass that could override it.",
+            modifiers.finalModifierSpan(nameSpan));
+    }
+    let constraints = members.readMemberConstraints(collector.resolver(), collector.reporter(), binding,
+        member, "Method '{name}' of '{binding.name()}'", collector.names());
+    let signature = members.buildSignature(collector.resolver(), collector.reporter(), member, name,
+        nameSpan, false, false, true, modifiers.declaresNoreturn, null, collector.names(), []);
+    Visibility visibility = members.memberVisibility(modifiers, binding, "Method", name,
+        collector.reporter(), collector.names());
+    members.checkThrowsPlacement(collector.reporter(), member, false, false);
+    members.checkNoreturnPlacement(collector.reporter(), member, false, false,
+        modifiers.declaresNoreturn);
+    members.checkStaticInstanceCollision(collector.reporter(), binding, name, false, nameSpan,
+        collector.names());
+    if (members.findSameSignature(binding.methods(), name, signature) != null) {
+        collector.reporter().report("Method '{name}' of the '{binding.name()}' binding is already "
+            + "declared with the same parameter types; overloads must differ in parameter "
+            + "count or types.", nameSpan);
+        return;
+    }
+    binding.methods().push(new Method(signature, visibility, false, false,
+        modifiers.declaresOverride, false, false, false, member.body() != null, constraints,
+        binding.primitive()));
+    // An 'abstract' member was already refused for the modifier, and its missing body is that
+    // same mistake, so it is not read as naming an intrinsic on top.
+    if (!modifiers.declaresAbstract) {
+        markIntrinsic(collector, binding, binding.methods(), member, name, nameSpan, false);
+    }
+}
+
+// What a binding member without a body means: it names an intrinsic the compiler implements,
+// and the declaration is where its signature is written. A member with a body is ordinary Ens
+// and replaces the compiler's own member of the same shape, so the only refusals left are the
+// few members a call site is not the only way to reach.
+markIntrinsic(SignatureCollector collector, PrimitiveBinding binding, List<Method> declared,
+              FunctionDeclarationNode member, string name, Span nameSpan, bool isStatic) {
+    let method = members.methodDeclaredBy(declared, member.green());
+    if (method == null) {
+        return;
+    }
+    if (member.body() != null) {
+        if (isStatic) {
+            return;
+        }
+        let refused = members.unreplaceableMember(binding.primitive(), name,
+            method.signature(), collector.names());
+        if (refused != null) {
+            collector.reporter().report("Method '{name}' of the '{binding.name()}' binding cannot "
+                + "be declared: {refused}", nameSpan);
+        }
+        return;
+    }
+    let intrinsic = members.primitiveIntrinsic(collector.resolver().typeStore(),
+        binding.primitive(), name, method.signature(), isStatic);
+    if (intrinsic == null) {
+        reportUnknownIntrinsic(collector, binding, method, nameSpan);
+        return;
+    }
+    method.setIntrinsic(intrinsic);
+}
+
+// A bodiless member the compiler implements nothing for. Naming one wrongly is a typo far more
+// often than it is a missing feature, so the message says what was written, lists the
+// intrinsics that do exist, and offers the other reading: that the member was meant to have a body.
+reportUnknownIntrinsic(SignatureCollector collector, PrimitiveBinding binding, Method method, Span at) {
+    string name = method.name();
+    let forms = members.primitiveIntrinsicForms(binding.primitive());
+    if (forms.length == 0) {
+        collector.reporter().report("Method '{name}' of the '{binding.name()}' binding has no "
+            + "body, and the compiler implements no member of '{binding.name()}' itself. "
+            + "Give '{name}' a body to write it in Ens.", at);
+        return;
+    }
+    collector.reporter().report("Method '{name}' of the '{binding.name()}' binding has no body, "
+        + "and '{layout.methodDisplay(method, collector.names())}' is not a member the compiler "
+        + "implements. The ones it does are {listed(forms)}. Match one of those, or give "
+        + "'{name}' a body to write it in Ens.", at);
+}
+
+// Resolves the base and the methods of every interface this module declares.
+public collectInterfaces(SignatureCollector collector) {
+    for (long n = 0; n < collector.interfaceDeclarations().length(); n++) {
+        let node = collector.interfaceDeclarations().get(n);
+        let interfaceType = interfaceFor(collector, node);
+        if (interfaceType == null) {
+            continue;
+        }
+        let parameters = interfaceType.typeParameterTypes();
+        collector.resolver().pushTypeParameters(parameters);
+        let extendsClause = node.extendsClause();
+        if (extendsClause != null) {
+            let reference = extendsClause.base();
+            Type base = collector.resolver().resolveType(reference);
+            checkAndSetInterfaceBase(collector, interfaceType, base, reference.span());
+        }
+        let body = node.body();
+        for (long i = 0; i < body.membersCount(); i++) {
+            switch (body.members(i)) {
+                is FieldDeclarationNode field -> {
+                    collector.reporter().report("An interface cannot declare fields; its body "
+                        + "lists only method signatures.", field.name().span());
+                },
+                is FunctionDeclarationNode method -> {
+                    collectInterfaceMethod(collector, interfaceType, method);
+                },
+                default -> { },
+            }
+        }
+        collector.resolver().popTypeParameters(parameters.length);
+        interfaceType.setMembersComplete();
+    }
+}
+
+collectInterfaceMethod(SignatureCollector collector, InterfaceType interfaceType,
+                       FunctionDeclarationNode member) {
+    let introducer = member.introducer();
+    if (introducer != null) {
+        if (introducer.kind() == SyntaxKind.DestructorKeyword) {
+            collector.reporter().report("An interface cannot declare a destructor; "
+                + "'{collector.names().nameOf(interfaceType)}' has no instances of its own.",
+                introducer.span());
+        } else {
+            collector.reporter().report("An interface cannot declare a constructor; "
+                + "'{collector.names().nameOf(interfaceType)}' has no instances of its own.",
+                introducer.span());
+        }
+        return;
+    }
+    let nameToken = member.name();
+    if (nameToken == null || nameToken.text().length == 0) {
+        return;
+    }
+    string name = nameToken.text();
+    Span nameSpan = nameToken.span();
+    if (name == interfaceType.name()) {
+        collector.reporter().report("An interface cannot declare a constructor; "
+            + "'{collector.names().nameOf(interfaceType)}' has no instances of its own.", nameSpan);
+        return;
+    }
+    let modifiers = members.functionModifiers(member);
+    members.checkMemberModifiers(collector.reporter(), member);
+    if (modifiers.hasVisibilityModifier()) {
+        collector.reporter().report("A member of an interface always has the interface's own "
+            + "visibility. Remove the modifier from '{name}'.",
+            modifiers.visibilityModifierSpan(nameSpan));
+    }
+    if (modifiers.declaresOverride || modifiers.declaresFinal || modifiers.declaresAbstract) {
+        collector.reporter().report("Interface methods are plain signatures; 'abstract', "
+            + "'override', and 'final' are not allowed on '{name}'.", nameSpan);
+    }
+    if (modifiers.declaresStatic) {
+        collector.reporter().report("An interface cannot declare a static member. Remove "
+            + "'static', or move '{name}' to a class or a struct.",
+            modifiers.staticModifierSpan(nameSpan));
+    }
+    if (member.body() != null) {
+        collector.reporter().report("Interface method '{name}' cannot have a body; end the "
+            + "signature with ';'. Implementing classes provide the body.", nameSpan);
+    }
+    let constraintList = member.typeParameters();
+    if (constraintList != null) {
+        collector.reporter().report("Interface method '{name}' cannot have a type-parameter list, "
+            + "because that would make it hold for some type arguments only, and an "
+            + "interface requirement holds for all of them. Remove the '<...>' list, or "
+            + "move the method to the implementing classes.", constraintList.span());
+    }
+    let throwsClause = member.throwsClause();
+    if (throwsClause != null && throwsClause.typesCount() == 0) {
+        collector.reporter().report("An interface method marked 'throws' must list its exception "
+            + "types, for example 'throws IOError'.",
+            throwsClause.throwsKeyword().span());
+    }
+    let signature = members.buildSignature(collector.resolver(), collector.reporter(), member, name,
+        nameSpan, false, true, true, modifiers.declaresNoreturn, null, collector.names(), []);
+    members.checkNoreturnPlacement(collector.reporter(), member, false, false,
+        modifiers.declaresNoreturn);
+    members.checkHashSignature(collector.reporter(), member, signature, false);
+    if (members.findSameSignature(interfaceType.methods(), name, signature) != null) {
+        collector.reporter().report("Method '{name}' of '{collector.names().nameOf(interfaceType)}' "
+            + "is already declared with the same parameter types; overloads must differ in parameter "
+            + "count or types.", nameSpan);
+        return;
+    }
+    interfaceType.methods().push(new Method(signature,
+        types.followedMemberVisibility(interfaceType.visibility()), false, false,
+        false, false, true, false, member.body() != null, [], interfaceType));
+}
+
+checkAndSetInterfaceBase(SignatureCollector collector, InterfaceType interfaceType, Type base, Span span) {
+    if (base is ErrorType) {
+        return;
+    }
+    string shown = collector.names().of(base);
+    if (!types.isInterfaceLike(base)) {
+        if (types.isClassLike(base)) {
+            collector.reporter().report("Interface '{collector.names().nameOf(interfaceType)}' "
+                + "cannot extend class '{shown}'; an interface extends an interface. Write "
+                + "'class {shown} implements {collector.names().nameOf(interfaceType)}' instead.", span);
+        } else {
+            collector.reporter().report("Interface '{collector.names().nameOf(interfaceType)}' cannot extend "
+                + "{extendTargetKind(base)} '{shown}'; an interface extends an interface.",
+                span);
+        }
+        return;
+    }
+    let authority = types.authorityOf(base);
+    if (base == interfaceType || authority == interfaceType) {
+        collector.reporter().report("Interface '{collector.names().nameOf(interfaceType)}' "
+            + "cannot extend itself.", span);
+        return;
+    }
+    interfaceType.setBase(base);
+}
+
+// Resolves the members and values of every enum this module declares.
+public collectEnums(SignatureCollector collector) {
+    for (long n = 0; n < collector.enumDeclarations().length(); n++) {
+        let node = collector.enumDeclarations().get(n);
+        let enumType = enumFor(collector, node);
+        if (enumType == null) {
+            continue;
+        }
+
+        bool numeric = false;
+        for (long i = 0; i < node.membersCount(); i++) {
+            if (node.members(i).value() != null) {
+                numeric = true;
+                break;
+            }
+        }
+        enumType.setNumeric(numeric);
+
+        let names = new List<string>();
+        let values = new List<long>();
+        long next = 0;
+        bool isFirst = true;
+        for (long i = 0; i < node.membersCount(); i++) {
+            let member = node.members(i);
+            let memberToken = member.name();
+            string name = memberToken.text();
+            if (name.length == 0) {
+                continue;
+            }
+            bool duplicate = false;
+            for (long j = 0; j < names.length(); j++) {
+                if (names.get(j) == name) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) {
+                collector.reporter().report("Enum '{collector.names().nameOf(enumType)}' already has a "
+                    + "member named '{name}'; remove the duplicate.", memberToken.span());
+                continue;
+            }
+
+            long value = next;
+            let initializer = member.value();
+            if (initializer != null) {
+                let constant = enumMemberConstant(initializer.value());
+                if (constant != null) {
+                    value = constant;
+                } else {
+                    collector.reporter().report("The value of enum member '{name}' must be an "
+                        + "integer constant, for example '{name} = 1'.",
+                        initializer.value().span());
+                }
+            } else if (numeric && isFirst) {
+                collector.reporter().report("Enum '{collector.names().nameOf(enumType)}' assigns values "
+                    + "to its members, so its first member '{name}' must have one too; give it a "
+                    + "value, for example '{name} = 0'.", memberToken.span());
+            }
+            next = value + 1;
+            isFirst = false;
+
+            if (numeric) {
+                for (long j = 0; j < values.length(); j++) {
+                    if (values.get(j) == value) {
+                        collector.reporter().report("Enum members '{name}' and '{names.get(j)}' "
+                            + "both have the value {value}; give each member of enum "
+                            + "'{collector.names().nameOf(enumType)}' a distinct value.", memberToken.span());
+                        break;
+                    }
+                }
+            }
+
+            names.push(name);
+            values.push(value);
+        }
+        if (names.length() == 0) {
+            collector.reporter().report("Enum '{collector.names().nameOf(enumType)}' must have at least "
+                + "one member.", node.name().span());
+        }
+        enumType.setMemberNames(names.toArray());
+        enumType.setMemberValues(values.toArray());
+    }
+}
+
+// Resolves the base and interfaces of each class this module declares, and queues the class for layout.
+public resolveClassBases(SignatureCollector collector) {
+    for (long n = 0; n < collector.classDeclarations().length(); n++) {
+        let node = collector.classDeclarations().get(n);
+        let found = classFor(collector, node);
+        if (found == null) {
+            continue;
+        }
+        collector.classItems().push(new ClassItem(collector.context(), found, node));
+        let parameters = found.typeParameterTypes();
+        if (found.isSealed() && found.isFinal()) {
+            collector.reporter().report("Class '{collector.names().nameOf(found)}' cannot be both "
+                + "'sealed' and 'final'; 'final' already forbids every subclass. Remove one of the two.",
+                node.name().span());
+        }
+        collector.resolver().pushTypeParameters(parameters);
+        let extendsClause = node.extendsClause();
+        if (extendsClause != null) {
+            let reference = extendsClause.base();
+            Type base = collector.resolver().resolveType(reference);
+            checkAndSetBase(collector, found, base, reference.span());
+        }
+        let implementsClause = node.implementsClause();
+        if (implementsClause != null) {
+            let accepted = new List<Type>();
+            for (long i = 0; i < implementsClause.interfacesCount(); i++) {
+                let reference = implementsClause.interfaces(i);
+                Type resolved = collector.resolver().resolveType(reference);
+                if (acceptInterface(collector, found, accepted, resolved, reference.span())) {
+                    accepted.push(resolved);
+                }
+            }
+            found.setInterfaces(accepted.toArray());
+        }
+        collector.resolver().popTypeParameters(parameters.length);
+    }
+}
+
+checkAndSetBase(SignatureCollector collector, ClassType classType, Type base, Span span) {
+    if (base is ErrorType) {
+        return;
+    }
+    string shown = collector.names().of(base);
+    if (types.isInterfaceLike(base)) {
+        collector.reporter().report("Cannot extend interface '{shown}'; a class implements an "
+            + "interface with 'implements {shown}'.", span);
+        return;
+    }
+    if (!types.isClassLike(base)) {
+        collector.reporter().report("'{shown}' is not a class; only classes can be extended.",
+            span);
+        return;
+    }
+    let authority = types.authorityOf(base);
+    if (base == classType || authority == classType) {
+        collector.reporter().report("Class '{collector.names().nameOf(classType)}' cannot extend "
+            + "itself.", span);
+        return;
+    }
+    if (authority is ClassType) {
+        if (authority.isFinal()) {
+            collector.reporter().report("Cannot extend '{collector.names().nameOf(authority)}' because it is "
+                + "declared 'final'.", span);
+            return;
+        }
+        if (authority.isSealed() && authority.modulePath() != collector.modulePath()) {
+            collector.reporter().report("Cannot extend '{collector.names().nameOf(authority)}' because it is "
+                + "declared 'sealed'; only the module that declares "
+                + "'{collector.names().nameOf(authority)}' can extend it.", span);
+            return;
+        }
+        classType.setBase(base);
+        authority.directSubclasses().push(classType);
+    }
+}
+
+// One name from an 'implements' clause, accepted when it is an interface no earlier name in
+// the same clause already listed. A class names a base with 'extends' and a struct has no
+// base at all, so each owner gets its own advice for a name that turns out to be a class.
+acceptInterface(SignatureCollector collector, DeclaredType owner, List<Type> accepted, Type resolved,
+                Span span) -> bool {
+    if (resolved is ErrorType) {
+        return false;
+    }
+    string shown = collector.names().of(resolved);
+    if (resolved is OptionalType || resolved is ArrayType) {
+        collector.reporter().report("'implements' takes plain interface names; '{shown}' is not "
+            + "an interface type.", span);
+        return false;
+    }
+    if (!types.isInterfaceLike(resolved)) {
+        if (types.isClassLike(resolved) && owner is StructType) {
+            collector.reporter().report("'{shown}' is a class, not an interface, and a struct "
+                + "never extends a class. Name an interface here, or hold a '{shown}' in a "
+                + "field of '{collector.names().nameOf(owner)}'.", span);
+        } else if (types.isClassLike(resolved)) {
+            collector.reporter().report("'{shown}' is a class, not an interface; use 'extends "
+                + "{shown}' for a base class.", span);
+        } else {
+            collector.reporter().report("'{shown}' is not an interface; 'implements' takes "
+                + "interfaces only.", span);
+        }
+        return false;
+    }
+    for (long i = 0; i < accepted.length(); i++) {
+        if (accepted.get(i) == resolved) {
+            collector.reporter().report("Interface '{shown}' is listed more than once in the "
+                + "'implements' clause.", span);
+            return false;
+        }
+    }
+    return true;
+}
+
+// The kind of a rejected interface 'extends' target, as the diagnostic reads it.
+extendTargetKind(Type base) -> string {
+    switch (base) {
+        is TypeParamType ignored -> {
+            return "type parameter";
+        },
+        is DeclaredType declared -> {
+            return types.kindWordOf(declared);
+        },
+        is InstantiationType instantiation -> {
+            return types.kindWordOf(instantiation.template());
+        },
+        default -> {
+            return "primitive type";
+        },
+    }
+}
+
+// The 64-bit value an enum member's initializer names: an int or long literal by its value, a
+// char literal by its codepoint, behind an optional '+' or '-' sign. Null when the expression is
+// not such an integer constant.
+enumMemberConstant(Expression expr) -> long? {
+    if (expr is LiteralExpressionNode && expr.value().kind() == SyntaxKind.CharLiteral) {
+        return literalvalues.charCodepoint(expr.value().text()) as long;
+    }
+    let literal = signedIntegerLiteral(expr);
+    if (literal == null) {
+        return null;
+    }
+    let magnitude = literalvalues.integerMagnitude(literal.value().text());
+    if (magnitude == null) {
+        return null;
+    }
+    long value = magnitude as long;
+    if (expr is PrefixExpressionNode && expr.operator().kind() == SyntaxKind.Minus) {
+        return 0 - value;
+    }
+    return value;
+}
+
+signedIntegerLiteral(Expression expr) -> LiteralExpressionNode? {
+    if (expr is LiteralExpressionNode) {
+        if (isEnumIntegerLiteralKind(expr.value().kind())) {
+            return expr;
+        }
+        return null;
+    }
+    if (expr is PrefixExpressionNode) {
+        SyntaxKind operator = expr.operator().kind();
+        if (operator != SyntaxKind.Plus && operator != SyntaxKind.Minus) {
+            return null;
+        }
+        let operand = expr.operand();
+        if (operand is LiteralExpressionNode && isEnumIntegerLiteralKind(operand.value().kind())) {
+            return operand;
+        }
+    }
+    return null;
+}
+
+isEnumIntegerLiteralKind(SyntaxKind kind) -> bool {
+    return kind == SyntaxKind.IntLiteral || kind == SyntaxKind.LongLiteral;
+}
+
+// The items as they read in a sentence: "a, b, and c", or "a and b" for two.
+listed(string[] items) -> string {
+    let builder = new StringBuilder();
+    for (long i = 0; i < items.length; i++) {
+        if (i > 0 && i + 1 < items.length) {
+            builder.append(", ");
+        } else if (i > 0) {
+            builder.append(items.length > 2 ? ", and " : " and ");
+        }
+        builder.append(items[i]);
+    }
+    return builder.toString();
+}

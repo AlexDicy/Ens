@@ -1,0 +1,834 @@
+import FunctionDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import FieldDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import SyntaxNode from @ens.frontend.syntax.node;
+import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
+import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SuperExpressionNode from @ens.frontend.syntax.generated.nodes;
+import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SafeMemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import TryExpressionNode from @ens.frontend.syntax.generated.nodes;
+import LambdaExpressionNode from @ens.frontend.syntax.generated.nodes;
+import GreenNode from @ens.frontend.syntax.green;
+import GreenToken from @ens.frontend.syntax.green;
+import Span from @ens.frontend.support.source;
+import Reporter from support.diagnostics;
+import SemaResult from result;
+import phases.exceptions;
+import ModuleExceptions from phases.exceptions;
+import FunctionItem from phases.exceptions;
+import TypeItem from phases.exceptions;
+import ThrowSet from phases.exceptions;
+import ThrowCount from phases.exceptions;
+import phases.members;
+import model.types;
+import FunctionType from model.types;
+import TypeParamType from model.types;
+import Type from model.types;
+import ErrorType from model.types;
+import DeclaredType from model.types;
+import ClassType from model.types;
+import StructType from model.types;
+import PrimitiveBinding from model.types;
+import TypeNames from model.types;
+import Method from model.types;
+import Signature from model.types;
+import List from @std.collections.list;
+import Set from @std.collections.set;
+import StringBuilder from @std.text.stringbuilder;
+
+// Checks one module's callables and calls after every outward throw set has converged.
+public final class ThrowValidation {
+    ModuleExceptions module;
+    SemaResult result;
+    Reporter reporter;
+    TypeNames names;
+    ClassType? errorClass;
+
+    // The methods the function being validated overrides or implements, which decide whether
+    // marking it 'throws' is a fix that compiles.
+    List<Signature> answeredScope;
+
+    public constructor(ModuleExceptions module) {
+        this.module = module;
+        this.result = module.result();
+        this.reporter = module.reporter();
+        this.names = module.names();
+        this.errorClass = module.errorClass();
+        this.answeredScope = new List<Signature>();
+    }
+
+    shadowedByEarlier(Type clauseType, List<Type?> clauseTypes, long index) -> bool {
+        for (long i = 0; i < index; i++) {
+            let earlier = clauseTypes.get(i);
+            if (earlier != null && this.module.alwaysSubclass(clauseType, earlier)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    relatedToAny(Type clauseType, ThrowSet bodySet) -> bool {
+        if (bodySet.hasUnresolved()) {
+            return true;
+        }
+        for (long i = 0; i < bodySet.members().length(); i++) {
+            if (this.module.mightOverlap(clauseType, bodySet.members().get(i))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // The thrown members the allowed set does not cover in every instantiation. An allowed set
+    // holding an unresolved type covers them all.
+    strayUnderScope(ThrowSet thrown, ThrowSet allowed) -> ThrowSet {
+        let strays = new ThrowSet();
+        if (allowed.hasUnresolved()) {
+            return strays;
+        }
+        for (long i = 0; i < thrown.members().length(); i++) {
+            let member = thrown.members().get(i);
+            bool covered = false;
+            for (long a = 0; a < allowed.members().length(); a++) {
+                if (this.module.alwaysSubclass(member, allowed.members().get(a))) {
+                    covered = true;
+                }
+            }
+            if (!covered) {
+                strays.add(member);
+            }
+        }
+        return strays;
+    }
+
+    // Reports every contract the module's functions, tests, types and lambdas break.
+    public validate() {
+        for (long i = 0; i < this.module.collectedFunctions().length(); i++) {
+            this.validateFunction(this.module.collectedFunctions().get(i));
+        }
+        for (long i = 0; i < this.module.collectedTests().length(); i++) {
+            this.validateExpressions(this.module.collectedTests().get(i).body(), CallSite.Test, null);
+        }
+        for (long i = 0; i < this.module.collectedTypes().length(); i++) {
+            this.validateTypeItem(this.module.collectedTypes().get(i));
+        }
+        for (long i = 0; i < this.module.collectedLambdas().length(); i++) {
+            this.validateLambda(this.module.collectedLambdas().get(i));
+        }
+    }
+
+    // A lambda's body is held to its target's throws list. It has no catch clauses of its own,
+    // so the fix for an unlisted failure is in a named function. A call reported for its missing
+    // 'try' is left out, since that report already names both fixes.
+    validateLambda(LambdaExpressionNode lambda) {
+        let outward = new ThrowSet();
+        this.module.collectLambdaThrows(lambda, outward, ThrowCount.UnmarkedJudgment);
+        if (!outward.raisesForCertain()) {
+            return;
+        }
+        Type[] allowed = this.lambdaTargetThrownTypes(lambda);
+        if (allowed.length == 0) {
+            string thrown = "";
+            string added = "what it throws";
+            if (!outward.isEmpty()) {
+                thrown = " {nameList(outward, this.names)}";
+                added = "the type";
+            }
+            this.reporter.report("This lambda's body can throw{thrown}, and its target function type "
+                + "declares no 'throws' list. Add {added} to the target's list, written after its "
+                + "return type as in '(() -> void throws IOError)', or "
+                + namedFunctionFix("throwing code"), lambda.arrow().span());
+            return;
+        }
+        let strays = this.strayUnderScope(outward, exceptions.throwSetOf(allowed, this.errorClass));
+        if (!strays.isEmpty()) {
+            this.reporter.report("This lambda's body can throw {nameList(strays, this.names)}, which its "
+                + "target function type does not list. Add it to the target's list, or "
+                + namedFunctionFix("throwing code"), lambda.arrow().span());
+        }
+    }
+
+    lambdaTargetThrownTypes(LambdaExpressionNode lambda) -> Type[] {
+        let info = this.result.lambdaOf(lambda.green());
+        if (info == null) {
+            return [];
+        }
+        let target = info.type();
+        if (target is FunctionType) {
+            return target.thrownTypes();
+        }
+        return [];
+    }
+
+    validateFunction(FunctionItem item) {
+        this.module.enterItemScope(item);
+        this.answeredScope = this.answeredSignatures(item);
+        let declaration = item.declaration;
+        let site = callSiteOf(item.signature, item.method);
+        let body = declaration.body();
+        if (body != null) {
+            this.validateExpressions(body, site, null);
+        }
+        for (long i = 0; i < declaration.catchClausesCount(); i++) {
+            this.validateExpressions(declaration.catchClauses(i).body(), catchBodySiteOf(site), null);
+        }
+        this.validateCaughtTypes(declaration);
+        this.validateParameterDefaults(declaration);
+        let outward = this.module.registry().judgedFor(declaration.green()) ?? new ThrowSet();
+        let method = item.method;
+        if (method != null && (method.isConstructor() || method.isDestructor())) {
+            this.validateNoEscape(item, method, outward);
+        } else {
+            this.validateContract(item, outward);
+            this.validateOverride(item);
+        }
+        this.validateCatchClauses(item);
+        this.module.leaveItemScope();
+        this.answeredScope = new List<Signature>();
+    }
+
+    // Checks the calls under the node. 'lambda' is the innermost lambda holding the node, and null
+    // outside every lambda, where 'site' is the kind of declaration holding it.
+    validateExpressions(SyntaxNode node, CallSite site, LambdaExpressionNode? lambda) {
+        switch (node) {
+            is TryExpressionNode tried -> {
+                let operand = tried.operand();
+                if (operand is CallExpressionNode) {
+                    this.validateCall(operand, true, tried.tryKeyword().span(), site, lambda);
+                    this.validateChildren(operand, site, lambda);
+                } else {
+                    this.validateExpressions(operand, site, lambda);
+                }
+            },
+            is CallExpressionNode call -> {
+                this.validateCall(call, false, call.span(), site, lambda);
+                this.validateChildren(call, site, lambda);
+            },
+            is LambdaExpressionNode inner -> {
+                this.validateChildren(inner, site, inner);
+            },
+            default -> {
+                this.validateChildren(node, site, lambda);
+            },
+        }
+    }
+
+    validateChildren(SyntaxNode node, CallSite site, LambdaExpressionNode? lambda) {
+        let children = node.childNodes();
+        for (long i = 0; i < children.length(); i++) {
+            this.validateExpressions(children.get(i), site, lambda);
+        }
+    }
+
+    validateCall(CallExpressionNode call, bool tried, Span triedAt, CallSite site,
+                 LambdaExpressionNode? lambda) {
+        let contract = this.module.callContract(call);
+        bool required = this.module.requiresTry(call, contract);
+        if (required && !tried) {
+            string raised = "can throw, because it is marked 'throws'.";
+            if (!contract.isEmpty()) {
+                raised = "can throw {nameList(contract, this.names)}.";
+            }
+            string fix = this.missingTryFix(contract, site, lambda);
+            this.reporter.report("Call to {calleePhrase(call)} {raised} {fix}", call.span());
+        }
+        if (!required && contract.raisesNothing() && tried) {
+            this.reporter.report("'try' is not needed here: {calleePhrase(call)} cannot throw. Remove 'try'.",
+                triedAt);
+        }
+    }
+
+    // The fix for a call that can throw and has no 'try', as its position allows. A test may throw
+    // anything, a function marked 'throws' is held to its own list separately, and a lambda may
+    // throw what its target function type lists. An override or implementation is offered the
+    // marker only when marking it compiles.
+    missingTryFix(ThrowSet contract, CallSite site, LambdaExpressionNode? lambda) -> string {
+        if (lambda != null) {
+            return this.lambdaTryFix(contract, lambda);
+        }
+        if (!this.marksCompile(contract)) {
+            if (site == CallSite.Unmarked) {
+                return "Prefix it with 'try', and catch it with a 'catch' clause after the body.";
+            }
+            if (site == CallSite.UnmarkedCatch) {
+                return "A 'catch' clause does not catch what its own body throws, and marking this method "
+                    + "'throws' would throw more than the method it answers to allows. Move the call into a "
+                    + "function that catches it with a 'catch' clause.";
+            }
+        }
+        return switch (site) {
+            CallSite.Unmarked -> "Prefix it with 'try', and either catch it with a 'catch' clause or mark "
+                + "this function 'throws'.",
+            CallSite.Marked -> "Prefix it with 'try'.",
+            CallSite.Constructor -> "Prefix it with 'try', and catch it with a 'catch' clause after the "
+                + "constructor body.",
+            CallSite.Destructor -> "Prefix it with 'try', and catch it with a 'catch' clause after the "
+                + "destructor body.",
+            CallSite.UnmarkedCatch -> "A 'catch' clause does not catch what its own body throws. Prefix it "
+                + "with 'try' and mark this function 'throws', or move the call into a function that "
+                + "catches it with a 'catch' clause.",
+            CallSite.ConstructorCatch -> "A 'catch' clause does not catch what its own body throws, and a "
+                + "constructor cannot be marked 'throws'. Move the call into a function that catches it "
+                + "with a 'catch' clause.",
+            CallSite.DestructorCatch -> "A 'catch' clause does not catch what its own body throws, and a "
+                + "destructor cannot be marked 'throws'. Move the call into a function that catches it "
+                + "with a 'catch' clause.",
+            CallSite.Test -> "Prefix it with 'try'.",
+        };
+    }
+
+    // The fix for a call in a lambda. The 'try' alone is enough when the target function type
+    // lists what the call can throw, or when the target's list has an entry that did not resolve.
+    lambdaTryFix(ThrowSet contract, LambdaExpressionNode lambda) -> string {
+        Type[] allowed = this.lambdaTargetThrownTypes(lambda);
+        let strays = this.strayUnderScope(contract, exceptions.throwSetOf(allowed, this.errorClass));
+        string added = "";
+        if (!strays.isEmpty()) {
+            added = nameList(strays, this.names);
+        } else if (contract.isEmpty() && allowed.length == 0) {
+            added = "what it throws";
+        }
+        if (added.length == 0) {
+            return "Prefix it with 'try'.";
+        }
+        return "Prefix it with 'try', and add {added} to the 'throws' list of the lambda's target "
+            + "function type, or " + namedFunctionFix("call");
+    }
+
+    // What the callable is judged on: its declared list when it names types, and otherwise what
+    // the judged sets hold for it. Without a judged set it is judged on its contract.
+    judgedContractOf(Signature signature) -> ThrowSet {
+        let declaration = signature.declaration();
+        if (signature.throwsTypes().length > 0 || declaration == null) {
+            return this.module.contractFor(signature);
+        }
+        return this.module.registry().judgedFor(declaration) ?? this.module.contractFor(signature);
+    }
+
+    // A constructor or destructor must handle everything its body can raise.
+    validateNoEscape(FunctionItem item, Method method, ThrowSet outward) {
+        if (!outward.raisesForCertain()) {
+            return;
+        }
+        string kind = "Constructor";
+        string word = "constructor";
+        if (method.isDestructor()) {
+            kind = "Destructor";
+            word = "destructor";
+        }
+        string ownerName = "";
+        let owner = item.owner;
+        if (owner != null) {
+            ownerName = " of '{this.names.nameOf(owner)}'";
+        }
+        string thrown = "";
+        if (!outward.isEmpty()) {
+            thrown = " {nameList(outward, this.names)}";
+        }
+        this.reporter.report("{kind}{ownerName} cannot let exceptions escape, but it can throw{thrown}. "
+            + "Catch the exceptions with 'catch' clauses after the {word} body.", item.signature.nameSpan());
+    }
+
+    validateContract(FunctionItem item, ThrowSet outward) {
+        let signature = item.signature;
+        if (signature.declaresThrows() && signature.throwsTypes().length > 0) {
+            let strays = this.strayUnderScope(outward, this.module.contractFor(signature));
+            if (!strays.isEmpty()) {
+                this.reporter.report("'{signature.name()}' can throw {nameList(strays, this.names)}, "
+                    + "which its 'throws' list does not name. Add it to the list, or catch it "
+                    + "with a 'catch' clause.", signature.nameSpan());
+            }
+            return;
+        }
+        if (signature.declaresThrows()) {
+            if (outward.raisesNothing() && item.declaration.body() != null) {
+                Span at = signature.nameSpan();
+                let throwsClause = item.declaration.throwsClause();
+                if (throwsClause != null) {
+                    at = throwsClause.throwsKeyword().span();
+                }
+                this.reporter.report("'{signature.name()}' is marked 'throws' but cannot "
+                    + "throw; remove 'throws'.", at);
+            }
+            return;
+        }
+        let markable = this.markable(outward, this.answeredSignatures(item));
+        if (!markable.isEmpty()) {
+            this.reporter.report("'{signature.name()}' can throw {nameList(markable, this.names)} but is "
+                + "not marked 'throws'. Add "
+                + "'throws {throwsClauseList(markable, this.names)}' after the signature, or "
+                + "catch it with a 'catch' clause after the body.", signature.nameSpan());
+        } else if (outward.isEmpty() && outward.raisesForCertain()) {
+            this.reporter.report("'{signature.name()}' can throw but is not marked 'throws'. Add 'throws' "
+                + "after the signature, or catch it with a 'catch' clause after the body.",
+                signature.nameSpan());
+        }
+    }
+
+    // The methods an override or an implementing method answers to: the method it overrides and
+    // every interface method it implements.
+    answeredSignatures(FunctionItem item) -> List<Signature> {
+        let answered = new List<Signature>();
+        let method = item.method;
+        let owner = item.owner;
+        if (method == null || owner == null) {
+            return answered;
+        }
+        let baseMethod = exceptions.findBaseMethod(owner, method);
+        if (baseMethod != null) {
+            answered.push(baseMethod.signature());
+        }
+        for (let implemented in types.interfacesOf(owner)) {
+            for (let level in types.interfaceLadderOf(implemented)) {
+                let required = types.methodsOf(level);
+                if (required == null) {
+                    continue;
+                }
+                for (long i = 0; i < required.length(); i++) {
+                    let provided = exceptions.findDeclaring(owner, required.get(i));
+                    if (provided != null && provided.signature().declaration() == item.declaration.green()) {
+                        answered.push(required.get(i).signature());
+                    }
+                }
+            }
+        }
+        return answered;
+    }
+
+    // The thrown members every answered method allows, so that marking the function 'throws' makes
+    // them legal. An answered method that is not marked 'throws' allows none, because a marked
+    // override of it is refused. A member one of them does not allow is reported as widening it.
+    markable(ThrowSet outward, List<Signature> answered) -> ThrowSet {
+        let kept = new ThrowSet();
+        for (long m = 0; m < outward.members().length(); m++) {
+            let member = outward.members().get(m);
+            if (this.allowedByAll(member, answered)) {
+                kept.add(member);
+            }
+        }
+        return kept;
+    }
+
+    // True when every answered method is marked 'throws' and allows the thrown type.
+    allowedByAll(Type thrown, List<Signature> answered) -> bool {
+        for (long a = 0; a < answered.length(); a++) {
+            let signature = answered.get(a);
+            if (!signature.declaresThrows()) {
+                return false;
+            }
+            let contract = this.module.contractFor(signature);
+            if (!contract.hasUnresolved() && !this.coveredBy(thrown, contract)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // True when marking the function being validated 'throws' would let the contract's types
+    // through every method it overrides or implements.
+    marksCompile(ThrowSet contract) -> bool {
+        if (this.answeredScope.length() == 0) {
+            return true;
+        }
+        for (long i = 0; i < this.answeredScope.length(); i++) {
+            if (!this.answeredScope.get(i).declaresThrows()) {
+                return false;
+            }
+        }
+        for (long m = 0; m < contract.members().length(); m++) {
+            if (!this.allowedByAll(contract.members().get(m), this.answeredScope)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // True when some member of the set is the thrown type or a superclass of it, in the active scope.
+    coveredBy(Type thrown, ThrowSet allowed) -> bool {
+        for (long a = 0; a < allowed.members().length(); a++) {
+            if (this.module.alwaysSubclass(thrown, allowed.members().get(a))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    validateOverride(FunctionItem item) {
+        let method = item.method;
+        let owner = item.owner;
+        if (method == null || owner == null) {
+            return;
+        }
+        let baseMethod = exceptions.findBaseMethod(owner, method);
+        if (baseMethod == null) {
+            return;
+        }
+        // An unmarked override of an unmarked base may throw nothing. A marked one is refused by layout.
+        let allowed = new ThrowSet();
+        if (baseMethod.signature().declaresThrows() || item.signature.declaresThrows()) {
+            allowed = this.module.contractFor(baseMethod.signature());
+        }
+        let strays = this.strayUnderScope(this.judgedContractOf(item.signature), allowed);
+        if (!strays.isEmpty()) {
+            this.reporter.report("Override '{method.name()}' can throw {nameList(strays, this.names)}, "
+                + "which the '{method.name()}' it overrides in "
+                + "'{this.names.of(baseMethod.definingType())}' does not list. An override "
+                + "throws only what the method it overrides allows.{catchFix(item.signature)}",
+                item.signature.nameSpan());
+        }
+    }
+
+    validateCaughtTypes(FunctionDeclarationNode declaration) {
+        for (long i = 0; i < declaration.catchClausesCount(); i++) {
+            let clause = declaration.catchClauses(i);
+            let binding = this.result.bindingOf(clause.green());
+            if (binding == null) {
+                continue;
+            }
+            Type caught = binding.type();
+            if (caught is ErrorType) {
+                continue;
+            }
+            let errorBase = this.errorClass;
+            if (errorBase == null) {
+                continue;
+            }
+            if (caught is TypeParamType) {
+                if (!this.module.alwaysSubclass(caught, errorBase)) {
+                    this.reporter.report("Cannot catch '{this.names.of(caught)}': a type "
+                        + "parameter is caught through its class bound, and "
+                        + "'{this.names.of(caught)}' has no bound under 'Error'. Bound it as "
+                        + "'{this.names.of(caught)}: Error', or by a subclass of 'Error'.",
+                        clause.caughtType().span());
+                }
+                continue;
+            }
+            if (!types.isClassLike(caught) || !types.isSubclassOf(caught, errorBase)) {
+                this.reporter.report("Cannot catch '{this.names.of(caught)}'; only 'Error' "
+                    + "or a subclass of it can be caught.", clause.caughtType().span());
+            }
+        }
+    }
+
+    validateCatchClauses(FunctionItem item) {
+        let declaration = item.declaration;
+        long clauseCount = declaration.catchClausesCount();
+        if (clauseCount == 0) {
+            return;
+        }
+        let bodySet = this.module.bodyThrows(declaration, ThrowCount.Contract);
+        if (bodySet.raisesNothing()) {
+            this.reporter.report("'{item.signature.name()}' has 'catch' clauses but its body "
+                + "cannot throw; remove them.",
+                declaration.catchClauses(0).catchKeyword().span());
+            return;
+        }
+        let clauseTypes = this.module.caughtClauseTypes(declaration);
+        for (long i = 0; i < clauseCount; i++) {
+            let clause = declaration.catchClauses(i);
+            let clauseType = clauseTypes.get(i);
+            if (clauseType == null) {
+                continue;
+            }
+            string shown = this.names.of(clauseType);
+            if (this.shadowedByEarlier(clauseType, clauseTypes, i)) {
+                this.reporter.report("This 'catch ({shown} ...)' is unreachable: an earlier "
+                    + "'catch' clause already handles it. Move it above that clause, or "
+                    + "remove it.", clause.caughtType().span());
+                continue;
+            }
+            if (!this.relatedToAny(clauseType, bodySet)) {
+                this.reporter.report("This 'catch ({shown} ...)' never runs: the body of "
+                    + "'{item.signature.name()}' cannot throw '{shown}' or a subclass of it. "
+                    + "Remove the clause.", clause.caughtType().span());
+            }
+        }
+    }
+
+    validateParameterDefaults(FunctionDeclarationNode declaration) {
+        let parameterList = declaration.parameters();
+        for (long i = 0; i < parameterList.parametersCount(); i++) {
+            let defaultValue = parameterList.parameters(i).defaultValue();
+            if (defaultValue != null) {
+                this.validateDefaultExpression(defaultValue.value(), "A default value");
+            }
+        }
+    }
+
+    validateDefaultExpression(SyntaxNode node, string label) {
+        if (node is CallExpressionNode) {
+            let contract = this.module.callContract(node);
+            if (this.module.requiresTry(node, contract)) {
+                string reason = "it is marked 'throws'";
+                if (!contract.isEmpty()) {
+                    reason = "it can throw {nameList(contract, this.names)}";
+                }
+                this.reporter.report("{label} cannot call {calleePhrase(node)} because {reason}; it must not "
+                    + "throw.", node.span());
+            }
+        }
+        let children = node.childNodes();
+        for (long i = 0; i < children.length(); i++) {
+            this.validateDefaultExpression(children.get(i), label);
+        }
+    }
+
+    validateTypeItem(TypeItem item) {
+        for (long i = 0; i < item.body.membersCount(); i++) {
+            let member = item.body.members(i);
+            if (member is FieldDeclarationNode) {
+                let defaultValue = member.defaultValue();
+                if (defaultValue != null) {
+                    this.validateDefaultExpression(defaultValue.value(),
+                        initializerLabel(item, member, this.names));
+                }
+            }
+        }
+        switch (item.declared) {
+            is ClassType classType -> {
+                this.validateInterfaceThrows(classType, item);
+            },
+            is StructType structType -> {
+                this.validateInterfaceThrows(structType, item);
+            },
+            is PrimitiveBinding binding -> {
+                this.validateInterfaceThrows(binding, item);
+            },
+            default -> { },
+        }
+    }
+
+    // Every conformance an owner declares holds its implementations to the interface's throws
+    // contract. A class is searched through its chain, while a struct and a primitive binding
+    // resolve to their own members.
+    validateInterfaceThrows(DeclaredType owner, TypeItem item) {
+        let checked = new Set<Type>();
+        for (let implemented in types.interfacesOf(owner)) {
+            for (let level in types.interfaceLadderOf(implemented)) {
+                if (!checked.add(level)) {
+                    continue;
+                }
+                this.validateLevelThrows(owner, item, level);
+            }
+        }
+    }
+
+    validateLevelThrows(DeclaredType owner, TypeItem item, Type level) {
+        let methods = types.methodsOf(level);
+        if (methods == null) {
+            return;
+        }
+        for (long i = 0; i < methods.length(); i++) {
+            let required = methods.get(i);
+            let provided = exceptions.findDeclaring(owner, required);
+            // A conditional member never satisfies an interface requirement; the layout phase
+            // already rejected the conformance, so there is no implementation to hold to the
+            // interface's contract here.
+            if (provided == null || provided.isConditional()) {
+                continue;
+            }
+            let allowed = this.module.contractFor(required.signature());
+            let strays = this.strayUnderScope(this.judgedContractOf(provided.signature()), allowed);
+            if (strays.isEmpty()) {
+                continue;
+            }
+            Span at = item.nameSpan;
+            string fix = "";
+            if (types.authorityOf(provided.definingType()) == owner) {
+                at = provided.signature().nameSpan();
+                fix = catchFix(provided.signature());
+            }
+            this.reporter.report("Method '{required.name()}' of '{this.names.nameOf(owner)}' can "
+                + "throw {nameList(strays, this.names)}, which the '{required.name()}' "
+                + "declared by interface '{this.names.of(level)}' does not list. An "
+                + "implementing method throws only what the interface lists.{fix}", at);
+        }
+    }
+}
+
+// How a diagnostic names the initializer it refuses. A lazy const is named outright, because a
+// read of one must never have to be a 'try'.
+initializerLabel(TypeItem item, FieldDeclarationNode member, TypeNames names) -> string {
+    if (members.fieldModifiers(member).declaresLazy) {
+        return "The initializer of lazy const "
+            + "'{names.nameOf(item.declared)}.{member.name().text()}'";
+    }
+    return "A field default";
+}
+
+// How a diagnostic names what a call calls. A function, method or variable holding a function
+// value is named by its quoted name. Any other callee is the function value its expression
+// produces, quoted when that expression is written on one line without a comment.
+calleePhrase(CallExpressionNode call) -> string {
+    switch (call.callee()) {
+        is IdentifierExpressionNode identifier -> {
+            return "'{identifier.name().text()}'";
+        },
+        is MemberExpressionNode member -> {
+            return "'{member.member().text()}'";
+        },
+        is SafeMemberExpressionNode member -> {
+            return "'{member.member().text()}'";
+        },
+        is SuperExpressionNode ignored -> {
+            return "'super'";
+        },
+        default -> {
+            let written = writtenOnOneLine(call.callee().green());
+            if (written == null) {
+                return "the function value";
+            }
+            return "the function value '{written}'";
+        },
+    }
+}
+
+// The node's text from its first token to its last, or null when a comment or a line break
+// sits between them. Whitespace, line breaks and comments are trivia on the tokens, so a comment
+// marker inside a string literal is text and never trivia.
+writtenOnOneLine(GreenNode node) -> string? {
+    let tokens = new List<GreenToken>();
+    collectTokens(node, tokens);
+    let builder = new StringBuilder();
+    string pending = "";
+    for (long i = 0; i < tokens.length(); i++) {
+        let token = tokens.get(i);
+        string full = token.fullText();
+        long contentStart = token.leadingLength();
+        long contentEnd = contentStart + token.contentLength();
+        if (i > 0) {
+            string between = pending + full.substring(0, contentStart);
+            if (between.contains("//") || between.contains("/*")) {
+                return null;
+            }
+            builder.append(between);
+        }
+        builder.append(token.text());
+        pending = full.substring(contentEnd);
+    }
+    string written = builder.toString();
+    if (written.contains("\n") || written.contains("\r")) {
+        return null;
+    }
+    return written;
+}
+
+// Every token under the node, in source order.
+collectTokens(GreenNode node, List<GreenToken> into) {
+    for (long i = 0; i < node.slotCount(); i++) {
+        switch (node.slot(i)) {
+            is GreenToken token -> {
+                into.push(token);
+            },
+            is GreenNode child -> {
+                collectTokens(child, into);
+            },
+            default -> { },
+        }
+    }
+}
+
+// The fix a widening refusal offers a method that is not marked 'throws': catching what it throws.
+// A method with a marker is held to its own list by its own reports, so it gets none here.
+catchFix(Signature signature) -> string {
+    if (signature.declaresThrows()) {
+        return "";
+    }
+    return " Catch it with a 'catch' clause after the body.";
+}
+
+// The fix that moves the throwing 'part' of a lambda into a named function.
+namedFunctionFix(string part) -> string {
+    return "move the {part} into a named function that catches it with a 'catch' clause.";
+}
+
+// Where a call is written. A missing 'try' is fixed differently in each place, and a call in a
+// 'catch' clause's body cannot be caught by that clause or its neighbors.
+enum CallSite {
+    Unmarked,
+    Marked,
+    Constructor,
+    Destructor,
+    Test,
+    UnmarkedCatch,
+    ConstructorCatch,
+    DestructorCatch,
+}
+
+callSiteOf(Signature signature, Method? method) -> CallSite {
+    if (method != null && method.isConstructor()) {
+        return CallSite.Constructor;
+    }
+    if (method != null && method.isDestructor()) {
+        return CallSite.Destructor;
+    }
+    if (signature.declaresThrows()) {
+        return CallSite.Marked;
+    }
+    return CallSite.Unmarked;
+}
+
+// The same site inside one of its 'catch' clauses. A marked function stays marked there.
+catchBodySiteOf(CallSite site) -> CallSite {
+    return switch (site) {
+        CallSite.Unmarked -> CallSite.UnmarkedCatch,
+        CallSite.Constructor -> CallSite.ConstructorCatch,
+        CallSite.Destructor -> CallSite.DestructorCatch,
+        default -> site,
+    };
+}
+
+// The set's types as a diagnostic reads them: each quoted, alphabetical, comma-separated.
+nameList(ThrowSet set, TypeNames names) -> string {
+    string[] sorted = sortedSpellings(set, names);
+    let builder = new StringBuilder();
+    for (long i = 0; i < sorted.length; i++) {
+        if (i > 0) {
+            builder.append(", ");
+        }
+        builder.append("'");
+        builder.append(sorted[i]);
+        builder.append("'");
+    }
+    return builder.toString();
+}
+
+// The same types unquoted, so a message can quote a whole 'throws IOError, ParseError' clause
+// for a reader to paste.
+throwsClauseList(ThrowSet set, TypeNames names) -> string {
+    return string.joined(sortedSpellings(set, names), ", ");
+}
+
+// The thrown types spelled and ordered, so two runs name them the same way.
+sortedSpellings(ThrowSet set, TypeNames names) -> string[] {
+    let spellings = new List<string>();
+    for (long i = 0; i < set.members().length(); i++) {
+        spellings.push(names.of(set.members().get(i)));
+    }
+    string[] sorted = spellings.toArray();
+    for (long i = 1; i < sorted.length; i++) {
+        string current = sorted[i];
+        long j = i - 1;
+        while (j >= 0 && isTextAfter(sorted[j], current)) {
+            sorted[j + 1] = sorted[j];
+            j--;
+        }
+        sorted[j + 1] = current;
+    }
+    return sorted;
+}
+
+isTextAfter(string left, string right) -> bool {
+    byte[] leftBytes = left.toBytes();
+    byte[] rightBytes = right.toBytes();
+    long limit = leftBytes.length;
+    if (rightBytes.length < limit) {
+        limit = rightBytes.length;
+    }
+    for (long i = 0; i < limit; i++) {
+        if (leftBytes[i] != rightBytes[i]) {
+            return leftBytes[i] > rightBytes[i];
+        }
+    }
+    return leftBytes.length > rightBytes.length;
+}
