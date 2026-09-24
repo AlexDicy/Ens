@@ -133,6 +133,7 @@ An `else if` chain of about 2500 links makes the front end exit with code 127 an
 `ens check libs/std --stdlib libs` reports 32 problems such as "expected 'Path (from std.fs)', got 'Path'": std checked as a package while it is also the standard library gives two copies of every std type; `check` should refuse the pairing or treat the folder as the library (2026-09-24).
 A four-character char literal, `char b = '0100';` or `byte a = '0100';`, passes `check`; "Character literal does not fit in 'byte'" does not name the literal (rule 1); "the fallback has to be a 'int' too" has the wrong article (found 2026-09-24 by review 9 of the nullable-operand family).
 A generic class or struct cannot pair `hash` with `equals` in any spelling: `override equals(Box<T> other)` is refused as overriding nothing, an unmarked `equals(Box<T> other)` still draws "defines 'hash' but not 'equals'", and the struct form contradicts itself; `equalsIntent` (members.ens ~1527) does not match a parameter of the owner's own instantiation, and the pairing fix spells `'Box'` without its type parameters (found 2026-09-24 by texts review 5; own commit).
+A workspace `ens.package` with syntax errors is treated as a workspace with no members by `build`, `check` and `test`, which then say "This workspace has no members" instead of reporting the manifest's errors; and `f<>() { }`, an empty type-parameter list, is accepted (found 2026-09-25 by the prose sweep review).
 
 ## The language server's replacement
 
