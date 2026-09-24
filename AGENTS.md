@@ -200,6 +200,7 @@ How a check runs:
 
 18. Every message is rendered with a representative value and read as text, in every combination its helpers produce.
 19. A changed message moves its pin, an `@expect-error` or `@expect-note` line or an exact-text assertion, and never weakens it to a substring a worse message would satisfy; a message with no pin gains one.
+20. Every message is read once, the way a newcomer reads it: one idea per sentence, concrete verbs such as throw, call, declare, remove and write, and none of 'answers to', 'stands for', 'reaches', 'holds', 'in place of' or 'governs'; a sentence that needs a second reading is rewritten.
 
 Never copy a weak message for parity with anything; write the good version.
 
