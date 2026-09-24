@@ -12,6 +12,7 @@ import GreenNode from @ens.frontend.syntax.green;
 import GreenToken from @ens.frontend.syntax.green;
 import Span from @ens.frontend.support.source;
 import Reporter from support.diagnostics;
+import support.diagnostics;
 import SemaResult from result;
 import phases.exceptions;
 import ModuleExceptions from phases.exceptions;
@@ -310,10 +311,10 @@ public final class ThrowValidation {
         if (!outward.raisesForCertain()) {
             return;
         }
-        string kind = "Constructor";
+        string kind = "The constructor";
         string word = "constructor";
         if (method.isDestructor()) {
-            kind = "Destructor";
+            kind = "The destructor";
             word = "destructor";
         }
         string ownerName = "";
@@ -347,12 +348,17 @@ public final class ThrowValidation {
                 if (throwsClause != null) {
                     at = throwsClause.throwsKeyword().span();
                 }
-                this.reporter.report("'{signature.name()}' is marked 'throws' but cannot "
-                    + "throw; remove 'throws'.", at);
+                this.reporter.report("'{signature.name()}' is marked 'throws', but no exception "
+                    + "can leave its body. Remove 'throws'.", at);
             }
             return;
         }
-        let markable = this.markable(outward, this.answeredSignatures(item));
+        let answered = this.answeredSignatures(item);
+        let markable = this.markable(outward, answered);
+        // A type the overridden or implemented method does not list is reported as widening it.
+        if (answered.length() > 0 && markable.members().length() < outward.members().length()) {
+            return;
+        }
         if (!markable.isEmpty()) {
             this.reporter.report("'{signature.name()}' can throw {nameList(markable, this.names)} but is "
                 + "not marked 'throws'. Add "
@@ -464,17 +470,22 @@ public final class ThrowValidation {
             return;
         }
         // An unmarked override of an unmarked base may throw nothing. A marked one is refused by layout.
+        if (item.signature.declaresThrows() && !baseMethod.signature().declaresThrows()) {
+            return;
+        }
         let allowed = new ThrowSet();
         if (baseMethod.signature().declaresThrows() || item.signature.declaresThrows()) {
             allowed = this.module.contractFor(baseMethod.signature());
         }
-        let strays = this.strayUnderScope(this.judgedContractOf(item.signature), allowed);
+        let thrown = this.judgedContractOf(item.signature);
+        let strays = this.strayUnderScope(thrown, allowed);
         if (!strays.isEmpty()) {
+            string baseName = this.names.of(baseMethod.definingType());
+            let fix = widenedThrowsFix(item.signature, baseMethod, baseName,
+                sharesPackage(baseMethod.definingType(), owner), strays, thrown, this.names);
             this.reporter.report("Override '{method.name()}' can throw {nameList(strays, this.names)}, "
-                + "which the '{method.name()}' it overrides in "
-                + "'{this.names.of(baseMethod.definingType())}' does not list. An override "
-                + "throws only what the method it overrides allows.{catchFix(item.signature)}",
-                item.signature.nameSpan());
+                + "which the '{method.name()}' it overrides in '{baseName}' does not list. An "
+                + "override throws only what the method it overrides lists.{fix}", item.signature.nameSpan());
         }
     }
 
@@ -518,9 +529,14 @@ public final class ThrowValidation {
         }
         let bodySet = this.module.bodyThrows(declaration, ThrowCount.Contract);
         if (bodySet.raisesNothing()) {
-            this.reporter.report("'{item.signature.name()}' has 'catch' clauses but its body "
-                + "cannot throw; remove them.",
-                declaration.catchClauses(0).catchKeyword().span());
+            string name = item.signature.name();
+            string message = "'{name}' has a 'catch' clause, but its body cannot throw, so the "
+                + "clause never runs. Remove the 'catch' clause.";
+            if (clauseCount > 1) {
+                message = "'{name}' has {diagnostics.countWord(clauseCount)} 'catch' clauses, but its body "
+                    + "cannot throw, so they never run. Remove the 'catch' clauses.";
+            }
+            this.reporter.report(message, declaration.catchClauses(0).catchKeyword().span());
             return;
         }
         let clauseTypes = this.module.caughtClauseTypes(declaration);
@@ -548,28 +564,37 @@ public final class ThrowValidation {
     validateParameterDefaults(FunctionDeclarationNode declaration) {
         let parameterList = declaration.parameters();
         for (long i = 0; i < parameterList.parametersCount(); i++) {
-            let defaultValue = parameterList.parameters(i).defaultValue();
+            let parameter = parameterList.parameters(i);
+            let defaultValue = parameter.defaultValue();
             if (defaultValue != null) {
-                this.validateDefaultExpression(defaultValue.value(), "A default value");
+                this.validateDefaultExpression(defaultValue.value(),
+                    "The default value of parameter '{parameter.name().text()}'",
+                    "A default value runs at each call that leaves the argument out, and no 'try' "
+                    + "can be written there.");
             }
         }
     }
 
-    validateDefaultExpression(SyntaxNode node, string label) {
+    // A call in a default or an initializer is refused when it can throw. 'label' opens the
+    // refusal. 'why' is the reason no exception may leave the call.
+    validateDefaultExpression(SyntaxNode node, string label, string why) {
         if (node is CallExpressionNode) {
             let contract = this.module.callContract(node);
             if (this.module.requiresTry(node, contract)) {
-                string reason = "it is marked 'throws'";
+                string reason = "is marked 'throws'";
+                string caught = "what it throws";
                 if (!contract.isEmpty()) {
-                    reason = "it can throw {nameList(contract, this.names)}";
+                    reason = "can throw {nameList(contract, this.names)}";
+                    caught = nameList(contract, this.names);
                 }
-                this.reporter.report("{label} cannot call {calleePhrase(node)} because {reason}; it must not "
-                    + "throw.", node.span());
+                this.reporter.report("{label} calls {calleePhrase(node)}, which {reason}. {why} "
+                    + "Move the call into a function that catches {caught} with a 'catch' clause, "
+                    + "and call that function here.", node.span());
             }
         }
         let children = node.childNodes();
         for (long i = 0; i < children.length(); i++) {
-            this.validateDefaultExpression(children.get(i), label);
+            this.validateDefaultExpression(children.get(i), label, why);
         }
     }
 
@@ -580,7 +605,8 @@ public final class ThrowValidation {
                 let defaultValue = member.defaultValue();
                 if (defaultValue != null) {
                     this.validateDefaultExpression(defaultValue.value(),
-                        initializerLabel(item, member, this.names));
+                        initializerLabel(item, member, this.names),
+                        initializerReason(item, member, this.names));
                 }
             }
         }
@@ -628,7 +654,8 @@ public final class ThrowValidation {
                 continue;
             }
             let allowed = this.module.contractFor(required.signature());
-            let strays = this.strayUnderScope(this.judgedContractOf(provided.signature()), allowed);
+            let thrown = this.judgedContractOf(provided.signature());
+            let strays = this.strayUnderScope(thrown, allowed);
             if (strays.isEmpty()) {
                 continue;
             }
@@ -636,9 +663,10 @@ public final class ThrowValidation {
             string fix = "";
             if (types.authorityOf(provided.definingType()) == owner) {
                 at = provided.signature().nameSpan();
-                fix = catchFix(provided.signature());
+                fix = widenedThrowsFix(provided.signature(), required, this.names.of(level),
+                    sharesPackage(level, owner), strays, thrown, this.names);
             }
-            this.reporter.report("Method '{required.name()}' of '{this.names.nameOf(owner)}' can "
+            this.reporter.report("Method '{required.name()}' of {members.ownerPhrase(owner, this.names)} can "
                 + "throw {nameList(strays, this.names)}, which the '{required.name()}' "
                 + "declared by interface '{this.names.of(level)}' does not list. An "
                 + "implementing method throws only what the interface lists.{fix}", at);
@@ -646,14 +674,21 @@ public final class ThrowValidation {
     }
 }
 
-// How a diagnostic names the initializer it refuses. A lazy const is named outright, because a
-// read of one must never have to be a 'try'.
+// How a diagnostic names the initializer it refuses.
 initializerLabel(TypeItem item, FieldDeclarationNode member, TypeNames names) -> string {
     if (members.fieldModifiers(member).declaresLazy) {
         return "The initializer of lazy const "
             + "'{names.nameOf(item.declared)}.{member.name().text()}'";
     }
-    return "A field default";
+    return "The default value of field '{member.name().text()}'";
+}
+
+// Why the refused initializer may not throw, as a sentence.
+initializerReason(TypeItem item, FieldDeclarationNode member, TypeNames names) -> string {
+    if (members.fieldModifiers(member).declaresLazy) {
+        return "A lazy const is read without 'try', so its initializer must not throw.";
+    }
+    return "A field default runs as each object is built, where no 'try' can be written.";
 }
 
 // How a diagnostic names what a call calls. A function, method or variable holding a function
@@ -686,7 +721,7 @@ calleePhrase(CallExpressionNode call) -> string {
 // The node's text from its first token to its last, or null when a comment or a line break
 // sits between them. Whitespace, line breaks and comments are trivia on the tokens, so a comment
 // marker inside a string literal is text and never trivia.
-writtenOnOneLine(GreenNode node) -> string? {
+public writtenOnOneLine(GreenNode node) -> string? {
     let tokens = new List<GreenToken>();
     collectTokens(node, tokens);
     let builder = new StringBuilder();
@@ -728,13 +763,55 @@ collectTokens(GreenNode node, List<GreenToken> into) {
     }
 }
 
-// The fix a widening refusal offers a method that is not marked 'throws': catching what it throws.
-// A method with a marker is held to its own list by its own reports, so it gets none here.
-catchFix(Signature signature) -> string {
-    if (signature.declaresThrows()) {
-        return "";
+// True when the declaration behind 'declaring' belongs to the same package as 'owner'.
+sharesPackage(Type declaring, DeclaredType owner) -> bool {
+    let declared = types.authorityOf(declaring);
+    return declared != null && declared.packagePrefix() == owner.packagePrefix();
+}
+
+// The fixes a widening refusal offers, which catch the extra exceptions or, when this package
+// declares the overridden method, add them to its 'throws' list.
+widenedThrowsFix(Signature provided, Method overridden, string overriddenOwner, bool widenable,
+                 ThrowSet strays, ThrowSet thrown, TypeNames names) -> string {
+    string caught = nameList(strays, names);
+    string clauses = "a 'catch' clause";
+    if (strays.members().length() > 1) {
+        clauses = "'catch' clauses";
     }
-    return " Catch it with a 'catch' clause after the body.";
+    string fix = " Catch {caught} with {clauses} after the body.";
+    if (provided.declaresThrows()) {
+        string removal = "Remove 'throws'";
+        Type[] written = provided.throwsTypes();
+        if (written.length > 0) {
+            let spellings = new List<string>();
+            bool allStray = true;
+            for (let entry in written) {
+                spellings.push(names.of(entry));
+                if (!strays.members().contains(entry)) {
+                    allStray = false;
+                }
+            }
+            removal = "Remove 'throws {string.joined(spellings.toArray(), ", ")}'";
+            if (!allStray) {
+                removal = "Remove {caught} from its 'throws' list";
+            }
+        }
+        fix = " {removal} and catch {caught} with {clauses} after the body.";
+    }
+    if (!widenable) {
+        return fix;
+    }
+    string clause = "'throws {throwsClauseList(strays, names)}'";
+    string where = "'{overridden.name()}' in '{overriddenOwner}'";
+    string widen = "Or mark {where} with {clause}";
+    if (overridden.signature().declaresThrows()) {
+        widen = "Or add {caught} to the 'throws' list of {where}";
+    }
+    if (!provided.declaresThrows()) {
+        widen = "{widen}, and write 'throws {throwsClauseList(thrown, names)}' after the signature of "
+            + "this '{provided.name()}'";
+    }
+    return "{fix} {widen}.";
 }
 
 // The fix that moves the throwing 'part' of a lambda into a named function.
@@ -778,19 +855,13 @@ catchBodySiteOf(CallSite site) -> CallSite {
     };
 }
 
-// The set's types as a diagnostic reads them: each quoted, alphabetical, comma-separated.
+// The set's types as a diagnostic lists them, each quoted, in alphabetical order.
 nameList(ThrowSet set, TypeNames names) -> string {
-    string[] sorted = sortedSpellings(set, names);
-    let builder = new StringBuilder();
-    for (long i = 0; i < sorted.length; i++) {
-        if (i > 0) {
-            builder.append(", ");
-        }
-        builder.append("'");
-        builder.append(sorted[i]);
-        builder.append("'");
+    let quoted = new List<string>();
+    for (let spelling in sortedSpellings(set, names)) {
+        quoted.push("'{spelling}'");
     }
-    return builder.toString();
+    return diagnostics.andJoined(quoted.toArray());
 }
 
 // The same types unquoted, so a message can quote a whole 'throws IOError, ParseError' clause

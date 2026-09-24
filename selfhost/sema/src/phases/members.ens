@@ -23,6 +23,8 @@ import MemberConstraint from model.types;
 import DeclaredType from model.types;
 import StructType from model.types;
 import ClassType from model.types;
+import InterfaceType from model.types;
+import PrimitiveBinding from model.types;
 import TypeParamType from model.types;
 import PrimitiveKind from model.types;
 import PrimitiveType from model.types;
@@ -54,6 +56,7 @@ public final class MemberModifiers {
     protected Span? lazyMark;
     protected Span? abstractMark;
     protected Span? finalMark;
+    protected Span? overrideMark;
 
     protected constructor() {
         this.visibilityMarks = new List<MemberVisibilityMark>();
@@ -83,6 +86,7 @@ public final class MemberModifiers {
             },
             OverrideKeyword -> {
                 this.declaresOverride = true;
+                this.overrideMark = span;
             },
             SealedKeyword -> {
                 this.declaresSealed = true;
@@ -110,6 +114,14 @@ public final class MemberModifiers {
 
     public hasVisibilityModifier() -> bool {
         return this.visibilityMarks.length() > 0;
+    }
+
+    // The first visibility modifier as written, or null when the member carries none.
+    public visibilityModifierWord() -> string? {
+        if (this.visibilityMarks.length() == 0) {
+            return null;
+        }
+        return types.visibilityWord(this.visibilityMarks.get(0).marked);
     }
 
     // Where a diagnostic about the visibility modifier points: the first mark, or the fallback
@@ -149,6 +161,15 @@ public final class MemberModifiers {
 
     public finalModifierSpan(Span fallback) -> Span {
         let mark = this.finalMark;
+        if (mark == null) {
+            return fallback;
+        }
+        return mark;
+    }
+
+    // Where a diagnostic about the 'override' modifier points.
+    public overrideModifierSpan(Span fallback) -> Span {
+        let mark = this.overrideMark;
         if (mark == null) {
             return fallback;
         }
@@ -395,16 +416,25 @@ declarationSubject(string kind, SyntaxToken? name) -> string {
     return "{kind} '{name.text()}'";
 }
 
-public checkMemberModifiers(Reporter reporter, FunctionDeclarationNode declaration) {
+// How a diagnostic opens on the constructor or the destructor of the named type.
+public specialMemberSubject(bool isConstructor, string ownerName) -> string {
+    string word = "destructor";
+    if (isConstructor) {
+        word = "constructor";
+    }
+    return "The {word} of '{ownerName}'";
+}
+
+public checkMemberModifiers(Reporter reporter, FunctionDeclarationNode declaration, string ownerName) {
     let introducer = declaration.introducer();
     string subject = declarationSubject("Method", declaration.name());
     if (introducer != null) {
         switch (introducer.kind()) {
             ConstructorKeyword -> {
-                subject = "A constructor";
+                subject = specialMemberSubject(true, ownerName);
             },
             DestructorKeyword -> {
-                subject = "A destructor";
+                subject = specialMemberSubject(false, ownerName);
             },
             default -> { },
         }
@@ -457,8 +487,8 @@ overMarkedMessage(string subject, Visibility declared, DeclaredType owner, TypeN
     string declaredWord = types.visibilityWord(declared);
     string problem = overMarkedProblem(subject, declared, owner, names);
     if (owner.visibility() == Visibility.Private) {
-        return "{problem} Remove '{declaredWord}'. An unmarked member of '{ownerName}' already "
-            + "reaches its whole file.";
+        return "{problem} Remove '{declaredWord}'. An unmarked member of '{ownerName}' can "
+            + "already be used anywhere in its file.";
     }
     string ownerWord = types.visibilityWord(owner.visibility());
     return "{problem} Replace '{declaredWord}' with '{ownerWord}', or mark '{ownerName}' "
@@ -468,7 +498,8 @@ overMarkedMessage(string subject, Visibility declared, DeclaredType owner, TypeN
 // The sentence refusing a member marked more visible than its owner.
 overMarkedProblem(string subject, Visibility declared, DeclaredType owner, TypeNames names) -> string {
     return "{subject} cannot be '{types.visibilityWord(declared)}' while '{names.nameOf(owner)}' "
-        + "is {ownerReachPhrase(owner)}, because a member is never more visible than the type that holds it.";
+        + "is {ownerReachPhrase(owner)}, because a member is never more visible than the type that "
+        + "declares it.";
 }
 
 // The first visibility mark written on a member, or null when it carries none. Every mark after
@@ -480,18 +511,22 @@ writtenVisibilityMark(MemberModifiers modifiers, string memberName, Visibility u
     if (marks.length() == 0) {
         return null;
     }
-    for (long i = 1; i < marks.length(); i++) {
-        reporter.report("'{memberName}' already has a visibility modifier; remove "
-            + "'{types.visibilityWord(marks.get(i).marked)}'.", marks.get(i).markSpan);
-    }
     let mark = marks.get(0);
+    string subject = "'{memberName}'";
+    if (memberName == "constructor") {
+        subject = specialMemberSubject(true, names.nameOf(owner));
+    }
+    for (long i = 1; i < marks.length(); i++) {
+        reporter.report(types.repeatedVisibilityMessage(subject, mark.marked, marks.get(i).marked),
+            marks.get(i).markSpan);
+    }
     if (mark.marked == Visibility.Private) {
         reporter.report(privateMarkMessage(memberName, unmarked, owner, names), mark.markSpan);
     }
     return mark;
 }
 
-// The refusal of a written 'private', with how far the member reaches unmarked. A constructor's
+// The refusal of a written 'private', with how far the member is visible unmarked. A constructor's
 // member name is 'constructor', its keyword.
 privateMarkMessage(string memberName, Visibility unmarked, DeclaredType owner,
                    TypeNames names) -> string {
@@ -501,12 +536,12 @@ privateMarkMessage(string memberName, Visibility unmarked, DeclaredType owner,
         target = "the constructor of '{ownerName}'";
     }
     if (owner.visibility() == Visibility.Private) {
-        return "A member of '{ownerName}' always reaches the whole file '{ownerName}' is declared "
-            + "in, so 'private' is never written. Remove it from {target}.";
+        return "A member of '{ownerName}' can be used anywhere in the file that declares "
+            + "'{ownerName}', so 'private' is never written. Remove it from {target}.";
     }
     if (unmarked != Visibility.Private) {
         return "'{memberName}' takes the visibility of '{ownerName}', so 'private' is never written. "
-            + "Remove it.";
+            + "Remove it from {target}.";
     }
     return "A member is private to its type unless it is marked, so 'private' is never written. "
         + "Remove it from {target}.";
@@ -690,8 +725,7 @@ public checkStaticFieldShape(Reporter reporter, FieldDeclarationNode declaration
     }
     if (declaration.defaultValue() == null) {
         reporter.report("Static const '{name}' needs its value on the declaration, because "
-            + "nothing else ever assigns it: write 'static const {shownType} {name} = ...'.",
-            at);
+            + "nothing else ever assigns it. Write 'static const {shownType} {name} = ...'.", at);
     }
     if (!isConstantFamily(field.type())) {
         reporter.report("Static const '{name}' has type '{shownType}', and a static const "
@@ -728,7 +762,7 @@ public checkLazyFieldShape(Reporter reporter, FieldDeclarationNode declaration, 
     }
     if (declaration.defaultValue() == null) {
         reporter.report("Lazy const '{name}' needs its value on the declaration, because "
-            + "nothing else ever assigns it: write 'lazy const {shownType} {name} = ...'.", at);
+            + "nothing else ever assigns it. Write 'lazy const {shownType} {name} = ...'.", at);
     }
     if (types.isVoidType(field.type())) {
         reporter.report("Lazy const '{name}' cannot have type 'void'; 'void' means no value. "
@@ -771,19 +805,20 @@ isConstantFamily(Type type) -> bool {
 // nothing marks it 'final' or 'abstract'. Constructors and destructors describe instances, so
 // they cannot be static either.
 public checkStaticMethodMarkers(Reporter reporter, MemberModifiers modifiers, string methodName,
-                                bool isConstructor, bool isDestructor, Span nameSpan) {
+                                bool isConstructor, bool isDestructor, Span nameSpan, string ownerName) {
     if (!modifiers.declaresStatic) {
         return;
     }
     Span at = modifiers.staticModifierSpan(nameSpan);
     if (isConstructor) {
-        reporter.report("A constructor cannot be 'static'; it always builds an instance. "
-            + "Remove 'static', or make it a static method that returns the new instance.", at);
+        reporter.report("{specialMemberSubject(true, ownerName)} cannot be 'static'. A "
+            + "constructor always builds a new object. Remove 'static', or make it a static method "
+            + "that returns the new object.", at);
         return;
     }
     if (isDestructor) {
-        reporter.report("A destructor cannot be 'static'; it runs when an instance is "
-            + "destroyed. Remove 'static'.", at);
+        reporter.report("{specialMemberSubject(false, ownerName)} cannot be 'static'. A destructor "
+            + "runs when the object is destroyed. Remove 'static'.", at);
         return;
     }
     if (modifiers.declaresAbstract) {
@@ -857,8 +892,9 @@ public collectStaticMethod(TypeResolver resolver, Reporter reporter, DeclaredTyp
                            List<Method> staticMethods, FunctionDeclarationNode member,
                            string methodName, Span nameSpan, MemberModifiers modifiers,
                            TypeNames names, bool allowBodiless = false) {
-    MemberConstraint[] constraints = readMemberConstraints(resolver, reporter, owner, member,
-        "Static method '{methodName}' of '{names.nameOf(owner)}'", names);
+    string ownerName = names.nameOf(owner);
+    string subject = "Static method '{methodName}' of {ownerPhrase(owner, names)}";
+    MemberConstraint[] constraints = readMemberConstraints(resolver, reporter, owner, member, subject, names);
     if (constraints.length > 0) {
         resolver.pushMemberConstraints(owner.declaration(), constraints);
     }
@@ -868,19 +904,43 @@ public collectStaticMethod(TypeResolver resolver, Reporter reporter, DeclaredTyp
         resolver.popMemberConstraints();
     }
     Visibility visibility = memberVisibility(modifiers, owner, "Method", methodName, reporter, names);
-    checkStaticMethodMarkers(reporter, modifiers, methodName, false, false, nameSpan);
-    checkThrowsPlacement(reporter, member, false, modifiers.declaresAbstract);
-    checkNoreturnPlacement(reporter, member, false, false, modifiers.declaresNoreturn);
+    checkStaticMethodMarkers(reporter, modifiers, methodName, false, false, nameSpan, ownerName);
+    checkThrowsPlacement(reporter, member, false, modifiers.declaresAbstract, owner, names);
+    checkNoreturnPlacement(reporter, member, false, false, modifiers.declaresNoreturn, ownerName);
     checkStaticInstanceCollision(reporter, owner, methodName, true, nameSpan, names);
     checkStaticFieldMethodCollision(reporter, owner, methodName, nameSpan, names);
     if (findSameSignature(staticMethods, methodName, signature) != null) {
-        reporter.report("Static method '{methodName}' of '{names.nameOf(owner)}' is already "
-            + "declared with the same parameter types; overloads must differ in parameter count "
-            + "or types.", nameSpan);
+        reporter.report(repeatedOverloadMessage(subject, "methods"), nameSpan);
         return;
     }
     staticMethods.push(new Method(signature, visibility, false, false, false, false, false,
         true, member.body() != null, constraints, owner));
+}
+
+// The refusal of a callable declared again with the same name and parameter types. The subject
+// opens the sentence. The kind is the plural of what shares the name, such as 'methods'.
+public repeatedOverloadMessage(string subject, string kindPlural) -> string {
+    return "{subject} is already declared with the same parameter types. Two {kindPlural} can "
+        + "share a name only when their parameters differ in number or type. Rename one of them, "
+        + "or change the parameters of one.";
+}
+
+// How a member diagnostic names the type that declares the member, after the word 'of'.
+public ownerPhrase(DeclaredType owner, TypeNames names) -> string {
+    switch (owner) {
+        is StructType declared -> {
+            return "struct '{names.nameOf(declared)}'";
+        },
+        is InterfaceType declared -> {
+            return "interface '{names.nameOf(declared)}'";
+        },
+        is PrimitiveBinding binding -> {
+            return "the '{binding.name()}' binding";
+        },
+        default -> {
+            return "'{names.nameOf(owner)}'";
+        },
+    }
 }
 
 // A static method may not share its name with a static const of the same type; the two sides of
@@ -1033,7 +1093,16 @@ public buildSignature(TypeResolver resolver, Reporter reporter,
                       TypeParamType[] typeParameters) -> Signature {
     let store = resolver.typeStore();
     if (declaration.body() == null && declaration.semicolon() != null && !allowBodiless) {
-        reporter.report("Shorthand declaration ';' is only allowed on a constructor.", nameSpan);
+        string rule = "A function outside a class or a struct always needs a body.";
+        if (functionModifiers(declaration).declaresStatic) {
+            rule = "A static method always needs a body.";
+        } else if (receiverType is ClassType) {
+            rule = "Only a constructor or an 'abstract' method can leave out its body.";
+        } else if (receiverType is StructType) {
+            rule = "Only a constructor can leave out its body.";
+        }
+        reporter.report("'{name}' has no body; it ends in ';'. {rule} Replace the ';' with a body "
+            + "between '\{' and '\}'.", nameSpan);
     }
 
     let parameterList = declaration.parameters();
@@ -1133,19 +1202,19 @@ reportUnboundShorthand(Reporter reporter, DeclaredType receiverType, string para
 // where it is part of the contract. It is never legal on a constructor or destructor, and a
 // 'noreturn' callable declares no return type because it returns nothing at all.
 public checkNoreturnPlacement(Reporter reporter, FunctionDeclarationNode declaration,
-                              bool isConstructor, bool isDestructor, bool isNoreturn) {
+                              bool isConstructor, bool isDestructor, bool isNoreturn, string ownerName) {
     if (!isNoreturn) {
         return;
     }
     Span at = noreturnModifierSpan(declaration);
     if (isConstructor) {
-        reporter.report("A constructor cannot be marked 'noreturn'; a constructor always "
-            + "returns the new instance. Remove 'noreturn'.", at);
+        reporter.report("{specialMemberSubject(true, ownerName)} cannot be marked 'noreturn'. A "
+            + "constructor always returns the new object. Remove 'noreturn'.", at);
         return;
     }
     if (isDestructor) {
-        reporter.report("A destructor cannot be marked 'noreturn'; it runs during cleanup and "
-            + "must return. Remove 'noreturn'.", at);
+        reporter.report("{specialMemberSubject(false, ownerName)} cannot be marked 'noreturn'. A "
+            + "destructor runs when the object is destroyed, and it always returns. Remove 'noreturn'.", at);
         return;
     }
     let returnClause = declaration.returnType();
@@ -1197,21 +1266,38 @@ public checkFieldMethodCollision(Reporter reporter, DeclaredType owner, string m
 
 // An abstract method has no body to infer thrown types from, so its clause must list them.
 public checkThrowsPlacement(Reporter reporter, FunctionDeclarationNode declaration,
-                            bool isConstructor, bool isAbstract) {
+                            bool isConstructor, bool isAbstract, DeclaredType? owner, TypeNames names) {
     let throwsClause = declaration.throwsClause();
     if (throwsClause == null) {
         return;
     }
     Span at = throwsClause.throwsKeyword().span();
-    if (isConstructor) {
-        reporter.report("A constructor cannot be marked 'throws'. Handle the exceptions with a "
-            + "'catch' clause after the constructor body.", at);
+    if (owner != null && isConstructor) {
+        reporter.report("{specialMemberSubject(true, names.nameOf(owner))} cannot be marked "
+            + "'throws'. A constructor never throws, so building an object never needs 'try'. "
+            + "Remove 'throws', and catch the exceptions with 'catch' clauses after the "
+            + "constructor body.", at);
         return;
     }
-    if (isAbstract && throwsClause.typesCount() == 0) {
-        reporter.report("An abstract method marked 'throws' must list its exception types, "
-            + "for example 'throws IOError'.", at);
+    if (throwsClause.typesCount() > 0) {
+        return;
     }
+    string name = "";
+    let nameToken = declaration.name();
+    if (nameToken != null) {
+        name = nameToken.text();
+    }
+    // Only a class can declare an abstract method. Elsewhere the 'abstract' is refused already.
+    if (owner is ClassType && isAbstract) {
+        reporter.report("Abstract method '{name}' of {ownerPhrase(owner, names)} "
+            + "{unlistedThrowsProblem()}", at);
+    }
+}
+
+// The reason and the fix for a bodiless declaration marked 'throws' with no types listed.
+public unlistedThrowsProblem() -> string {
+    return "is marked 'throws' but lists no exception types. Without a body, the types it throws "
+        + "must be written out. List them after 'throws', as in 'throws Error', or remove 'throws'.";
 }
 
 public hashSignatureConforms(Signature signature) -> bool {
@@ -1229,7 +1315,7 @@ public hashSignatureConforms(Signature signature) -> bool {
 // collections rely on, and it may not fail, because the language takes a value's hash where
 // no caller could write a 'try'.
 public checkHashSignature(Reporter reporter, FunctionDeclarationNode declaration,
-                          Signature signature, bool isConstructor) {
+                          Signature signature, bool isConstructor, DeclaredType owner, TypeNames names) {
     if (isConstructor || signature.name() != "hash") {
         return;
     }
@@ -1244,10 +1330,29 @@ public checkHashSignature(Reporter reporter, FunctionDeclarationNode declaration
     if (returned is PrimitiveType) {
         returnsLong = returned.kind() == PrimitiveKind.Long;
     }
-    if (signature.parameters().length != 0 || !returnsLong) {
-        reporter.report("A method named 'hash' must have the signature 'hash() -> long'.",
-            signature.nameSpan());
+    bool takesParameters = signature.parameters().length != 0;
+    if (!takesParameters && returnsLong) {
+        return;
     }
+    string problem = "returns '{names.of(returned)}'";
+    if (types.isVoidType(returned)) {
+        problem = "returns nothing";
+    }
+    if (takesParameters && returnsLong) {
+        problem = "takes parameters";
+    } else if (takesParameters) {
+        problem = "takes parameters and {problem}";
+    }
+    string reason = "Every class inherits 'hash() -> long'";
+    string required = "'override hash() -> long'";
+    if (owner is StructType) {
+        reason = "Every struct has a built-in 'hash() -> long'";
+    } else if (owner is InterfaceType) {
+        reason = "An interface method named 'hash' must be 'hash() -> long'";
+        required = "'hash() -> long'";
+    }
+    reporter.report("Method 'hash' of {ownerPhrase(owner, names)} {problem}. A Map or Set calls 'hash()' "
+        + "to find a key. {reason}. Write {required}, or rename the method.", signature.nameSpan());
 }
 
 public toStringSignatureConforms(Signature signature) -> bool {
@@ -1290,10 +1395,7 @@ public checkStructOverrideMarker(Reporter reporter, StructType owner, string mem
                                  Signature signature, MemberModifiers modifiers,
                                  bool isConstructor, string? behavior, TypeNames names) {
     if (isConstructor) {
-        if (modifiers.declaresOverride || modifiers.declaresAbstract) {
-            reporter.report("A constructor cannot be 'override' or 'abstract'.",
-                signature.nameSpan());
-        }
+        checkConstructorMarkers(reporter, modifiers, names.nameOf(owner), signature.nameSpan());
         return;
     }
     if (modifiers.declaresOverride || behavior == null) {
@@ -1307,8 +1409,28 @@ public checkStructOverrideMarker(Reporter reporter, StructType owner, string mem
         conforms = equalsSignatureConforms(signature, owner);
     }
     if (conforms) {
-        reporter.report("Method '{memberName}' overrides the built-in {behavior} of struct "
-            + "'{names.nameOf(owner)}'; mark it 'override'.", signature.nameSpan());
+        reporter.report("Method '{memberName}' of struct '{names.nameOf(owner)}' replaces the "
+            + "built-in {behavior} but is not marked 'override'. Write 'override' before "
+            + "'{memberName}'.", signature.nameSpan());
+    }
+}
+
+// A constructor is refused 'override', 'final' and 'abstract', whatever type it builds.
+public checkConstructorMarkers(Reporter reporter, MemberModifiers modifiers, string ownerName, Span at) {
+    string subject = specialMemberSubject(true, ownerName);
+    if (modifiers.declaresOverride) {
+        reporter.report("{subject} cannot be 'override'. A constructor never replaces the "
+            + "constructor of a base class. Remove 'override'.", modifiers.overrideModifierSpan(at));
+    }
+    if (modifiers.declaresFinal) {
+        reporter.report("{subject} cannot be 'final'. 'final' stops a subclass from replacing a "
+            + "method, and no subclass replaces a constructor. Remove 'final'.",
+            modifiers.finalModifierSpan(at));
+    }
+    if (modifiers.declaresAbstract) {
+        reporter.report("{subject} cannot be 'abstract'. 'abstract' marks a method each subclass "
+            + "writes for itself, and a subclass never writes its base class's constructor. Remove "
+            + "'abstract'.", modifiers.abstractModifierSpan(at));
     }
 }
 
@@ -1414,12 +1536,11 @@ public checkHashEqualsPairing(Reporter reporter, DeclaredType owner, Span at, Ty
     }
     if (ownHash && !equalsAnywhere) {
         reporter.report("{kind} '{names.nameOf(owner)}' defines 'hash' but not 'equals', and equal "
-            + "values have to hash equally. Add an "
-            + "'equals({names.nameOf(owner)} other) -> bool' method.", at);
+            + "values have to hash equally. Add 'override equals({names.nameOf(owner)} other) -> bool'.", at);
     }
     if (ownEquals && !hashAnywhere) {
         reporter.report("{kind} '{names.nameOf(owner)}' defines 'equals' but not 'hash', and equal "
-            + "values have to hash equally. Add a 'hash() -> long' method.", at);
+            + "values have to hash equally. Add 'override hash() -> long'.", at);
     }
 }
 

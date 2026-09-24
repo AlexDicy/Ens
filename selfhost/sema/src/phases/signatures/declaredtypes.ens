@@ -78,8 +78,10 @@ public collectStructFields(SignatureCollector collector) {
         }
         let extendsClause = node.extendsClause();
         if (extendsClause != null) {
-            collector.reporter().report("Only classes can use 'extends'; structs do not support "
-                + "inheritance.", extendsClause.extendsKeyword().span());
+            collector.reporter().report("Struct '{collector.names().nameOf(found)}' cannot use "
+                + "'extends'. Only a class can have a base class. Remove the 'extends ...' clause, "
+                + "or make '{collector.names().nameOf(found)}' a class.",
+                extendsClause.extendsKeyword().span());
         }
         let parameters = found.typeParameterTypes();
         collector.resolver().pushTypeParameters(parameters);
@@ -95,8 +97,11 @@ public collectStructFields(SignatureCollector collector) {
                     continue;
                 }
                 if (field.isWeak()) {
-                    collector.reporter().report("'weak' fields are not allowed on structs.",
-                        field.nameSpan());
+                    collector.reporter().report("Field '{field.name()}' of struct "
+                        + "'{collector.names().nameOf(found)}' cannot be 'weak'. A weak field "
+                        + "becomes 'null' when its object is destroyed. A struct is copied "
+                        + "wherever it goes, so its copies could not all be set to 'null'. Remove "
+                        + "'weak'.", field.nameSpan());
                 }
                 if (field.name().length > 0) {
                     if (members.findField(found.fields(), field.name()) != null) {
@@ -183,8 +188,11 @@ collectStructMethod(SignatureCollector collector, StructType structType, Functio
     Span nameSpan = member.span();
     if (introducer != null) {
         if (introducer.kind() == SyntaxKind.DestructorKeyword) {
-            collector.reporter().report("A struct cannot declare a destructor; destructors are "
-                + "only allowed on classes.", introducer.span());
+            string structName = collector.names().nameOf(structType);
+            collector.reporter().report("Struct '{structName}' cannot declare a destructor. A "
+                + "destructor runs when the last reference to an object goes away, and a "
+                + "struct is copied, never referenced. Remove the destructor, or make "
+                + "'{structName}' a class.", introducer.span());
             return;
         }
         isConstructor = true;
@@ -212,7 +220,7 @@ collectStructMethod(SignatureCollector collector, StructType structType, Functio
         methodName = "constructor";
     }
     let modifiers = members.functionModifiers(member);
-    members.checkMemberModifiers(collector.reporter(), member);
+    members.checkMemberModifiers(collector.reporter(), member, collector.names().nameOf(structType));
     if (modifiers.declaresStatic && !isConstructor) {
         members.collectStaticMethod(collector.resolver(), collector.reporter(), structType,
             structType.staticMethods(), member, methodName, nameSpan, modifiers,
@@ -220,14 +228,15 @@ collectStructMethod(SignatureCollector collector, StructType structType, Functio
         return;
     }
     members.checkStaticMethodMarkers(collector.reporter(), modifiers, methodName, isConstructor,
-        false, nameSpan);
+        false, nameSpan, collector.names().nameOf(structType));
     string memberKindWord = "Method";
     if (isConstructor) {
         memberKindWord = "Constructor";
     }
-    string constraintSubject = "{memberKindWord} '{methodName}' of '{collector.names().nameOf(structType)}'";
+    string structName = collector.names().nameOf(structType);
+    string constraintSubject = "{memberKindWord} '{methodName}' of struct '{structName}'";
     if (isConstructor) {
-        constraintSubject = "A constructor of '{collector.names().nameOf(structType)}'";
+        constraintSubject = members.specialMemberSubject(true, collector.names().nameOf(structType));
     }
     let constraints = members.readMemberConstraints(collector.resolver(), collector.reporter(),
         structType, member, constraintSubject, collector.names());
@@ -236,7 +245,7 @@ collectStructMethod(SignatureCollector collector, StructType structType, Functio
     }
     let signature = members.buildSignature(collector.resolver(), collector.reporter(), member, methodName,
         nameSpan, isConstructor, false, isConstructor || modifiers.declaresAbstract,
-        modifiers.declaresNoreturn, structType, collector.names(), []);
+        modifiers.declaresNoreturn && !isConstructor, structType, collector.names(), []);
     if (constraints.length > 0) {
         collector.resolver().popMemberConstraints();
     }
@@ -256,10 +265,11 @@ collectStructMethod(SignatureCollector collector, StructType structType, Functio
             nameSpan, collector.names());
     }
     members.checkThrowsPlacement(collector.reporter(), member, isConstructor,
-        modifiers.declaresAbstract);
+        modifiers.declaresAbstract, structType, collector.names());
     members.checkNoreturnPlacement(collector.reporter(), member, isConstructor, false,
-        modifiers.declaresNoreturn);
-    members.checkHashSignature(collector.reporter(), member, signature, isConstructor);
+        modifiers.declaresNoreturn, collector.names().nameOf(structType));
+    members.checkHashSignature(collector.reporter(), member, signature, isConstructor, structType,
+        collector.names());
     members.checkEqualsSignature(collector.reporter(), member, signature, structType, isConstructor,
         collector.names());
     members.checkToStringSignature(collector.reporter(), member, signature, isConstructor);
@@ -272,9 +282,8 @@ collectStructMethod(SignatureCollector collector, StructType structType, Functio
             structType, nameSpan, collector.names());
     }
     if (members.findSameSignature(structType.methods(), methodName, signature) != null) {
-        collector.reporter().report("Method '{methodName}' of '{collector.names().nameOf(structType)}' "
-            + "is already declared with the same parameter types; overloads must differ in parameter "
-            + "count or types.", nameSpan);
+        string subject = "Method '{methodName}' of struct '{collector.names().nameOf(structType)}'";
+        collector.reporter().report(members.repeatedOverloadMessage(subject, "methods"), nameSpan);
         return;
     }
     structType.methods().push(new Method(signature, visibility, isConstructor,
@@ -397,7 +406,7 @@ collectPrimitiveMember(SignatureCollector collector, PrimitiveBinding binding,
     string name = nameToken.text();
     Span nameSpan = nameToken.span();
     let modifiers = members.functionModifiers(member);
-    members.checkMemberModifiers(collector.reporter(), member);
+    members.checkMemberModifiers(collector.reporter(), member, binding.name());
     if (modifiers.declaresStatic) {
         members.collectStaticMethod(collector.resolver(), collector.reporter(), binding,
             binding.staticMethods(), member, name, nameSpan, modifiers, collector.names(), true);
@@ -418,20 +427,19 @@ collectPrimitiveMember(SignatureCollector collector, PrimitiveBinding binding,
             modifiers.finalModifierSpan(nameSpan));
     }
     let constraints = members.readMemberConstraints(collector.resolver(), collector.reporter(), binding,
-        member, "Method '{name}' of '{binding.name()}'", collector.names());
+        member, "Method '{name}' of the '{binding.name()}' binding", collector.names());
     let signature = members.buildSignature(collector.resolver(), collector.reporter(), member, name,
         nameSpan, false, false, true, modifiers.declaresNoreturn, null, collector.names(), []);
     Visibility visibility = members.memberVisibility(modifiers, binding, "Method", name,
         collector.reporter(), collector.names());
-    members.checkThrowsPlacement(collector.reporter(), member, false, false);
+    members.checkThrowsPlacement(collector.reporter(), member, false, false, binding, collector.names());
     members.checkNoreturnPlacement(collector.reporter(), member, false, false,
-        modifiers.declaresNoreturn);
+        modifiers.declaresNoreturn, binding.name());
     members.checkStaticInstanceCollision(collector.reporter(), binding, name, false, nameSpan,
         collector.names());
     if (members.findSameSignature(binding.methods(), name, signature) != null) {
-        collector.reporter().report("Method '{name}' of the '{binding.name()}' binding is already "
-            + "declared with the same parameter types; overloads must differ in parameter "
-            + "count or types.", nameSpan);
+        collector.reporter().report(members.repeatedOverloadMessage(
+            "Method '{name}' of the '{binding.name()}' binding", "methods"), nameSpan);
         return;
     }
     binding.methods().push(new Method(signature, visibility, false, false,
@@ -513,8 +521,11 @@ public collectInterfaces(SignatureCollector collector) {
         for (long i = 0; i < body.membersCount(); i++) {
             switch (body.members(i)) {
                 is FieldDeclarationNode field -> {
-                    collector.reporter().report("An interface cannot declare fields; its body "
-                        + "lists only method signatures.", field.name().span());
+                    string interfaceName = collector.names().nameOf(interfaceType);
+                    collector.reporter().report("Interface '{interfaceName}' cannot declare field "
+                        + "'{field.name().text()}'. An interface lists only the methods a type "
+                        + "must provide. Remove the field, or move it into a class that "
+                        + "implements '{interfaceName}'.", field.name().span());
                 },
                 is FunctionDeclarationNode method -> {
                     collectInterfaceMethod(collector, interfaceType, method);
@@ -531,14 +542,15 @@ collectInterfaceMethod(SignatureCollector collector, InterfaceType interfaceType
                        FunctionDeclarationNode member) {
     let introducer = member.introducer();
     if (introducer != null) {
+        string interfaceName = collector.names().nameOf(interfaceType);
         if (introducer.kind() == SyntaxKind.DestructorKeyword) {
-            collector.reporter().report("An interface cannot declare a destructor; "
-                + "'{collector.names().nameOf(interfaceType)}' has no instances of its own.",
-                introducer.span());
+            collector.reporter().report("Interface '{interfaceName}' cannot declare a destructor. "
+                + "An interface has no objects of its own to destroy. Remove the "
+                + "destructor.", introducer.span());
         } else {
-            collector.reporter().report("An interface cannot declare a constructor; "
-                + "'{collector.names().nameOf(interfaceType)}' has no instances of its own.",
-                introducer.span());
+            collector.reporter().report("Interface '{interfaceName}' cannot declare a constructor. "
+                + "An interface has no objects of its own to build. Remove the "
+                + "constructor.", introducer.span());
         }
         return;
     }
@@ -549,12 +561,13 @@ collectInterfaceMethod(SignatureCollector collector, InterfaceType interfaceType
     string name = nameToken.text();
     Span nameSpan = nameToken.span();
     if (name == interfaceType.name()) {
-        collector.reporter().report("An interface cannot declare a constructor; "
-            + "'{collector.names().nameOf(interfaceType)}' has no instances of its own.", nameSpan);
+        collector.reporter().report("Interface '{collector.names().nameOf(interfaceType)}' cannot "
+            + "declare a constructor. An interface has no objects of its own to build. Remove the "
+            + "constructor.", nameSpan);
         return;
     }
     let modifiers = members.functionModifiers(member);
-    members.checkMemberModifiers(collector.reporter(), member);
+    members.checkMemberModifiers(collector.reporter(), member, collector.names().nameOf(interfaceType));
     if (modifiers.hasVisibilityModifier()) {
         collector.reporter().report("A member of an interface always has the interface's own "
             + "visibility. Remove the modifier from '{name}'.",
@@ -582,19 +595,20 @@ collectInterfaceMethod(SignatureCollector collector, InterfaceType interfaceType
     }
     let throwsClause = member.throwsClause();
     if (throwsClause != null && throwsClause.typesCount() == 0) {
-        collector.reporter().report("An interface method marked 'throws' must list its exception "
-            + "types, for example 'throws IOError'.",
+        string owner = collector.names().nameOf(interfaceType);
+        collector.reporter().report("Method '{name}' of interface '{owner}' "
+            + members.unlistedThrowsProblem(),
             throwsClause.throwsKeyword().span());
     }
     let signature = members.buildSignature(collector.resolver(), collector.reporter(), member, name,
         nameSpan, false, true, true, modifiers.declaresNoreturn, null, collector.names(), []);
     members.checkNoreturnPlacement(collector.reporter(), member, false, false,
-        modifiers.declaresNoreturn);
-    members.checkHashSignature(collector.reporter(), member, signature, false);
+        modifiers.declaresNoreturn, collector.names().nameOf(interfaceType));
+    members.checkHashSignature(collector.reporter(), member, signature, false, interfaceType,
+        collector.names());
     if (members.findSameSignature(interfaceType.methods(), name, signature) != null) {
-        collector.reporter().report("Method '{name}' of '{collector.names().nameOf(interfaceType)}' "
-            + "is already declared with the same parameter types; overloads must differ in parameter "
-            + "count or types.", nameSpan);
+        string subject = "Method '{name}' of interface '{collector.names().nameOf(interfaceType)}'";
+        collector.reporter().report(members.repeatedOverloadMessage(subject, "methods"), nameSpan);
         return;
     }
     interfaceType.methods().push(new Method(signature,
@@ -665,8 +679,9 @@ public collectEnums(SignatureCollector collector) {
                 }
             }
             if (duplicate) {
-                collector.reporter().report("Enum '{collector.names().nameOf(enumType)}' already has a "
-                    + "member named '{name}'; remove the duplicate.", memberToken.span());
+                collector.reporter().report("Enum '{collector.names().nameOf(enumType)}' already "
+                    + "has a member named '{name}'. Remove this second '{name}', or rename "
+                    + "it.", memberToken.span());
                 continue;
             }
 

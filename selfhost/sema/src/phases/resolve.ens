@@ -36,6 +36,7 @@ import TypeStore from model.types;
 import TypeNames from model.types;
 import DeclaredType from model.types;
 import ClassType from model.types;
+import StructType from model.types;
 import InstantiationType from model.types;
 import TypeParamType from model.types;
 import Method from model.types;
@@ -333,8 +334,10 @@ public class TypeResolver {
             return [];
         }
         if (clause.typesCount() == 0) {
-            this.report("A function type marked 'throws' must list its exception types, for "
-                + "example '(() -> void throws IOError)'.", clause.throwsKeyword().span());
+            this.report("This function type is marked 'throws' but lists no exception types. "
+                + "Without a body, the types it throws must be written out. List them after "
+                + "'throws', as in '(() -> void throws Error)', or remove 'throws'.",
+                clause.throwsKeyword().span());
             return [];
         }
         let resolved = new List<Type>();
@@ -607,18 +610,83 @@ public class TypeResolver {
             if (types.satisfiesBound(argument, bound, this.extraBoundsOf(argument))) {
                 continue;
             }
-            string shownArgument = this.names().of(argument);
-            string shownBound = this.names().of(bound);
-            if (types.isInterfaceLike(bound)) {
-                this.report("Type argument '{shownArgument}' for type parameter "
-                    + "'{parameter.name()}' must implement interface '{shownBound}'.", span);
-            } else {
-                this.report("Type argument '{shownArgument}' for type parameter "
-                    + "'{parameter.name()}' must be '{shownBound}' or a subclass of it.", span);
-            }
+            this.report(this.unmetBoundMessage(parameter, argument, bound), span);
             satisfied = false;
         }
         return satisfied;
+    }
+
+    // The refusal of a type argument that fails one bound of its parameter. A type parameter
+    // gains the bound. A class or struct of this package can take on the interface.
+    unmetBoundMessage(TypeParamType parameter, Type argument, Type bound) -> string {
+        string shownArgument = this.names().of(argument);
+        string shownBound = this.names().of(bound);
+        string subject = "Type argument '{shownArgument}' for type parameter '{parameter.name()}'";
+        if (parameter.ownerName().length > 0) {
+            subject = "{subject} of '{parameter.ownerName()}'";
+        }
+        bool isInterface = types.isInterfaceLike(bound);
+        string problem = "{subject} must be '{shownBound}' or a subclass of it.";
+        string fix = "Replace '{shownArgument}' with '{shownBound}' or a class that extends it.";
+        if (isInterface) {
+            problem = "{subject} must implement interface '{shownBound}'.";
+            fix = "Replace '{shownArgument}' with a type that implements '{shownBound}'";
+            let declared = this.writableConformer(argument);
+            if (declared == null) {
+                fix = "{fix}.";
+            } else if (declared.length == 0) {
+                fix = "{fix}, or add 'implements {shownBound}' to the declaration of '{shownArgument}'.";
+            } else {
+                fix = "{fix}, or add '{shownBound}' to the 'implements' list of '{shownArgument}'.";
+            }
+        }
+        if (argument is TypeParamType) {
+            if (!isInterface) {
+                for (let existing in argument.bounds()) {
+                    if (types.isInterfaceLike(existing)) {
+                        continue;
+                    }
+                    string existingName = this.names().of(existing);
+                    return "{problem} '{shownArgument}' already has the class bound "
+                        + "'{existingName}', and a type parameter takes one class bound. Replace "
+                        + "'{existingName}' with '{shownBound}' or a class that extends '{shownBound}'.";
+                }
+            }
+            let written = new List<string>();
+            if (!isInterface) {
+                written.push(shownBound);
+            }
+            for (let existing in argument.bounds()) {
+                written.push(this.names().of(existing));
+            }
+            if (isInterface) {
+                written.push(shownBound);
+            }
+            string bounds = written.get(0);
+            for (long i = 1; i < written.length(); i++) {
+                bounds = "{bounds} + {written.get(i)}";
+            }
+            fix = "Add the bound where '{shownArgument}' is declared, as in '{shownArgument}: {bounds}'.";
+        }
+        return "{problem} {fix}";
+    }
+
+    // The interfaces a class or struct of this package implements, or null for any other type.
+    writableConformer(Type argument) -> Type[]? {
+        switch (argument) {
+            is ClassType declared -> {
+                if (declared.packagePrefix() == this.resolverPackagePrefix) {
+                    return declared.interfaces();
+                }
+            },
+            is StructType declared -> {
+                if (declared.packagePrefix() == this.resolverPackagePrefix) {
+                    return declared.interfaces();
+                }
+            },
+            default -> { },
+        }
+        return null;
     }
 
     // The quiet twin of checkArgumentBounds, for callers that filter candidates before selecting
@@ -832,8 +900,9 @@ public class TypeResolver {
                 }
             }
             if (duplicate) {
-                this.report("Duplicate bound '{this.names().of(bound)}' on type parameter "
-                    + "'{parameterName}'; list each bound once.", reference.span());
+                this.report("Type parameter '{parameterName}' already has the bound "
+                    + "'{this.names().of(bound)}'. Remove this second "
+                    + "'{this.names().of(bound)}'.", reference.span());
                 continue;
             }
             if (!isInterface) {

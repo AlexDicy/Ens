@@ -238,19 +238,40 @@ class ClassLayout {
 
     checkWeakField(Field field) {
         let fieldType = field.type();
-        if (fieldType is OptionalType) {
-            let inner = fieldType.inner();
-            if (types.isClassLike(inner)) {
-                if (types.isInterfaceLike(inner)) {
-                    this.reporter.report("A 'weak' field must refer to a class, not to an "
-                        + "interface. Declare it with the implementing class's type.",
-                        field.nameSpan());
-                }
-                return;
+        Type core = fieldType;
+        long nullableLevels = 0;
+        while (true) {
+            if (!(core is OptionalType)) {
+                break;
             }
+            core = core.inner();
+            nullableLevels++;
         }
-        this.reporter.report("A 'weak' field must be a nullable class type, for example "
-            + "'weak Foo? f'.", field.nameSpan());
+        string name = field.name();
+        string subject = "Field '{name}' of class '{this.names.nameOf(this.classType)}' is 'weak'";
+        string coreName = this.names.of(core);
+        if (types.isInterfaceLike(core)) {
+            string fix = "Replace '{coreName}' with a class that implements '{coreName}'.";
+            if (nullableLevels == 0) {
+                fix = "Replace '{coreName}' with a class that implements '{coreName}', and add '?' after it.";
+            }
+            this.reporter.report("{subject}, so its type must be a class. '{coreName}' is an "
+                + "interface. {fix}", field.nameSpan());
+            return;
+        }
+        if (!types.isClassLike(core)) {
+            this.reporter.report("{subject}, so its type must be a class. "
+                + "'{this.names.of(fieldType)}' is not a class. Remove 'weak'.", field.nameSpan());
+            return;
+        }
+        if (nullableLevels == 0) {
+            this.reporter.report("{subject}, so its type must be nullable. A weak field becomes "
+                + "'null' when its object is destroyed. Write 'weak {coreName}? {name}'.", field.nameSpan());
+        } else if (nullableLevels > 1) {
+            this.reporter.report("{subject}, so its type needs exactly one '?'. "
+                + "'{this.names.of(fieldType)}' has {diagnostics.countWord(nullableLevels)}. Write "
+                + "'weak {coreName}? {name}'.", field.nameSpan());
+        }
     }
 
     collectMethods() {
@@ -290,8 +311,12 @@ class ClassLayout {
                 return;
             }
         }
+        string className = this.names.nameOf(this.classType);
+        string destructorSubject = members.specialMemberSubject(false, className);
         if (isDestructor && this.findDestructor() != null) {
-            this.reporter.report("A class can declare at most one destructor.", nameSpan);
+            this.reporter.report("Class '{className}' already declares a destructor. A class has "
+                + "at most one destructor. Remove this second 'destructor', or move its body into "
+                + "the first.", nameSpan);
             return;
         }
         string methodName = rawName;
@@ -303,26 +328,26 @@ class ClassLayout {
         }
         let modifiers = members.functionModifiers(member);
         if (modifiers.declaresStatic && !isConstructor && !isDestructor) {
-            members.checkMemberModifiers(this.reporter, member);
+            members.checkMemberModifiers(this.reporter, member, className);
             members.collectStaticMethod(this.resolver, this.reporter, this.classType,
                 this.classType.staticMethods(), member, methodName, nameSpan, modifiers,
                 this.names);
             return;
         }
         members.checkStaticMethodMarkers(this.reporter, modifiers, methodName, isConstructor,
-            isDestructor, nameSpan);
+            isDestructor, nameSpan, className);
         MemberConstraint[] constraints = [];
         if (isDestructor) {
             let constraintList = member.typeParameters();
             if (constraintList != null) {
-                this.reporter.report("A destructor cannot have a type-parameter list; it takes "
-                    + "no parameters of any kind. Remove the '<...>' list.",
+                this.reporter.report("{destructorSubject} cannot have a type-parameter list. A "
+                    + "destructor takes no parameters of any kind. Remove the '<...>' list.",
                     constraintList.span());
             }
         } else {
             string constraintSubject = "Method '{methodName}' of '{this.names.nameOf(this.classType)}'";
             if (isConstructor) {
-                constraintSubject = "A constructor of '{this.names.nameOf(this.classType)}'";
+                constraintSubject = members.specialMemberSubject(true, className);
             }
             constraints = members.readMemberConstraints(this.resolver, this.reporter,
                 this.classType, member, constraintSubject, this.names);
@@ -330,10 +355,17 @@ class ClassLayout {
         if (constraints.length > 0) {
             this.resolver.pushMemberConstraints(this.classType.declaration(), constraints);
         }
-        let signature = members.buildSignature(this.resolver, this.reporter, member,
-            methodName, nameSpan, isConstructor, false,
-            isConstructor || modifiers.declaresAbstract, modifiers.declaresNoreturn,
-            this.classType, this.names, []);
+        bool refusedNoreturn = isConstructor || isDestructor;
+        Signature signature = members.buildSignature(this.resolver, this.reporter, member,
+            methodName, nameSpan, isConstructor, false, isConstructor || modifiers.declaresAbstract,
+            modifiers.declaresNoreturn && !refusedNoreturn, this.classType, this.names, []);
+        Type writtenReturn = signature.returnType();
+        if (isDestructor && member.returnType() != null) {
+            // A refused return type becomes the error type, so the body raises no second report.
+            signature = new Signature(signature.name(), signature.parameters(),
+                this.resolver.typeStore().errorType(), signature.declaresThrows(),
+                false, signature.throwsTypes(), signature.throwsTypeSpans(), [], member.green(), nameSpan);
+        }
         if (constraints.length > 0) {
             this.resolver.popMemberConstraints();
         }
@@ -359,9 +391,8 @@ class ClassLayout {
         }
         if (members.findSameSignature(this.classType.methods(), methodName, signature)
                 != null) {
-            this.reporter.report("Method '{methodName}' of '{this.names.nameOf(this.classType)}' is "
-                + "already declared with the same parameter types; overloads must differ in "
-                + "parameter count or types.", nameSpan);
+            this.reporter.report(members.repeatedOverloadMessage(
+                "Method '{methodName}' of '{className}'", "methods"), nameSpan);
             return;
         }
         let method = new Method(signature, visibility, isConstructor,
@@ -371,30 +402,15 @@ class ClassLayout {
         this.classType.methods().push(method);
 
         members.checkNoreturnPlacement(this.reporter, member, isConstructor, isDestructor,
-            modifiers.declaresNoreturn);
-        members.checkMemberModifiers(this.reporter, member);
+            modifiers.declaresNoreturn, className);
+        members.checkMemberModifiers(this.reporter, member, className);
 
         if (isDestructor) {
-            if (modifiers.hasVisibilityModifier() || modifiers.declaresOverride
-                    || modifiers.declaresFinal || modifiers.declaresAbstract) {
-                this.reporter.report("A destructor cannot have modifiers such as visibility, "
-                    + "'override', 'final', or 'abstract'.", nameSpan);
-            }
-            if (member.parameters().parametersCount() > 0) {
-                this.reporter.report("A destructor cannot declare parameters.", nameSpan);
-            }
-            if (member.returnType() != null) {
-                this.reporter.report("A destructor cannot declare a return type.", nameSpan);
-            }
-            let throwsClause = member.throwsClause();
-            if (throwsClause != null) {
-                this.reporter.report("A destructor cannot be marked 'throws'.",
-                    throwsClause.throwsKeyword().span());
-            }
+            this.checkDestructorShape(member, modifiers, destructorSubject, nameSpan, writtenReturn);
             return;
         }
 
-        if (modifiers.declaresFinal && visibility == Visibility.Private) {
+        if (modifiers.declaresFinal && visibility == Visibility.Private && !isConstructor) {
             this.reporter.report("Method '{methodName}' cannot be 'final': it is private to "
                 + "'{this.names.nameOf(this.classType)}', so no subclass can override it anyway. Remove "
                 + "'final'.", nameSpan);
@@ -406,16 +422,14 @@ class ClassLayout {
                 false, nameSpan, this.names);
         }
         members.checkThrowsPlacement(this.reporter, member, isConstructor,
-            modifiers.declaresAbstract);
-        members.checkHashSignature(this.reporter, member, signature, isConstructor);
+            modifiers.declaresAbstract, this.classType, this.names);
+        members.checkHashSignature(this.reporter, member, signature, isConstructor, this.classType,
+            this.names);
         members.checkEqualsSignature(this.reporter, member, signature, this.classType,
             isConstructor, this.names);
         members.checkToStringSignature(this.reporter, member, signature, isConstructor);
         if (isConstructor) {
-            if (modifiers.declaresOverride || modifiers.declaresAbstract) {
-                this.reporter.report("A constructor cannot be 'override' or 'abstract'.",
-                    nameSpan);
-            }
+            members.checkConstructorMarkers(this.reporter, modifiers, className, nameSpan);
             return;
         }
         if (modifiers.declaresAbstract) {
@@ -458,6 +472,51 @@ class ClassLayout {
         return null;
     }
 
+    // A destructor is never called. It takes no visibility, no dispatch marker, no parameters,
+    // no result and no 'throws'.
+    checkDestructorShape(FunctionDeclarationNode member, MemberModifiers modifiers, string subject,
+                         Span nameSpan, Type returned) {
+        let visibilityWord = modifiers.visibilityModifierWord();
+        if (visibilityWord != null) {
+            this.reporter.report("{subject} cannot be '{visibilityWord}'. No code calls a "
+                + "destructor; it runs when the object is destroyed. Remove '{visibilityWord}'.",
+                modifiers.visibilityModifierSpan(nameSpan));
+        }
+        string? dispatchWord = null;
+        Span dispatchSpan = nameSpan;
+        if (modifiers.declaresOverride) {
+            dispatchWord = "override";
+            dispatchSpan = modifiers.overrideModifierSpan(nameSpan);
+        } else if (modifiers.declaresFinal) {
+            dispatchWord = "final";
+            dispatchSpan = modifiers.finalModifierSpan(nameSpan);
+        } else if (modifiers.declaresAbstract) {
+            dispatchWord = "abstract";
+            dispatchSpan = modifiers.abstractModifierSpan(nameSpan);
+        }
+        if (dispatchWord != null) {
+            this.reporter.report("{subject} cannot be '{dispatchWord}'. No destructor replaces "
+                + "another: when an object is destroyed, its own class's destructor and every base "
+                + "class's destructor run. Remove '{dispatchWord}'.", dispatchSpan);
+        }
+        if (member.parameters().parametersCount() > 0) {
+            this.reporter.report("{subject} cannot take parameters. No code calls a destructor, so "
+                + "nothing could pass them. Write it as 'destructor()'.", nameSpan);
+        }
+        if (member.returnType() != null) {
+            this.reporter.report("{subject} cannot declare a return type. No code calls a "
+                + "destructor, so nothing could use the result. "
+                + "Remove '-> {this.names.of(returned)}'.", nameSpan);
+        }
+        let throwsClause = member.throwsClause();
+        if (throwsClause != null) {
+            this.reporter.report("{subject} cannot be marked 'throws'. It runs when the object is "
+                + "destroyed, where no code can catch an exception. Remove 'throws', and catch the "
+                + "exceptions with 'catch' clauses after the destructor body.",
+                throwsClause.throwsKeyword().span());
+        }
+    }
+
     // Validates the override marker against the concrete base chain and the implemented
     // interfaces. 'hash' and 'equals' override built-in behavior. Their conforming shapes
     // require the marker even with no base declaration. A 'toString' taking no parameters
@@ -486,8 +545,14 @@ class ClassLayout {
             if (baseBySignature != null) {
                 string ownerName = this.names.of(baseBySignature.definingType());
                 if (baseBySignature.isFinal()) {
-                    this.reporter.report("Cannot override '{methodName}' because it is "
-                        + "declared 'final' in '{ownerName}'.", nameSpan);
+                    string fix = "Rename this '{methodName}' and remove 'override'";
+                    let declaring = types.authorityOf(baseBySignature.definingType());
+                    if (declaring != null && declaring.packagePrefix() == this.classType.packagePrefix()) {
+                        fix = "{fix}, or remove 'final' from '{methodName}' in "
+                            + "'{this.names.nameOf(declaring)}'";
+                    }
+                    this.reporter.report("Cannot override '{methodName}', because it is "
+                        + "declared 'final' in '{ownerName}'. {fix}.", nameSpan);
                 }
                 if (narrowsReturnShape(baseBySignature.signature(), signature)) {
                     string declared = this.names.of(baseBySignature.signature().returnType());
@@ -539,6 +604,10 @@ class ClassLayout {
             }
             let privateBase = this.findPrivateInBase(methodName);
             if (privateBase != null) {
+                // A private abstract method is already refused where it is declared.
+                if (privateBase.isAbstract()) {
+                    return;
+                }
                 string owner = this.names.of(privateBase.definingType());
                 this.reporter.report("Cannot override '{methodName}': '{owner}' declares it "
                     + "privately, so it is not inherited here. Mark it 'protected' in "
@@ -581,22 +650,20 @@ class ClassLayout {
         if (interfaceBySignature != null && !method.isConditional()) {
             string interfaceName = this.names.of(interfaceBySignature.definingType());
             this.reporter.report("Method '{methodName}' of '{this.names.nameOf(this.classType)}' "
-                + "implements a method declared in interface '{interfaceName}'; mark it "
-                + "'override'.", nameSpan);
+                + "implements a method declared in interface '{interfaceName}' but is not marked "
+                + "'override'. Write 'override' before '{methodName}'.", nameSpan);
             return;
         }
         if (reservedConforming) {
-            if (methodName == "toString") {
-                this.reporter.report("Method 'toString' of '{this.names.nameOf(this.classType)}' replaces "
-                    + "the text form every class already has; mark it 'override'.", nameSpan);
-                return;
-            }
-            string builtin = "identity equality";
+            string replaced = "the text form every class already has";
             if (methodName == "hash") {
-                builtin = "identity hash";
+                replaced = "the built-in identity hash";
+            } else if (methodName == "equals") {
+                replaced = "the built-in identity equality";
             }
-            this.reporter.report("Method '{methodName}' overrides the built-in {builtin}; "
-                + "mark it 'override'.", nameSpan);
+            this.reporter.report("Method '{methodName}' of '{this.names.nameOf(this.classType)}' "
+                + "replaces {replaced} but is not marked 'override'. Write 'override' before "
+                + "'{methodName}'.", nameSpan);
         }
     }
 
@@ -744,10 +811,12 @@ class ClassLayout {
                     + "'{levelName}' requires '{requiredReturn}', "
                     + narrowedReturnAdvice(required.signature().returnType(), this.names) + ".", at);
             } else if (!overrideCompatible(required.signature(), provided.signature())) {
+                string requiredReturn = this.names.of(required.signature().returnType());
                 this.reporter.report("Method '{required.name()}' of "
-                    + "'{this.names.nameOf(this.classType)}' does not match "
-                    + "'{methodDisplay(required, this.names)}' declared in interface "
-                    + "'{levelName}'.", at);
+                    + "'{this.names.nameOf(this.classType)}' returns "
+                    + "'{this.names.of(provided.signature().returnType())}', but interface "
+                    + "'{levelName}' requires '{requiredReturn}'. Change the return type of "
+                    + "'{required.name()}' to '{requiredReturn}'.", at);
             }
             if (required.isNoreturn() && !provided.isNoreturn()) {
                 this.reporter.report("Method '{required.name()}' of "

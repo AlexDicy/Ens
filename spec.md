@@ -242,7 +242,8 @@ Everything else is an error: assigning from a method, a destructor, or a free fu
 A const field may be nullable, and it cannot also be `weak`, because a weak field resets to null when its target is destroyed while a const field never changes.
 
 A field carries visibility modifiers, `const`, `static` (which requires `const`), `lazy` (which requires `const` too), and in a class also `weak`; no other modifier applies to one.
-A method carries visibility, the markers that govern overriding (`abstract`, `override`, `final`), `noreturn`, and `static`, while a constructor and a destructor carry visibility alone, and a function declared at the top level carries visibility and `noreturn` alone, because nothing inherits it.
+A method carries visibility, the overriding markers (`abstract`, `override`, `final`), `noreturn`, and `static`, while a constructor carries visibility alone, and a function declared at the top level carries visibility and `noreturn` alone, because nothing inherits it.
+A destructor carries no modifier at all, because no code ever calls it.
 `sealed` belongs to a class, so it does not apply to a field or a callable; `const` belongs to a field or a variable inside a function, so it does not apply to a callable.
 Writing a modifier where it does not belong is an error that names where it does.
 

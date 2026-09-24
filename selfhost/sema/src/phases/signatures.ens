@@ -270,6 +270,33 @@ public final class SignatureCollector {
 
     // The declared type a node owns, or null when a duplicate declaration lost its name.
 
+    // The refusal of a 'main' declared outside the program's own main module. A dependency's
+    // main module is its package's, so moving the function there fixes nothing.
+    misplacedMainMessage() -> string {
+        string rule = "Function 'main' starts the program, so only the program's main module, "
+            + "'main.ens', can declare it.";
+        string packageName = this.moduleContext.module().packagePrefix();
+        if (packageName.length > 0 && this.canonicalPath == "{packageName}.main") {
+            string fix = "Rename this function.";
+            string imported = this.moduleContext.firstImport();
+            if (imported.length > 0) {
+                fix = "Rename this function, or remove {imported}.";
+            }
+            return "{rule} This file is the main module of package '{packageName}', a dependency of "
+                + "this program. {fix}";
+        }
+        bool noMainModule = !this.moduleContext.module().hasPackageManifest()
+            && !this.moduleContext.programHasMainModule();
+        if (this.canonicalPath == "src.main" && noMainModule) {
+            return "{rule} The program folder has no 'ens.package' file, so 'src/main.ens' is module "
+                + "'src.main' and not the main module. Move this file to 'main.ens' at the root of the "
+                + "program folder, or add an 'ens.package' file so that 'src/main.ens' becomes the main "
+                + "module.";
+        }
+        return "{rule} This file is module '{this.canonicalPath}'. Rename this function, or move it "
+            + "into 'main.ens'.";
+    }
+
     collectFunctions() {
         // A module whose path starts with '$' is compiler-owned - the synthesized test runner -
         // and is exempt from the entry-point placement rule.
@@ -283,9 +310,7 @@ public final class SignatureCollector {
             string name = nameToken.text();
             Span nameSpan = nameToken.span();
             if (name == "main" && !mayDefineMain) {
-                this.fileReporter.report("Function 'main' is the program entry point, so only the "
-                    + "main module (src/main.ens) can define it, not '{this.canonicalPath}'.",
-                    nameSpan);
+                this.fileReporter.report(this.misplacedMainMessage(), nameSpan);
             }
             let modifiers = members.functionModifiers(node);
             let typeParameters = this.typeResolver.resolveTypeParameters(node.green(), name,
@@ -294,10 +319,10 @@ public final class SignatureCollector {
             let signature = members.buildSignature(this.typeResolver, this.fileReporter, node, name,
                 nameSpan, false, false, false, modifiers.declaresNoreturn, null, this.typeNames,
                 typeParameters);
-            members.checkThrowsPlacement(this.fileReporter, node, false,
-                modifiers.declaresAbstract);
+            members.checkThrowsPlacement(this.fileReporter, node, false, modifiers.declaresAbstract,
+                null, this.typeNames);
             members.checkNoreturnPlacement(this.fileReporter, node, false, false,
-                modifiers.declaresNoreturn);
+                modifiers.declaresNoreturn, "");
             members.checkFunctionModifiers(this.fileReporter, node);
             this.typeResolver.popTypeParameters(typeParameters.length);
             if (name == "main" && mayDefineMain) {
@@ -329,9 +354,8 @@ public final class SignatureCollector {
                 }
                 let clashing = this.moduleContext.functions().entryWithSameParameters(signature);
                 if (clashing != null && !clashing.isBuiltin()) {
-                    this.fileReporter.report("Function '{name}' is already declared with the same "
-                        + "parameter types; overloads must differ in parameter count or types.",
-                        nameSpan);
+                    this.fileReporter.report(members.repeatedOverloadMessage("Function '{name}'",
+                        "functions"), nameSpan);
                     continue;
                 }
                 // A declaration matching a function the language provides takes it over here and
@@ -393,7 +417,7 @@ public final class SignatureCollector {
             let module = this.moduleContext.module();
             if (library.length > 0 && module.nativesRestricted() && !module.declaresNative(library)) {
                 this.fileReporter.report("External library '{library}' is not declared in "
-                    + "{module.manifestPath()}. Add 'native {library};' (or a 'system' or "
+                    + "'{module.manifestPath()}'. Add 'native {library};' (or a 'system' or "
                     + "per-platform form) to the package manifest.", block.library().span());
             }
             for (long i = 0; i < block.functionsCount(); i++) {
@@ -480,8 +504,22 @@ public final class SignatureCollector {
             [], [], declaration.green(), nameSpan);
         let existing = this.moduleContext.functions().entriesNamed(name);
         if (existing != null && existing.length() > 0) {
-            this.fileReporter.report("External function '{name}' cannot share its name with "
-                + "another function; C symbols cannot be overloaded.", nameSpan);
+            string other = "function '{name}'";
+            string fix = "Remove this declaration, or rename the other '{name}'.";
+            for (long i = 0; i < existing.length(); i++) {
+                if (existing.get(i).isExternal()) {
+                    other = "another external function";
+                    fix = "Remove one of the two declarations.";
+                    break;
+                }
+                if (existing.get(i).isBuiltin()) {
+                    other = "'{name}', a function the language provides in every module";
+                    fix = "Remove this declaration.";
+                }
+            }
+            this.fileReporter.report("External function '{name}' has the same name as {other}. A "
+                + "native library function is looked up by its name alone, so two functions cannot "
+                + "share one. {fix}", nameSpan);
             return;
         }
         if (this.nameCollidesWithBinding(name)) {
