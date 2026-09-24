@@ -111,6 +111,8 @@ Since narrowing applies to stable places only (2026-09-22), arithmetic on a chec
 A write into a field of a struct-typed `lazy const`, `Settings.point.x = 5;` on a `lazy const Point point`, or a mutating method call on it, compiles and the write is lost, so the value reads back unchanged at -O2 and -O0; the whole-value assignment and a write to a `const` field of it are refused, so this is the one shape the lazy const rule misses (2026-09-23).
 The plain null-check suggestion, `Check it for null first ('if (value != null)')`, names a placeholder where rule 1 wants the real name; it is pinned as it stands in the sema test "unsound reads stay rejected" so the fix moves that pin (2026-09-22).
 `t.label + 1` on a `string?` takes the numeric branch, because the string branch tests the type rather than what is under its `?`, so it reports `'+' needs numbers on both sides, got 'string?' and 'int'.` where a string and a number concatenate, and `t.label < word` on a `string?` reports `'<' compares numbers, got 'string?' and 'string'.` without the `compareTo` hint the plain `string` case gets (2026-09-23).
+The positional-plus-named argument text in calls.ens says "Remove the named argument for 'width'" because the argument's written text reaches it only through `ArgumentValue`, which bodies.ens builds; pass the text so the fix can name the token, "Remove 'width: 2'" (2026-09-24).
+The constructor texts in bodies.ens keep the old shape beside the new one (rule 14): "Constructor 'Box' expects 1 argument, got 0." (bodies.ens ~6836, ~8012) becomes "The constructor of 'Box' expects one argument, got none." with counts in words, and the `super(...)` texts at ~854 and ~862 follow (2026-09-24).
 
 
 The exact-pin sweep of `selfhost/sema/tests` (2026-09-23) pinned 33 diagnostics no test had asserted, as they stand, so each fix below moves a pin in the named test.
@@ -129,6 +131,9 @@ An unmarked `abstract` method on a `public` class is reported twice, once as the
 
 A user's `LINK` or `_LINK_` environment variable, meant for Microsoft's `link.exe`, reaches every in-process lld-link run (`LINK=/threads:0 ens build x.ens` fails with lld-link's own error); `/lldignoreenv` in the COFF argument vector would keep the link deterministic, and belongs with the link policy in `selfhost/link/` (2026-09-23).
 Unloading `ens-lld` with `FreeLibrary` after a single-threaded link crashes at process exit inside `rpmalloc_initialize` from an unloaded page; `ens` never unloads the bridge, so nothing reaches it (2026-09-23).
+An `else if` chain of about 2500 links makes the front end exit with code 127 and no message: `parseIfStatement` recurses on `else if` without `enterNesting`, so the nesting limit never counts the chain; 2200 links still parse (found 2026-09-24 reviewing the parser split, reproduced with the compiler from 45a32eb).
+`ens check libs/std --stdlib libs` reports 32 problems such as "expected 'Path (from std.fs)', got 'Path'": std checked as a package while it is also the standard library gives two copies of every std type; `check` should refuse the pairing or treat the folder as the library (2026-09-24).
+A four-character char literal, `char b = '0100';` or `byte a = '0100';`, passes `check`; "Character literal does not fit in 'byte'" does not name the literal (rule 1); "the fallback has to be a 'int' too" has the wrong article (found 2026-09-24 by review 9 of the nullable-operand family).
 
 ## The language server's replacement
 
