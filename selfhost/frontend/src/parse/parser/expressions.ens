@@ -1,0 +1,611 @@
+// The grammar of expressions, from operators and their precedence to lambdas and literals.
+import support.source;
+import SyntaxKind from syntax.generated.kind;
+import syntax.generated.kind;
+import Parser from parse.parser;
+import parse.parser.statements;
+import parse.parser.types;
+
+// ============================================================ expressions
+
+// A whole expression, assignments included, returned as a completed node.
+public parseExpression(Parser parser) -> long {
+    return parsePrecedence(parser, 1);
+}
+
+// Every operator that extends what came before wraps it, so a chain's length is the depth of
+// the expression tree and is bounded by the same count parentheses are. The levels a chain
+// took are returned together, because they are one expression rather than one per link.
+parsePrecedence(Parser parser, long minPrecedence) -> long {
+    if (!parser.enterNesting(deeplyNestedExpression())) {
+        return parser.abandoned(SyntaxKind.ErrorExpression);
+    }
+    long taken = 1;
+    long completed = parsePrefix(parser);
+    while (true) {
+        let operator = parser.currentKind();
+        if (operator == SyntaxKind.Less && tryParseGenericSuffix(parser)) {
+            if (!parser.enterNesting(deeplyNestedExpression())) {
+                parser.leaveNestingTimes(taken);
+                return parser.abandoned(SyntaxKind.ErrorExpression);
+            }
+            taken++;
+            if (parser.at(SyntaxKind.OpenParenthesis)) {
+                let call = parser.precede(completed);
+                parseArgumentList(parser);
+                completed = parser.complete(call, SyntaxKind.CallExpression);
+            } else {
+                completed = parser.complete(parser.precede(completed),
+                    SyntaxKind.GenericNameExpression);
+            }
+            continue;
+        }
+        bool safeSubscript = parser.atSafeSubscript();
+        bool coalesce = parser.atNullCoalesce();
+        bool separatedCoalesce = !coalesce && parser.atSeparatedNullCoalesce();
+        long precedence = infixPrecedence(operator);
+        if (safeSubscript) {
+            precedence = 14;
+        } else if (coalesce || separatedCoalesce) {
+            precedence = Precedence.nullCoalesce;
+        }
+        if (precedence < minPrecedence || precedence == 0) {
+            break;
+        }
+        if (!parser.enterNesting(deeplyNestedExpression())) {
+            parser.leaveNestingTimes(taken);
+            return parser.abandoned(SyntaxKind.ErrorExpression);
+        }
+        taken++;
+        if (safeSubscript) {
+            let marker = parser.precede(completed);
+            parser.bump();
+            parser.bump();
+            parseExpression(parser);
+            parser.expect(SyntaxKind.CloseBracket, "Expected ']' to close the subscript");
+            completed = parser.complete(marker, SyntaxKind.SafeSubscriptExpression);
+            continue;
+        }
+        if (coalesce || separatedCoalesce) {
+            if (separatedCoalesce) {
+                parser.reportSeparatedQuestions();
+            }
+            let marker = parser.precede(completed);
+            parser.bump();
+            parser.bump();
+            parsePrecedence(parser, precedence);
+            completed = parser.complete(marker, SyntaxKind.NullCoalesceExpression);
+            continue;
+        }
+        switch (operator) {
+            Question -> {
+                let marker = parser.precede(completed);
+                parser.bump();
+                bool branchOpensBracket = parser.at(SyntaxKind.OpenBracket);
+                parseExpression(parser);
+                parser.expect(SyntaxKind.Colon, missingTernaryColon(branchOpensBracket));
+                parsePrecedence(parser, 1);
+                completed = parser.complete(marker, SyntaxKind.TernaryExpression);
+            },
+            OpenParenthesis -> {
+                let marker = parser.precede(completed);
+                parser.nullSlot();
+                parseArgumentList(parser);
+                completed = parser.complete(marker, SyntaxKind.CallExpression);
+            },
+            OpenBracket -> {
+                let marker = parser.precede(completed);
+                parser.bump();
+                parseExpression(parser);
+                parser.expect(SyntaxKind.CloseBracket, "Expected ']' to close the subscript");
+                completed = parser.complete(marker, SyntaxKind.SubscriptExpression);
+            },
+            PlusPlus, MinusMinus -> {
+                let marker = parser.precede(completed);
+                parser.bump();
+                completed = parser.complete(marker, SyntaxKind.PostfixExpression);
+            },
+            Dot -> {
+                let marker = parser.precede(completed);
+                parser.bump();
+                parser.expect(SyntaxKind.Identifier, "Expected a member name after '.'");
+                completed = parser.complete(marker, SyntaxKind.MemberExpression);
+            },
+            QuestionDot -> {
+                let marker = parser.precede(completed);
+                parser.bump();
+                parser.expect(SyntaxKind.Identifier, "Expected a member name after '?.'");
+                completed = parser.complete(marker, SyntaxKind.SafeMemberExpression);
+            },
+            AsKeyword -> {
+                bool checked = parser.peekKind(1) == SyntaxKind.Question;
+                let marker = parser.precede(completed);
+                parser.bump();
+                if (checked) {
+                    parser.bump();
+                    types.parseCastTargetType(parser,
+                        "Expected a type after 'as?', for example 'x as? Circle'");
+                    completed = parser.complete(marker, SyntaxKind.CheckedCastExpression);
+                } else {
+                    types.parseCastTargetType(parser, "Expected a type after 'as', for example 'x as long'");
+                    completed = parser.complete(marker, SyntaxKind.CastExpression);
+                }
+            },
+            IsKeyword -> {
+                let marker = parser.precede(completed);
+                parser.bump();
+                types.parseNamedType(parser, "Expected a type after 'is', for example 'x is Circle'");
+                completed = parser.complete(marker, SyntaxKind.TypeTestExpression);
+            },
+            default -> {
+                let marker = parser.precede(completed);
+                parser.bump();
+                if (isAssignmentOperator(operator)) {
+                    parsePrecedence(parser, precedence);
+                    completed = parser.complete(marker, SyntaxKind.AssignmentExpression);
+                } else {
+                    parsePrecedence(parser, precedence + 1);
+                    completed = parser.complete(marker, SyntaxKind.BinaryExpression);
+                }
+            },
+        }
+    }
+    parser.leaveNestingTimes(taken);
+    return completed;
+}
+
+// At a '<' after an expression, commits type arguments only when they parse cleanly and either
+// a call's '(' follows, the `callee<TypeArgs>(args)` shape, or a member access's '.' follows,
+// the `TypeName<TypeArgs>.member` shape. Otherwise it rewinds so the '<' stays a comparison.
+tryParseGenericSuffix(Parser parser) -> bool {
+    let restore = parser.mark();
+    types.parseTypeArgumentList(parser);
+    if (parser.clean(restore) && (parser.at(SyntaxKind.OpenParenthesis) || parser.at(SyntaxKind.Dot))) {
+        return true;
+    }
+    parser.rewind(restore);
+    return false;
+}
+
+parsePrefix(Parser parser) -> long {
+    bool lambdaHere = !parser.inArmLabels();
+    switch (parser.currentKind()) {
+        IntLiteral, LongLiteral, FloatLiteral, DoubleLiteral, StringLiteral, CharLiteral,
+        TrueKeyword, FalseKeyword, NullKeyword -> {
+            return parseSingleTokenExpression(parser, SyntaxKind.LiteralExpression);
+        },
+        Identifier -> {
+            if (lambdaHere && parser.peekKind(1) == SyntaxKind.Arrow) {
+                return parseBareParameterLambda(parser);
+            }
+            return parseSingleTokenExpression(parser, SyntaxKind.IdentifierExpression);
+        },
+        // A primitive's keyword names the type itself, which is how a static of that type is
+        // reached: 'string.joined(parts, ", ")'.
+        BoolKeyword, ByteKeyword, ShortKeyword, UShortKeyword, IntKeyword, UIntKeyword,
+        LongKeyword, ULongKeyword, FloatKeyword, DoubleKeyword, DecimalKeyword, CharKeyword,
+        StringKeyword, VoidKeyword -> {
+            return parseSingleTokenExpression(parser, SyntaxKind.IdentifierExpression);
+        },
+        ThisKeyword -> {
+            return parseSingleTokenExpression(parser, SyntaxKind.ThisExpression);
+        },
+        SuperKeyword -> {
+            return parseSingleTokenExpression(parser, SyntaxKind.SuperExpression);
+        },
+        OpenParenthesis -> {
+            if (lambdaHere && parser.atArrowAfterParentheses()) {
+                return parseLambda(parser);
+            }
+            let marker = parser.start();
+            parser.bump();
+            parseExpression(parser);
+            parser.expect(SyntaxKind.CloseParenthesis, "Expected ')' to close the parentheses");
+            return parser.complete(marker, SyntaxKind.ParenthesizedExpression);
+        },
+        Minus, Plus, Exclamation, Tilde, PlusPlus, MinusMinus -> {
+            let marker = parser.start();
+            parser.bump();
+            parsePrecedence(parser, 13);
+            return parser.complete(marker, SyntaxKind.PrefixExpression);
+        },
+        OpenBracket -> {
+            return parseArrayLiteral(parser);
+        },
+        OpenBrace -> {
+            return parseStructLiteral(parser);
+        },
+        NewKeyword -> {
+            return parseNewExpression(parser);
+        },
+        TryKeyword -> {
+            let marker = parser.start();
+            parser.bump();
+            parsePrecedence(parser, 14);
+            return parser.complete(marker, SyntaxKind.TryExpression);
+        },
+        SwitchKeyword -> {
+            return statements.parseSwitchExpression(parser);
+        },
+        InterpolatedStringStart -> {
+            return parseInterpolatedString(parser);
+        },
+        default -> {
+            parser.report("Expected an expression, for example a value like '42', a variable "
+                + "name, or a call", source.makeSpan(parser.lastContentEnd(), 0));
+            return emptyErrorExpression(parser);
+        },
+    }
+}
+
+parseSingleTokenExpression(Parser parser, SyntaxKind nodeKind) -> long {
+    let marker = parser.start();
+    parser.bump();
+    return parser.complete(marker, nodeKind);
+}
+
+// ============================================================ lambdas
+
+// LambdaExpression = '(' parameters ')' '->' body. The caller has established that the token
+// after the matching ')' is '->'.
+parseLambda(Parser parser) -> long {
+    let marker = parser.start();
+    parser.bump();
+    parseLambdaParameters(parser);
+    parser.expect(SyntaxKind.CloseParenthesis,
+        "Expected ')' to close the lambda's parameters");
+    parser.expect(SyntaxKind.Arrow,
+        "Expected '->' after the lambda's parameters, for example '(a, b) -> a - b'");
+    parseLambdaBody(parser);
+    return parser.complete(marker, SyntaxKind.LambdaExpression);
+}
+
+// 'a -> a * 2', which the language does not accept: the parentheses around a lambda's
+// parameters are always required. The name becomes the sole parameter of a lambda whose
+// parentheses the parser supplies, so the body is still checked.
+parseBareParameterLambda(Parser parser) -> long {
+    parser.reportAtCurrent("A lambda's parameters are always written in parentheses: use "
+        + "'({parser.currentText()}) -> ...' rather than "
+        + "'{parser.currentText()} -> ...'");
+    let marker = parser.start();
+    parser.missingInPlace();
+    let list = parser.start();
+    let parameter = parser.start();
+    parser.nullSlot();
+    parser.bumpAs(SyntaxKind.Identifier);
+    parser.complete(parameter, SyntaxKind.LambdaParameter);
+    parser.complete(list, SyntaxKind.List);
+    parser.missingInPlace();
+    parser.bump();
+    parseLambdaBody(parser);
+    return parser.complete(marker, SyntaxKind.LambdaExpression);
+}
+
+parseLambdaParameters(Parser parser) {
+    let list = parser.start();
+    bool needSeparator = false;
+    while (!parser.at(SyntaxKind.CloseParenthesis) && !parser.atEnd()) {
+        if (needSeparator) {
+            if (parser.at(SyntaxKind.Comma)) {
+                parser.bump();
+                if (parser.at(SyntaxKind.CloseParenthesis)) {
+                    parser.report("Expected a parameter after ','",
+                        source.makeSpan(parser.lastContentEnd(), 0));
+                    break;
+                }
+            } else {
+                parser.missing(SyntaxKind.Comma,
+                    "Expected ',' between the lambda's parameters");
+            }
+        }
+        parseLambdaParameter(parser);
+        needSeparator = true;
+    }
+    parser.complete(list, SyntaxKind.List);
+}
+
+// LambdaParameter = declaredType? name. A bare name takes its type from the target type; a
+// written type comes first, exactly as in a parameter list.
+parseLambdaParameter(Parser parser) {
+    let marker = parser.start();
+    bool bareName = parser.at(SyntaxKind.Identifier)
+        && (parser.peekKind(1) == SyntaxKind.Comma
+            || parser.peekKind(1) == SyntaxKind.CloseParenthesis);
+    if (!bareName && types.isTypeOrGroupStart(parser.currentKind())) {
+        types.parseType(parser, "Expected the parameter's type, for example '(int a, int b) -> a - b'");
+    } else {
+        parser.nullSlot();
+    }
+    if (parser.at(SyntaxKind.Identifier)) {
+        parser.bump();
+    } else if (parser.at(SyntaxKind.Comma) || parser.at(SyntaxKind.CloseParenthesis)) {
+        parser.missing(SyntaxKind.Identifier, "Expected the parameter's name after its type, "
+            + "for example '(int a, int b) -> a - b'");
+    } else if (kind.isKeyword(parser.currentKind())) {
+        parser.reportAtCurrent("'{parser.currentText()}' is a keyword and cannot be used as a "
+            + "parameter name; choose a different name such as 'value'");
+        parser.bumpAs(SyntaxKind.Identifier);
+    } else {
+        parser.reportAtCurrent("Expected the lambda parameter's name, for example "
+            + "'(a, b) -> a - b'");
+        parser.bumpAs(SyntaxKind.Identifier);
+    }
+    parser.complete(marker, SyntaxKind.LambdaParameter);
+}
+
+// The body after '->': a block when a '{' follows that is not a struct literal, and a single
+// expression otherwise.
+parseLambdaBody(Parser parser) {
+    if (parser.at(SyntaxKind.OpenBrace) && !atStructLiteralStart(parser)) {
+        statements.parseBlock(parser);
+        return;
+    }
+    parseExpression(parser);
+}
+
+// InterpolatedStringExpression = start firstHole (middle hole)* end; the lexer guarantees
+// text segments and holes alternate, so the slots read in source order.
+public parseInterpolatedString(Parser parser) -> long {
+    let marker = parser.start();
+    parser.bump();
+    parseExpression(parser);
+    let continuations = parser.start();
+    while (parser.at(SyntaxKind.InterpolatedStringMiddle)) {
+        let part = parser.start();
+        parser.bump();
+        parseExpression(parser);
+        parser.complete(part, SyntaxKind.InterpolationPart);
+    }
+    parser.complete(continuations, SyntaxKind.List);
+    parser.expect(SyntaxKind.InterpolatedStringEnd, "Expected the end of the interpolated string");
+    return parser.complete(marker, SyntaxKind.InterpolatedStringExpression);
+}
+
+// An ErrorExpression holding no tokens, for an expression slot with nothing to fill it.
+public emptyErrorExpression(Parser parser) -> long {
+    let marker = parser.start();
+    let skipped = parser.start();
+    parser.complete(skipped, SyntaxKind.List);
+    return parser.complete(marker, SyntaxKind.ErrorExpression);
+}
+
+parseArrayLiteral(Parser parser) -> long {
+    let marker = parser.start();
+    parser.bump();
+    let list = parser.start();
+    if (!parser.at(SyntaxKind.CloseBracket) && !parser.atEnd()) {
+        parseExpression(parser);
+        while (parser.at(SyntaxKind.Comma)) {
+            parser.bump();
+            if (parser.at(SyntaxKind.CloseBracket)) {
+                break;
+            }
+            parseExpression(parser);
+        }
+    }
+    parser.complete(list, SyntaxKind.List);
+    parser.expect(SyntaxKind.CloseBracket, "Expected ']' to close the array literal");
+    return parser.complete(marker, SyntaxKind.ArrayLiteralExpression);
+}
+
+// A '{' begins a struct literal only in expression position; blocks and switch-arm bodies are
+// dispatched before reaching here, and the arm body checks atStructLiteralStart first.
+parseStructLiteral(Parser parser) -> long {
+    let marker = parser.start();
+    parser.bump();
+    let list = parser.start();
+    if (!parser.at(SyntaxKind.CloseBrace) && !parser.atEnd()) {
+        parseStructLiteralField(parser);
+        while (parser.at(SyntaxKind.Comma)) {
+            parser.bump();
+            if (parser.at(SyntaxKind.CloseBrace)) {
+                break;
+            }
+            parseStructLiteralField(parser);
+        }
+    }
+    parser.complete(list, SyntaxKind.List);
+    parser.expect(SyntaxKind.CloseBrace, "Expected '\}' to close the struct literal");
+    return parser.complete(marker, SyntaxKind.StructLiteralExpression);
+}
+
+parseStructLiteralField(Parser parser) {
+    let marker = parser.start();
+    parser.expect(SyntaxKind.Identifier,
+        "Expected a field name, for example '\{x: 1, y: 2\}'");
+    parser.expect(SyntaxKind.Colon,
+        "Expected ':' after the field name, for example '\{x: 1\}'");
+    parseExpression(parser);
+    parser.complete(marker, SyntaxKind.StructLiteralField);
+}
+
+// A '{' whose next two tokens are `IDENT :` starts a struct literal; Ens has no labels, so that
+// shape can never begin a statement. Every other '{' is a block.
+public atStructLiteralStart(Parser parser) -> bool {
+    return parser.at(SyntaxKind.OpenBrace) && parser.peekKind(1) == SyntaxKind.Identifier
+        && parser.peekKind(2) == SyntaxKind.Colon;
+}
+
+// NewExpression = 'new' createdType arguments? dimensions*. The created type keeps '?'
+// suffixes and any '[]' pair that more suffixes follow ('new Box?[]?[3]'); a final '[...]'
+// run is the dimension list ('new int[3][4]').
+parseNewExpression(Parser parser) -> long {
+    let marker = parser.start();
+    parser.bump();
+    parseNewCreatedType(parser);
+    if (parser.at(SyntaxKind.OpenParenthesis)) {
+        parseArgumentList(parser);
+        let dimensions = parser.start();
+        parser.complete(dimensions, SyntaxKind.List);
+    } else if (parser.at(SyntaxKind.OpenBracket)) {
+        parser.nullSlot();
+        parseArrayDimensions(parser);
+    } else {
+        parser.nullSlot();
+        let dimensions = parser.start();
+        parser.complete(dimensions, SyntaxKind.List);
+        parser.report("Expected '(' for constructor arguments or '[' for an array size after "
+            + "the type in 'new', for example 'new Point(0, 0)' or 'new int[8]'",
+            source.makeSpan(parser.lastContentEnd(), 0));
+    }
+    return parser.complete(marker, SyntaxKind.NewExpression);
+}
+
+parseNewCreatedType(Parser parser) {
+    long completed = types.parseTypeHead(parser,
+        "Expected a type after 'new', for example 'new Point(0, 0)'");
+    while (true) {
+        if (parser.at(SyntaxKind.Question)) {
+            let marker = parser.precede(completed);
+            parser.bump();
+            completed = parser.complete(marker, SyntaxKind.OptionalType);
+            continue;
+        }
+        bool elementBrackets = parser.at(SyntaxKind.OpenBracket)
+            && parser.peekKind(1) == SyntaxKind.CloseBracket
+            && (parser.peekKind(2) == SyntaxKind.Question
+                || parser.peekKind(2) == SyntaxKind.OpenBracket);
+        if (elementBrackets) {
+            let marker = parser.precede(completed);
+            parser.bump();
+            parser.bump();
+            completed = parser.complete(marker, SyntaxKind.ArrayType);
+            continue;
+        }
+        break;
+    }
+}
+
+parseArrayDimensions(Parser parser) {
+    let list = parser.start();
+    bool seenEmpty = false;
+    while (parser.at(SyntaxKind.OpenBracket)) {
+        let dimension = parser.start();
+        parser.bump();
+        if (parser.at(SyntaxKind.CloseBracket)) {
+            parser.nullSlot();
+            parser.bump();
+            seenEmpty = true;
+        } else {
+            if (seenEmpty) {
+                parser.reportAtCurrent("Sized dimensions must come before any '[]' dimensions, "
+                    + "for example 'new int[3][]'");
+            }
+            parseExpression(parser);
+            parser.expect(SyntaxKind.CloseBracket, "Expected ']' after the array size");
+        }
+        parser.complete(dimension, SyntaxKind.ArrayDimension);
+    }
+    parser.complete(list, SyntaxKind.List);
+}
+
+parseArgumentList(Parser parser) {
+    let marker = parser.start();
+    parser.expect(SyntaxKind.OpenParenthesis, "Expected '(' to begin the arguments");
+    let list = parser.start();
+    if (!parser.at(SyntaxKind.CloseParenthesis) && !parser.atEnd()) {
+        parseArgument(parser);
+        while (parser.at(SyntaxKind.Comma)) {
+            parser.bump();
+            if (parser.at(SyntaxKind.CloseParenthesis)) {
+                break;
+            }
+            parseArgument(parser);
+        }
+    }
+    parser.complete(list, SyntaxKind.List);
+    parser.expect(SyntaxKind.CloseParenthesis, "Expected ')' to close the arguments");
+    parser.complete(marker, SyntaxKind.ArgumentList);
+}
+
+parseArgument(Parser parser) {
+    if (parser.atContextual("out") && parser.peekKind(1) == SyntaxKind.Identifier) {
+        let marker = parser.start();
+        parser.bumpAs(SyntaxKind.OutKeyword);
+        parser.bump();
+        parser.complete(marker, SyntaxKind.OutArgument);
+        return;
+    }
+    if (parser.at(SyntaxKind.Identifier) && parser.peekKind(1) == SyntaxKind.Colon) {
+        let marker = parser.start();
+        parser.bump();
+        parser.bump();
+        parseExpression(parser);
+        parser.complete(marker, SyntaxKind.NamedArgument);
+        return;
+    }
+    parseExpression(parser);
+}
+
+// ============================================================ kind tables
+
+public canStartExpression(SyntaxKind kind) -> bool {
+    if (types.isPrimitiveTypeKeyword(kind)) {
+        return true;
+    }
+    return switch (kind) {
+        IntLiteral, LongLiteral, FloatLiteral, DoubleLiteral, StringLiteral, CharLiteral,
+        InterpolatedStringStart, Identifier, TrueKeyword, FalseKeyword, NullKeyword, ThisKeyword,
+        SuperKeyword, NewKeyword, TryKeyword, SwitchKeyword, OpenParenthesis, OpenBracket,
+        Minus, Plus, Exclamation, Tilde, PlusPlus, MinusMinus -> true,
+        default -> false,
+    };
+}
+
+isAssignmentOperator(SyntaxKind kind) -> bool {
+    return switch (kind) {
+        Equals, PlusEquals, MinusEquals, StarEquals, SlashEquals, PercentEquals, AmpersandEquals,
+        PipeEquals, CaretEquals, LessLessEquals, GreaterGreaterEquals,
+        GreaterGreaterGreaterEquals -> true,
+        default -> false,
+    };
+}
+
+// What an expression too deep to parse reports, whether it got there by nesting or by chaining:
+// both are the same count and the same fix, so both say it the same way.
+deeplyNestedExpression() -> string {
+    return "This expression nests too deeply to be parsed; split it into smaller expressions";
+}
+
+final class Precedence {
+    // '??' binds like '||' and is right-associative. The operator is a pair of Question tokens
+    // rather than a kind of its own, so its strength cannot come out of infixPrecedence.
+    protected static const long nullCoalesce = 3;
+}
+
+// What a conditional expression missing its ':' reports. A first branch that opened with '[' is
+// most likely a safe subscript written with a space, so the message says how to spell that too.
+missingTernaryColon(bool branchOpensBracket) -> string {
+    string message = "This conditional expression is missing its ':'. Write "
+        + "'condition ? valueWhenTrue : valueWhenFalse', with ':' between the two results.";
+    if (!branchOpensBracket) {
+        return message;
+    }
+    return message + " If you meant to index a value that may be null, write '?[' with no space "
+        + "before the bracket, for example 'rows?[0]'.";
+}
+
+// The binding strength of an infix or postfix operator, or 0 when the kind ends an expression.
+// Assignment is right-associative, and so is '??' through Precedence.nullCoalesce; the caller
+// passes the same precedence back down for those and precedence + 1 for the rest.
+infixPrecedence(SyntaxKind kind) -> long {
+    if (isAssignmentOperator(kind)) {
+        return 1;
+    }
+    return switch (kind) {
+        Question -> 2,
+        PipePipe -> 3,
+        AmpersandAmpersand -> 4,
+        Pipe -> 5,
+        Caret -> 6,
+        Ampersand -> 7,
+        EqualsEquals, NotEquals -> 8,
+        Less, Greater, LessEquals, GreaterEquals, IsKeyword -> 9,
+        LessLess, GreaterGreater, GreaterGreaterGreater -> 10,
+        Plus, Minus -> 11,
+        Star, Slash, Percent -> 12,
+        AsKeyword -> 13,
+        Dot, QuestionDot, OpenParenthesis, OpenBracket, PlusPlus, MinusMinus -> 14,
+        default -> 0,
+    };
+}

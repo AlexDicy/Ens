@@ -1,0 +1,528 @@
+// The grammar of statements and blocks, switch statements and switch expressions included.
+import support.source;
+import SyntaxKind from syntax.generated.kind;
+import Parser from parse.parser;
+import parse.parser.types;
+import parse.parser.expressions;
+
+// ============================================================ statements
+
+// One statement, chosen by its first token, or an error statement where no statement can begin.
+public parseStatement(Parser parser) {
+    switch (parser.currentKind()) {
+        OpenBrace -> parseBlock(parser),
+        LetKeyword, ConstKeyword -> parseVariableDeclaration(parser),
+        IfKeyword -> parseIfStatement(parser),
+        WhileKeyword -> parseWhileStatement(parser),
+        ForKeyword -> parseForStatement(parser),
+        SwitchKeyword -> parseSwitchStatement(parser),
+        BreakKeyword -> parseKeywordStatement(parser, SyntaxKind.BreakStatement,
+            "Expected ';' after 'break'"),
+        ContinueKeyword -> parseKeywordStatement(parser, SyntaxKind.ContinueStatement,
+            "Expected ';' after 'continue'"),
+        RethrowKeyword -> parseKeywordStatement(parser, SyntaxKind.RethrowStatement,
+            "Expected ';' after 'rethrow'"),
+        ReturnKeyword -> parseReturnStatement(parser),
+        ThrowKeyword -> parseThrowStatement(parser),
+        CatchKeyword -> parseStatementError(parser,
+            "A 'catch' block can only follow a function body's closing '}'"),
+        FinallyKeyword -> parseStatementError(parser, "'finally' is not supported; write the "
+            + "cleanup before each return or in the catch clause"),
+        default -> {
+            if (atTypedVariableDeclaration(parser)) {
+                parseVariableDeclaration(parser);
+            } else if (expressions.canStartExpression(parser.currentKind())) {
+                parseExpressionStatement(parser);
+            } else {
+                parseStatementError(parser, "Expected a statement, for example an assignment, "
+                    + "a call, or a declaration like 'let count = 0;'");
+            }
+        },
+    }
+}
+
+// A block holds statements that hold blocks, so its nesting counts towards the same limit an
+// expression's and a type's do: all three deepen the tree the later phases walk. Past the limit
+// the body becomes one error statement holding the tokens, so the braces around it still match.
+public parseBlock(Parser parser) {
+    let marker = parser.start();
+    parser.expect(SyntaxKind.OpenBrace, "Expected '\{' to begin the block");
+    let statements = parser.start();
+    if (parser.enterNesting("These blocks nest too deeply to be parsed; move the inner ones "
+            + "into functions of their own")) {
+        while (!parser.at(SyntaxKind.CloseBrace) && !parser.atEnd()) {
+            parseStatement(parser);
+        }
+        parser.leaveNesting();
+    } else {
+        skipDeepBlockBody(parser);
+    }
+    parser.complete(statements, SyntaxKind.List);
+    parser.expect(SyntaxKind.CloseBrace, "Expected '\}' to close the block");
+    parser.complete(marker, SyntaxKind.Block);
+}
+
+// The statements of a block too deep to parse, taken as tokens up to the brace that closes it,
+// so the enclosing blocks still find their own closers.
+skipDeepBlockBody(Parser parser) {
+    let marker = parser.start();
+    let skipped = parser.start();
+    long depth = 0;
+    while (!parser.atEnd()) {
+        let kind = parser.currentKind();
+        if (kind == SyntaxKind.CloseBrace) {
+            if (depth == 0) {
+                break;
+            }
+            depth--;
+        } else if (kind == SyntaxKind.OpenBrace) {
+            depth++;
+        }
+        parser.bump();
+    }
+    parser.complete(skipped, SyntaxKind.List);
+    parser.complete(marker, SyntaxKind.ErrorStatement);
+}
+
+// For a required Block slot with no '{' present. An empty Block with missing braces keeps the
+// typed accessors total. It is zero-width and consumes nothing, so the pair of braces is one
+// guess reaching no further than the statement being built.
+public parseBlockOrMissing(Parser parser, string message) {
+    if (parser.at(SyntaxKind.OpenBrace)) {
+        parseBlock(parser);
+        return;
+    }
+    parser.report(message, source.makeSpan(parser.lastContentEnd(), 0));
+    let marker = parser.start();
+    parser.missingInPlace();
+    let statements = parser.start();
+    parser.complete(statements, SyntaxKind.List);
+    parser.pushMissingToken();
+    parser.complete(marker, SyntaxKind.Block);
+}
+
+// Recovery inside blocks: wraps the junk in an ErrorStatement; a ';' ends the junk and is
+// consumed into it, and a '}' ends it unconsumed so the enclosing block can close.
+parseStatementError(Parser parser, string message) {
+    parser.reportAtCurrent(message);
+    let marker = parser.start();
+    let skipped = parser.start();
+    while (!parser.atEnd()) {
+        let kind = parser.currentKind();
+        if (kind == SyntaxKind.CloseBrace) {
+            break;
+        }
+        if (kind == SyntaxKind.Semicolon) {
+            parser.bump();
+            break;
+        }
+        parser.bump();
+    }
+    parser.complete(skipped, SyntaxKind.List);
+    parser.complete(marker, SyntaxKind.ErrorStatement);
+}
+
+// True at `Type name = ...` or `Type name;`. The type is parsed speculatively and always
+// rewound, and the caller re-parses it for real. A type the parser could not read keeps the
+// reading it was written as, so it reports its own problem once. Dropping the statement to the
+// expression path would re-read the same text and report once per link of a broken chain.
+public atTypedVariableDeclaration(Parser parser) -> bool {
+    if (!types.isTypeOrGroupStart(parser.currentKind())) {
+        return false;
+    }
+    let restore = parser.mark();
+    types.parseType(parser, "");
+    bool named = parser.at(SyntaxKind.Identifier)
+        && (parser.peekKind(1) == SyntaxKind.Equals
+            || parser.peekKind(1) == SyntaxKind.Semicolon);
+    // A chain that ran into the end of the file has no name to look for, and nothing more was
+    // written to say what it was: the tokens already read as a type stay one. A single name
+    // there is left to the expression path, which is what an unfinished statement usually is.
+    bool truncatedChain = parser.atEnd() && parser.position() - restore.position > 1;
+    bool result = named || truncatedChain;
+    parser.rewind(restore);
+    return result;
+}
+
+// Nothing at file scope holds a value, so the message names the variable it read and says
+// where the value can be stored instead.
+public topLevelVariableMessage(Parser parser) -> string {
+    string name = declaredVariableName(parser);
+    string what = "the declaration";
+    if (name.length > 0) {
+        what = "'{name}'";
+    }
+    return "Variables cannot be declared at the top level; move {what} inside a function, or "
+        + "expose the value through a function, for example 'pi() -> int \{ return 3; \}'";
+}
+
+// The name a variable declaration gives, read speculatively and always rewound, or "" when
+// the declaration is too broken to reach a name.
+declaredVariableName(Parser parser) -> string {
+    let restore = parser.mark();
+    if (parser.at(SyntaxKind.LetKeyword) || parser.at(SyntaxKind.ConstKeyword)) {
+        parser.bump();
+    }
+    bool bareName = parser.at(SyntaxKind.Identifier)
+        && (parser.peekKind(1) == SyntaxKind.Equals || parser.peekKind(1) == SyntaxKind.Semicolon);
+    if (!bareName && types.isTypeOrGroupStart(parser.currentKind())) {
+        types.parseType(parser, "");
+    }
+    string name = "";
+    if (parser.at(SyntaxKind.Identifier)) {
+        name = parser.currentText();
+    }
+    parser.rewind(restore);
+    return name;
+}
+
+// VariableDeclaration = modifier? declaredType? name initializer? ';'. Whether at least one
+// of modifier and declared type is present is checked semantically, not here.
+parseVariableDeclaration(Parser parser) {
+    let marker = parser.start();
+    if (parser.at(SyntaxKind.LetKeyword) || parser.at(SyntaxKind.ConstKeyword)) {
+        parser.bump();
+    } else {
+        parser.nullSlot();
+    }
+    bool bareName = parser.at(SyntaxKind.Identifier)
+        && (parser.peekKind(1) == SyntaxKind.Equals || parser.peekKind(1) == SyntaxKind.Semicolon);
+    if (bareName) {
+        parser.nullSlot();
+        parser.bump();
+    } else if (types.isTypeOrGroupStart(parser.currentKind())) {
+        types.parseType(parser, "Expected the variable's type");
+        parser.expect(SyntaxKind.Identifier,
+            "Expected the variable's name after its type, for example 'int count = 0;'");
+    } else {
+        parser.nullSlot();
+        parser.missing(SyntaxKind.Identifier,
+            "Expected the variable's name, for example 'let count = 0;'");
+    }
+    if (parser.at(SyntaxKind.Equals)) {
+        parseInitializer(parser);
+    } else {
+        parser.nullSlot();
+    }
+    parser.expect(SyntaxKind.Semicolon,
+        "Expected ';' after the variable declaration, for example 'let count = 0;'");
+    parser.complete(marker, SyntaxKind.VariableDeclaration);
+}
+
+// Initializer = '=' value. The caller is at '='.
+public parseInitializer(Parser parser) {
+    let marker = parser.start();
+    parser.bump();
+    expressions.parseExpression(parser);
+    parser.complete(marker, SyntaxKind.Initializer);
+}
+
+parseIfStatement(Parser parser) {
+    let marker = parser.start();
+    parser.bump();
+    parser.expect(SyntaxKind.OpenParenthesis, "Expected '(' before the if condition, for "
+        + "example 'if (ready) \{ ... \}'");
+    expressions.parseExpression(parser);
+    parser.expect(SyntaxKind.CloseParenthesis, "Expected ')' after the if condition");
+    parseBlockOrMissing(parser, "Expected '\{' for the if body; the branches of 'if' are always "
+        + "blocks, for example 'if (ready) \{ start(); \}'");
+    if (parser.at(SyntaxKind.ElseKeyword)) {
+        let elseMarker = parser.start();
+        parser.bump();
+        if (parser.at(SyntaxKind.IfKeyword)) {
+            parseIfStatement(parser);
+        } else {
+            parseBlockOrMissing(parser, "Expected '\{' or another 'if' after 'else'");
+        }
+        parser.complete(elseMarker, SyntaxKind.ElseClause);
+    } else {
+        parser.nullSlot();
+    }
+    parser.complete(marker, SyntaxKind.IfStatement);
+}
+
+parseWhileStatement(Parser parser) {
+    let marker = parser.start();
+    parser.bump();
+    parser.expect(SyntaxKind.OpenParenthesis, "Expected '(' before the while condition, for "
+        + "example 'while (running) \{ ... \}'");
+    expressions.parseExpression(parser);
+    parser.expect(SyntaxKind.CloseParenthesis, "Expected ')' after the while condition");
+    parseBlockOrMissing(parser, "Expected '\{' for the loop body");
+    parser.complete(marker, SyntaxKind.WhileStatement);
+}
+
+parseForStatement(Parser parser) {
+    let marker = parser.start();
+    parser.bump();
+    parser.expect(SyntaxKind.OpenParenthesis, "Expected '(' after 'for'");
+    if (atForEachHeader(parser)) {
+        if (parser.at(SyntaxKind.LetKeyword) || parser.at(SyntaxKind.ConstKeyword)) {
+            parser.bump();
+        } else {
+            parser.nullSlot();
+        }
+        if (parser.at(SyntaxKind.Identifier) && parser.peekIsContextual(1, "in")) {
+            parser.nullSlot();
+            parser.bump();
+        } else {
+            types.parseType(parser, "Expected the loop variable's type or 'let'");
+            parser.expect(SyntaxKind.Identifier, "Expected the loop variable's name");
+        }
+        if (parser.atContextual("in")) {
+            parser.bumpAs(SyntaxKind.InKeyword);
+        } else {
+            parser.missing(SyntaxKind.InKeyword,
+                "Expected 'in' between the loop variable and the values, for example "
+                + "'for (let item in items)'");
+        }
+        expressions.parseExpression(parser);
+        parser.expect(SyntaxKind.CloseParenthesis, "Expected ')' after the for-each header");
+        parseBlockOrMissing(parser, "Expected '\{' for the loop body");
+        parser.complete(marker, SyntaxKind.ForEachStatement);
+        return;
+    }
+    if (parser.at(SyntaxKind.Semicolon)) {
+        parser.nullSlot();
+        parser.bump();
+    } else {
+        if (parser.at(SyntaxKind.LetKeyword) || parser.at(SyntaxKind.ConstKeyword)
+                || atTypedVariableDeclaration(parser)) {
+            parseVariableDeclaration(parser);
+        } else {
+            parseExpressionStatement(parser);
+        }
+        parser.nullSlot();
+    }
+    if (parser.at(SyntaxKind.Semicolon) || !expressions.canStartExpression(parser.currentKind())) {
+        parser.nullSlot();
+    } else {
+        expressions.parseExpression(parser);
+    }
+    parser.expect(SyntaxKind.Semicolon, "Expected ';' after the for condition");
+    if (parser.at(SyntaxKind.CloseParenthesis) || !expressions.canStartExpression(parser.currentKind())) {
+        parser.nullSlot();
+    } else {
+        expressions.parseExpression(parser);
+    }
+    parser.expect(SyntaxKind.CloseParenthesis, "Expected ')' after the for clauses");
+    parseBlockOrMissing(parser, "Expected '\{' for the loop body");
+    parser.complete(marker, SyntaxKind.ForStatement);
+}
+
+// At the first token inside the for parentheses: true for `[let|const]? [Type]? name in`.
+// Purely speculative; everything is rewound.
+atForEachHeader(Parser parser) -> bool {
+    let restore = parser.mark();
+    if (parser.at(SyntaxKind.LetKeyword) || parser.at(SyntaxKind.ConstKeyword)) {
+        parser.bump();
+    }
+    bool result;
+    if (parser.at(SyntaxKind.Identifier) && parser.peekIsContextual(1, "in")) {
+        result = true;
+    } else if (types.isTypeOrGroupStart(parser.currentKind())) {
+        types.parseType(parser, "");
+        result = parser.clean(restore) && parser.at(SyntaxKind.Identifier)
+            && parser.peekIsContextual(1, "in");
+    } else {
+        result = false;
+    }
+    parser.rewind(restore);
+    return result;
+}
+
+parseKeywordStatement(Parser parser, SyntaxKind statementKind, string semicolonMessage) {
+    let marker = parser.start();
+    parser.bump();
+    parser.expect(SyntaxKind.Semicolon, semicolonMessage);
+    parser.complete(marker, statementKind);
+}
+
+parseReturnStatement(Parser parser) {
+    let marker = parser.start();
+    parser.bump();
+    if (parser.at(SyntaxKind.Semicolon)
+            || (!expressions.canStartExpression(parser.currentKind()) && !parser.at(SyntaxKind.OpenBrace))) {
+        parser.nullSlot();
+    } else {
+        expressions.parseExpression(parser);
+    }
+    parser.expect(SyntaxKind.Semicolon,
+        "Expected ';' after the return statement, for example 'return value;'");
+    parser.complete(marker, SyntaxKind.ReturnStatement);
+}
+
+parseThrowStatement(Parser parser) {
+    let marker = parser.start();
+    parser.bump();
+    if (parser.at(SyntaxKind.Semicolon)) {
+        parser.report("'throw' needs an error value, for example 'throw new "
+            + "ParseError(\"bad input\");'. To rethrow the current error inside a catch "
+            + "block, use 'rethrow;'", source.makeSpan(parser.lastContentEnd(), 0));
+        let empty = parser.start();
+        let skipped = parser.start();
+        parser.complete(skipped, SyntaxKind.List);
+        parser.complete(empty, SyntaxKind.ErrorExpression);
+    } else {
+        expressions.parseExpression(parser);
+    }
+    parser.expect(SyntaxKind.Semicolon, "Expected ';' after the throw statement");
+    parser.complete(marker, SyntaxKind.ThrowStatement);
+}
+
+parseExpressionStatement(Parser parser) {
+    let marker = parser.start();
+    expressions.parseExpression(parser);
+    parser.expect(SyntaxKind.Semicolon,
+        "Expected ';' after the expression, for example 'total = total + 1;'");
+    parser.complete(marker, SyntaxKind.ExpressionStatement);
+}
+
+// ============================================================ switch
+
+parseSwitchStatement(Parser parser) {
+    let marker = parser.start();
+    parseSwitchParts(parser);
+    parser.complete(marker, SyntaxKind.SwitchStatement);
+}
+
+// A switch in expression position, returned completed so the operators after it can wrap it.
+public parseSwitchExpression(Parser parser) -> long {
+    let marker = parser.start();
+    parseSwitchParts(parser);
+    return parser.complete(marker, SyntaxKind.SwitchExpression);
+}
+
+parseSwitchParts(Parser parser) {
+    parser.bump();
+    parser.expect(SyntaxKind.OpenParenthesis, "Expected '(' after 'switch'");
+    expressions.parseExpression(parser);
+    parser.expect(SyntaxKind.CloseParenthesis, "Expected ')' after the switch value");
+    parser.expect(SyntaxKind.OpenBrace, "Expected '\{' to begin the switch arms");
+    let arms = parser.start();
+    bool needSeparator = false;
+    while (!parser.at(SyntaxKind.CloseBrace) && !parser.atEnd()) {
+        if (needSeparator) {
+            if (parser.at(SyntaxKind.Comma)) {
+                parser.bump();
+            } else {
+                // The comma between arms is optional in the language; a zero-width Missing
+                // token keeps the separated list's odd separator indices without a diagnostic.
+                parser.pushMissingToken();
+            }
+            if (parser.at(SyntaxKind.CloseBrace)) {
+                break;
+            }
+        }
+        let kind = parser.currentKind();
+        if (kind == SyntaxKind.DefaultKeyword || kind == SyntaxKind.IsKeyword
+                || expressions.canStartExpression(kind)) {
+            parseSwitchArm(parser);
+            needSeparator = true;
+        } else {
+            // An arm the parser could not read is still an arm, and still takes a separator
+            // after it, so the list stays the item-then-separator pairs its slots assume.
+            parseSwitchArmError(parser);
+            needSeparator = true;
+        }
+    }
+    parser.complete(arms, SyntaxKind.List);
+    parser.expect(SyntaxKind.CloseBrace, "Expected '\}' to close the switch");
+}
+
+parseSwitchArm(Parser parser) {
+    switch (parser.currentKind()) {
+        DefaultKeyword -> {
+            let marker = parser.start();
+            parser.bump();
+            parseArmArrowAndBody(parser, "Expected '->' after 'default'");
+            parser.complete(marker, SyntaxKind.DefaultArm);
+        },
+        IsKeyword -> {
+            let marker = parser.start();
+            parser.bump();
+            types.parseTypeAndSuffixes(parser, "Expected a type after 'is', for example "
+                + "'is Circle c -> c.radius'", false);
+            if (parser.at(SyntaxKind.Identifier)) {
+                parser.bump();
+            } else {
+                parser.nullSlot();
+            }
+            parseArmArrowAndBody(parser, "Expected '->' after the type arm");
+            parser.complete(marker, SyntaxKind.TypeArm);
+        },
+        default -> {
+            let marker = parser.start();
+            let labels = parser.start();
+            bool outerLabels = parser.inArmLabels();
+            parser.setInArmLabels(true);
+            expressions.parseExpression(parser);
+            while (parser.at(SyntaxKind.Comma)) {
+                // 'default' and 'is' begin an arm and can never be a label, so a comma before
+                // one separated arms; left unconsumed, the arm list takes it as its separator.
+                if (parser.peekKind(1) == SyntaxKind.DefaultKeyword
+                        || parser.peekKind(1) == SyntaxKind.IsKeyword) {
+                    break;
+                }
+                parser.bump();
+                if (parser.at(SyntaxKind.Arrow) || parser.at(SyntaxKind.CloseBrace) || parser.atEnd()) {
+                    break;
+                }
+                expressions.parseExpression(parser);
+            }
+            parser.setInArmLabels(outerLabels);
+            parser.complete(labels, SyntaxKind.List);
+            parseArmArrowAndBody(parser, "Expected '->' after the switch labels, for "
+                + "example '1 -> handleOne()'");
+            parser.complete(marker, SyntaxKind.ValueArm);
+        },
+    }
+}
+
+// A body written without the arrow is still taken as the body, so the arrow is the only
+// diagnostic. With nothing that could be a body after it, the slot takes an empty node, because
+// reading the next arm there would report it twice.
+parseArmArrowAndBody(Parser parser, string missingMessage) {
+    if (parser.at(SyntaxKind.Arrow)) {
+        parser.bump();
+        parseArmBody(parser);
+        return;
+    }
+    parser.missing(SyntaxKind.Arrow, missingMessage);
+    if (parser.at(SyntaxKind.OpenBrace) || expressions.canStartExpression(parser.currentKind())) {
+        parseArmBody(parser);
+        return;
+    }
+    let ignored = expressions.emptyErrorExpression(parser);
+}
+
+parseArmBody(Parser parser) {
+    if (parser.at(SyntaxKind.OpenBrace) && !expressions.atStructLiteralStart(parser)) {
+        parseBlock(parser);
+    } else {
+        expressions.parseExpression(parser);
+    }
+}
+
+// Junk between switch arms; stops before the ',' or '}' so the arm loop stays in charge.
+parseSwitchArmError(Parser parser) {
+    parser.reportAtCurrent("Expected a switch arm, for example '1 -> handleOne()'");
+    let marker = parser.start();
+    let skipped = parser.start();
+    bool first = true;
+    while (!parser.atEnd()) {
+        let kind = parser.currentKind();
+        if (kind == SyntaxKind.CloseBrace) {
+            break;
+        }
+        bool armBoundary = kind == SyntaxKind.Comma || kind == SyntaxKind.DefaultKeyword
+            || kind == SyntaxKind.IsKeyword || expressions.canStartExpression(kind);
+        if (!first && armBoundary) {
+            break;
+        }
+        parser.bump();
+        first = false;
+    }
+    parser.complete(skipped, SyntaxKind.List);
+    parser.complete(marker, SyntaxKind.ErrorSwitchArm);
+}

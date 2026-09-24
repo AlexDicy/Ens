@@ -1,0 +1,920 @@
+// The grammar of imports, externals, tests, functions, and type declarations with their members.
+import support.source;
+import SyntaxKind from syntax.generated.kind;
+import syntax.generated.kind;
+import Parser from parse.parser;
+import parse.parser.statements;
+import parse.parser.types;
+import parse.parser.expressions;
+
+// ============================================================ top level
+
+// One item of a source file, which is an import, a declaration or a test, or an error node over
+// tokens that begin none of them.
+public parseTopLevelItem(Parser parser) {
+    if (parser.at(SyntaxKind.ImportKeyword)) {
+        parseImportDeclaration(parser);
+        return;
+    }
+    if (parser.at(SyntaxKind.ExternalKeyword)) {
+        parseExternalDeclaration(parser);
+        return;
+    }
+    bool testStart = parser.peekKind(1) == SyntaxKind.StringLiteral
+        || parser.peekKind(1) == SyntaxKind.InterpolatedStringStart;
+    if (testStart && parser.atContextual("test")) {
+        parseTestDeclaration(parser);
+        return;
+    }
+    if (atPrimitiveBinding(parser, 0)) {
+        parsePrimitiveDeclaration(parser);
+        return;
+    }
+    long modifierCount = 0;
+    while (isModifier(parser.peekKind(modifierCount))) {
+        modifierCount++;
+    }
+    let afterModifiers = parser.peekKind(modifierCount);
+    if (afterModifiers == SyntaxKind.StructKeyword) {
+        parseTypeDeclaration(parser, SyntaxKind.StructDeclaration);
+        return;
+    }
+    if (afterModifiers == SyntaxKind.ClassKeyword) {
+        parseTypeDeclaration(parser, SyntaxKind.ClassDeclaration);
+        return;
+    }
+    if (afterModifiers == SyntaxKind.InterfaceKeyword) {
+        parseInterfaceDeclaration(parser);
+        return;
+    }
+    if (afterModifiers == SyntaxKind.EnumKeyword) {
+        parseEnumDeclaration(parser);
+        return;
+    }
+    if (afterModifiers == SyntaxKind.ExternalKeyword) {
+        parseExternalDeclaration(parser);
+        return;
+    }
+    if (modifierCount > 0 && parser.peekIsContextual(modifierCount, "test")
+            && (parser.peekKind(modifierCount + 1) == SyntaxKind.StringLiteral
+                || parser.peekKind(modifierCount + 1) == SyntaxKind.InterpolatedStringStart)) {
+        parseTopLevelError(parser, "A test cannot have modifiers such as 'noreturn'; write "
+            + "'test' at the start of the line");
+        return;
+    }
+    if (modifierCount > 0 && atPrimitiveBinding(parser, modifierCount)) {
+        parseTopLevelError(parser, "A primitive binding takes no modifiers; write 'primitive "
+            + "string \{ ... \}' and let each member's own modifier decide how far it "
+            + "reaches");
+        return;
+    }
+    if (looksLikeFunctionDeclaration(parser, false)) {
+        parseFunctionDeclaration(parser, asMethod: false);
+        return;
+    }
+    if (parser.at(SyntaxKind.LetKeyword) || parser.at(SyntaxKind.ConstKeyword)
+            || statements.atTypedVariableDeclaration(parser)) {
+        parseTopLevelError(parser, statements.topLevelVariableMessage(parser));
+        return;
+    }
+    if (parser.at(SyntaxKind.FinallyKeyword)) {
+        parseTopLevelError(parser, "'finally' is not supported; write the cleanup before each "
+            + "return or in the catch clause");
+        return;
+    }
+    parseTopLevelError(parser, "Expected a top-level declaration such as a function, "
+        + "class, struct, interface, enum, import, or test");
+}
+
+// ============================================================ declarations
+
+parseImportDeclaration(Parser parser) {
+    let marker = parser.start();
+    parser.bump();
+    bool named = atImportBinding(parser);
+    string importedName = "";
+    if (named) {
+        let binding = parser.start();
+        importedName = parser.currentText();
+        parser.bump();
+        if (parser.at(SyntaxKind.AsKeyword)) {
+            parseImportAlias(parser);
+        } else {
+            parser.nullSlot();
+        }
+        parser.bumpAs(SyntaxKind.FromKeyword);
+        parser.complete(binding, SyntaxKind.ImportBinding);
+    } else {
+        parser.nullSlot();
+    }
+    let path = parser.start();
+    long pathStart = parser.tokens()[parser.position()].offset;
+    if (parser.at(SyntaxKind.At)) {
+        parser.bump();
+    } else {
+        parser.nullSlot();
+    }
+    let segments = parser.start();
+    parser.expect(SyntaxKind.Identifier,
+        "Expected the import path, for example 'import engine.renderer;'");
+    while (parser.at(SyntaxKind.Dot) && parser.peekKind(1) == SyntaxKind.Identifier) {
+        parser.bump();
+        parser.bump();
+    }
+    parser.complete(segments, SyntaxKind.List);
+    parser.complete(path, SyntaxKind.ImportPath);
+    if (parser.at(SyntaxKind.AsKeyword)) {
+        if (named) {
+            string pathText = "...";
+            if (parser.lastContentEnd() > pathStart) {
+                pathText = parser.text().substring(pathStart, parser.lastContentEnd());
+            }
+            parser.reportAtCurrent("Write the alias right after the name it renames, as in "
+                + "'import {importedName} as {aliasExampleName(parser)} from {pathText};'.");
+        }
+        parseImportAlias(parser);
+    } else {
+        parser.nullSlot();
+    }
+    if (parser.at(SyntaxKind.AsKeyword)) {
+        parser.reportAtCurrent("An import takes one alias; remove this second 'as', or write "
+            + "another import to bind the other name.");
+        parser.missingInPlace();
+    } else {
+        parser.expect(SyntaxKind.Semicolon, "Expected ';' after the import path");
+    }
+    parser.complete(marker, SyntaxKind.ImportDeclaration);
+}
+
+// Whether the tokens after 'import' spell a named import, 'Name from' or 'Name as Alias from'.
+// A keyword in the alias position still counts, so it is reported as a bad alias rather than
+// read as a module named like the type.
+atImportBinding(Parser parser) -> bool {
+    if (!parser.at(SyntaxKind.Identifier)) {
+        return false;
+    }
+    if (parser.peekIsContextual(1, "from")) {
+        return true;
+    }
+    if (parser.peekKind(1) != SyntaxKind.AsKeyword) {
+        return false;
+    }
+    let aliasKind = parser.peekKind(2);
+    if (aliasKind != SyntaxKind.Identifier && !kind.isKeyword(aliasKind)) {
+        return false;
+    }
+    return parser.peekIsContextual(3, "from");
+}
+
+// The next token's text when it can stand as the alias in an example, or a placeholder.
+aliasExampleName(Parser parser) -> string {
+    let index = parser.position() + 1;
+    if (index < parser.tokens().length) {
+        let token = parser.tokens()[index];
+        if (token.kind == SyntaxKind.Identifier) {
+            return parser.text().substring(token.offset, token.end());
+        }
+    }
+    return "Alias";
+}
+
+parseImportAlias(Parser parser) {
+    let marker = parser.start();
+    parser.bump();
+    if (kind.isKeyword(parser.currentKind())) {
+        parser.reportAtCurrent("'{parser.currentText()}' is a keyword and cannot be used as an "
+            + "import alias; choose a different name");
+        parser.bumpAs(SyntaxKind.Identifier);
+    } else {
+        parser.expect(SyntaxKind.Identifier, "Expected the alias name after 'as', for example "
+            + "'import engine.renderer as gfx;'");
+    }
+    parser.complete(marker, SyntaxKind.ImportAlias);
+}
+
+parseExternalDeclaration(Parser parser) {
+    long modifierCount = 0;
+    while (isModifier(parser.peekKind(modifierCount))) {
+        modifierCount++;
+    }
+    // The type form may carry a visibility modifier; the block form stays file-private.
+    if (parser.peekIsContextual(modifierCount + 1, "type")) {
+        let marker = parser.start();
+        parseModifierList(parser);
+        parser.bump();
+        parser.bumpAs(SyntaxKind.TypeKeyword);
+        parser.expect(SyntaxKind.Identifier,
+            "Expected the external type's name, for example 'external type HANDLE;'");
+        parser.expect(SyntaxKind.Semicolon, "Expected ';' after the external type declaration");
+        parser.complete(marker, SyntaxKind.ExternalTypeDeclaration);
+        return;
+    }
+    if (modifierCount > 0) {
+        parseTopLevelError(parser, "An external function block is always private to its file and "
+            + "cannot carry a visibility modifier; wrap its calls in Ens functions to share "
+            + "them");
+        return;
+    }
+    let marker = parser.start();
+    parser.bump();
+    if (parser.atContextual("from")) {
+        parser.bumpAs(SyntaxKind.FromKeyword);
+    } else {
+        parser.missing(SyntaxKind.FromKeyword, "Expected 'from' after 'external', for example "
+            + "'external from libc \{ ... \}'");
+    }
+    parser.expect(SyntaxKind.Identifier, "Expected the native library's name after 'from', "
+        + "for example 'external from libc \{ ... \}'");
+    parser.expect(SyntaxKind.OpenBrace, "Expected '\{' to begin the external block");
+    let functions = parser.start();
+    while (!parser.at(SyntaxKind.CloseBrace) && !parser.atEnd()) {
+        if (parser.at(SyntaxKind.Identifier)) {
+            parseExternalFunctionDeclaration(parser);
+        } else {
+            parseMemberError(parser, "Expected an external function signature, for example "
+                + "'CloseHandle(HANDLE h) -> int;'");
+        }
+    }
+    parser.complete(functions, SyntaxKind.List);
+    parser.expect(SyntaxKind.CloseBrace, "Expected '\}' to close the external block");
+    parser.complete(marker, SyntaxKind.ExternalBlock);
+}
+
+parseExternalFunctionDeclaration(Parser parser) {
+    let marker = parser.start();
+    parser.bump();
+    parseParameterList(parser);
+    if (parser.at(SyntaxKind.Arrow)) {
+        let returnType = parser.start();
+        parser.bump();
+        types.parseType(parser, "Expected the return type after '->'");
+        parser.complete(returnType, SyntaxKind.ReturnTypeClause);
+    } else {
+        parser.nullSlot();
+    }
+    parser.expect(SyntaxKind.Semicolon, "Expected ';' after the external function declaration");
+    parser.complete(marker, SyntaxKind.ExternalFunctionDeclaration);
+}
+
+parseTestDeclaration(Parser parser) {
+    let marker = parser.start();
+    parser.bumpAs(SyntaxKind.TestKeyword);
+    if (parser.at(SyntaxKind.StringLiteral)) {
+        parser.bump();
+    } else if (parser.at(SyntaxKind.InterpolatedStringStart)) {
+        expressions.parseInterpolatedString(parser);
+    } else {
+        parser.missing(SyntaxKind.StringLiteral,
+            "Expected the test description string, for example "
+            + "'test \"adds numbers\" \{ ... \}'");
+    }
+    statements.parseBlockOrMissing(parser, "Expected '\{' for the test body");
+    parser.complete(marker, SyntaxKind.TestDeclaration);
+}
+
+parseFunctionDeclaration(Parser parser, bool asMethod) {
+    string what = "function";
+    if (asMethod) {
+        what = "method";
+    }
+    let marker = parser.start();
+    parseModifierList(parser);
+    if (parser.at(SyntaxKind.ConstructorKeyword) || parser.at(SyntaxKind.DestructorKeyword)) {
+        parser.bump();
+        parser.nullSlot();
+    } else {
+        parser.nullSlot();
+        if (kind.isKeyword(parser.currentKind())) {
+            parser.reportAtCurrent("'{parser.currentText()}' is a keyword and cannot be used as a "
+                + "{what} name; choose a different name");
+            parser.bumpAs(SyntaxKind.Identifier);
+        } else {
+            parser.expect(SyntaxKind.Identifier, "Expected the {what}'s name");
+        }
+    }
+    if (parser.at(SyntaxKind.Less)) {
+        parseTypeParameterList(parser);
+    } else {
+        parser.nullSlot();
+    }
+    parseParameterList(parser);
+    if (parser.at(SyntaxKind.Arrow)) {
+        let returnType = parser.start();
+        parser.bump();
+        types.parseType(parser, "Expected the return type after '->', for example '-> int'");
+        parser.complete(returnType, SyntaxKind.ReturnTypeClause);
+    } else {
+        parser.nullSlot();
+    }
+    if (parser.at(SyntaxKind.ThrowsKeyword)) {
+        types.parseThrowsClause(parser);
+    } else {
+        parser.nullSlot();
+    }
+    if (parser.at(SyntaxKind.OpenBrace)) {
+        statements.parseBlock(parser);
+        parser.nullSlot();
+    } else if (parser.at(SyntaxKind.Semicolon)) {
+        parser.nullSlot();
+        parser.bump();
+    } else {
+        parser.nullSlot();
+        parser.missing(SyntaxKind.OpenBrace,
+            "Expected '\{' to begin the {what} body, or ';' for a bodiless declaration");
+    }
+    let catches = parser.start();
+    while (parser.at(SyntaxKind.CatchKeyword)) {
+        parseCatchClause(parser);
+    }
+    parser.complete(catches, SyntaxKind.List);
+    parser.complete(marker, SyntaxKind.FunctionDeclaration);
+}
+
+parseModifierList(Parser parser) {
+    let modifiers = parser.start();
+    while (isModifier(parser.currentKind())) {
+        parser.bump();
+    }
+    parser.complete(modifiers, SyntaxKind.List);
+}
+
+parseParameterList(Parser parser) {
+    let marker = parser.start();
+    parser.expect(SyntaxKind.OpenParenthesis, "Expected '(' to begin the parameter list");
+    let parameters = parser.start();
+    bool needSeparator = false;
+    while (!parser.at(SyntaxKind.CloseParenthesis) && !parser.at(SyntaxKind.OpenBrace)
+            && !parser.at(SyntaxKind.Semicolon) && !parser.atEnd()) {
+        if (needSeparator) {
+            if (parser.at(SyntaxKind.Comma)) {
+                parser.bump();
+                if (parser.at(SyntaxKind.CloseParenthesis)) {
+                    parser.report("Expected a parameter after ','",
+                        source.makeSpan(parser.lastContentEnd(), 0));
+                    break;
+                }
+            } else {
+                parser.missing(SyntaxKind.Comma, "Expected ',' between parameters");
+            }
+        }
+        if (atParameterStart(parser)) {
+            parseParameter(parser);
+        } else {
+            parseParameterError(parser);
+        }
+        needSeparator = true;
+    }
+    parser.complete(parameters, SyntaxKind.List);
+    parser.expect(SyntaxKind.CloseParenthesis, "Expected ')' to close the parameter list");
+    parser.complete(marker, SyntaxKind.ParameterList);
+}
+
+atParameterStart(Parser parser) -> bool {
+    return parser.at(SyntaxKind.ThisKeyword) || types.isTypeOrGroupStart(parser.currentKind());
+}
+
+parseParameter(Parser parser) {
+    let marker = parser.start();
+    if (parser.at(SyntaxKind.ThisKeyword)) {
+        parser.nullSlot();
+        parser.nullSlot();
+        let prefix = parser.start();
+        parser.bump();
+        parser.expect(SyntaxKind.Dot, "Expected '.' after 'this' in the parameter, for "
+            + "example 'constructor(this.x);'");
+        parser.complete(prefix, SyntaxKind.ThisPrefix);
+        parser.expect(SyntaxKind.Identifier, "Expected the field name after 'this.'");
+    } else {
+        if (parser.atContextual("out") && types.isTypeStart(parser.peekKind(1))) {
+            parser.bumpAs(SyntaxKind.OutKeyword);
+        } else {
+            parser.nullSlot();
+        }
+        types.parseType(parser, "Expected the parameter's type, for example 'int value'");
+        // A '<' left after the type is a type-argument list the parser could not read: a
+        // parameter's type has no comparison to fall back on, unlike an expression.
+        if (parser.atOpeningAngle()) {
+            skipUnreadableParameterTail(parser);
+        }
+        parser.nullSlot();
+        if (kind.isKeyword(parser.currentKind())) {
+            parser.reportAtCurrent("'{parser.currentText()}' is a keyword and cannot be used as "
+                + "a parameter name; choose a different name such as 'value'");
+            parser.bumpAs(SyntaxKind.Identifier);
+        } else {
+            parser.expect(SyntaxKind.Identifier,
+                "Expected the parameter's name, for example 'int value'");
+        }
+    }
+    if (parser.at(SyntaxKind.Equals)) {
+        statements.parseInitializer(parser);
+    } else {
+        parser.nullSlot();
+    }
+    parser.complete(marker, SyntaxKind.Parameter);
+}
+
+// A parameter ends at its boundary, so anything between its name and that boundary was part of
+// a type the parser could not read, and belongs to this parameter. Left for the list loop it
+// would cost a problem per link, since every link of a type starts something that looks like
+// another parameter. A name written past the leftovers is still the parameter's own.
+skipUnreadableParameterTail(Parser parser) {
+    long angles = 0;
+    long parens = 0;
+    while (!parser.atEnd()) {
+        let kind = parser.currentKind();
+        if (parens == 0 && (kind == SyntaxKind.CloseParenthesis
+                || kind == SyntaxKind.OpenBrace || kind == SyntaxKind.Semicolon)) {
+            return;
+        }
+        if (angles == 0 && parens == 0
+                && (kind == SyntaxKind.Comma || kind == SyntaxKind.Equals
+                    || atParameterName(parser))) {
+            return;
+        }
+        if (parser.atOpeningAngle()) {
+            angles++;
+            parser.expectOpeningAngle("");
+            continue;
+        }
+        if (parser.atClosingAngle()) {
+            if (angles > 0) {
+                angles--;
+            }
+            parser.expectClosingAngle("");
+            continue;
+        }
+        if (kind == SyntaxKind.OpenParenthesis) {
+            parens++;
+        } else if (kind == SyntaxKind.CloseParenthesis) {
+            parens--;
+        }
+        parser.bump();
+    }
+}
+
+// True where a parameter's name would be: a name with nothing but the end of the parameter
+// after it. A keyword there counts, since parseParameter reports it and takes it as the name.
+atParameterName(Parser parser) -> bool {
+    if (!parser.at(SyntaxKind.Identifier) && !kind.isKeyword(parser.currentKind())) {
+        return false;
+    }
+    let after = parser.peekKind(1);
+    return after == SyntaxKind.Comma || after == SyntaxKind.CloseParenthesis
+        || after == SyntaxKind.OpenBrace || after == SyntaxKind.Semicolon
+        || after == SyntaxKind.Equals;
+}
+
+// Junk in a parameter list; stops before ',' or the next parameter so the list loop stays in
+// charge, and before ')', '{', or ';' so the declaration can continue.
+parseParameterError(Parser parser) {
+    parser.reportAtCurrent("Expected a parameter, for example 'int value'");
+    let marker = parser.start();
+    let skipped = parser.start();
+    bool first = true;
+    while (!parser.atEnd()) {
+        let kind = parser.currentKind();
+        if (kind == SyntaxKind.CloseParenthesis || kind == SyntaxKind.OpenBrace
+                || kind == SyntaxKind.Semicolon) {
+            break;
+        }
+        if (!first && (kind == SyntaxKind.Comma || atParameterStart(parser))) {
+            break;
+        }
+        parser.bump();
+        first = false;
+    }
+    parser.complete(skipped, SyntaxKind.List);
+    parser.complete(marker, SyntaxKind.ErrorDeclaration);
+}
+
+parseCatchClause(Parser parser) {
+    let marker = parser.start();
+    parser.bump();
+    parser.expect(SyntaxKind.OpenParenthesis,
+        "Expected '(' after 'catch', for example 'catch (IOError e)'");
+    types.parseNamedType(parser,
+        "Expected the error type in the catch clause, for example 'catch (IOError e)'");
+    parser.expect(SyntaxKind.Identifier,
+        "Expected a name for the caught error, for example 'catch (IOError e)'");
+    parser.expect(SyntaxKind.CloseParenthesis, "Expected ')' after the catch binding");
+    statements.parseBlockOrMissing(parser, "Expected '\{' for the catch body");
+    parser.complete(marker, SyntaxKind.CatchClause);
+}
+
+parseTypeDeclaration(Parser parser, SyntaxKind declarationKind) {
+    let marker = parser.start();
+    parseModifierList(parser);
+    parser.bump();
+    parser.expect(SyntaxKind.Identifier, "Expected the type's name");
+    if (parser.at(SyntaxKind.Less)) {
+        parseTypeParameterList(parser);
+    } else {
+        parser.nullSlot();
+    }
+    if (parser.at(SyntaxKind.ExtendsKeyword)) {
+        let extendsClause = parser.start();
+        parser.bump();
+        types.parseNamedType(parser, "Expected the base class name after 'extends'");
+        parser.complete(extendsClause, SyntaxKind.ExtendsClause);
+    } else {
+        parser.nullSlot();
+    }
+    if (parser.at(SyntaxKind.ImplementsKeyword)) {
+        let implementsClause = parser.start();
+        parser.bump();
+        let interfaces = parser.start();
+        types.parseNamedType(parser, "Expected an interface name after 'implements'");
+        while (parser.at(SyntaxKind.Comma)) {
+            parser.bump();
+            types.parseNamedType(parser, "Expected an interface name after ','");
+        }
+        parser.complete(interfaces, SyntaxKind.List);
+        parser.complete(implementsClause, SyntaxKind.ImplementsClause);
+    } else {
+        parser.nullSlot();
+    }
+    parseMemberList(parser, false);
+    parser.complete(marker, declarationKind);
+}
+
+// At a primitive binding, 'ahead' tokens from the cursor. The check on the clause or brace
+// that follows is what keeps 'primitive' an ordinary identifier, so a declaration written with
+// it as a type name is parsed as one and diagnosed as one.
+atPrimitiveBinding(Parser parser, long ahead) -> bool {
+    if (!parser.peekIsContextual(ahead, "primitive")) {
+        return false;
+    }
+    let named = parser.peekKind(ahead + 1);
+    if (named != SyntaxKind.Identifier && !types.isPrimitiveTypeKeyword(named)) {
+        return false;
+    }
+    let following = parser.peekKind(ahead + 2);
+    return following == SyntaxKind.OpenBrace || following == SyntaxKind.ImplementsKeyword;
+}
+
+// 'primitive string implements Comparable<string> { ... }', what a primitive's members are.
+// The word 'primitive' is re-tagged here and nowhere else, so it stays a valid identifier in
+// every other position.
+parsePrimitiveDeclaration(Parser parser) {
+    let marker = parser.start();
+    parser.bumpAs(SyntaxKind.PrimitiveKeyword);
+    parser.bump();
+    if (parser.at(SyntaxKind.ImplementsKeyword)) {
+        let implementsClause = parser.start();
+        parser.bump();
+        let interfaces = parser.start();
+        types.parseNamedType(parser, "Expected an interface name after 'implements'");
+        while (parser.at(SyntaxKind.Comma)) {
+            parser.bump();
+            types.parseNamedType(parser, "Expected an interface name after ','");
+        }
+        parser.complete(interfaces, SyntaxKind.List);
+        parser.complete(implementsClause, SyntaxKind.ImplementsClause);
+    } else {
+        parser.nullSlot();
+    }
+    parseMemberList(parser, false);
+    parser.complete(marker, SyntaxKind.PrimitiveDeclaration);
+}
+
+parseInterfaceDeclaration(Parser parser) {
+    let marker = parser.start();
+    parseModifierList(parser);
+    parser.bump();
+    parser.expect(SyntaxKind.Identifier, "Expected the interface's name");
+    if (parser.at(SyntaxKind.Less)) {
+        parseTypeParameterList(parser);
+    } else {
+        parser.nullSlot();
+    }
+    if (parser.at(SyntaxKind.ExtendsKeyword)) {
+        let extendsClause = parser.start();
+        parser.bump();
+        types.parseNamedType(parser, "Expected the interface name after 'extends'");
+        parser.complete(extendsClause, SyntaxKind.ExtendsClause);
+    } else {
+        parser.nullSlot();
+    }
+    if (parser.at(SyntaxKind.ImplementsKeyword)) {
+        parser.reportAtCurrent("An interface cannot use 'implements'; an interface builds on "
+            + "another one with 'extends', and classes implement interfaces");
+        parseMemberList(parser, true);
+    } else {
+        parseMemberList(parser, false);
+    }
+    parser.complete(marker, SyntaxKind.InterfaceDeclaration);
+}
+
+// withLeadingJunk handles clauses that have no slot, such as an interface's stray
+// 'implements ...'. The open brace slot becomes a Missing token, and the junk up to and
+// including the real '{' lands in an ErrorDeclaration at the head of the member list.
+parseMemberList(Parser parser, bool withLeadingJunk) {
+    let marker = parser.start();
+    if (withLeadingJunk) {
+        parser.missingInPlace();
+    } else {
+        parser.expect(SyntaxKind.OpenBrace, "Expected '\{' to begin the body");
+    }
+    let members = parser.start();
+    if (withLeadingJunk) {
+        let junk = parser.start();
+        let skipped = parser.start();
+        while (!parser.atEnd() && !parser.at(SyntaxKind.CloseBrace)) {
+            if (parser.at(SyntaxKind.OpenBrace)) {
+                parser.bump();
+                break;
+            }
+            parser.bump();
+        }
+        parser.complete(skipped, SyntaxKind.List);
+        parser.complete(junk, SyntaxKind.ErrorDeclaration);
+    }
+    while (!parser.at(SyntaxKind.CloseBrace) && !parser.atEnd()) {
+        parseMember(parser);
+    }
+    parser.complete(members, SyntaxKind.List);
+    parser.expect(SyntaxKind.CloseBrace, "Expected '\}' to close the body");
+    parser.complete(marker, SyntaxKind.MemberList);
+}
+
+parseMember(Parser parser) {
+    if (parser.at(SyntaxKind.FinallyKeyword)) {
+        parseMemberError(parser, "'finally' is not supported; write the cleanup before each "
+            + "return or in the catch clause");
+        return;
+    }
+    if (looksLikeFunctionDeclaration(parser, true) || looksLikeKeywordNamedMethod(parser)) {
+        parseFunctionDeclaration(parser, asMethod: true);
+        return;
+    }
+    long modifierCount = 0;
+    while (isModifier(parser.peekKind(modifierCount))) {
+        modifierCount++;
+    }
+    if (types.isTypeOrGroupStart(parser.peekKind(modifierCount))) {
+        parseFieldDeclaration(parser);
+        return;
+    }
+    parseMemberError(parser, "Expected a field or a method declaration");
+}
+
+parseFieldDeclaration(Parser parser) {
+    let marker = parser.start();
+    parseModifierList(parser);
+    types.parseType(parser, "Expected the field's type");
+    parser.expect(SyntaxKind.Identifier, "Expected the field's name");
+    if (parser.at(SyntaxKind.Equals)) {
+        statements.parseInitializer(parser);
+    } else {
+        parser.nullSlot();
+    }
+    parser.expect(SyntaxKind.Semicolon, "Expected ';' after the field declaration");
+    parser.complete(marker, SyntaxKind.FieldDeclaration);
+}
+
+// Junk in a member list. A ';' ends it and is consumed, a braced region is skipped whole so a
+// stray body cannot end the enclosing type early, and '}' ends it unconsumed.
+parseMemberError(Parser parser, string message) {
+    parser.reportAtCurrent(message);
+    let marker = parser.start();
+    let skipped = parser.start();
+    while (!parser.atEnd()) {
+        let kind = parser.currentKind();
+        if (kind == SyntaxKind.CloseBrace) {
+            break;
+        }
+        if (kind == SyntaxKind.Semicolon) {
+            parser.bump();
+            break;
+        }
+        if (kind == SyntaxKind.OpenBrace) {
+            parser.bumpBalancedBraces();
+            break;
+        }
+        parser.bump();
+    }
+    parser.complete(skipped, SyntaxKind.List);
+    parser.complete(marker, SyntaxKind.ErrorDeclaration);
+}
+
+parseEnumDeclaration(Parser parser) {
+    let marker = parser.start();
+    parseModifierList(parser);
+    parser.bump();
+    parser.expect(SyntaxKind.Identifier, "Expected the enum's name");
+    parser.expect(SyntaxKind.OpenBrace, "Expected '\{' to begin the enum members");
+    let members = parser.start();
+    bool needSeparator = false;
+    while (!parser.at(SyntaxKind.CloseBrace) && !parser.atEnd()) {
+        if (needSeparator) {
+            if (parser.at(SyntaxKind.Comma)) {
+                parser.bump();
+            } else {
+                parser.missing(SyntaxKind.Comma, "Expected ',' after the enum member");
+            }
+            if (parser.at(SyntaxKind.CloseBrace)) {
+                break;
+            }
+        }
+        if (parser.at(SyntaxKind.Identifier)) {
+            let member = parser.start();
+            parser.bump();
+            if (parser.at(SyntaxKind.Equals)) {
+                statements.parseInitializer(parser);
+            } else {
+                parser.nullSlot();
+            }
+            parser.complete(member, SyntaxKind.EnumMember);
+            needSeparator = true;
+        } else {
+            parseEnumMemberError(parser);
+            needSeparator = false;
+        }
+    }
+    parser.complete(members, SyntaxKind.List);
+    parser.expect(SyntaxKind.CloseBrace, "Expected '\}' to close the enum");
+    parser.complete(marker, SyntaxKind.EnumDeclaration);
+}
+
+parseEnumMemberError(Parser parser) {
+    parser.reportAtCurrent("Expected an enum member name");
+    let marker = parser.start();
+    let skipped = parser.start();
+    bool first = true;
+    while (!parser.atEnd()) {
+        let kind = parser.currentKind();
+        if (kind == SyntaxKind.CloseBrace) {
+            break;
+        }
+        if (!first && (kind == SyntaxKind.Comma || kind == SyntaxKind.Identifier)) {
+            break;
+        }
+        parser.bump();
+        first = false;
+    }
+    parser.complete(skipped, SyntaxKind.List);
+    parser.complete(marker, SyntaxKind.ErrorDeclaration);
+}
+
+parseTypeParameterList(Parser parser) {
+    let marker = parser.start();
+    parser.expectOpeningAngle("Expected '<' to begin the type parameters");
+    let parameters = parser.start();
+    if (!parser.atClosingAngle() && !parser.atEnd()) {
+        parseTypeParameter(parser);
+        while (parser.at(SyntaxKind.Comma)) {
+            parser.bump();
+            if (parser.atClosingAngle()) {
+                break;
+            }
+            parseTypeParameter(parser);
+        }
+    }
+    parser.complete(parameters, SyntaxKind.List);
+    parser.expectClosingAngle("Expected '>' to close the type parameters");
+    parser.complete(marker, SyntaxKind.TypeParameterList);
+}
+
+parseTypeParameter(Parser parser) {
+    let marker = parser.start();
+    parser.expect(SyntaxKind.Identifier, "Expected the type parameter's name, for example "
+        + "'<T>'");
+    if (parser.at(SyntaxKind.Colon)) {
+        let bounds = parser.start();
+        parser.bump();
+        let list = parser.start();
+        types.parseNamedType(parser, "Expected a bound after ':', for example '<T: Shape>'");
+        while (parser.at(SyntaxKind.Plus)) {
+            parser.bump();
+            types.parseNamedType(parser, "Expected a bound after '+'");
+        }
+        parser.complete(list, SyntaxKind.List);
+        parser.complete(bounds, SyntaxKind.BoundsClause);
+    } else {
+        parser.nullSlot();
+    }
+    parser.complete(marker, SyntaxKind.TypeParameter);
+}
+
+// True at `Modifier* Identifier TypeParameterList? ( ... )` followed by '->', '{', 'throws',
+// or, for members, ';'. Everything is rewound.
+looksLikeFunctionDeclaration(Parser parser, bool allowBodiless) -> bool {
+    let restore = parser.mark();
+    while (isModifier(parser.currentKind())) {
+        parser.bump();
+    }
+    bool result = false;
+    if (parser.at(SyntaxKind.Identifier)) {
+        parser.bump();
+        bool headerOk = true;
+        if (parser.at(SyntaxKind.Less)) {
+            parseTypeParameterList(parser);
+            headerOk = parser.clean(restore);
+        }
+        if (headerOk && parser.at(SyntaxKind.OpenParenthesis) && skipBalancedParentheses(parser)) {
+            let after = parser.currentKind();
+            result = after == SyntaxKind.Arrow || after == SyntaxKind.OpenBrace
+                || after == SyntaxKind.ThrowsKeyword
+                || (allowBodiless && after == SyntaxKind.Semicolon);
+        }
+    }
+    // Nothing re-reads these tokens as a declaration once this returns false, so a depth limit
+    // reached inside the header would go unsaid.
+    if (!result) {
+        parser.carryDepthLimits(restore);
+    }
+    parser.rewind(restore);
+    return result;
+}
+
+// A reserved word in a member-name position followed by '(' parses as a method, so one bad
+// name does not cascade through the member list. A type-parameter list may be between them,
+// which is how 'constructor<T: Comparable<T>>()' is recognized. Everything is rewound.
+looksLikeKeywordNamedMethod(Parser parser) -> bool {
+    let restore = parser.mark();
+    while (isModifier(parser.currentKind())) {
+        parser.bump();
+    }
+    bool result = false;
+    if (kind.isKeyword(parser.currentKind())) {
+        parser.bump();
+        bool headerOk = true;
+        if (parser.at(SyntaxKind.Less)) {
+            parseTypeParameterList(parser);
+            headerOk = parser.clean(restore);
+        }
+        result = headerOk && parser.at(SyntaxKind.OpenParenthesis);
+    }
+    if (!result) {
+        parser.carryDepthLimits(restore);
+    }
+    parser.rewind(restore);
+    return result;
+}
+
+// At '('; consumes through the matching ')'. False when the file ends first.
+skipBalancedParentheses(Parser parser) -> bool {
+    long depth = 0;
+    while (!parser.atEnd()) {
+        let kind = parser.currentKind();
+        if (kind == SyntaxKind.OpenParenthesis) {
+            depth++;
+        } else if (kind == SyntaxKind.CloseParenthesis) {
+            depth--;
+        }
+        parser.bump();
+        if (depth == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The junk is wrapped in an ErrorDeclaration. A ';' ends it and is consumed into it, a braced
+// region is skipped whole so a stray block cannot derail the items after it, and a
+// declaration-starting keyword ends it without being consumed.
+parseTopLevelError(Parser parser, string message) {
+    parser.reportAtCurrent(message);
+    let marker = parser.start();
+    let skipped = parser.start();
+    bool first = true;
+    while (!parser.atEnd()) {
+        let kind = parser.currentKind();
+        if (!first && atTopLevelDeclarationStart(kind)) {
+            break;
+        }
+        if (kind == SyntaxKind.Semicolon) {
+            parser.bump();
+            break;
+        }
+        if (kind == SyntaxKind.OpenBrace) {
+            parser.bumpBalancedBraces();
+            break;
+        }
+        parser.bump();
+        first = false;
+    }
+    parser.complete(skipped, SyntaxKind.List);
+    parser.complete(marker, SyntaxKind.ErrorDeclaration);
+}
+
+// ============================================================ kind tables
+
+isModifier(SyntaxKind kind) -> bool {
+    return switch (kind) {
+        PublicKeyword, PrivateKeyword, ProtectedKeyword, ExportKeyword, AbstractKeyword,
+        OverrideKeyword, FinalKeyword, SealedKeyword, WeakKeyword, ConstKeyword,
+        NoreturnKeyword, StaticKeyword, LazyKeyword -> true,
+        default -> false,
+    };
+}
+
+atTopLevelDeclarationStart(SyntaxKind kind) -> bool {
+    return switch (kind) {
+        ImportKeyword, StructKeyword, ClassKeyword, InterfaceKeyword, EnumKeyword,
+        ExternalKeyword, PublicKeyword, PrivateKeyword, ProtectedKeyword, ExportKeyword,
+        AbstractKeyword, FinalKeyword, SealedKeyword -> true,
+        default -> false,
+    };
+}
