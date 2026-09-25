@@ -1242,6 +1242,8 @@ int n = arr.length;      // error: long -> int, can be forced with `arr.length a
 ```
 
 Integer literals without a type suffix adapt to the surrounding type when it's an integer that fits the value. With no context they default to `int`. Values out of range produce a specific error.
+Where a nullable type such as `byte?` is expected, a literal adapts to the type without the `?`, so `byte? small = 1;` compiles, and so does `small += 1;` right after it.
+A literal in parentheses adapts the same way as the literal alone.
 
 That default is held to the same rule as any other type, so a literal nothing gives a type to must fit the type it falls back to, and a value past it is an error naming the type that would hold it rather than a silent truncation.
 A cast counts as naming a type: a literal whose value the target holds adapts to it, while one the target cannot hold keeps its default and is truncated by the cast, which is what a narrowing cast is for.
@@ -1249,7 +1251,7 @@ A cast counts as naming a type: a literal whose value the target holds adapts to
 ```ens
 byte b = 5;              // OK - 5 fits in byte
 long n = 5;              // OK - 5 fits in long
-byte big = 300;          // error: 300 does not fit in 'byte' (range -128..127)
+byte big = 300;          // error: 300 does not fit in 'byte' (range from 0 to 255)
 ```
 
 Floating-point literals follow the same rule in their own family: one written without a type suffix adapts to the surrounding type when that type is `float` or `double`, and with no context it defaults to `double`.
@@ -1266,7 +1268,7 @@ float ratio = 0.5;       // OK - the literal adapts to float
 float tenth = 0.1;       // OK - rounds to the nearest float
 double wide = 0.5;       // OK - a literal with no other context is a double
 float suffixed = 1.0f;   // OK - written as a float outright
-float tooBig = 3.5e38;   // error: too large for 'float', which holds about 3.4e38 at most
+float tooBig = 3.5e38;   // error: too large for 'float', whose largest value is about 3.402e38
 float viaOperator = 1.0 + 2.0;  // error: the operands are doubles, and their sum is a double
 ```
 
