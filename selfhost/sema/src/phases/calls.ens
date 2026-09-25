@@ -11,6 +11,7 @@ import model.types;
 import Type from model.types;
 import ErrorType from model.types;
 import PrimitiveType from model.types;
+import PrimitiveKind from model.types;
 import Method from model.types;
 import Parameter from model.types;
 import Signature from model.types;
@@ -260,7 +261,12 @@ mapArguments(Signature signature, CallShape shape, string kindWord, string displ
     long total = shape.argumentCount();
     long required = requiredArgumentCount(signature);
     if (positionalCount > parameterCount) {
-        outcome.failure = "{subject} expects {argumentCountText(signature)}, got {total}.";
+        string removal = "Remove the extra argument.";
+        if (total - parameterCount > 1) {
+            removal = "Remove the extra arguments.";
+        }
+        outcome.failure = "{subject} takes {argumentCountText(signature)}, but this call passes "
+            + "{total}. {removal}";
         return outcome;
     }
     bool[] bound = new bool[parameterCount];
@@ -298,11 +304,13 @@ mapArguments(Signature signature, CallShape shape, string kindWord, string displ
             outcome.defaulted++;
             continue;
         }
-        string parameterName = "{j + 1}";
-        if (parameters[j].name().length > 0) {
-            parameterName = "'{parameters[j].name()}'";
+        string name = parameters[j].name();
+        if (name.length == 0) {
+            outcome.failure = "{subject} is missing an argument for parameter {j + 1}. Add one.";
+            return outcome;
         }
-        outcome.failure = "{subject} is missing an argument for parameter {parameterName}.";
+        outcome.failure = "{subject} is missing an argument for parameter '{name}'. Add one, as in "
+            + "'{name}: ...'.";
         return outcome;
     }
     outcome.ok = true;
@@ -465,8 +473,7 @@ public resolveCall(List<CallCandidate> candidates, CallShape shape, Reporter rep
         if (candidates.length() == 1 && singleFailure.length > 0) {
             reporter.report(singleFailure, span);
         } else {
-            reporter.report("No overload of '{displayName}' matches this call. Candidates: "
-                + "{candidateList(candidates, names)}.", span);
+            reporter.report(noMatchMessage(candidates, shape, displayName, kindWord, names), span);
         }
         return new CallResolution(true, null, []);
     }
@@ -501,12 +508,7 @@ public resolveCall(List<CallCandidate> candidates, CallShape shape, Reporter rep
         best.push(pool.get(0));
     }
     if (best.length() > 1 && !shape.hasErrorArgument()) {
-        let shown = new List<CallCandidate>();
-        for (long i = 0; i < best.length(); i++) {
-            shown.push(best.get(i).candidate);
-        }
-        reporter.report("Call to '{displayName}' is ambiguous. Candidates: "
-            + "{candidateList(shown, names)}.", span);
+        reporter.report(ambiguityMessage(best, shape, displayName, kindWord, names), span);
         return new CallResolution(true, null, []);
     }
 
@@ -534,17 +536,168 @@ betterThan(ViableCandidate left, ViableCandidate right) -> bool {
     return left.defaulted < right.defaulted;
 }
 
-candidateList(List<CallCandidate> candidates, TypeNames names) -> string {
-    let builder = new StringBuilder();
-    for (long i = 0; i < candidates.length(); i++) {
-        if (i > 0) {
-            builder.append(", ");
-        }
-        builder.append("'");
-        builder.append(signatureDisplay(candidates.get(i).signature(), names));
-        builder.append("'");
+// The refusal of a call no declaration of the name accepts, naming the argument types it passes.
+noMatchMessage(List<CallCandidate> candidates, CallShape shape, string displayName,
+               string kindWord, TypeNames names) -> string {
+    string declared = "None of the declared '{displayName}' functions";
+    if (kindWord == "Method") {
+        declared = "None of the declared '{displayName}' methods";
+    } else if (kindWord == "Constructor" || kindWord == "Base constructor") {
+        declared = "None of the declared constructors of '{displayName}'";
     }
-    return builder.toString();
+    string listing = "They are {candidateList(candidates, names)}.";
+    long count = shape.argumentCount();
+    if (count == 0) {
+        return "{declared} can be called with no arguments. {listing} Add the arguments of one "
+            + "of them.";
+    }
+    let argumentTypes = new List<string>();
+    for (long i = 0; i < count; i++) {
+        argumentTypes.push("'{names.of(shape.argumentAt(i).type())}'");
+    }
+    string typesText = diagnostics.andJoined(argumentTypes.toArray());
+    if (count == 1) {
+        string type = names.of(shape.argumentAt(0).type());
+        return "{declared} takes a value of type '{type}'. {listing} Change the argument to match "
+            + "one of them.";
+    }
+    return "{declared} takes the arguments {typesText}. {listing} Change the arguments to match "
+        + "one of them.";
+}
+
+// The refusal of a call that several declarations accept equally well. The fix converts every
+// argument whose parameter type differs among them to the type the first of them takes, which
+// makes that one match best. When the passed arguments agree, the fix passes the first defaulted
+// argument whose type differs among them.
+ambiguityMessage(List<ViableCandidate> best, CallShape shape, string displayName, string kindWord,
+                 TypeNames names) -> string {
+    let shown = new List<CallCandidate>();
+    for (long i = 0; i < best.length(); i++) {
+        shown.push(best.get(i).candidate);
+    }
+    string problem = "This call matches {candidateList(shown, names)} equally well, so it is not "
+        + "clear which one to call.";
+    let first = best.get(0);
+    Parameter[] wanted = first.candidate.signature().parameters();
+    let written = new List<string>();
+    let described = new List<string>();
+    bool renderable = true;
+    for (long i = 0; i < shape.argumentCount(); i++) {
+        Type target = wanted[first.mapping[i]].type();
+        bool differs = false;
+        for (long c = 1; c < best.length(); c++) {
+            let other = best.get(c);
+            if (other.candidate.signature().parameters()[other.mapping[i]].type() != target) {
+                differs = true;
+            }
+        }
+        let argument = shape.argumentAt(i);
+        if (!differs || argument.type() == target) {
+            continue;
+        }
+        string? text = literalText(argument);
+        if (text == null) {
+            renderable = false;
+        } else {
+            written.push("'{text} as {names.of(target)}'");
+        }
+        described.push("argument {i + 1} to '{names.of(target)}'");
+    }
+    if (described.length() > 0) {
+        if (!renderable) {
+            return "{problem} Convert {diagnostics.andJoined(described.toArray())} with 'as', so "
+                + "the call matches one of them exactly.";
+        }
+        if (written.length() == 1) {
+            return "{problem} Convert an argument with 'as', such as {written.get(0)}, so the call "
+                + "matches one of them exactly.";
+        }
+        return "{problem} Convert the arguments with 'as', as in "
+            + "{diagnostics.andJoined(written.toArray())}, so the call matches one of them exactly.";
+    }
+    return "{problem} {defaultedArgumentFix(best, shape, displayName, kindWord, names)}";
+}
+
+// The fix for candidates that differ only in a parameter the call leaves to its default: pass
+// that argument with the type the first candidate takes.
+defaultedArgumentFix(List<ViableCandidate> best, CallShape shape, string displayName,
+                     string kindWord, TypeNames names) -> string {
+    Parameter[] wanted = best.get(0).candidate.signature().parameters();
+    long passed = shape.argumentCount();
+    long apart = -1;
+    for (long j = passed; j < wanted.length && apart < 0; j++) {
+        for (long c = 1; c < best.length(); c++) {
+            Parameter[] other = best.get(c).candidate.signature().parameters();
+            if (j >= other.length || other[j].type() != wanted[j].type()) {
+                apart = j;
+            }
+        }
+    }
+    if (apart < 0) {
+        return "Remove one of the declarations, or give them different parameter types.";
+    }
+    Type target = wanted[apart].type();
+    string matched = signatureDisplay(best.get(0).candidate.signature(), names);
+    string fallback = "Pass a value of type '{names.of(target)}' as argument {apart + 1}, so the "
+        + "call matches '{matched}'.";
+    string? value = zeroText(target, names);
+    if (apart != passed || kindWord != "Function" || shape.named().length() > 0 || value == null) {
+        return fallback;
+    }
+    let arguments = new List<string>();
+    for (long i = 0; i < passed; i++) {
+        string? text = literalText(shape.argumentAt(i));
+        if (text == null) {
+            return fallback;
+        }
+        arguments.push(text);
+    }
+    arguments.push(value);
+    return "Pass argument {apart + 1} as well, as in "
+        + "'{displayName}({string.joined(arguments.toArray(), ", ")})', so the call matches '{matched}'.";
+}
+
+// A numeric literal argument as it can be written again, or null for any other argument.
+literalText(ArgumentValue argument) -> string? {
+    string sign = "";
+    if (argument.isNegative()) {
+        sign = "-";
+    }
+    if (argument.isIntegerLiteral() && !argument.isCharacterLiteral()) {
+        return "{sign}{argument.magnitude()}";
+    }
+    if (argument.isFloatLiteral()) {
+        return "{sign}{argument.floatMagnitude()}";
+    }
+    return null;
+}
+
+// A zero of a number type, written so it has exactly that type, or null for any other type.
+zeroText(Type type, TypeNames names) -> string? {
+    if (!(type is PrimitiveType)) {
+        return null;
+    }
+    if (convert.isIntegerType(type)) {
+        if (type.kind() == PrimitiveKind.Int) {
+            return "0";
+        }
+        return "0 as {names.of(type)}";
+    }
+    if (convert.isFloatType(type)) {
+        if (type.kind() == PrimitiveKind.Double) {
+            return "0.0";
+        }
+        return "0.0 as {names.of(type)}";
+    }
+    return null;
+}
+
+candidateList(List<CallCandidate> candidates, TypeNames names) -> string {
+    let displays = new List<string>();
+    for (long i = 0; i < candidates.length(); i++) {
+        displays.push("'{signatureDisplay(candidates.get(i).signature(), names)}'");
+    }
+    return diagnostics.andJoined(displays.toArray());
 }
 
 // The signature as it reads in an overload diagnostic: 'name(int, string)'.

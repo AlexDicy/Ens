@@ -236,12 +236,16 @@ class ConstantEvaluator {
         this.collected.push(new FileDiagnostic(item.context.module().filePath(), message, span));
     }
 
-    // The standard refusal: what the initializer did, then what a constant may be built from.
-    reportNotConstant(ConstantItem item, Span span, string what) {
+    // The standard refusal: what the initializer did, then what a constant may be built from,
+    // or the given fix instead of that last sentence.
+    reportNotConstant(ConstantItem item, Span span, string what, string fix = "") {
+        string closing = "A constant is built from literals, '+', '-', '*', '/', '%', string "
+            + "concatenation and other static consts read through their type name.";
+        if (fix.length > 0) {
+            closing = fix;
+        }
         this.report(item, "The initializer of static const '{this.itemName(item)}' must "
-            + "be a compile-time constant, but {what}. A constant is built from literals, "
-            + "'+', '-', '*', '/', '%', string concatenation, and other static consts read "
-            + "through their type name.", span);
+            + "be a compile-time constant, but {what}. {closing}", span);
     }
 
     evaluate(ConstantItem item, Expression node) -> ConstantValue? {
@@ -277,17 +281,17 @@ class ConstantEvaluator {
             },
             is ArrayLiteralExpressionNode ignored -> {
                 this.reportNotConstant(item, node.span(), "it builds an array, and a static "
-                    + "const holds a primitive, 'char', 'bool', or 'string'");
+                    + "const can only have a number type, 'char', 'bool' or 'string'");
                 return null;
             },
             is StructLiteralExpressionNode ignored -> {
                 this.reportNotConstant(item, node.span(), "it builds a struct, and a static "
-                    + "const holds a primitive, 'char', 'bool', or 'string'");
+                    + "const can only have a number type, 'char', 'bool' or 'string'");
                 return null;
             },
             is InterpolatedStringExpressionNode ignored -> {
-                this.reportNotConstant(item, node.span(), "string interpolation builds its "
-                    + "text at run time; join the pieces with '+' instead");
+                this.reportNotConstant(item, node.span(), "it uses string interpolation, which "
+                    + "builds its text at run time", "Join the pieces with '+' instead.");
                 return null;
             },
             default -> {
@@ -305,7 +309,8 @@ class ConstantEvaluator {
                 let magnitude = literalvalues.integerMagnitude(token.text());
                 if (magnitude == null) {
                     this.report(item, "Integer literal '{token.text()}' is too large for any "
-                        + "integer type.", literal.span());
+                        + "integer type. The largest, 'ulong', goes up to "
+                        + "{Integers.ceiling}.", literal.span());
                     return null;
                 }
                 return literalvalues.integerConstant(false, magnitude);
@@ -327,8 +332,8 @@ class ConstantEvaluator {
                 return literalvalues.boolConstant(false);
             },
             NullKeyword -> {
-                this.reportNotConstant(item, literal.span(), "a static const holds a "
-                    + "primitive, 'char', 'bool', or 'string' value, none of which is null");
+                this.reportNotConstant(item, literal.span(), "a static const has a number type, "
+                    + "'char', 'bool' or 'string', and none of those can be null");
                 return null;
             },
             default -> {
@@ -382,9 +387,13 @@ class ConstantEvaluator {
         }
         if (left.kind() == ConstantKind.String || right.kind() == ConstantKind.String) {
             if (operator != SyntaxKind.Plus || left.kind() != right.kind()) {
+                string works = "works on two numbers";
+                if (operator == SyntaxKind.Plus) {
+                    works = "works on two numbers or two strings";
+                }
                 this.report(item, "'{binary.operator().text()}' in a constant expression "
-                    + "combines two numbers, or '+' joins two strings; here it gets "
-                    + "{constantKindText(left)} and {constantKindText(right)}.", binary.span());
+                    + "{works}, but this one is used on {constantKindText(left)} and "
+                    + "{constantKindText(right)}.", binary.span());
                 return null;
             }
             return literalvalues.stringConstant(left.text() + right.text());
@@ -395,11 +404,17 @@ class ConstantEvaluator {
             return null;
         }
         if (left.kind() == ConstantKind.Float || right.kind() == ConstantKind.Float) {
+            if (operator == SyntaxKind.Percent) {
+                this.report(item, "'%' in a constant expression works on integers only, and this "
+                    + "one is used on {fractionalOperands(left, right)}.", binary.span());
+                return null;
+            }
             return this.combineFloats(item, binary, operator, asFloat(left), asFloat(right));
         }
         return this.combineIntegers(item, binary, operator, left, right);
     }
 
+    // Combines two numbers of which one is fractional, for every operator but '%'.
     combineFloats(ConstantItem item, BinaryExpressionNode binary, SyntaxKind operator,
                   double left, double right) -> ConstantValue? {
         switch (operator) {
@@ -421,7 +436,7 @@ class ConstantEvaluator {
                 return literalvalues.floatConstant(false, left / right);
             },
             default -> {
-                this.report(item, "'%' in a constant expression works on integers.",
+                this.report(item, "Internal: the fractional constant arithmetic was given '%'.",
                     binary.span());
                 return null;
             },
@@ -494,9 +509,8 @@ class ConstantEvaluator {
     }
 
     reportOverflow(ConstantItem item, BinaryExpressionNode binary) {
-        this.report(item, "The initializer of static const "
-            + "'{this.itemName(item)}' overflows: the result does not fit "
-            + "any integer type.", binary.span());
+        this.report(item, "The initializer of static const '{this.itemName(item)}' computes a "
+            + "number outside the range of every integer type.", binary.span());
     }
 
     // A read of another static const, written through its type name: 'Path.separator'.
@@ -594,7 +608,7 @@ class ConstantEvaluator {
 
     reportUnknownHead(ConstantItem item, string headName, Span span) {
         if (this.namesOwnerTypeParameter(item, headName)) {
-            this.reportNotConstant(item, span, typeParameterClause(headName));
+            this.reportNotConstant(item, span, typeParameterClause(headName, this.ownerName(item)));
             return;
         }
         this.reportNotConstant(item, span, "'{headName}' is not a class or struct this file "
@@ -619,30 +633,57 @@ class ConstantEvaluator {
         let object = member.object();
         if (object is MemberExpressionNode) {
             let inner = object.object();
-            if (inner is IdentifierExpressionNode && item.context.linkTable().binding(inner.name().text())
-                        is ImportedNamespace) {
-                this.reportNotConstant(item, member.span(), "it reads "
-                    + "'{object.member().text()}.{memberName}' through the module namespace "
-                    + "'{inner.name().text()}'; import '{object.member().text()}' by name and "
-                    + "write '{object.member().text()}.{memberName}'");
-                return;
+            if (inner is IdentifierExpressionNode) {
+                let binding = item.context.linkTable().binding(inner.name().text());
+                if (binding is ImportedNamespace) {
+                    string typeName = object.member().text();
+                    this.reportNotConstant(item, member.span(), "it reads "
+                        + "'{typeName}.{memberName}' through the module name "
+                        + "'{inner.name().text()}'",
+                        this.importFix(item, binding.modulePath(), typeName, memberName));
+                    return;
+                }
             }
         }
         this.reportNotConstant(item, member.span(),
             "it reads a member of a value, which only exists at run time");
     }
 
+    // The fix for a static const read through a module name: the name this file already has for
+    // the type, or the import that gives it one.
+    importFix(ConstantItem item, string modulePath, string typeName, string memberName) -> string {
+        let names = this.namesOf(item);
+        let declared = item.context.resolver().typeStore().findDeclared(modulePath, typeName);
+        if (declared == null) {
+            return "Module '{modulePath}' has no type named '{typeName}'. Check the spelling, or "
+                + "import '{typeName}' from the module that declares it.";
+        }
+        let already = names.nameFor(declared);
+        if (already != null) {
+            return "Write '{already}.{memberName}'.";
+        }
+        string bound = types.freeNameFor(declared, names);
+        string binding = typeName;
+        if (bound != typeName) {
+            binding = "{typeName} as {bound}";
+        }
+        return "Write 'import {binding} from {names.importPathOf(declared)};' and then "
+            + "'{bound}.{memberName}'.";
+    }
+
     evaluateIdentifier(ConstantItem item, IdentifierExpressionNode identifier) {
         string name = identifier.name().text();
         let sibling = members.findField(types.staticFieldsOf(item.owner), name);
         if (sibling != null) {
-            this.report(item, "Statics are read through the type name even inside "
-                + "'{this.ownerName(item)}'; write '{this.ownerName(item)}.{name}'.",
-                identifier.span());
+            string owner = this.ownerName(item);
+            this.report(item, "'{name}' is a static const of '{owner}', and a static const is "
+                + "always read through its type name, even inside '{owner}'. Write "
+                + "'{owner}.{name}'.", identifier.span());
             return;
         }
         if (this.namesOwnerTypeParameter(item, name)) {
-            this.reportNotConstant(item, identifier.span(), typeParameterClause(name));
+            this.reportNotConstant(item, identifier.span(),
+                typeParameterClause(name, this.ownerName(item)));
             return;
         }
         this.reportNotConstant(item, identifier.span(), "'{name}' is not a constant; only "
@@ -666,11 +707,22 @@ class ConstantEvaluator {
             } else if (defining.packagePrefix() == item.context.module().packagePrefix()) {
                 needed = "public";
             }
-            this.report(item, "'{field.name()}' is "
-                + "{types.visibilityWord(field.visibility())} to "
-                + "{types.kindWordOf(defining)} '{this.namesOf(item).nameOf(defining)}', so the "
-                + "initializer of '{this.itemName(item)}' cannot read it. Mark '{field.name()}' "
-                + "'{needed}'.", at);
+            string definingName = this.namesOf(item).nameOf(defining);
+            string owner = "{types.kindWordOf(defining)} '{definingName}'";
+            string problem = "'{field.name()}' is private to {owner}, so the initializer of "
+                + "'{this.itemName(item)}' cannot read it.";
+            if (field.visibility() == Visibility.Protected) {
+                problem = "'{field.name()}' is protected in {owner}, so only '{definingName}' and "
+                    + "its subclasses can read it.";
+            } else if (field.visibility() == Visibility.Public) {
+                string packageName = "its own package";
+                if (defining.packagePrefix().length > 0) {
+                    packageName = "package '{defining.packagePrefix()}'";
+                }
+                problem = "'{field.name()}' is public inside {packageName}, so another package "
+                    + "cannot read it.";
+            }
+            this.report(item, "{problem} Mark '{field.name()}' '{needed}'.", at);
         }
         return allowed;
     }
@@ -691,8 +743,7 @@ class ConstantEvaluator {
             if (value.kind() == ConstantKind.String) {
                 return value;
             }
-            this.report(item, "Static const '{name}' has type 'string' but its initializer "
-                + "is {constantKindText(value)}.", at);
+            this.report(item, mismatchMessage(name, "string", value), at);
             return null;
         }
         if (!(declared is PrimitiveType)) {
@@ -703,16 +754,15 @@ class ConstantEvaluator {
             if (value.kind() == ConstantKind.Bool) {
                 return value;
             }
-            this.report(item, "Static const '{name}' has type 'bool' but its initializer is "
-                + "{constantKindText(value)}.", at);
+            this.report(item, mismatchMessage(name, "bool", value), at);
             return null;
         }
         if (kind == PrimitiveKind.Char) {
             if (value.kind() == ConstantKind.Char) {
                 return value;
             }
-            this.report(item, "Static const '{name}' has type 'char' but its initializer is "
-                + "{constantKindText(value)}; write a char literal such as '/'.", at);
+            this.report(item, "Static const '{name}' has type 'char', but its initializer is "
+                + "{constantKindText(value)}. Write a char literal such as '/'.", at);
             return null;
         }
         if (kind == PrimitiveKind.Float || kind == PrimitiveKind.Double) {
@@ -731,16 +781,28 @@ class ConstantEvaluator {
                     negative = value.isNegative();
                 },
                 default -> {
-                    this.report(item, "Static const '{name}' has type "
-                        + "'{this.namesOf(item).of(declared)}' but its initializer is "
-                        + "{constantKindText(value)}.", at);
+                    this.report(item, mismatchMessage(name, this.namesOf(item).of(declared), value),
+                        at);
                     return null;
                 },
             }
             if (!literalvalues.floatMagnitudeFits(magnitude, kind)) {
+                string limit = "largest";
+                string beyond = "larger";
+                string within = "a smaller value";
+                if (negative) {
+                    limit = "smallest";
+                    beyond = "smaller";
+                    within = "a value inside the range";
+                }
+                string fix = "Use {within}.";
+                if (kind == PrimitiveKind.Float) {
+                    fix = "Use 'double', or {within}.";
+                }
                 this.report(item, "Static const '{name}' has type "
-                    + "'{this.namesOf(item).of(declared)}', which holds at most "
-                    + "{literalvalues.floatLimit(kind)}; this value is larger.", at);
+                    + "'{this.namesOf(item).of(declared)}', whose {limit} value is "
+                    + "{literalvalues.floatLimit(kind, negative)}, and this value is {beyond}. {fix}",
+                    at);
                 return null;
             }
             return literalvalues.floatConstant(negative, magnitude);
@@ -756,16 +818,16 @@ class ConstantEvaluator {
                 magnitudeValue = value.magnitude();
             },
             default -> {
-                this.report(item, "Static const '{name}' has type "
-                    + "'{this.namesOf(item).of(declared)}' but its initializer is "
-                    + "{constantKindText(value)}.", at);
+                this.report(item, mismatchMessage(name, this.namesOf(item).of(declared), value),
+                    at);
                 return null;
             },
         }
         if (!literalvalues.magnitudeFits(negativeValue, magnitudeValue, kind)) {
+            string shown = literalvalues.constantText(value);
             this.report(item, "Static const '{name}' has type '{this.namesOf(item).of(declared)}', "
-                + "which holds {literalvalues.integerRange(kind)}; "
-                + "{literalvalues.constantText(value)} is outside that range.", at);
+                + "which goes {literalvalues.integerRange(kind)}, and '{shown}' is outside that "
+                + "range. Use a type that fits '{shown}', or a value inside that range.", at);
             return null;
         }
         return literalvalues.integerConstant(negativeValue, magnitudeValue);
@@ -773,10 +835,49 @@ class ConstantEvaluator {
 }
 
 // Why a type parameter is never part of a compile-time constant, as the middle clause of the
-// standard refusal. The constant is one value for every type argument, so no type argument
-// is in reach of its initializer.
-typeParameterClause(string name) -> string {
-    return "'{name}' is a type parameter, and one value is shared by every type argument";
+// standard refusal. The constant has one value for every type argument.
+typeParameterClause(string name, string ownerName) -> string {
+    return "'{name}' is a type parameter, and a static const of '{ownerName}' has one value for "
+        + "every choice of '{name}'";
+}
+
+// The refusal of an initializer whose value is of another kind than the declared type.
+mismatchMessage(string name, string declared, ConstantValue value) -> string {
+    return "Static const '{name}' has type '{declared}', but its initializer is "
+        + "{constantKindText(value)}. Write a value of type '{declared}', or change the type to "
+        + "'{valueTypeName(value)}'.";
+}
+
+// The type a constant value has when nothing else decides it, as the fix of a mismatch names it.
+valueTypeName(ConstantValue value) -> string {
+    if (value.kind() == ConstantKind.Integer) {
+        if (literalvalues.magnitudeFits(value.isNegative(), value.magnitude(), PrimitiveKind.Int)) {
+            return "int";
+        }
+        if (literalvalues.magnitudeFits(value.isNegative(), value.magnitude(), PrimitiveKind.Long)) {
+            return "long";
+        }
+        return "ulong";
+    }
+    return switch (value.kind()) {
+        Integer -> "int",
+        Float -> "double",
+        Bool -> "bool",
+        Char -> "char",
+        String -> "string",
+    };
+}
+
+// The fractional operands of a '%', as its refusal names them.
+fractionalOperands(ConstantValue left, ConstantValue right) -> string {
+    if (left.kind() == ConstantKind.Float && right.kind() == ConstantKind.Float) {
+        return "the fractional numbers '{literalvalues.constantText(left)}' and "
+            + "'{literalvalues.constantText(right)}'";
+    }
+    if (left.kind() == ConstantKind.Float) {
+        return constantKindText(left);
+    }
+    return constantKindText(right);
 }
 
 isConstantOperator(SyntaxKind operator) -> bool {
@@ -800,11 +901,11 @@ asFloat(ConstantValue value) -> double {
 // How a constant value's kind reads in a diagnostic.
 constantKindText(ConstantValue value) -> string {
     return switch (value.kind()) {
-        Integer -> "the number {literalvalues.constantText(value)}",
-        Float -> "the fractional number {literalvalues.constantText(value)}",
+        Integer -> "the number '{literalvalues.constantText(value)}'",
+        Float -> "the fractional number '{literalvalues.constantText(value)}'",
         Bool -> "the bool '{literalvalues.constantText(value)}'",
         Char -> "a char",
-        String -> "the string {literalvalues.constantText(value)}",
+        String -> "the string '{literalvalues.constantText(value)}'",
     };
 }
 

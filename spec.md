@@ -933,7 +933,7 @@ Each test prints one line, a failing test also prints its message and the stack 
 
 ```
 PASS addition adds small integers
-FAIL subtraction fails on purpose: expected 1, got -1
+FAIL subtraction fails on purpose: expected '1', got '-1'
   at assertEqual (testing.ens:7)
   at "subtraction fails on purpose" (math_test.ens:11)
 2/3 tests passed
@@ -951,7 +951,7 @@ Each member's results are announced under its package name, the way a build anno
 PASS greeting composes
 1/1 tests passed
 [2/2] demo.app:
-FAIL rendering fails on purpose: expected 1, got -1
+FAIL rendering fails on purpose: expected '1', got '-1'
   at assertEqual (testing.ens:7)
   at "rendering fails on purpose" (render_test.ens:5)
 0/1 tests passed
@@ -1895,12 +1895,13 @@ The name is one no other call answers and starts with `prefix`, so something lef
 `path()` answers where it is, and the value's destructor removes it, a directory with everything in it, keeping any failure to itself.
 `keep()` dismisses that removal and answers the path, which the caller then owns.
 
-A `FileSystemError` from `@std.fs.error` carries the `path` the operation could not finish on, a `kind`, and a `nativeError`.
+A `FileSystemError` from `@std.fs.error` carries the `path` the operation could not finish on, a `kind`, a `nativeError` and a `reason`.
 The kinds are `NotFound` for nothing at the path or a missing directory written above it, `PermissionDenied` for an operation refused, `AlreadyExists` for something already there that the operation will not replace, `NotADirectory` for a path written above this one that names a file, `IsADirectory` for a directory named where a file was wanted, `DirectoryNotEmpty` for a directory that still holds entries, `NoSpace` for a file system with no room left or a quota used up, and `Other` for anything else the system reported, whose own number the message carries.
 The set is closed, so a program that answers for every member answers for everything the module reports.
 Windows has no error number that says a directory was named, so a directory named where a file was wanted reports `PermissionDenied` there and `IsADirectory` everywhere else.
 `nativeError` is the number the system itself reported, which a program logs rather than acts on: on Windows a failure a file-system call reported carries a Win32 number and one a stream call reported carries the C library's `errno`, because that is what each of them answers, while every other platform carries `errno` throughout.
 It is `0` where nothing was asked of the system.
+`reason` is the part of the message that says why the operation did not happen, such as `nothing is there`, for a program that shows the path in its own words.
 
 ```ens
 import @std.fs;

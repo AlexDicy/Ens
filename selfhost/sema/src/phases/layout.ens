@@ -41,28 +41,38 @@ public layoutProgram(List<ClassItem> items) -> FileDiagnostic[] {
     return diagnostics.sorted(collected);
 }
 
-// A class whose base chain reaches back to itself cannot be laid out; the first class found on
-// a cycle is diagnosed and its base link cleared, which dissolves the cycle for the rest.
+// A class whose base chain comes back to itself cannot be laid out; the first class found on
+// a cycle is diagnosed and its base link cleared, which dissolves the cycle for the rest. A class
+// whose chain runs into a cycle it is not part of is left to the classes on that cycle.
 breakInheritanceCycles(List<ClassItem> items, List<FileDiagnostic> collected) {
     for (long i = 0; i < items.length(); i++) {
         let item = items.get(i);
         let classType = item.classType();
+        let names = item.context().names();
         let seen = new Set<ClassType>();
+        let chain = new List<string>();
         ClassType? current = classType;
         bool cycle = false;
         while (current != null) {
             if (!seen.add(current)) {
-                cycle = true;
+                cycle = current == classType;
                 break;
             }
+            chain.push(names.nameOf(current));
             current = baseAuthority(current);
         }
         if (!cycle) {
             continue;
         }
-        collected.push(new FileDiagnostic(item.context().module().filePath(),
-            "Class '{item.context().names().nameOf(classType)}' extends itself through its "
-            + "base classes. A class cannot inherit from itself, directly or indirectly.",
+        string className = names.nameOf(classType);
+        let steps = new StringBuilder();
+        steps.append("Class '{className}' extends ");
+        for (long c = 1; c < chain.length(); c++) {
+            steps.append("'{chain.get(c)}', which extends ");
+        }
+        steps.append("'{className}', so '{className}' would be its own base class. Remove one of the "
+            + "'extends' clauses in that chain.");
+        collected.push(new FileDiagnostic(item.context().module().filePath(), steps.toString(),
             item.declaration().name().span()));
         let base = classType.base();
         if (base != null) {
@@ -206,7 +216,8 @@ class ClassLayout {
                         + "inherited field, or give this one another name.", field.nameSpan());
                 } else {
                     this.reporter.report("Field '{field.name()}' is already declared in "
-                        + "'{this.names.nameOf(this.classType)}'.", field.nameSpan());
+                        + "'{this.names.nameOf(this.classType)}'. Remove this second "
+                        + "'{field.name()}', or rename it.", field.nameSpan());
                 }
                 return;
             }
@@ -227,7 +238,8 @@ class ClassLayout {
         if (field.name().length > 0) {
             if (members.findField(this.classType.staticFields(), field.name()) != null) {
                 this.reporter.report("{members.typeLevelFieldNoun(field)} '{field.name()}' is "
-                    + "already declared in '{this.names.nameOf(this.classType)}'.", field.nameSpan());
+                    + "already declared in '{this.names.nameOf(this.classType)}'. Remove this second "
+                    + "'{field.name()}', or rename it.", field.nameSpan());
                 return;
             }
             members.checkStaticInstanceCollision(this.reporter, this.classType, field.name(),
@@ -305,9 +317,9 @@ class ClassLayout {
                 return;
             }
             if (rawName == this.classType.name()) {
-                this.reporter.report("To declare a constructor, use the 'constructor' "
-                    + "keyword. A method cannot be named after its class "
-                    + "'{this.names.nameOf(this.classType)}'.", nameSpan);
+                this.reporter.report("Method '{rawName}' has the name of its class, and a method "
+                    + "cannot be named after its class. To declare a constructor, write "
+                    + "'constructor(...)' instead of '{rawName}(...)'.", nameSpan);
                 return;
             }
         }
@@ -434,12 +446,21 @@ class ClassLayout {
         }
         if (modifiers.declaresAbstract) {
             if (!this.classType.isAbstract()) {
-                this.reporter.report("Abstract method '{methodName}' requires class "
-                    + "'{this.names.nameOf(this.classType)}' to be declared 'abstract'.", nameSpan);
+                string className = this.names.nameOf(this.classType);
+                string message = "Abstract method '{methodName}' has no body, so class "
+                    + "'{className}' must be 'abstract' too. Mark '{className}' 'abstract', or give "
+                    + "'{methodName}' a body and remove 'abstract'.";
+                if (member.body() != null) {
+                    message = "Abstract method '{methodName}' is declared in class '{className}', "
+                        + "which is not 'abstract'. Mark '{className}' 'abstract', or remove "
+                        + "'abstract' from '{methodName}'.";
+                }
+                this.reporter.report(message, nameSpan);
             }
             if (member.body() != null) {
-                this.reporter.report("Abstract method '{methodName}' cannot have a body.",
-                    nameSpan);
+                this.reporter.report("Abstract method '{methodName}' has a body, but an abstract "
+                    + "method leaves its body to each subclass. Replace the body with ';', or "
+                    + "remove 'abstract'.", nameSpan);
             }
             // A subclass has to implement an abstract method. A member private to its own type is
             // out of every subclass's reach.
@@ -559,12 +580,12 @@ class ClassLayout {
                     this.reporter.report("Override of '{methodName}' returns "
                         + "'{this.names.of(signature.returnType())}', but the '{methodName}' "
                         + "declared in '{ownerName}' returns '{declared}', "
-                        + narrowedReturnAdvice(baseBySignature.signature().returnType(), this.names)
+                        + narrowedReturnAdvice(baseBySignature.signature().returnType(),
+                            signature.returnType(), this.names)
                         + ".", nameSpan);
                 } else if (!overrideCompatible(baseBySignature.signature(), signature)) {
-                    this.reporter.report("Override of '{methodName}' does not match the "
-                        + "'{methodName}' declared in '{ownerName}', which is "
-                        + "'{methodDisplay(baseBySignature, this.names)}'.", nameSpan);
+                    this.reporter.report(mismatchedOverrideMessage(method, baseBySignature,
+                        "'{ownerName}'", this.names), nameSpan);
                 }
                 let throwsClause = member.throwsClause();
                 if (throwsClause != null && !baseBySignature.signature().declaresThrows()) {
@@ -585,18 +606,14 @@ class ClassLayout {
             }
             let baseByName = this.findInBase(methodName, signature, false);
             if (baseByName != null) {
-                this.reporter.report("Override of '{methodName}' does not match the "
-                    + "'{methodName}' declared in "
-                    + "'{this.names.of(baseByName.definingType())}', which is "
-                    + "'{methodDisplay(baseByName, this.names)}'.", nameSpan);
+                this.reporter.report(mismatchedOverrideMessage(method, baseByName,
+                    "'{this.names.of(baseByName.definingType())}'", this.names), nameSpan);
                 return;
             }
             let interfaceByName = this.findInInterfaces(methodName, signature, false);
             if (interfaceByName != null) {
-                this.reporter.report("Override of '{methodName}' does not match the "
-                    + "'{methodName}' declared in interface "
-                    + "'{this.names.of(interfaceByName.definingType())}', which is "
-                    + "'{methodDisplay(interfaceByName, this.names)}'.", nameSpan);
+                this.reporter.report(mismatchedOverrideMessage(method, interfaceByName,
+                    "interface '{this.names.of(interfaceByName.definingType())}'", this.names), nameSpan);
                 return;
             }
             if (reservedIntent) {
@@ -609,10 +626,11 @@ class ClassLayout {
                     return;
                 }
                 string owner = this.names.of(privateBase.definingType());
+                string className = this.names.nameOf(this.classType);
                 this.reporter.report("Cannot override '{methodName}': '{owner}' declares it "
-                    + "privately, so it is not inherited here. Mark it 'protected' in "
-                    + "'{owner}', or drop 'override' to declare a method of this class's own.",
-                    nameSpan);
+                    + "privately, so '{className}' does not inherit it. Mark it 'protected' in "
+                    + "'{owner}', or remove 'override' to declare a separate method of "
+                    + "'{className}'.", nameSpan);
                 return;
             }
             if (methodName == "toString" && signature.parameters().length > 0) {
@@ -622,8 +640,10 @@ class ClassLayout {
                     nameSpan);
                 return;
             }
-            this.reporter.report("Method '{methodName}' is marked 'override' but no base "
-                + "class or implemented interface declares it.", nameSpan);
+            string className = this.names.nameOf(this.classType);
+            this.reporter.report("Method '{methodName}' of '{className}' is marked 'override', but "
+                + "no base class or interface of '{className}' declares '{methodName}'. Remove "
+                + "'override', or check the spelling of '{methodName}'.", nameSpan);
             return;
         }
         if (baseBySignature != null) {
@@ -792,15 +812,10 @@ class ClassLayout {
                 continue;
             }
             if (provided.isConditional()) {
-                string requiredBy = "'{interfaceName}'";
-                if (level != implemented) {
-                    requiredBy = "'{levelName}', which '{interfaceName}' extends";
-                }
                 this.reporter.report("Class '{this.names.nameOf(this.classType)}' provides "
-                    + "'{methodDisplay(required, this.names)}', required by {requiredBy}, only for some "
-                    + "type arguments, and an interface requirement holds for all of them. "
-                    + "Remove the '<...>' constraint list from '{required.name()}', or stop "
-                    + "implementing '{interfaceName}'.", at);
+                    + "'{methodDisplay(required, this.names)}' only for some type arguments, but "
+                    + "'{interfaceName}' needs it for every type argument. Remove the '<...>' list "
+                    + "from '{required.name()}', or stop implementing '{interfaceName}'.", at);
                 continue;
             }
             if (narrowsReturnShape(required.signature(), provided.signature())) {
@@ -809,7 +824,8 @@ class ClassLayout {
                     + "'{this.names.nameOf(this.classType)}' returns "
                     + "'{this.names.of(provided.signature().returnType())}', but interface "
                     + "'{levelName}' requires '{requiredReturn}', "
-                    + narrowedReturnAdvice(required.signature().returnType(), this.names) + ".", at);
+                    + narrowedReturnAdvice(required.signature().returnType(),
+                        provided.signature().returnType(), this.names) + ".", at);
             } else if (!overrideCompatible(required.signature(), provided.signature())) {
                 string requiredReturn = this.names.of(required.signature().returnType());
                 this.reporter.report("Method '{required.name()}' of "
@@ -823,18 +839,18 @@ class ClassLayout {
                     + "'{this.names.nameOf(this.classType)}' must be marked 'noreturn', "
                     + "because interface '{levelName}' declares it 'noreturn'.", at);
             }
-            // Anyone who can name the class, or hold one of its values as the interface, can call
-            // the method through the interface. So it has to reach as far as the class does, the
-            // same rule 'toString', 'hash', and 'equals' already follow. 'protected' and private
-            // share one tier, so the narrowest case is named on its own.
+            // Anyone who can name the class, or store one of its values as the interface, can call
+            // the method through the interface. So it must be as visible as the class, the same
+            // rule 'toString', 'hash', and 'equals' already follow. 'protected' and private share
+            // one tier, so the narrowest case is named on its own.
             Visibility requiredReach = types.followedMemberVisibility(this.classType.visibility());
             if (provided.visibility() == Visibility.Private || types.visibilityTier(provided.visibility())
                         < types.visibilityTier(requiredReach)) {
                 this.reporter.report("Method '{required.name()}' of "
                     + "'{this.names.nameOf(this.classType)}' is "
                     + "{types.visibilityWord(provided.visibility())}, but it provides "
-                    + "'{methodDisplay(required, this.names)}' required by '{interfaceName}', so it has "
-                    + "to reach as far as '{this.names.nameOf(this.classType)}' itself. Mark "
+                    + "'{methodDisplay(required, this.names)}' for interface '{interfaceName}', so it "
+                    + "must be usable everywhere '{this.names.nameOf(this.classType)}' is. Mark "
                     + "it '{types.visibilityWord(requiredReach)}'.", at);
             }
         }
@@ -874,9 +890,14 @@ class ClassLayout {
                 }
                 checked.push(method);
                 let declaring = this.findDeclaring(method.name(), method.signature());
-                if (declaring != null && declaring.isAbstract()) {
-                    this.reporter.report("Class '{this.names.nameOf(this.classType)}' must override "
-                        + "abstract method '{method.name()}', or be declared 'abstract'.", at);
+                // An abstract method this class declares itself is refused where it is declared.
+                if (declaring != null && declaring.isAbstract()
+                        && declaring.definingType() != this.classType) {
+                    string className = this.names.nameOf(this.classType);
+                    this.reporter.report("Class '{className}' does not override '{method.name()}', "
+                        + "an abstract method of '{this.names.of(declaring.definingType())}'. "
+                        + "Declare '{method.name()}' in '{className}' with a body and 'override', "
+                        + "or mark '{className}' 'abstract'.", at);
                 }
             }
             current = types.baseOf(current);
@@ -924,11 +945,33 @@ public narrowsReturnShape(Signature base, Signature derived) -> bool {
 // Why a return type held differently from the declared one is refused, and the fix. The caller
 // names the two methods first, because a class override and an interface requirement name
 // themselves differently; this is the part they share.
-public narrowedReturnAdvice(Type declared, TypeNames names) -> string {
-    return "and the two are stored differently. An override may narrow a class, interface, "
-        + "array, string, function or handle reference, because each of those is one reference "
-        + "either way, but not a number and not a nullable value type. Return "
-        + "'{names.of(declared)}'";
+public narrowedReturnAdvice(Type declared, Type actual, TypeNames names) -> string {
+    string fix = "Return '{names.of(declared)}'";
+    if (declared is OptionalType) {
+        if (declared.inner() is OptionalType) {
+            return "and an override cannot remove one '?' from a type that has two. {fix}";
+        }
+        return "and an override can remove the '?' only from a class, interface, array, string, "
+            + "function or external type, not from a number or a struct. {fix}";
+    }
+    if (convert.isNumericType(declared) && convert.isNumericType(actual)) {
+        return "and an override must return exactly the same number type. {fix}";
+    }
+    return "and an override must return exactly '{names.of(declared)}'. {fix}";
+}
+
+// The refusal of an override whose parameters or return type differ from the method it names,
+// with 'owner' naming where that method is declared.
+// Removing 'override' is offered only when the parameters differ, which makes the method a
+// separate overload; with the same parameters it would hide the declared one.
+mismatchedOverrideMessage(Method method, Method declared, string owner, TypeNames names) -> string {
+    string name = method.name();
+    string fix = "Change this '{name}' to match it.";
+    if (!types.sameParameterTypes(method.signature(), declared.signature())) {
+        fix = "Change this '{name}' to match it, or remove 'override'.";
+    }
+    return "Override of '{name}' is '{methodDisplay(method, names)}', but the '{name}' "
+        + "declared in {owner} is '{methodDisplay(declared, names)}'. {fix}";
 }
 
 // The signature as an interface requirement reads: 'speak(int) -> string'.

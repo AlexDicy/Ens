@@ -48,6 +48,8 @@ public final class ThrowValidation {
     // The methods the function being validated overrides or implements, which decide whether
     // marking it 'throws' is a fix that compiles.
     List<Signature> answeredScope;
+    // Whether one of them is a method of a base class.
+    bool answersBase;
 
     public constructor(ModuleExceptions module) {
         this.module = module;
@@ -56,6 +58,7 @@ public final class ThrowValidation {
         this.names = module.names();
         this.errorClass = module.errorClass();
         this.answeredScope = new List<Signature>();
+        this.answersBase = false;
     }
 
     shadowedByEarlier(Type clauseType, List<Type?> clauseTypes, long index) -> bool {
@@ -129,23 +132,27 @@ public final class ThrowValidation {
         }
         Type[] allowed = this.lambdaTargetThrownTypes(lambda);
         if (allowed.length == 0) {
-            string thrown = "";
-            string added = "what it throws";
-            if (!outward.isEmpty()) {
-                thrown = " {nameList(outward, this.names)}";
-                added = "the type";
+            if (outward.isEmpty()) {
+                this.reporter.report("This lambda can throw, but the function type it is given to has "
+                    + "no 'throws' list. Add a 'throws' list after that function type's return type, "
+                    + "as in '(() -> void throws Error)', or "
+                    + namedFunctionFix("throwing code", "it"), lambda.arrow().span());
+                return;
             }
-            this.reporter.report("This lambda's body can throw{thrown}, and its target function type "
-                + "declares no 'throws' list. Add {added} to the target's list, written after its "
-                + "return type as in '(() -> void throws IOError)', or "
-                + namedFunctionFix("throwing code"), lambda.arrow().span());
+            string thrown = nameList(outward, this.names);
+            string clause = throwsClauseList(outward, this.names);
+            this.reporter.report("This lambda can throw {thrown}, but the function type it is given to "
+                + "has no 'throws' list. Add 'throws {clause}' after that function type's return type, "
+                + "as in '(() -> void throws {clause})', or "
+                + namedFunctionFix("throwing code", thrown), lambda.arrow().span());
             return;
         }
         let strays = this.strayUnderScope(outward, exceptions.throwSetOf(allowed, this.errorClass));
         if (!strays.isEmpty()) {
-            this.reporter.report("This lambda's body can throw {nameList(strays, this.names)}, which its "
-                + "target function type does not list. Add it to the target's list, or "
-                + namedFunctionFix("throwing code"), lambda.arrow().span());
+            string thrown = nameList(strays, this.names);
+            this.reporter.report("This lambda can throw {thrown}, which the function type it is given "
+                + "to does not list. Add {thrown} to that function type's 'throws' list, or "
+                + namedFunctionFix("throwing code", thrown), lambda.arrow().span());
         }
     }
 
@@ -164,6 +171,10 @@ public final class ThrowValidation {
     validateFunction(FunctionItem item) {
         this.module.enterItemScope(item);
         this.answeredScope = this.answeredSignatures(item);
+        let answering = item.method;
+        let answeringOwner = item.owner;
+        this.answersBase = answering != null && answeringOwner != null
+            && exceptions.findBaseMethod(answeringOwner, answering) != null;
         let declaration = item.declaration;
         let site = callSiteOf(item.signature, item.method);
         let body = declaration.body();
@@ -186,6 +197,7 @@ public final class ThrowValidation {
         this.validateCatchClauses(item);
         this.module.leaveItemScope();
         this.answeredScope = new List<Signature>();
+        this.answersBase = false;
     }
 
     // Checks the calls under the node. 'lambda' is the innermost lambda holding the node, and null
@@ -252,9 +264,15 @@ public final class ThrowValidation {
                 return "Prefix it with 'try', and catch it with a 'catch' clause after the body.";
             }
             if (site == CallSite.UnmarkedCatch) {
-                return "A 'catch' clause does not catch what its own body throws, and marking this method "
-                    + "'throws' would throw more than the method it answers to allows. Move the call into a "
-                    + "function that catches it with a 'catch' clause.";
+                string caught = "it";
+                string refusal = "is not marked 'throws'";
+                if (!contract.isEmpty()) {
+                    caught = nameList(contract, this.names);
+                    refusal = "does not throw {caught}";
+                }
+                return "A 'catch' clause does not catch what the code inside it throws, and this method "
+                    + "cannot be marked 'throws', because {this.answeredPhrase(refusal)}. Move the call "
+                    + "into a function that catches {caught} with a 'catch' clause.";
             }
         }
         return switch (site) {
@@ -265,15 +283,15 @@ public final class ThrowValidation {
                 + "constructor body.",
             CallSite.Destructor -> "Prefix it with 'try', and catch it with a 'catch' clause after the "
                 + "destructor body.",
-            CallSite.UnmarkedCatch -> "A 'catch' clause does not catch what its own body throws. Prefix it "
-                + "with 'try' and mark this function 'throws', or move the call into a function that "
+            CallSite.UnmarkedCatch -> "A 'catch' clause does not catch what the code inside it throws. "
+                + "Prefix it with 'try' and mark this function 'throws', or move the call into a "
+                + "function that catches it with a 'catch' clause.",
+            CallSite.ConstructorCatch -> "A 'catch' clause does not catch what the code inside it throws, "
+                + "and a constructor cannot be marked 'throws'. Move the call into a function that "
                 + "catches it with a 'catch' clause.",
-            CallSite.ConstructorCatch -> "A 'catch' clause does not catch what its own body throws, and a "
-                + "constructor cannot be marked 'throws'. Move the call into a function that catches it "
-                + "with a 'catch' clause.",
-            CallSite.DestructorCatch -> "A 'catch' clause does not catch what its own body throws, and a "
-                + "destructor cannot be marked 'throws'. Move the call into a function that catches it "
-                + "with a 'catch' clause.",
+            CallSite.DestructorCatch -> "A 'catch' clause does not catch what the code inside it throws, "
+                + "and a destructor cannot be marked 'throws'. Move the call into a function that "
+                + "catches it with a 'catch' clause.",
             CallSite.Test -> "Prefix it with 'try'.",
         };
     }
@@ -292,8 +310,24 @@ public final class ThrowValidation {
         if (added.length == 0) {
             return "Prefix it with 'try'.";
         }
-        return "Prefix it with 'try', and add {added} to the 'throws' list of the lambda's target "
-            + "function type, or " + namedFunctionFix("call");
+        string caught = added;
+        if (strays.isEmpty()) {
+            caught = "it";
+        }
+        return "Prefix it with 'try', and add {added} to the 'throws' list of the function type the "
+            + "lambda is given to, or " + namedFunctionFix("call", caught);
+    }
+
+    // The methods the function being validated overrides or implements, as the subject of a
+    // sentence that ends in 'refusal'.
+    answeredPhrase(string refusal) -> string {
+        if (this.answeredScope.length() == 1) {
+            if (this.answersBase) {
+                return "the method it overrides {refusal}";
+            }
+            return "the interface method it implements {refusal}";
+        }
+        return "one of the methods it overrides or implements {refusal}";
     }
 
     // What the callable is judged on: its declared list when it names types, and otherwise what
@@ -515,8 +549,9 @@ public final class ThrowValidation {
                 continue;
             }
             if (!types.isClassLike(caught) || !types.isSubclassOf(caught, errorBase)) {
-                this.reporter.report("Cannot catch '{this.names.of(caught)}'; only 'Error' "
-                    + "or a subclass of it can be caught.", clause.caughtType().span());
+                this.reporter.report("Cannot catch '{this.names.of(caught)}', because only 'Error' "
+                    + "or a subclass of it can be thrown and caught. Catch a class that extends "
+                    + "'Error'.", clause.caughtType().span());
             }
         }
     }
@@ -548,9 +583,9 @@ public final class ThrowValidation {
             }
             string shown = this.names.of(clauseType);
             if (this.shadowedByEarlier(clauseType, clauseTypes, i)) {
-                this.reporter.report("This 'catch ({shown} ...)' is unreachable: an earlier "
-                    + "'catch' clause already handles it. Move it above that clause, or "
-                    + "remove it.", clause.caughtType().span());
+                this.reporter.report("This 'catch ({shown} ...)' never runs, because an earlier "
+                    + "'catch' clause already catches every '{shown}'. Move it above that clause, "
+                    + "or remove it.", clause.caughtType().span());
                 continue;
             }
             if (!this.relatedToAny(clauseType, bodySet)) {
@@ -814,9 +849,9 @@ widenedThrowsFix(Signature provided, Method overridden, string overriddenOwner, 
     return "{fix} {widen}.";
 }
 
-// The fix that moves the throwing 'part' of a lambda into a named function.
-namedFunctionFix(string part) -> string {
-    return "move the {part} into a named function that catches it with a 'catch' clause.";
+// The fix that moves the throwing 'part' of a lambda into a named function that catches 'caught'.
+namedFunctionFix(string part, string caught) -> string {
+    return "move the {part} into a named function that catches {caught} with a 'catch' clause.";
 }
 
 // Where a call is written. A missing 'try' is fixed differently in each place, and a call in a
