@@ -56,8 +56,16 @@ export final class InstalledToolchains {
     Path? rootFolder;
     string programFileName;
     InstalledToolchain[] found;
+    string userFolderVariable;
 
-    export constructor(this.rootFolder, this.programFileName, this.found);
+    export constructor(this.rootFolder, this.programFileName, this.found,
+                       this.userFolderVariable = "HOME");
+
+    // The variable that names the user's own folder, which the toolchains folder is under when
+    // 'ENS_TOOLCHAINS' is not set.
+    export userVariable() -> string {
+        return this.userFolderVariable;
+    }
 
     // The toolchains folder, or empty text when no setting names where that is.
     export root() -> Path? {
@@ -164,7 +172,7 @@ export hand(Environment environment, ToolchainRequest request, string governingV
     if (chosen == null) {
         return new Handoff(false, 0);
     }
-    return new Handoff(true, runToolchain(chosen, argv, reporter));
+    return new Handoff(true, runToolchain(chosen, decision.version(), argv, reporter));
 }
 
 // Which toolchain does the work. `governing` is the version the build root is written for, `running`
@@ -183,8 +191,8 @@ export select(ToolchainRequest request, string governing, string running,
     }
     if (request.environmentValue() == ToolchainVersions.local) {
         string named = requestWording(request, requested);
-        return buildHere("{named} names Ens {requested}, and ENS_TOOLCHAIN=local keeps the work "
-            + "here, so this toolchain is building it");
+        return buildHere("Building with this toolchain: 'ENS_TOOLCHAIN=local' is set, so {named} "
+            + "is not used");
     }
     if (requested.length > 0) {
         return honorRequest(request, requested, running, installed);
@@ -194,12 +202,11 @@ export select(ToolchainRequest request, string governing, string running,
     }
     Path? program = installed.programOf(governing);
     if (program == null) {
-        string missing = missingFrom(installed, governing);
-        return buildHere("This build root is written for Ens {governing} and this toolchain is "
-            + "{running}; {missing}, so this toolchain is building it");
+        return buildHere("This build is written for Ens {governing}, which is not installed, so "
+            + "this toolchain, Ens {running}, is building it. " + foundInstead(installed));
     }
     return new ToolchainDecision(governing, program, "",
-        "This build root is written for Ens {governing}, so '{program}' is building it");
+        "This build is written for Ens {governing}, so '{program}' is building it");
 }
 
 // A version the command line or the environment requested by name. Requesting one that is not here
@@ -212,11 +219,15 @@ honorRequest(ToolchainRequest request, string requested, string running,
         return new ToolchainDecision(requested, program, "",
             "{named} names Ens {requested}, so '{program}' is building it");
     }
-    string missing = missingFrom(installed, requested);
-    string remedy = howToInstall(installed, requested);
-    return new ToolchainDecision("", null, "{named} names a toolchain that is not installed: "
-        + "{missing}. {remedy}, or name 'local' to build with this toolchain, which is Ens "
-        + "{running}", "");
+    string local = "write '--toolchain local' to build with this toolchain, Ens {running}";
+    if (installed.root() == null) {
+        return new ToolchainDecision("", null, "{named} names Ens {requested}, and there is no "
+            + "toolchains folder to look in: " + noFolderReason(installed) + ". Set "
+            + "'ENS_TOOLCHAINS' to the folder your toolchains are in, or {local}", "");
+    }
+    return new ToolchainDecision("", null, "{named} names Ens {requested}, which is not "
+        + "installed: " + foundInstead(installed) + ". Install Ens {requested} as '"
+        + installedAt(installed, requested) + "', or {local}", "");
 }
 
 // The toolchains folder: the folder ENS_TOOLCHAINS names, else '.ens/toolchains' under this user's
@@ -244,22 +255,31 @@ export discover(Path? root, string hostTriple) -> InstalledToolchains {
             }
         }
     }
-    return new InstalledToolchains(root, program, found.toArray());
+    return new InstalledToolchains(root, program, found.toArray(), userVariableFor(hostTriple));
 } catch (FileSystemError refused) {
     InstalledToolchain[] none = [];
-    return new InstalledToolchains(root, platform.executableNamed("ens", hostTriple), none);
+    return new InstalledToolchains(root, platform.executableNamed("ens", hostTriple), none,
+        userVariableFor(hostTriple));
+}
+
+// The variable that names the user's own folder on the machine the triple names.
+userVariableFor(string triple) -> string {
+    if (platform.platformName(triple) == "windows") {
+        return "USERPROFILE";
+    }
+    return "HOME";
 }
 
 // Delegates the whole command to another toolchain: the arguments exactly as they were given, its streams
 // left with this process so its output appears as it is written, and ENS_TOOLCHAIN=local in its
 // environment, which is what stops it delegating the work again. One hop is all there ever is.
-runToolchain(Path program, string[] argv, Reporter reporter) -> int {
+runToolchain(Path program, string version, string[] argv, Reporter reporter) -> int {
     let pinned = Environment.current();
     pinned.set("ENS_TOOLCHAIN", ToolchainVersions.local);
     let ran = try process.run(program, argv, environment: pinned);
     return childexit.exitCodeOf(ran.status);
 } catch (ProcessError refused) {
-    reporter.problem("the toolchain at '{program}' could not be run: {refused.message}");
+    reporter.problem("the Ens {version} toolchain is installed, but {refused.message}");
     return 1;
 }
 
@@ -277,31 +297,23 @@ requestWording(ToolchainRequest request, string requested) -> string {
     if (request.option().length > 0) {
         return "'--toolchain {requested}'";
     }
-    return "ENS_TOOLCHAIN={requested}";
+    return "'ENS_TOOLCHAIN={requested}'";
 }
 
-// Why the requested version is not here: what the folder holds instead, or that no setting names where to
-// look at all.
-missingFrom(InstalledToolchains installed, string requested) -> string {
+// What the toolchains folder contains, or why there is no folder to look in.
+foundInstead(InstalledToolchains installed) -> string {
     if (installed.root() == null) {
-        return "no toolchain for {requested} is installed, and neither ENS_TOOLCHAINS nor HOME "
-            + "(USERPROFILE on Windows) is set";
+        return "There is no toolchains folder: " + noFolderReason(installed);
     }
     string[] versions = installed.versions();
     if (versions.length == 0) {
-        return "'{installed.root()}' holds no toolchain at all";
+        return "'{installed.root()}' contains no toolchain";
     }
-    return "'{installed.root()}' holds " + report.quotedNames(versions);
+    return "'{installed.root()}' contains only " + report.quotedNames(versions);
 }
 
-// What it would take for the requested version to be found next time.
-howToInstall(InstalledToolchains installed, string requested) -> string {
-    if (installed.root() == null) {
-        return "Set ENS_TOOLCHAINS to the folder your toolchains live in, or set HOME (USERPROFILE "
-            + "on Windows) so they are looked for under '.ens/toolchains' there";
-    }
-    return "Install Ens {requested} as '"
-        + installedAt(installed, requested) + "'";
+noFolderReason(InstalledToolchains installed) -> string {
+    return "neither 'ENS_TOOLCHAINS' nor '{installed.userVariable()}' is set";
 }
 
 // Where a requested version's program would be under the toolchains folder. Only a message

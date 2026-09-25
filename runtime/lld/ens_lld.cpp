@@ -145,12 +145,15 @@ ENS_LLD_EXPORT int ens_lld_link(int flavor, const char* argumentBlock, long long
                                 char** output) {
     if (output != nullptr) *output = nullptr;
     if (argumentBlock == nullptr || argumentCount <= 0) {
-        if (output != nullptr) *output = copied("no linker arguments were given");
+        if (output != nullptr) {
+            *output = copied("Internal: ens_lld_link was called with no arguments");
+        }
         return kUnusableRequest;
     }
     if (flavor != kFlavorCoff && flavor != kFlavorElf && flavor != kFlavorMachO) {
         if (output != nullptr) {
-            *output = copied("unknown linker flavor " + std::to_string(flavor));
+            *output = copied("Internal: ens_lld_link was called with the unknown linker flavor "
+                             + std::to_string(flavor));
         }
         return kUnusableRequest;
     }

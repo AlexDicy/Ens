@@ -1103,13 +1103,17 @@ task("test")
 
             -- argv the command refuses, each one naming what to write instead
             run({"frobnicate"}, nil, 2, "unknown command 'frobnicate'")
-            run({"biuld", hello}, nil, 2, "did you mean 'build'?")
-            run({"build", "--outpu", hello}, nil, 2, "did you mean '--output'?")
-            run({"build", "--output"}, nil, 2, "needs a value", "-o<file>")
-            run({"build", "-O"}, nil, 2, "-O<level>", "--optimization-level <level>")
-            run({"build", "--optimization-level=9"}, nil, 2, "takes a level from 0 to 3")
+            run({"biuld", hello}, nil, 2, "ens: unknown command 'biuld'. Did you mean 'build'?")
+            run({"build", "--outpu", hello}, nil, 2,
+                "ens: unknown option '--outpu' for 'ens build'. Did you mean '--output'?")
+            run({"build", "--output"}, nil, 2,
+                "ens: option '--output' needs a value. Write '--output <file>' or '-o <file>'")
+            run({"build", "-O"}, nil, 2,
+                "ens: option '-O' needs a value. Write '-O <level>' or '--optimization-level <level>'")
+            run({"build", "--optimization-level=9"}, nil, 2, "ens: '9' is not an optimization "
+                .. "level. Write a level from 0 to 3, as in '-O2' or '--optimization-level 2'")
             run({"build", "-q", "-v"}, nil, 2,
-                "ens: '--quiet' and '--verbose' are opposites; keep the one you meant")
+                "ens: '--quiet' and '--verbose' cannot be used together. Remove one of them")
             run({"build", "--target", "pdp11-dec-unix"}, nil, 2, "pdp11-dec-unix")
             run({"build", hello, "extra"}, nil, 2, "unexpected argument 'extra'")
             -- every problem the command reports in its own words carries the 'ens: ' prefix, the
@@ -1235,7 +1239,7 @@ task("test")
             run({"build", hello, "--output", path.join(root, "loud.exe"), "-v"}, nil, 0,
                 "Emitted 8 object files from 14 modules")
             run({"build", hello, "--output", path.join(root, "arc.exe"), "--explain-arc"}, nil, 0,
-                "elided across the program")
+                "removed in the whole program")
 
             -- an application package is named after its package; a library keeps no artifact and
             -- refuses an output, while keeping its object files the way a program keeps its own.
@@ -1256,7 +1260,8 @@ task("test")
                 table.insert(failures, "a library build left a folder of its own beside the command")
             end
             run({"build", path.join(tests_dir, "pkg_import_dep"), "--output",
-                path.join(root, "tools.exe")}, nil, 2, "builds as a library")
+                path.join(root, "tools.exe")}, nil, 2, "so it is a library and there is no "
+                .. "executable to write. Remove '--output' to compile it as a library")
 
             -- check writes nothing and reports what it found
             run({"check", hello}, nil, 0, "nothing to report")
@@ -1286,7 +1291,8 @@ task("test")
                 'package split.lib {\n    ens "0.2";\n}\n')
             io.writefile(path.join(split, "lib", "src", "greet.ens"),
                 'export greet() -> string {\n    return "hi";\n}\n')
-            run({"build", split}, nil, 2, "disagree on the Ens version", "split.app", "split.lib",
+            run({"build", split}, nil, 2, "are written for different versions of Ens", "split.app",
+                "split.lib",
                 "'0.1'", "'0.2'")
 
             -- a source folder reached through a symbolic link is compiled, which is how a checkout
@@ -1434,20 +1440,20 @@ task("test")
             run({"run", echo, "-v"}, nil, 0, "Building 'echo' for", "Running '")
 
             -- a target with no main() is a usage problem, not a build failure
-            run({"run", path.join(tests_dir, "pkg_import_dep")}, nil, 2, "is not a program to run",
-                "does not define main()")
+            run({"run", path.join(tests_dir, "pkg_import_dep")}, nil, 2, "' cannot be run, because "
+                .. "its main module does not define main().", "Add a main() function there")
 
             -- a program that does not compile fails the work rather than the command line
             local broken = path.join(root, "broken")
             writePackage(broken, 'package demo.broken {\n    ens "0.1";\n}\n', {
                 ["src/main.ens"] = 'main() -> int {\n    return missing();\n}\n',
             })
-            run({"run", broken}, nil, 1, "did not compile, so it did not run")
+            run({"run", broken}, nil, 1, "' was not built, so it was not run")
             assertTempEmpty("a failed ens run")
 
             -- '--target' asks for a machine this command cannot run what it builds on
             run({"run", echo, "--target", "aarch64-unknown-linux-gnu"}, nil, 2,
-                "runs what it builds", "drop '--target'")
+                "runs what it builds", "Remove '--target'")
 
             -- a workspace root runs its one program, and says so when there is none or several
             local one = path.join(root, "one")
@@ -1468,7 +1474,8 @@ task("test")
             writePackage(path.join(none, "lib"), 'package none.lib {\n    ens "0.1";\n}\n', {
                 ["src/greet.ens"] = 'export greet() -> string {\n    return "hi";\n}\n',
             })
-            run({"run", none}, nil, 2, "holds no program to run")
+            run({"run", none}, nil, 2, "' has no program to run: no member's 'src/main.ens' defines "
+                .. "main(). Add main() to the 'src/main.ens' of the member to run")
 
             -- a workspace root whose program depends on a sibling member: the sibling's text is
             -- what comes out, everything after '--' reaches the program, the program's own code
@@ -1509,8 +1516,9 @@ task("test")
             assertTempEmpty("ens test")
             run({"test", suite, "--filter", "zero"}, nil, 0, "PASS twice zero",
                 "1/1 tests passed", "!twice a small")
-            run({"test", suite, "--filter", "unicorn"}, nil, 0, "has 'unicorn' in its description",
-                "2 tests are there in all")
+            run({"test", suite, "--filter", "unicorn"}, nil, 0, "has 'unicorn' in its description, "
+                .. "so no test ran. Use a '--filter' text that is part of one of the 2 tests' "
+                .. "descriptions")
             assertTempEmpty("a filter that matched nothing")
 
             local failing = path.join(root, "failing")
@@ -1568,8 +1576,9 @@ task("test")
                 "1/1 tests passed")
 
             -- a file is not a folder of tests, and a workspace root tests its members
-            run({"test", path.join(tests_dir, "hello.ens")}, nil, 2, "is one file",
-                "folder the tests live in")
+            run({"test", path.join(tests_dir, "hello.ens")}, nil, 2, "' is one file, and 'ens test' "
+                .. "reads a folder of test files. Name the folder the tests are in, or the package "
+                .. "they belong to")
             run({"test", one, "--tests", path.join(suite, "tests")}, nil, 2,
                 "'--tests' names one folder of tests")
             run({"test", one}, nil, 0, "There are no tests in")
@@ -1609,7 +1618,7 @@ task("test")
             -- member had rather than pretending those tests were never there
             io.writefile(beta_tests, 'import @std.testing;\n\n'
                 .. 'test "beta broken" {\n    try testing.assertEqual(nope(), 1);\n}\n')
-            run({"test", suites}, nil, 2, "the tests did not compile",
+            run({"test", suites}, nil, 2, "the tests were not built, so none of them ran",
                 "1/2 tests passed across 2 members; 'suite.beta' did not finish")
             assertTempEmpty("a workspace member whose tests did not compile")
 
@@ -1806,7 +1815,8 @@ task("test")
 
             -- state and usage problems, each one saying what to do instead
             run({"override", "remove", "nope.pkg"}, in_ws, 1,
-                "package 'nope.pkg' is not overridden", "ens override list")
+                "package 'nope.pkg' is not overridden in '", "'. Run 'ens override list' to see the "
+                    .. "overridden packages")
             run({"override", "add", "not/a/name!", "../json"}, in_ws, 2, "is not a package name")
             run({"override", "add", "acme.json"}, in_ws, 2, "ens override add")
             run({"override", "wat"}, in_ws, 2, "unknown command 'wat'")
@@ -1820,7 +1830,9 @@ task("test")
             io.writefile(path.join(plain, "ens.package"), 'package demo.plain {\n    ens "0.1";\n}\n')
             io.writefile(path.join(plain, "ens.overrides"), 'workspace {\n    member "x";\n}\n')
             run({"override", "list"}, {curdir = plain, envs = env}, 1,
-                "does not hold an overrides declaration")
+                "ens.overrides' has no 'overrides { ... }' block. An ens.overrides file contains one "
+                    .. "'overrides { ... }' block and nothing else. Packages and workspaces are "
+                    .. "declared in ens.package")
 
             -- a file that does not parse is one problem sentence of the command's own, with the
             -- reading's own diagnostic under it at the line and column it is about
@@ -1830,8 +1842,8 @@ task("test")
                 'package demo.unreadable {\n    ens "0.1";\n}\n')
             io.writefile(path.join(unreadable, "ens.overrides"), 'overrides {\n    nonsense\n')
             run({"override", "list"}, {curdir = unreadable, envs = env}, 1,
-                "ens: '", "ens.overrides' cannot be read. Fix the file by hand before editing it "
-                    .. "with 'ens override'",
+                "ens: '", "ens.overrides' has the errors listed below. Fix them by hand before "
+                    .. "editing the file with 'ens override'",
                 "ens.overrides:2:5: error: ")
 
             if #failures == 0 then
@@ -2061,14 +2073,14 @@ task("test")
             -- transitively raised beta.utils 1.1. The tag listing is read, never shown, and a
             -- verbose run says which step each wait is on.
             run({"build", ".", "-v"}, in_app, 0,
-                "Settling 3 packages",
+                "Choosing versions for 3 packages",
                 "Listing the tags at '" .. url_json .. "'",
                 "Fetching the tag '1.0' of 'alex.json' from '" .. url_json .. "'",
                 "Fetched 'alex.json' 1.0 from '" .. url_json .. "' (tag '1.0')",
                 "Fetched 'acme.tools' 1.0",
                 "Fetched 'beta.utils' 1.1",
-                "Updated ens.lock: locked acme.tools 1.0, locked alex.json 1.0, "
-                    .. "locked beta.utils 1.1",
+                "Updated ens.lock: added 'acme.tools' 1.0, added 'alex.json' 1.0, "
+                    .. "added 'beta.utils' 1.1",
                 "!refs/tags/")
             run_program(path.join(app, "gitapp" .. exe_suffix), 0, "json 1.0 | tools(utils 1.1)")
 
@@ -2114,8 +2126,8 @@ task("test")
 
             -- a cold cache under --offline fails by name, and says how to fix it
             run({"build", ".", "--offline"}, {curdir = app, envs = withCache(cold)}, 1,
-                "'--offline' forbids fetching package", "the cache does not hold it",
-                "without '--offline'")
+                "1.0 is not in the cache, and '--offline' does not allow fetching it from '",
+                "'. Run the command once without '--offline'")
             os.mv(repos .. ".away", repos)
 
             -- --locked turns a pending change into an error, names what would change, and leaves
@@ -2123,7 +2135,8 @@ task("test")
             write_app("1.1")
             run({"build", ".", "--locked"}, in_app, 1,
                 "ens.lock no longer matches what this build requires",
-                "updated alex.json 1.0 -> 1.1", "'--locked' does not allow it to change")
+                "updated 'alex.json' from 1.0 to 1.1", "'--locked' does not allow it to change. Run "
+                    .. "the command without '--locked' to update the lock")
             if lock_text() ~= locked then
                 table.insert(failures, "--locked changed ens.lock")
             end
@@ -2132,7 +2145,7 @@ task("test")
             -- changed and nothing more
             run({"build", "."}, in_app, 0,
                 "Fetched 'alex.json' 1.1 from '" .. url_json .. "' (tag 'v1.1')",
-                "Updated ens.lock: updated alex.json 1.0 -> 1.1", "!locked beta.utils")
+                "Updated ens.lock: updated 'alex.json' from 1.0 to 1.1", "!added 'beta.utils'")
             run_program(path.join(app, "gitapp" .. exe_suffix), 0, "json 1.1 | tools(utils 1.1)")
             if not lock_text():find("package alex.json 1.1", 1, true) then
                 table.insert(failures, "ens.lock does not record the raised version")
@@ -2141,15 +2154,17 @@ task("test")
             -- both '2.0' and 'v2.0' exist, so the version could mean either
             write_app("2.0")
             run({"build", "."}, in_app, 1,
-                "both the tags '2.0' and 'v2.0' exist at " .. url_json,
-                "remove or rename one of the two tags")
+                "both the tags '2.0' and 'v2.0' exist at '" .. url_json .. "', so version '2.0' of "
+                    .. "package 'alex.json' could mean either one. Remove or rename one of the two "
+                    .. "tags")
 
             -- a version nothing is tagged for names both spellings and the way in for unreleased
             -- work
             write_app("9.9")
             run({"build", "."}, in_app, 1,
                 "package 'alex.json' has no tag '9.9' or 'v9.9'",
-                "ens override add alex.json <folder>")
+                "Tag the release, or build against unreleased work in a folder with "
+                    .. "'ens override add alex.json <folder>'")
             write_app("1.1")
 
             -- requirements spanning majors are refused, naming both requirers
@@ -2162,9 +2177,10 @@ task("test")
             io.writefile(path.join(spanning, "src", "main.ens"),
                 'main() -> int {\n    return 0;\n}\n')
             run({"build", "."}, {curdir = spanning, envs = withCache(cache)}, 1,
-                "the requirements on package 'beta.utils' span major versions",
+                "package 'beta.utils' is required at two major versions: '",
                 "requires '1.1'", "requires '2.0'",
-                "one of the two requirements has to change")
+                "A build uses one major version of a package, so change one of the two "
+                    .. "requirements to match the other")
 
             -- every package has to agree on where a dependency comes from
             local disagreeing = path.join(root, "disagreeing")
@@ -2176,8 +2192,9 @@ task("test")
             io.writefile(path.join(disagreeing, "src", "main.ens"),
                 'main() -> int {\n    return 0;\n}\n')
             run({"build", "."}, {curdir = disagreeing, envs = withCache(cache)}, 1,
-                "package 'beta.utils' is required from two different repositories",
-                "one of the two 'from' clauses has to change")
+                "package 'beta.utils' is required from two different repositories: '",
+                "A build takes each package from one place, so change one of the two 'from' URLs "
+                    .. "to match the other")
 
             -- the tag has to declare the package that was asked for
             local misnamed = path.join(root, "misnamed")
@@ -2217,7 +2234,8 @@ task("test")
             io.writefile(path.join(missing_member, "src", "main.ens"),
                 'main() -> int {\n    return 0;\n}\n')
             run({"build", "."}, {curdir = missing_member, envs = withCache(cache)}, 1,
-                "none of its members declares package 'ws.absent'", "'ws.core' and 'ws.extra'")
+                "contains a workspace whose members are 'ws.core' and 'ws.extra', and none of "
+                    .. "them is 'ws.absent'. Check the dependency's name and its URL")
 
             -- a package using submodules is refused, because a package is used as it was fetched
             local using_sub = path.join(root, "usingsub")
@@ -2227,8 +2245,8 @@ task("test")
             io.writefile(path.join(using_sub, "src", "main.ens"),
                 'main() -> int {\n    return 0;\n}\n')
             run({"build", "."}, {curdir = using_sub, envs = withCache(cache)}, 1,
-                "uses git submodules", "has to be self-contained",
-                "Declare what the submodule holds as a dependency")
+                "uses git submodules, and a package has to contain all of its own files. Declare "
+                    .. "what the submodule contains as a dependency of")
 
             -- a tag that moved is caught against the lock, naming both digests
             local using_retag = path.join(root, "usingretag")
@@ -2247,18 +2265,21 @@ task("test")
             git(retag_dir, "tag", "-f", "1.0")
             os.tryrm(path.join(cache, "trees"))
             run({"build", "."}, in_retag, 1,
-                "are not the files ens.lock records", "the lock has sha256:",
-                "hashes to sha256:", "may have moved", "delete ens.lock")
+                "are not the files ens.lock records: the lock has 'sha256:",
+                "and the fetched files have 'sha256:", "may have moved since the lock was written. "
+                    .. "If the new files are the right ones, delete ens.lock and build again to "
+                    .. "record them")
 
             -- losing the last git dependency removes the lock, and --locked refuses that too
             write_package(using_retag, "demo.retag")
             io.writefile(path.join(using_retag, "src", "main.ens"),
                 'main() -> int {\n    return 0;\n}\n')
             run({"build", ".", "--locked"}, in_retag, 1,
-                "this build fetches nothing any more", "no prebuilt library",
-                "'--locked' does not allow it to change")
+                "this build no longer fetches any git package or prebuilt library, so ens.lock "
+                    .. "would be removed, and '--locked' does not allow that. Run the command "
+                    .. "without '--locked' to remove it")
             run({"build", "."}, in_retag, 0,
-                "Removed ens.lock: this build fetches nothing any more")
+                "Removed ens.lock: this build no longer fetches any git package or prebuilt library")
             if os.isfile(path.join(using_retag, "ens.lock")) then
                 table.insert(failures, "ens.lock survived losing its last git dependency")
             end
@@ -2395,8 +2416,9 @@ task("test")
             os.mv(files, files .. ".away")
             run({"build", ".", "--offline"}, in_app, 0, "prebuilt: Built '")
             run({"build", ".", "--offline"}, {curdir = app, envs = withCache(cold)}, 1,
-                "'--offline' forbids downloading the prebuilt library for native 'extras'",
-                "without '--offline'")
+                "the prebuilt library for native 'extras' is not in the cache, and '--offline' "
+                    .. "does not allow downloading it from '",
+                "'. Run the command once without '--offline'")
             os.mv(files .. ".away", files)
 
             -- rebinding and then unbinding a prebuilt library are both lock changes, so '--locked'
@@ -2412,18 +2434,19 @@ task("test")
             local in_lifecycle = {curdir = lifecycle, envs = withCache(cache)}
             write_lifecycle(binding("extras", good))
             run({"build", "."}, in_lifecycle, 0,
-                "Updated ens.lock: recorded the prebuilt libraries this build itself binds")
+                "Updated ens.lock: added the prebuilt libraries of this build itself")
             write_lifecycle(binding("renamed", good))
             run({"build", ".", "--locked"}, in_lifecycle, 1,
                 "ens.lock no longer matches what this build requires",
-                "updated the prebuilt libraries this build itself binds",
+                "changed the prebuilt libraries of this build itself",
                 "'--locked' does not allow it to change")
             write_lifecycle("    native extras system;\n")
             run({"build", ".", "--locked"}, in_lifecycle, 1,
-                "this build fetches nothing any more", "no prebuilt library",
-                "'--locked' does not allow it to change")
+                "this build no longer fetches any git package or prebuilt library, so ens.lock "
+                    .. "would be removed, and '--locked' does not allow that. Run the command "
+                    .. "without '--locked' to remove it")
             run({"build", "."}, in_lifecycle, 0,
-                "Removed ens.lock: this build fetches nothing any more")
+                "Removed ens.lock: this build no longer fetches any git package or prebuilt library")
             if os.isfile(path.join(lifecycle, "ens.lock")) then
                 table.insert(failures, "ens.lock survived losing its last prebuilt library")
             end
@@ -2437,8 +2460,9 @@ task("test")
             io.writefile(path.join(bad, "src", "main.ens"),
                 'main() -> int {\n    return 0;\n}\n')
             run({"build", "."}, {curdir = bad, envs = withCache(cache)}, 1,
-                "hashes to " .. good, "manifest declares " .. wrong,
-                "is not the library the manifest means", "put the new hash in the manifest")
+                "has the hash '" .. good .. "', but the manifest declares '" .. wrong .. "', so it "
+                    .. "is not the file the manifest names. If the library changed on purpose, "
+                    .. "write the new hash in the manifest")
             if os.isdir(path.join(cache, "artifacts", wrong:gsub("^sha256:", ""))) then
                 table.insert(failures, "a library whose digest did not match was cached anyway")
             end
@@ -2489,7 +2513,7 @@ task("test")
                 'import @art.dep.dep;\n\nmain() -> int {\n    print(dep.tag());\n'
                 .. '    return 0;\n}\n')
             run({"build", "."}, {curdir = recorded, envs = withCache(cache)}, 0,
-                "Fetched 'art.dep' 1.0", "Updated ens.lock: locked art.dep 1.0")
+                "Fetched 'art.dep' 1.0", "Updated ens.lock: added 'art.dep' 1.0")
             run_program(path.join(recorded, "lockapp" .. exe_suffix), 0, "dep with a prebuilt library")
             local lock = ((io.readfile(path.join(recorded, "ens.lock")) or ""):gsub("\r\n", "\n"))
             local own = "root demo.lockapp\n"
@@ -2552,7 +2576,7 @@ task("test")
                 .. binding("renamedextras", good) .. "}\n")
             run({"build", ".", "--locked"}, {curdir = ws, envs = withCache(cache)}, 1,
                 "ens.lock no longer matches what this build requires",
-                "updated the prebuilt libraries demo.member binds",
+                "changed the prebuilt libraries of 'demo.member'",
                 "'--locked' does not allow it to change")
 
             if #failures == 0 then
@@ -2679,7 +2703,8 @@ task("test")
             run(host_exe, {"check", broken, "-v"}, chains, 1, hopped_to,
                 "Undefined function 'missing'")
             run(host_exe, {"build", library, "--output", path.join(root, "library.exe"), "-v"},
-                chains, 2, hopped_to, "builds as a library")
+                chains, 2, hopped_to, "so it is a library and there is no executable to write. "
+                .. "Remove '--output' to compile it as a library")
 
             -- '--toolchain' asks for one by name, whatever the build root says, and answers for a
             -- name that is not installed instead of ignoring it
@@ -2688,7 +2713,9 @@ task("test")
                 chains, 0, "'--toolchain 9.9'", hopped_to, ": Built '")
             run_program(by_option, 0, "Hello, world!")
             run(host_exe, {"build", hello, "--toolchain", "9.9"}, nothing_installed, 2,
-                "'--toolchain 9.9'", "holds no toolchain at all", "name 'local'",
+                "'--toolchain 9.9' names Ens 9.9, which is not installed: '", "' contains no "
+                    .. "toolchain. Install Ens 9.9 as '", "', or write '--toolchain local' to build "
+                    .. "with this toolchain, Ens ",
                 slashed(path.join(empty, "9.9", "ens" .. exe_suffix)))
 
             -- both ways of keeping the work here
@@ -2709,7 +2736,8 @@ task("test")
             -- been: a statement, not a requirement. It builds here, and says so only when asked.
             local anyway = path.join(root, "anyway.exe")
             run(host_exe, {"build", pkg, "--output", anyway, "-v"}, nothing_installed, 0,
-                "written for Ens 9.9", "holds no toolchain at all", "this toolchain is building it",
+                "This build is written for Ens 9.9, which is not installed, so this toolchain, Ens ",
+                ", is building it. '", "' contains no toolchain",
                 ": Built '")
             run_program(anyway, 0, "built by a delegate")
             run(host_exe, {"build", pkg, "--output", path.join(root, "quiet.exe")},
@@ -2746,9 +2774,11 @@ task("test")
                 "built by a delegate", not_hopped)
             run(host_exe, {"test", pkg, "-v"}, chains, 0, hopped_to, "There are no tests in")
             run(host_exe, {"run", hello, "--toolchain", "9.9"}, nothing_installed, 2,
-                "'--toolchain 9.9'", "holds no toolchain at all")
+                "'--toolchain 9.9' names Ens 9.9, which is not installed: '", "' contains no "
+                    .. "toolchain")
             run(host_exe, {"test", pkg, "--toolchain", "9.9"}, nothing_installed, 2,
-                "'--toolchain 9.9'", "holds no toolchain at all")
+                "'--toolchain 9.9' names Ens 9.9, which is not installed: '", "' contains no "
+                    .. "toolchain")
 
             -- the commands that never delegate, however the environment is set
             run(host_exe, {"version"}, {ENS_TOOLCHAINS = toolchains, ENS_TOOLCHAIN = "9.9"}, 0,

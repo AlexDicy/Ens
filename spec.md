@@ -745,13 +745,13 @@ The toolchain is one command, `ens`, with a subcommand for each thing it does.
 - `ens build [path]` compiles a program and writes an executable.
 - `ens check [path]` does everything a build does up to code generation and nothing after it: the same problems are reported, and no artifact is produced.
 - `ens run [path] [-- arguments]` builds a program in a folder of its own, runs it, and removes the folder, so the tree it was pointed at is left as it was found.
-  Everything written after `--` reaches the program exactly as it was written, and the code the program ends with becomes this command's own.
+  Everything written after `--` is passed to the program exactly as written, and `ens run` exits with the program's exit code.
 - `ens test [path]` builds a target's tests together with its sources and runs them, as described in the section on tests.
 - `ens override add <package> <folder>`, `ens override remove <package>` and `ens override list` maintain the `ens.overrides` file beside the build root's manifest.
 - `ens version` prints the toolchain version.
 
 The path is an `.ens` file, a folder of sources, a package folder, or a workspace root.
-With no path, the command works on the nearest package above the folder it was run in, found the way `git` finds a repository from a subfolder.
+With no path, the command works on the nearest package in or above the folder it was run in, found the way `git` finds a repository from a subfolder.
 At a workspace root every member is built, checked, or tested, each one after the members it depends on; `ens run` needs the workspace to hold exactly one application and says which members it found when there is more than one.
 
 An executable is named after what was built: a single file's own name, the last segment of a package's name (`acme.tools` builds `tools`), or the folder's name when a folder declares no package.

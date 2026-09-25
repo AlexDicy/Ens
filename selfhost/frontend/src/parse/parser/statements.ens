@@ -17,28 +17,34 @@ public parseStatement(Parser parser) {
         ForKeyword -> parseForStatement(parser),
         SwitchKeyword -> parseSwitchStatement(parser),
         BreakKeyword -> parseKeywordStatement(parser, SyntaxKind.BreakStatement,
-            "Expected ';' after 'break'"),
+            "Expected ';' after 'break'."),
         ContinueKeyword -> parseKeywordStatement(parser, SyntaxKind.ContinueStatement,
-            "Expected ';' after 'continue'"),
+            "Expected ';' after 'continue'."),
         RethrowKeyword -> parseKeywordStatement(parser, SyntaxKind.RethrowStatement,
-            "Expected ';' after 'rethrow'"),
+            "Expected ';' after 'rethrow'."),
         ReturnKeyword -> parseReturnStatement(parser),
         ThrowKeyword -> parseThrowStatement(parser),
         CatchKeyword -> parseStatementError(parser,
-            "A 'catch' block can only follow a function body's closing '}'"),
-        FinallyKeyword -> parseStatementError(parser, "'finally' is not supported; write the "
-            + "cleanup before each return or in the catch clause"),
+            "A 'catch' block can only follow the closing '}' of a function's body. Move this "
+            + "'catch' block to right after the function's '}'."),
+        FinallyKeyword -> parseStatementError(parser, finallyMessage()),
         default -> {
             if (atTypedVariableDeclaration(parser)) {
                 parseVariableDeclaration(parser);
             } else if (expressions.canStartExpression(parser.currentKind())) {
                 parseExpressionStatement(parser);
             } else {
-                parseStatementError(parser, "Expected a statement, for example an assignment, "
-                    + "a call, or a declaration like 'let count = 0;'");
+                parseStatementError(parser, "Expected a statement, such as an assignment, a call "
+                    + "or a declaration like 'let count = 0;'.");
             }
         },
     }
+}
+
+// What a 'finally' block reports, as a statement and as a declaration alike.
+public finallyMessage() -> string {
+    return "Ens has no 'finally' block. Remove it, and write its cleanup before each 'return' "
+        + "and in the 'catch' block instead.";
 }
 
 // A block holds statements that hold blocks, so its nesting counts towards the same limit an
@@ -46,10 +52,12 @@ public parseStatement(Parser parser) {
 // the body becomes one error statement holding the tokens, so the braces around it still match.
 public parseBlock(Parser parser) {
     let marker = parser.start();
-    parser.expect(SyntaxKind.OpenBrace, "Expected '\{' to begin the block");
+    bool opened = parser.at(SyntaxKind.OpenBrace);
+    long openOffset = parser.tokens()[parser.position()].offset;
+    parser.expect(SyntaxKind.OpenBrace, "Expected '\{' to begin the block.");
     let statements = parser.start();
-    if (parser.enterNesting("These blocks nest too deeply to be parsed; move the inner ones "
-            + "into functions of their own")) {
+    if (parser.enterNesting("These blocks are nested too deeply to compile. Move the inner "
+            + "blocks into functions of their own.")) {
         while (!parser.at(SyntaxKind.CloseBrace) && !parser.atEnd()) {
             parseStatement(parser);
         }
@@ -58,7 +66,14 @@ public parseBlock(Parser parser) {
         skipDeepBlockBody(parser);
     }
     parser.complete(statements, SyntaxKind.List);
-    parser.expect(SyntaxKind.CloseBrace, "Expected '\}' to close the block");
+    if (parser.at(SyntaxKind.CloseBrace)) {
+        parser.bump();
+    } else if (opened) {
+        parser.missing(SyntaxKind.CloseBrace, "Expected '\}' to close the block that starts on "
+            + "line {parser.lineAt(openOffset)}.");
+    } else {
+        parser.missing(SyntaxKind.CloseBrace, "Expected '\}' to close the block.");
+    }
     parser.complete(marker, SyntaxKind.Block);
 }
 
@@ -144,36 +159,58 @@ public atTypedVariableDeclaration(Parser parser) -> bool {
     return result;
 }
 
-// Nothing at file scope holds a value, so the message names the variable it read and says
-// where the value can be stored instead.
+// A variable outside a function, named by the message. The declaration is read speculatively
+// and rewound; its example function is given only when the type and a one-token value are known.
 public topLevelVariableMessage(Parser parser) -> string {
-    string name = declaredVariableName(parser);
-    string what = "the declaration";
-    if (name.length > 0) {
-        what = "'{name}'";
-    }
-    return "Variables cannot be declared at the top level; move {what} inside a function, or "
-        + "expose the value through a function, for example 'pi() -> int \{ return 3; \}'";
-}
-
-// The name a variable declaration gives, read speculatively and always rewound, or "" when
-// the declaration is too broken to reach a name.
-declaredVariableName(Parser parser) -> string {
     let restore = parser.mark();
     if (parser.at(SyntaxKind.LetKeyword) || parser.at(SyntaxKind.ConstKeyword)) {
         parser.bump();
     }
     bool bareName = parser.at(SyntaxKind.Identifier)
         && (parser.peekKind(1) == SyntaxKind.Equals || parser.peekKind(1) == SyntaxKind.Semicolon);
+    string typeText = "";
     if (!bareName && types.isTypeOrGroupStart(parser.currentKind())) {
+        long typeStart = parser.tokens()[parser.position()].offset;
         types.parseType(parser, "");
+        typeText = parser.text().substring(typeStart, parser.lastContentEnd());
     }
     string name = "";
+    string value = "";
     if (parser.at(SyntaxKind.Identifier)) {
         name = parser.currentText();
+        if (parser.peekKind(1) == SyntaxKind.Equals && parser.peekKind(3) == SyntaxKind.Semicolon) {
+            let token = parser.tokens()[parser.position() + 2];
+            value = parser.text().substring(token.offset, token.end());
+            if (typeText.length == 0) {
+                typeText = literalTypeName(parser.peekKind(2));
+            }
+        }
     }
     parser.rewind(restore);
-    return name;
+    if (name.length == 0) {
+        return "A variable cannot be declared outside a function. Move the declaration into a "
+            + "function.";
+    }
+    string message = "'{name}' is a variable, and a variable cannot be declared outside a "
+        + "function. Move '{name}' into a function, or write a function that returns its value";
+    if (typeText.length == 0 || value.length == 0) {
+        return message + ".";
+    }
+    return message + ", for example '{name}() -> {typeText} \{ return {value}; \}'.";
+}
+
+// The type a literal of this kind has, or "" for a kind that is not a literal.
+literalTypeName(SyntaxKind kind) -> string {
+    return switch (kind) {
+        IntLiteral -> "int",
+        LongLiteral -> "long",
+        FloatLiteral -> "float",
+        DoubleLiteral -> "double",
+        StringLiteral -> "string",
+        CharLiteral -> "char",
+        TrueKeyword, FalseKeyword -> "bool",
+        default -> "",
+    };
 }
 
 // VariableDeclaration = modifier? declaredType? name initializer? ';'. Whether at least one
@@ -191,13 +228,13 @@ parseVariableDeclaration(Parser parser) {
         parser.nullSlot();
         parser.bump();
     } else if (types.isTypeOrGroupStart(parser.currentKind())) {
-        types.parseType(parser, "Expected the variable's type");
+        types.parseType(parser, "Expected the variable's type.");
         parser.expect(SyntaxKind.Identifier,
-            "Expected the variable's name after its type, for example 'int count = 0;'");
+            "Expected the variable's name after its type. For example, write 'int count = 0;'.");
     } else {
         parser.nullSlot();
         parser.missing(SyntaxKind.Identifier,
-            "Expected the variable's name, for example 'let count = 0;'");
+            "Expected the variable's name. For example, write 'let count = 0;'.");
     }
     if (parser.at(SyntaxKind.Equals)) {
         parseInitializer(parser);
@@ -205,7 +242,7 @@ parseVariableDeclaration(Parser parser) {
         parser.nullSlot();
     }
     parser.expect(SyntaxKind.Semicolon,
-        "Expected ';' after the variable declaration, for example 'let count = 0;'");
+        "Expected ';' after the variable declaration. For example, write 'let count = 0;'.");
     parser.complete(marker, SyntaxKind.VariableDeclaration);
 }
 
@@ -220,19 +257,17 @@ public parseInitializer(Parser parser) {
 parseIfStatement(Parser parser) {
     let marker = parser.start();
     parser.bump();
-    parser.expect(SyntaxKind.OpenParenthesis, "Expected '(' before the if condition, for "
-        + "example 'if (ready) \{ ... \}'");
-    expressions.parseExpression(parser);
-    parser.expect(SyntaxKind.CloseParenthesis, "Expected ')' after the if condition");
-    parseBlockOrMissing(parser, "Expected '\{' for the if body; the branches of 'if' are always "
-        + "blocks, for example 'if (ready) \{ start(); \}'");
+    parseCondition(parser, "Expected '(' before the condition of 'if'. Write the condition in "
+        + "parentheses, as in 'if (ready) \{ ... \}'.", "Expected ')' after the condition of 'if'.");
+    parseBlockOrMissing(parser, "Expected '\{' to begin the body of 'if'. The branches of 'if' "
+        + "are always blocks, as in 'if (ready) \{ start(); \}'.");
     if (parser.at(SyntaxKind.ElseKeyword)) {
         let elseMarker = parser.start();
         parser.bump();
         if (parser.at(SyntaxKind.IfKeyword)) {
             parseIfStatement(parser);
         } else {
-            parseBlockOrMissing(parser, "Expected '\{' or another 'if' after 'else'");
+            parseBlockOrMissing(parser, "Expected '\{' or another 'if' after 'else'.");
         }
         parser.complete(elseMarker, SyntaxKind.ElseClause);
     } else {
@@ -244,18 +279,33 @@ parseIfStatement(Parser parser) {
 parseWhileStatement(Parser parser) {
     let marker = parser.start();
     parser.bump();
-    parser.expect(SyntaxKind.OpenParenthesis, "Expected '(' before the while condition, for "
-        + "example 'while (running) \{ ... \}'");
-    expressions.parseExpression(parser);
-    parser.expect(SyntaxKind.CloseParenthesis, "Expected ')' after the while condition");
-    parseBlockOrMissing(parser, "Expected '\{' for the loop body");
+    parseCondition(parser, "Expected '(' before the condition of 'while'. Write the condition in "
+        + "parentheses, as in 'while (running) \{ ... \}'.",
+        "Expected ')' after the condition of 'while'.");
+    parseBlockOrMissing(parser, "Expected '\{' to begin the loop body.");
     parser.complete(marker, SyntaxKind.WhileStatement);
+}
+
+// The parenthesized condition of 'if' and 'while'. When the '(' is missing, a missing ')' is
+// the same mistake, so only the '(' is reported.
+parseCondition(Parser parser, string openMessage, string closeMessage) {
+    bool opened = parser.at(SyntaxKind.OpenParenthesis);
+    parser.expect(SyntaxKind.OpenParenthesis, openMessage);
+    expressions.parseExpression(parser);
+    if (parser.at(SyntaxKind.CloseParenthesis)) {
+        parser.bump();
+    } else if (opened) {
+        parser.missing(SyntaxKind.CloseParenthesis, closeMessage);
+    } else {
+        parser.missingUnreported(SyntaxKind.CloseParenthesis);
+    }
 }
 
 parseForStatement(Parser parser) {
     let marker = parser.start();
     parser.bump();
-    parser.expect(SyntaxKind.OpenParenthesis, "Expected '(' after 'for'");
+    parser.expect(SyntaxKind.OpenParenthesis, "Expected '(' after 'for'. For example, write "
+        + "'for (let item in items) \{ ... \}'.");
     if (atForEachHeader(parser)) {
         if (parser.at(SyntaxKind.LetKeyword) || parser.at(SyntaxKind.ConstKeyword)) {
             parser.bump();
@@ -266,19 +316,21 @@ parseForStatement(Parser parser) {
             parser.nullSlot();
             parser.bump();
         } else {
-            types.parseType(parser, "Expected the loop variable's type or 'let'");
-            parser.expect(SyntaxKind.Identifier, "Expected the loop variable's name");
+            types.parseType(parser, "Expected 'let' or a type for the loop variable. For example, "
+                + "write 'for (let item in items)'.");
+            parser.expect(SyntaxKind.Identifier, "Expected the loop variable's name.");
         }
         if (parser.atContextual("in")) {
             parser.bumpAs(SyntaxKind.InKeyword);
         } else {
             parser.missing(SyntaxKind.InKeyword,
-                "Expected 'in' between the loop variable and the values, for example "
-                + "'for (let item in items)'");
+                "Expected 'in' between the loop variable and the values it walks through. For "
+                + "example, write 'for (let item in items)'.");
         }
         expressions.parseExpression(parser);
-        parser.expect(SyntaxKind.CloseParenthesis, "Expected ')' after the for-each header");
-        parseBlockOrMissing(parser, "Expected '\{' for the loop body");
+        parser.expect(SyntaxKind.CloseParenthesis, "Expected ')' after the values the loop walks "
+            + "through, as in 'for (let item in items)'.");
+        parseBlockOrMissing(parser, "Expected '\{' to begin the loop body.");
         parser.complete(marker, SyntaxKind.ForEachStatement);
         return;
     }
@@ -299,14 +351,16 @@ parseForStatement(Parser parser) {
     } else {
         expressions.parseExpression(parser);
     }
-    parser.expect(SyntaxKind.Semicolon, "Expected ';' after the for condition");
+    parser.expect(SyntaxKind.Semicolon, "Expected ';' after the condition of 'for'. The three "
+        + "parts are separated by ';', as in 'for (int i = 0; i < 10; i++)'.");
     if (parser.at(SyntaxKind.CloseParenthesis) || !expressions.canStartExpression(parser.currentKind())) {
         parser.nullSlot();
     } else {
         expressions.parseExpression(parser);
     }
-    parser.expect(SyntaxKind.CloseParenthesis, "Expected ')' after the for clauses");
-    parseBlockOrMissing(parser, "Expected '\{' for the loop body");
+    parser.expect(SyntaxKind.CloseParenthesis, "Expected ')' after the three parts of 'for', as "
+        + "in 'for (int i = 0; i < 10; i++)'.");
+    parseBlockOrMissing(parser, "Expected '\{' to begin the loop body.");
     parser.complete(marker, SyntaxKind.ForStatement);
 }
 
@@ -348,7 +402,7 @@ parseReturnStatement(Parser parser) {
         expressions.parseExpression(parser);
     }
     parser.expect(SyntaxKind.Semicolon,
-        "Expected ';' after the return statement, for example 'return value;'");
+        "Expected ';' after the return statement. For example, write 'return value;'.");
     parser.complete(marker, SyntaxKind.ReturnStatement);
 }
 
@@ -356,9 +410,10 @@ parseThrowStatement(Parser parser) {
     let marker = parser.start();
     parser.bump();
     if (parser.at(SyntaxKind.Semicolon)) {
-        parser.report("'throw' needs an error value, for example 'throw new "
-            + "ParseError(\"bad input\");'. To rethrow the current error inside a catch "
-            + "block, use 'rethrow;'", source.makeSpan(parser.lastContentEnd(), 0));
+        parser.report("'throw' needs an error value, an object of a class that extends 'Error', "
+            + "such as one you declare with 'class ParseError extends Error \{ ... \}'. To throw "
+            + "the caught error again inside a 'catch' block, write 'rethrow;'.",
+            source.makeSpan(parser.lastContentEnd(), 0));
         let empty = parser.start();
         let skipped = parser.start();
         parser.complete(skipped, SyntaxKind.List);
@@ -366,7 +421,7 @@ parseThrowStatement(Parser parser) {
     } else {
         expressions.parseExpression(parser);
     }
-    parser.expect(SyntaxKind.Semicolon, "Expected ';' after the throw statement");
+    parser.expect(SyntaxKind.Semicolon, "Expected ';' after the throw statement.");
     parser.complete(marker, SyntaxKind.ThrowStatement);
 }
 
@@ -374,7 +429,7 @@ parseExpressionStatement(Parser parser) {
     let marker = parser.start();
     expressions.parseExpression(parser);
     parser.expect(SyntaxKind.Semicolon,
-        "Expected ';' after the expression, for example 'total = total + 1;'");
+        "Expected ';' after the expression. For example, write 'total = total + 1;'.");
     parser.complete(marker, SyntaxKind.ExpressionStatement);
 }
 
@@ -395,10 +450,11 @@ public parseSwitchExpression(Parser parser) -> long {
 
 parseSwitchParts(Parser parser) {
     parser.bump();
-    parser.expect(SyntaxKind.OpenParenthesis, "Expected '(' after 'switch'");
+    parser.expect(SyntaxKind.OpenParenthesis, "Expected '(' after 'switch'. For example, write "
+        + "'switch (color) \{ ... \}'.");
     expressions.parseExpression(parser);
-    parser.expect(SyntaxKind.CloseParenthesis, "Expected ')' after the switch value");
-    parser.expect(SyntaxKind.OpenBrace, "Expected '\{' to begin the switch arms");
+    parser.expect(SyntaxKind.CloseParenthesis, "Expected ')' after the switch value.");
+    parser.expect(SyntaxKind.OpenBrace, "Expected '\{' to begin the switch's arms.");
     let arms = parser.start();
     bool needSeparator = false;
     while (!parser.at(SyntaxKind.CloseBrace) && !parser.atEnd()) {
@@ -427,7 +483,7 @@ parseSwitchParts(Parser parser) {
         }
     }
     parser.complete(arms, SyntaxKind.List);
-    parser.expect(SyntaxKind.CloseBrace, "Expected '\}' to close the switch");
+    parser.expect(SyntaxKind.CloseBrace, "Expected '\}' to close the switch.");
 }
 
 parseSwitchArm(Parser parser) {
@@ -435,20 +491,24 @@ parseSwitchArm(Parser parser) {
         DefaultKeyword -> {
             let marker = parser.start();
             parser.bump();
-            parseArmArrowAndBody(parser, "Expected '->' after 'default'");
+            parseArmArrowAndBody(parser, "Expected '->' after 'default'. For example, write "
+                + "'default -> handleOther()'.");
             parser.complete(marker, SyntaxKind.DefaultArm);
         },
         IsKeyword -> {
             let marker = parser.start();
+            long armStart = parser.tokens()[parser.position()].offset;
             parser.bump();
-            types.parseTypeAndSuffixes(parser, "Expected a type after 'is', for example "
-                + "'is Circle c -> c.radius'", false);
+            types.parseTypeAndSuffixes(parser, "Expected a type after 'is'. For example, write "
+                + "'is Circle c -> c.radius'.", false);
             if (parser.at(SyntaxKind.Identifier)) {
                 parser.bump();
             } else {
                 parser.nullSlot();
             }
-            parseArmArrowAndBody(parser, "Expected '->' after the type arm");
+            let armText = parser.text().substring(armStart, parser.lastContentEnd());
+            parseArmArrowAndBody(parser, "Expected '->' after '{armText}'. For example, write "
+                + "'is Circle c -> c.radius'.");
             parser.complete(marker, SyntaxKind.TypeArm);
         },
         default -> {
@@ -472,8 +532,8 @@ parseSwitchArm(Parser parser) {
             }
             parser.setInArmLabels(outerLabels);
             parser.complete(labels, SyntaxKind.List);
-            parseArmArrowAndBody(parser, "Expected '->' after the switch labels, for "
-                + "example '1 -> handleOne()'");
+            parseArmArrowAndBody(parser, "Expected '->' after the switch labels. For example, "
+                + "write '1 -> handleOne()'.");
             parser.complete(marker, SyntaxKind.ValueArm);
         },
     }
@@ -506,7 +566,7 @@ parseArmBody(Parser parser) {
 
 // Junk between switch arms; stops before the ',' or '}' so the arm loop stays in charge.
 parseSwitchArmError(Parser parser) {
-    parser.reportAtCurrent("Expected a switch arm, for example '1 -> handleOne()'");
+    parser.reportAtCurrent("Expected a switch arm. For example, write '1 -> handleOne()'.");
     let marker = parser.start();
     let skipped = parser.start();
     bool first = true;
