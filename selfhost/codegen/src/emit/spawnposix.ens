@@ -1,11 +1,17 @@
 // The POSIX pieces both child families share: the wait that a signal cannot cut short, the status
-// it leaves, and the vectors that point into the NUL separated blocks the caller built.
+// it leaves, the read of the errno a child that could not exec reports, the close-on-exec mark,
+// the move of a child's end above the standard descriptors and the dup2 onto one of them, and the
+// vectors that point into the NUL separated blocks the caller built.
 import Value from @ens.llvm.values;
 import BasicBlock from @ens.llvm.blocks;
 import @ens.llvm.instructions;
 import @ens.llvm.memory;
+import Errno from emit.errorkinds;
+import DescriptorControl from emit.nativeshapes;
+import emit.nativeshapes;
 import Runtime from emit.runtime;
 import RuntimeDefinition from emit.runtime;
+import RuntimeFunction from emit.runtime;
 
 // Waits for the child and leaves its raw wait status in the slot, going on to `lostBlock` when no
 // status could be read at all and leaving the builder where the status is known. A signal
@@ -35,6 +41,78 @@ public awaitChild(Runtime runtime, RuntimeDefinition definition, Value child, Va
         instructions.buildICmpEQ(builder, why, runtime.int32(4), ""), callBlock, lostBlock);
 
     builder.positionAtEnd(knownBlock);
+}
+
+// Reads up to four bytes into the slot, calling again after a signal interrupts, and returns how
+// many were read. A read that fails for another reason is reported as no bytes, since the child has
+// either exec'd or ended with 127 and a wait distinguishes the two.
+public retryingRead(Runtime runtime, RuntimeDefinition definition, RuntimeFunction readDescriptor,
+                    Value descriptor, Value slot, string label) -> Value {
+    let builder = runtime.builder;
+    let callBlock = runtime.block(definition, "{label}.read.call");
+    let refusedBlock = runtime.block(definition, "{label}.read.refused");
+    let doneBlock = runtime.block(definition, "{label}.read.done");
+    let lengthSlot = memory.buildAlloca(builder, runtime.int64Type, "{label}.length");
+    instructions.buildBr(builder, callBlock);
+
+    builder.positionAtEnd(callBlock);
+    let count = runtime.call(readDescriptor, [descriptor, slot, runtime.int64(4)], "count");
+    let why = runtime.lastError();
+    memory.buildStore(builder, count, lengthSlot);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLT(builder, count, runtime.int64(0), ""), refusedBlock, doneBlock);
+
+    builder.positionAtEnd(refusedBlock);
+    memory.buildStore(builder, runtime.int64(0), lengthSlot);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, why, runtime.int32(Errno.interrupted), ""), callBlock,
+        doneBlock);
+
+    builder.positionAtEnd(doneBlock);
+    return memory.buildLoad(builder, runtime.int64Type, lengthSlot, "{label}.arrived");
+}
+
+// Moves the descriptor in the slot up above the three standard descriptors when it is one of them,
+// so that aiming a standard descriptor at another end cannot close it first. The copy is
+// close-on-exec like the original, and the original closes itself at exec. The copy replaces the
+// original in the slot, and the move goes on to `doneBlock`; a failed move leaves -1 in the slot
+// and errno in the reason slot and goes on to `failedBlock`.
+public liftLowEnd(Runtime runtime, RuntimeDefinition definition, RuntimeFunction control,
+                  Value slot, Value reasonSlot, BasicBlock doneBlock, BasicBlock failedBlock,
+                  string label) {
+    let builder = runtime.builder;
+    let liftBlock = runtime.block(definition, label + ".lift");
+    let end = memory.buildLoad(builder, runtime.int32Type, slot, label + ".end");
+    instructions.buildCondBr(builder, instructions.buildICmpSLT(builder, end,
+        runtime.int32(DescriptorControl.lowestFreeDescriptor), ""), liftBlock, doneBlock);
+
+    builder.positionAtEnd(liftBlock);
+    let lifted = runtime.call(control, [end,
+        runtime.int32(nativeshapes.duplicateCloseOnExecCommand(runtime.targetTriple)),
+        runtime.int32(DescriptorControl.lowestFreeDescriptor)], label + ".lifted");
+    memory.buildStore(builder, runtime.lastError(), reasonSlot);
+    memory.buildStore(builder, lifted, slot);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSGE(builder, lifted, runtime.int32(0), ""), doneBlock, failedBlock);
+}
+
+// Marks the descriptor close-on-exec and returns what fcntl returned, which is -1 when it failed.
+public markCloseOnExec(Runtime runtime, RuntimeFunction control, Value descriptor, string name) -> Value {
+    return runtime.call(control, [descriptor, runtime.int32(DescriptorControl.setFlags),
+        runtime.int32(DescriptorControl.closeOnExec)], name);
+}
+
+// Aims the standard descriptor `target` at `descriptor` and leaves errno in the reason slot,
+// going on to `doneBlock` when dup2 succeeds and to `failedBlock` when it fails.
+public aimDescriptor(Runtime runtime, Value descriptor, long target, Value reasonSlot,
+                     BasicBlock doneBlock, BasicBlock failedBlock, string name) {
+    let builder = runtime.builder;
+    let duplicate = runtime.libc("dup2",
+        runtime.int32Type.functionType([runtime.int32Type, runtime.int32Type]));
+    let aimed = runtime.call(duplicate, [descriptor, runtime.int32(target)], name);
+    memory.buildStore(builder, runtime.lastError(), reasonSlot);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSGE(builder, aimed, runtime.int32(0), ""), doneBlock, failedBlock);
 }
 
 // The exit code a POSIX wait status stands for: the low seven bits name the signal that ended the

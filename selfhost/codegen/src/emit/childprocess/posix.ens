@@ -7,7 +7,6 @@ import BasicBlock from @ens.llvm.blocks;
 import @ens.llvm.instructions;
 import @ens.llvm.memory;
 import ChildStream from emit.nativeshapes;
-import DescriptorControl from emit.nativeshapes;
 import Kevent from emit.nativeshapes;
 import PollEvent from emit.nativeshapes;
 import PollReady from emit.nativeshapes;
@@ -143,13 +142,12 @@ public posixStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
     builder.positionAtEnd(childBlock);
     changeWorkingDirectory(runtime, definition, changeDirectory, workingDirectory, reasonSlot,
         reportBlock);
-    let dupCommand = nativeshapes.duplicateCloseOnExecCommand(runtime.targetTriple);
-    liftLowEnd(runtime, definition, control, dupCommand, ends, PipeEnds.inputRead, modes[0],
-        reasonSlot, reportBlock, "input");
-    liftLowEnd(runtime, definition, control, dupCommand, ends, PipeEnds.outputWrite, modes[1],
-        reasonSlot, reportBlock, "output");
-    liftLowEnd(runtime, definition, control, dupCommand, ends, PipeEnds.errorsWrite, modes[2],
-        reasonSlot, reportBlock, "errors");
+    liftPipedEnd(runtime, definition, control, ends, PipeEnds.inputRead, modes[0], reasonSlot,
+        reportBlock, "input");
+    liftPipedEnd(runtime, definition, control, ends, PipeEnds.outputWrite, modes[1], reasonSlot,
+        reportBlock, "output");
+    liftPipedEnd(runtime, definition, control, ends, PipeEnds.errorsWrite, modes[2], reasonSlot,
+        reportBlock, "errors");
     attachEnd(runtime, definition, ends, PipeEnds.inputRead, 0, modes[0], reasonSlot,
         reportBlock, "input");
     attachEnd(runtime, definition, ends, PipeEnds.outputWrite, 1, modes[1], reasonSlot,
@@ -182,7 +180,7 @@ public posixStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
     closeEnd(runtime, definition, ends, PipeEnds.outputWrite, "held.output");
     closeEnd(runtime, definition, ends, PipeEnds.errorsWrite, "held.errors");
     closeEnd(runtime, definition, ends, PipeEnds.reportWrite, "held.report");
-    let reportLength = retryingRead(runtime, definition, readDescriptor,
+    let reportLength = spawnposix.retryingRead(runtime, definition, readDescriptor,
         loadEnd(runtime, ends, PipeEnds.reportRead), reportedSlot, "report");
     closeEnd(runtime, definition, ends, PipeEnds.reportRead, "read.report");
     instructions.buildCondBr(builder,
@@ -715,12 +713,10 @@ openPipe(Runtime runtime, RuntimeDefinition definition, RuntimeFunction makePipe
         instructions.buildICmpEQ(builder, piped, runtime.int32(0), ""), flagBlock, refusedBlock);
 
     builder.positionAtEnd(flagBlock);
-    let first = runtime.call(control, [loadEnd(runtime, ends, firstSlot),
-        runtime.int32(DescriptorControl.setFlags), runtime.int32(DescriptorControl.closeOnExec)],
+    let first = spawnposix.markCloseOnExec(runtime, control, loadEnd(runtime, ends, firstSlot),
         "flagged.read");
-    let second = runtime.call(control, [loadEnd(runtime, ends, firstSlot + 1),
-        runtime.int32(DescriptorControl.setFlags), runtime.int32(DescriptorControl.closeOnExec)],
-        "flagged.write");
+    let second = spawnposix.markCloseOnExec(runtime, control,
+        loadEnd(runtime, ends, firstSlot + 1), "flagged.write");
     let flagError = runtime.lastError();
     let flagged = instructions.buildAnd(builder,
         instructions.buildICmpSGE(builder, first, runtime.int32(0), ""),
@@ -755,32 +751,20 @@ changeWorkingDirectory(Runtime runtime, RuntimeDefinition definition,
     builder.positionAtEnd(doneBlock);
 }
 
-// Moves a child's end that is at one of the three standard descriptors up above them, so that
-// aiming another end at that descriptor cannot close it first. The copy is close-on-exec like the
-// original, and the original closes itself at exec.
-liftLowEnd(Runtime runtime, RuntimeDefinition definition, RuntimeFunction control,
-           long dupCommand, Value ends, long slot, Value mode, Value reasonSlot,
-           BasicBlock reportBlock, string label) {
+// Lifts the child's end of the stream above the three standard descriptors when the stream has a
+// pipe.
+liftPipedEnd(Runtime runtime, RuntimeDefinition definition, RuntimeFunction control, Value ends,
+             long slot, Value mode, Value reasonSlot, BasicBlock reportBlock, string label) {
     let builder = runtime.builder;
     let checkBlock = runtime.block(definition, "child.lift.{label}.check");
-    let liftBlock = runtime.block(definition, "child.lift.{label}.lift");
     let doneBlock = runtime.block(definition, "child.lift.{label}.done");
     instructions.buildCondBr(builder,
         instructions.buildICmpEQ(builder, mode, runtime.int32(StdioMode.inherit), ""), doneBlock,
         checkBlock);
 
     builder.positionAtEnd(checkBlock);
-    let end = loadEnd(runtime, ends, slot);
-    instructions.buildCondBr(builder, instructions.buildICmpSLT(builder, end,
-        runtime.int32(DescriptorControl.lowestFreeDescriptor), ""), liftBlock, doneBlock);
-
-    builder.positionAtEnd(liftBlock);
-    let lifted = runtime.call(control, [end, runtime.int32(dupCommand),
-        runtime.int32(DescriptorControl.lowestFreeDescriptor)], "lifted");
-    memory.buildStore(builder, runtime.lastError(), reasonSlot);
-    memory.buildStore(builder, lifted, endSlot(runtime, ends, slot));
-    instructions.buildCondBr(builder,
-        instructions.buildICmpSGE(builder, lifted, runtime.int32(0), ""), doneBlock, reportBlock);
+    spawnposix.liftLowEnd(runtime, definition, control, endSlot(runtime, ends, slot), reasonSlot,
+        doneBlock, reportBlock, "child.lift.{label}");
 
     builder.positionAtEnd(doneBlock);
 }
@@ -790,8 +774,6 @@ liftLowEnd(Runtime runtime, RuntimeDefinition definition, RuntimeFunction contro
 attachEnd(Runtime runtime, RuntimeDefinition definition, Value ends, long slot, long target,
           Value mode, Value reasonSlot, BasicBlock reportBlock, string label) {
     let builder = runtime.builder;
-    let duplicate = runtime.libc("dup2",
-        runtime.int32Type.functionType([runtime.int32Type, runtime.int32Type]));
     let attachBlock = runtime.block(definition, "child.attach.{label}.aim");
     let doneBlock = runtime.block(definition, "child.attach.{label}.done");
     instructions.buildCondBr(builder,
@@ -799,42 +781,10 @@ attachEnd(Runtime runtime, RuntimeDefinition definition, Value ends, long slot, 
         attachBlock);
 
     builder.positionAtEnd(attachBlock);
-    let aimed = runtime.call(duplicate, [loadEnd(runtime, ends, slot), runtime.int32(target)],
-        "aimed");
-    memory.buildStore(builder, runtime.lastError(), reasonSlot);
-    instructions.buildCondBr(builder,
-        instructions.buildICmpSGE(builder, aimed, runtime.int32(0), ""), doneBlock, reportBlock);
+    spawnposix.aimDescriptor(runtime, loadEnd(runtime, ends, slot), target, reasonSlot, doneBlock,
+        reportBlock, "aimed");
 
     builder.positionAtEnd(doneBlock);
-}
-
-// Reads up to four bytes into the slot, calling again after a signal interrupts, and returns how
-// many were read. A read the pipe itself refused is reported as no bytes, since the child has
-// either exec'd or ended with 127 and a wait distinguishes the two.
-retryingRead(Runtime runtime, RuntimeDefinition definition, RuntimeFunction readDescriptor,
-             Value descriptor, Value slot, string label) -> Value {
-    let builder = runtime.builder;
-    let callBlock = runtime.block(definition, "{label}.read.call");
-    let refusedBlock = runtime.block(definition, "{label}.read.refused");
-    let doneBlock = runtime.block(definition, "{label}.read.done");
-    let lengthSlot = memory.buildAlloca(builder, runtime.int64Type, "{label}.length");
-    instructions.buildBr(builder, callBlock);
-
-    builder.positionAtEnd(callBlock);
-    let count = runtime.call(readDescriptor, [descriptor, slot, runtime.int64(4)], "count");
-    let why = runtime.lastError();
-    memory.buildStore(builder, count, lengthSlot);
-    instructions.buildCondBr(builder,
-        instructions.buildICmpSLT(builder, count, runtime.int64(0), ""), refusedBlock, doneBlock);
-
-    builder.positionAtEnd(refusedBlock);
-    memory.buildStore(builder, runtime.int64(0), lengthSlot);
-    instructions.buildCondBr(builder,
-        instructions.buildICmpEQ(builder, why, runtime.int32(Errno.interrupted), ""), callBlock,
-        doneBlock);
-
-    builder.positionAtEnd(doneBlock);
-    return memory.buildLoad(builder, runtime.int64Type, lengthSlot, "{label}.arrived");
 }
 
 // Closes the descriptor the table slot holds when it holds one, and marks the slot empty.

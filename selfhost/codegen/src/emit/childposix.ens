@@ -1,6 +1,8 @@
 // The POSIX half of the child bridges. The pipe is made before the fork, the child aims both of
 // its output descriptors at the writing end, and the parent closes its own copy straight after
-// forking, because a reading end still open for writing here would never report the end.
+// forking, because a reading end still open for writing here would never report the end. Every
+// end of both pipes is close-on-exec, and the second pipe carries the errno of an exec that failed
+// back to the parent.
 import TypeRef from @ens.llvm.types;
 import Value from @ens.llvm.values;
 import @ens.llvm.instructions;
@@ -14,25 +16,42 @@ import emit.system;
 
 public posixStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
     let makePipe = runtime.libc("pipe", runtime.int32Type.functionType([runtime.pointerType]));
+    let control = runtime.libc("fcntl",
+        runtime.int32Type.variadicFunctionType([runtime.int32Type, runtime.int32Type]));
     let forkProcess = runtime.libc("fork", runtime.int32Type.functionType([]));
-    let duplicate = runtime.libc("dup2",
-        runtime.int32Type.functionType([runtime.int32Type, runtime.int32Type]));
     let closeDescriptor = runtime.libc("close",
         runtime.int32Type.functionType([runtime.int32Type]));
     let execProgram = runtime.libc("execvp",
         runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType]));
+    let writeDescriptor = runtime.libc("write", runtime.int64Type.functionType([runtime.int32Type,
+        runtime.pointerType, runtime.int64Type]));
+    let readDescriptor = runtime.libc("read", runtime.int64Type.functionType([runtime.int32Type,
+        runtime.pointerType, runtime.int64Type]));
     let exitChild = runtime.libc("_exit", runtime.voidType.functionType([runtime.int32Type]));
     let allocate = runtime.malloc();
+    let release = runtime.free();
     let definition = runtime.beginDefinition("ens_start_process", type);
     let builder = runtime.builder;
+    let pipeBlock = runtime.block(definition, "start.pipe");
+    let reportBlock = runtime.block(definition, "start.report");
+    let flagBlock = runtime.block(definition, "start.flags");
     let forkBlock = runtime.block(definition, "start.fork");
     let childBlock = runtime.block(definition, "start.child");
+    let liftedBlock = runtime.block(definition, "start.child.lifted");
+    let aimErrorsBlock = runtime.block(definition, "start.child.aim.errors");
+    let aimedBlock = runtime.block(definition, "start.child.aimed");
     let takeBlock = runtime.block(definition, "start.child.environment");
     let execBlock = runtime.block(definition, "start.child.exec");
+    let childFailedBlock = runtime.block(definition, "start.child.failed");
     let parentBlock = runtime.block(definition, "start.parent");
-    let holdBlock = runtime.block(definition, "start.hold");
+    let awaitBlock = runtime.block(definition, "start.report.await");
+    let execFailedBlock = runtime.block(definition, "start.exec.failed");
     let recordBlock = runtime.block(definition, "start.record");
+    let closeReportBlock = runtime.block(definition, "start.close.report");
+    let closePipeBlock = runtime.block(definition, "start.close.pipe");
+    let unforkedBlock = runtime.block(definition, "start.unforked");
     let closeReadBlock = runtime.block(definition, "start.close.read");
+    let releaseBlock = runtime.block(definition, "start.release");
     let failedBlock = runtime.block(definition, "start.failed");
 
     // The child inherits a copy of whatever is still buffered in this process's streams, which it
@@ -40,15 +59,45 @@ public posixStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
     // child's output and unduplicated.
     runtime.flushBuffered();
     let descriptors = memory.buildAlloca(builder, runtime.int32Type.arrayType(2 as ulong), "pipe");
+    let report = memory.buildAlloca(builder, runtime.int32Type.arrayType(2 as ulong), "report");
+    let reportedSlot = memory.buildAlloca(builder, runtime.int32Type, "reported");
+    let statusSlot = memory.buildAlloca(builder, runtime.int32Type, "collect.status");
+    // Allocated before the fork, so no failure after it can leave a child running.
+    let block = runtime.call(allocate, [runtime.int64(16)], "child.block");
+    instructions.buildCondBr(builder, runtime.isNull(block), failedBlock, pipeBlock);
+
+    builder.positionAtEnd(pipeBlock);
     let piped = runtime.call(makePipe, [descriptors], "piped");
     instructions.buildCondBr(builder,
-        instructions.buildICmpEQ(builder, piped, runtime.int32(0), ""), forkBlock, failedBlock);
+        instructions.buildICmpEQ(builder, piped, runtime.int32(0), ""), reportBlock, releaseBlock);
 
-    builder.positionAtEnd(forkBlock);
+    builder.positionAtEnd(reportBlock);
+    let writeSlot = runtime.offsetPointer(descriptors, 4, "write.slot");
     let readEnd = memory.buildLoad(builder, runtime.int32Type,
         runtime.offsetPointer(descriptors, 0, ""), "read.end");
-    let writeEnd = memory.buildLoad(builder, runtime.int32Type,
-        runtime.offsetPointer(descriptors, 4, ""), "write.end");
+    let writeEnd = memory.buildLoad(builder, runtime.int32Type, writeSlot, "write.end");
+    let reportPiped = runtime.call(makePipe, [report], "report.piped");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, reportPiped, runtime.int32(0), ""), flagBlock,
+        closePipeBlock);
+
+    builder.positionAtEnd(flagBlock);
+    let reportRead = memory.buildLoad(builder, runtime.int32Type,
+        runtime.offsetPointer(report, 0, ""), "report.read");
+    let reportWrite = memory.buildLoad(builder, runtime.int32Type,
+        runtime.offsetPointer(report, 4, ""), "report.write");
+    let marks = [spawnposix.markCloseOnExec(runtime, control, readEnd, "flagged.read"),
+        spawnposix.markCloseOnExec(runtime, control, writeEnd, "flagged.write"),
+        spawnposix.markCloseOnExec(runtime, control, reportRead, "flagged.report.read"),
+        spawnposix.markCloseOnExec(runtime, control, reportWrite, "flagged.report.write")];
+    Value flagged = instructions.buildICmpSGE(builder, marks[0], runtime.int32(0), "");
+    for (long index = 1; index < marks.length; index++) {
+        flagged = instructions.buildAnd(builder, flagged,
+            instructions.buildICmpSGE(builder, marks[index], runtime.int32(0), ""), "");
+    }
+    instructions.buildCondBr(builder, flagged, forkBlock, closeReportBlock);
+
+    builder.positionAtEnd(forkBlock);
     let program = runtime.parameter(definition, 0);
     let argumentCount = runtime.parameter(definition, 2);
     let environmentCount = runtime.parameter(definition, 5);
@@ -65,11 +114,23 @@ public posixStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
     instructions.buildCondBr(builder,
         instructions.buildICmpEQ(builder, child, runtime.int32(0), ""), childBlock, parentBlock);
 
+    // The output pipe took the lowest free descriptors, so the report write end is always above 2
+    // and only the output end can need lifting. Every end closes itself at exec, and dup2 leaves 1
+    // and 2 open across it.
     builder.positionAtEnd(childBlock);
-    runtime.call(duplicate, [writeEnd, runtime.int32(1)], "");
-    runtime.call(duplicate, [writeEnd, runtime.int32(2)], "");
-    runtime.call(closeDescriptor, [readEnd], "");
-    runtime.call(closeDescriptor, [writeEnd], "");
+    spawnposix.liftLowEnd(runtime, definition, control, writeSlot, reportedSlot, liftedBlock,
+        childFailedBlock, "start.child.output");
+
+    builder.positionAtEnd(liftedBlock);
+    let output = memory.buildLoad(builder, runtime.int32Type, writeSlot, "output");
+    spawnposix.aimDescriptor(runtime, output, 1, reportedSlot, aimErrorsBlock, childFailedBlock,
+        "aimed.output");
+
+    builder.positionAtEnd(aimErrorsBlock);
+    spawnposix.aimDescriptor(runtime, output, 2, reportedSlot, aimedBlock, childFailedBlock,
+        "aimed.errors");
+
+    builder.positionAtEnd(aimedBlock);
     instructions.buildCondBr(builder, instructions.buildICmpSGT(builder, environmentCount,
         runtime.int64(0), ""), takeBlock, execBlock);
 
@@ -77,20 +138,36 @@ public posixStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
     memory.buildStore(builder, environmentVector, system.environGlobal(runtime));
     instructions.buildBr(builder, execBlock);
 
+    // execvp returns only when the program could not be started.
     builder.positionAtEnd(execBlock);
     runtime.call(execProgram, [program, argumentVector], "");
+    memory.buildStore(builder, runtime.lastError(), reportedSlot);
+    instructions.buildBr(builder, childFailedBlock);
+
+    builder.positionAtEnd(childFailedBlock);
+    runtime.call(writeDescriptor, [reportWrite, reportedSlot, runtime.int64(4)], "");
     runtime.call(exitChild, [runtime.int32(127)], "");
     instructions.buildUnreachable(builder);
 
     builder.positionAtEnd(parentBlock);
     runtime.call(closeDescriptor, [writeEnd], "");
+    runtime.call(closeDescriptor, [reportWrite], "");
     instructions.buildCondBr(builder,
-        instructions.buildICmpSLT(builder, child, runtime.int32(0), ""), closeReadBlock,
-        holdBlock);
+        instructions.buildICmpSLT(builder, child, runtime.int32(0), ""), unforkedBlock,
+        awaitBlock);
 
-    builder.positionAtEnd(holdBlock);
-    let block = runtime.call(allocate, [runtime.int64(16)], "child.block");
-    instructions.buildCondBr(builder, runtime.isNull(block), closeReadBlock, recordBlock);
+    // A successful exec closes the report pipe with nothing written, so no bytes means started.
+    builder.positionAtEnd(awaitBlock);
+    let reportLength = spawnposix.retryingRead(runtime, definition, readDescriptor, reportRead,
+        reportedSlot, "report");
+    runtime.call(closeDescriptor, [reportRead], "");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSGT(builder, reportLength, runtime.int64(0), ""), execFailedBlock,
+        recordBlock);
+
+    builder.positionAtEnd(execFailedBlock);
+    spawnposix.awaitChild(runtime, definition, child, statusSlot, closeReadBlock, "collect");
+    instructions.buildBr(builder, closeReadBlock);
 
     builder.positionAtEnd(recordBlock);
     memory.buildStore(builder, instructions.buildSExt(builder, child, runtime.int64Type, ""),
@@ -99,8 +176,25 @@ public posixStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
         children.childField(runtime, block, 8));
     instructions.buildRet(builder, block);
 
+    builder.positionAtEnd(closeReportBlock);
+    runtime.call(closeDescriptor, [reportRead], "");
+    runtime.call(closeDescriptor, [reportWrite], "");
+    instructions.buildBr(builder, closePipeBlock);
+
+    builder.positionAtEnd(closePipeBlock);
+    runtime.call(closeDescriptor, [writeEnd], "");
+    instructions.buildBr(builder, closeReadBlock);
+
+    builder.positionAtEnd(unforkedBlock);
+    runtime.call(closeDescriptor, [reportRead], "");
+    instructions.buildBr(builder, closeReadBlock);
+
     builder.positionAtEnd(closeReadBlock);
     runtime.call(closeDescriptor, [readEnd], "");
+    instructions.buildBr(builder, releaseBlock);
+
+    builder.positionAtEnd(releaseBlock);
+    runtime.call(release, [block], "");
     instructions.buildRet(builder, runtime.nullPointer());
 
     builder.positionAtEnd(failedBlock);

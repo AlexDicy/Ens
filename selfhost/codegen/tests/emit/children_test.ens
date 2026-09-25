@@ -5,6 +5,7 @@ import @ens.llvm.target;
 import EmissionHost from support;
 import ChildExit from emit.children;
 import emit.children;
+import emit.nativeshapes;
 
 test "starting a child verifies" {
     let host = new EmissionHost("children_start");
@@ -15,6 +16,85 @@ test "starting a child verifies" {
         host.runtime.int64(1), commandLine, block, host.runtime.int64(1), host.runtime.int64(7)],
         "child");
     try host.finish();
+}
+
+// F_SETFD is 2 and FD_CLOEXEC is 1 on both POSIX triples; the lift is F_DUPFD_CLOEXEC from 3.
+test "a POSIX start closes every pipe end on exec and reports a failed exec" {
+    for (let triple in posixTriples()) {
+        let host = new EmissionHost("children_report_{triple}");
+        host.retarget(triple);
+        children.startProcessRuntime(host.runtime);
+        string text = host.text();
+        long lift = nativeshapes.duplicateCloseOnExecCommand(triple);
+        try assertBlockHolds(triple, text, "start.flags", ["@fcntl(i32 %read.end, i32 2, i32 1)",
+            "@fcntl(i32 %write.end, i32 2, i32 1)", "@fcntl(i32 %report.read, i32 2, i32 1)",
+            "@fcntl(i32 %report.write, i32 2, i32 1)",
+            "label %start.fork, label %start.close.report"]);
+        try assertBlockHolds(triple, text, "start.child",
+            ["%start.child.output.end = load i32, ptr %write.slot",
+                "label %start.child.output.lift, label %start.child.lifted"]);
+        try assertBlockHolds(triple, text, "start.child.output.lift",
+            ["@fcntl(i32 %start.child.output.end, i32 {lift}, i32 3)",
+                "label %start.child.lifted, label %start.child.failed"]);
+        try assertBlockHolds(triple, text, "start.child.lifted",
+            ["%output = load i32, ptr %write.slot",
+                "%aimed.output = call i32 @dup2(i32 %output, i32 1)",
+                "icmp sge i32 %aimed.output, 0",
+                "label %start.child.aim.errors, label %start.child.failed"]);
+        try assertBlockHolds(triple, text, "start.child.aim.errors",
+            ["%aimed.errors = call i32 @dup2(i32 %output, i32 2)", "icmp sge i32 %aimed.errors, 0",
+                "label %start.child.aimed, label %start.child.failed"]);
+        try assertBlockHolds(triple, text, "start.child.failed",
+            ["@write(i32 %report.write, ptr %reported, i64 4)", "@_exit(i32 127)"]);
+        try host.finish();
+    }
+}
+
+// The branches and 'preds' lines pin the order: the parent closes both writing ends before it
+// reads the report, and a failed exec is waited for, its read end closed and its block freed
+// before the start returns null.
+test "a POSIX start closes its writing ends before the report read and releases a failed exec" {
+    for (let triple in posixTriples()) {
+        let host = new EmissionHost("children_order_{triple}");
+        host.retarget(triple);
+        children.startProcessRuntime(host.runtime);
+        string text = host.text();
+        try assertBlockHolds(triple, text, "start.parent", ["@close(i32 %write.end)",
+            "@close(i32 %report.write)", "label %start.unforked, label %start.report.await"]);
+        try assertBlockHolds(triple, text, "start.report.await", ["preds = %start.parent\n",
+            "br label %report.read.call"]);
+        try assertBlockHolds(triple, text, "report.read.call",
+            ["preds = %report.read.refused, %start.report.await\n",
+                "@read(i32 %report.read, ptr %reported, i64 4)"]);
+        try assertBlockHolds(triple, text, "report.read.done", ["@close(i32 %report.read)",
+            "label %start.exec.failed, label %start.record"]);
+        try assertBlockHolds(triple, text, "start.exec.failed", ["br label %collect.call"]);
+        try assertBlockHolds(triple, text, "collect.call",
+            ["@waitpid(i32 %child, ptr %collect.status, i32 0)"]);
+        try assertBlockHolds(triple, text, "collect.known", ["br label %start.close.read"]);
+        try assertBlockHolds(triple, text, "start.close.read", ["@close(i32 %read.end)",
+            "br label %start.release"]);
+        try assertBlockHolds(triple, text, "start.release", ["@free(ptr %child.block)",
+            "ret ptr null"]);
+        try host.finish();
+    }
+}
+
+// The entry block prints first, so a block allocated there comes before every pipe and the fork.
+test "a POSIX start allocates the child's block before anything can start" {
+    for (let triple in posixTriples()) {
+        let host = new EmissionHost("children_block_{triple}");
+        host.retarget(triple);
+        children.startProcessRuntime(host.runtime);
+        string text = host.text();
+        long allocated = text.indexOf("%child.block = call ptr @malloc(i64 16)");
+        long piped = text.indexOf("%piped = call i32 @pipe(");
+        try testing.assertTrue(allocated >= 0 && piped > allocated,
+            "{triple} does not allocate the block before the first pipe: {text}");
+        try testing.assertTrue(text.indexOf("@free(ptr %child.block)") >= 0,
+            "{triple} never frees the block of a start that failed: {text}");
+        try host.finish();
+    }
 }
 
 test "reading, waiting and releasing a child verify" {
@@ -85,4 +165,30 @@ test "every target's child bridges build code the verifier accepts" {
 childTriples() -> string[] {
     return [target.hostTargetTriple(), "x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu",
         "aarch64-apple-darwin23"];
+}
+
+posixTriples() -> string[] {
+    return ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin23"];
+}
+
+// Fails unless the printed block holds every line, naming the first one it lacks.
+assertBlockHolds(string triple, string text, string label, string[] lines) throws {
+    string block = blockText(text, label);
+    for (let line in lines) {
+        try testing.assertTrue(block.indexOf(line) >= 0,
+            "{triple}: block '{label}' has no '{line}': {block}");
+    }
+}
+
+// One printed block, from its label line to the blank line that ends it, or "" when there is none.
+blockText(string text, string label) -> string {
+    long start = text.indexOf("\n{label}:");
+    if (start < 0) {
+        return "";
+    }
+    long end = text.indexOf("\n\n", start + 1);
+    if (end < 0) {
+        return text.substring(start + 1);
+    }
+    return text.substring(start + 1, end);
 }
