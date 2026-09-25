@@ -277,6 +277,8 @@ class NullableOperand {
     protected string guard;
     protected bool wholeCall;
     protected bool calls;
+    protected bool everyLevel = true;
+    protected bool writes = false;
 
     protected constructor(this.form, this.levels, this.spelling, this.held, this.local,
                           this.declaration, this.words, this.callee, this.writeBack, this.stores,
@@ -338,6 +340,7 @@ class LiteralOrigin {
     protected string constructed = "";
     protected SyntaxNode? statement = null;
     protected Expression? whole = null;
+    protected bool element = false;
 
     protected constructor(this.kind, this.name, this.owner, this.declared);
 }
@@ -365,12 +368,85 @@ class PendingLiteralRange {
     }
 }
 
+// A number literal too large for the type 'narrow', spelled 'narrowName', and the type 'wider' that
+// takes it, which is empty when no type does. 'negative' and 'magnitude' give an integer's value.
+// 'joined' marks a literal beside a value of type 'narrow', whose every value 'wider' has as well.
+class Widening {
+    protected PrimitiveKind narrow;
+    protected string narrowName;
+    protected string wider;
+    protected bool negative;
+    protected ulong magnitude;
+    protected bool joined = false;
+    // The most negative and the largest literal of the join it stands in, which the wider type takes
+    // too; 'beyond' marks a literal no integer type takes.
+    protected bool lowNegative = false;
+    protected ulong low = 0;
+    protected ulong high = 0;
+    protected bool beyond = false;
+    protected List<Expression>? literals = null;
+
+    protected constructor(this.narrow, this.narrowName, this.wider, this.negative, this.magnitude);
+}
+
+// A literal of a join that does not fit the type it was given, kept until the whole join is analyzed
+// so that every literal of the join is judged together.
+class JoinFailure {
+    protected Span span;
+    protected string written;
+    protected string text;
+    protected bool negative;
+    protected ulong magnitude;
+    protected PrimitiveType target;
+    protected LiteralOrigin? origin;
+    // Set when the literal takes its type from another untyped literal beside it, or from nothing.
+    protected bool besideLiteral = false;
+    // For a literal that takes its type 'toward' from the value 'beside' in an array literal: the
+    // literal, and the target and origin the array is checked against.
+    protected Expression? literal = null;
+    protected Expression? beside = null;
+    protected Type? toward = null;
+    protected Type? fixTarget = null;
+    protected LiteralOrigin? fixOrigin = null;
+
+    protected constructor(this.span, this.written, this.text, this.negative, this.magnitude, this.target,
+                          this.origin);
+}
+
+// An element of an array literal that does not fit the element type, kept until the whole join is
+// analyzed, because the refusal of a literal of the join covers it.
+class HeldMismatch {
+    protected string message;
+    protected Span span;
+
+    protected constructor(this.message, this.span);
+}
+
+// The join analysis was in before a join began: its outermost join, and the literals and elements it
+// kept.
+class JoinScope {
+    protected Expression? root;
+    protected List<JoinFailure> failures;
+    protected List<HeldMismatch> mismatches;
+    protected bool created;
+
+    protected constructor(this.root, this.failures, this.mismatches, this.created);
+}
+
 // The text after a literal that takes its type from the value beside it in a join or an operator:
 // the fix, and the sentence that says where the type comes from.
 class JoinText {
     protected string fix;
     protected string why;
     protected string clause = "";
+    // The literals of the join the fix covers, which get no report of their own.
+    protected List<Expression>? covered = null;
+    // Set for a literal of an array literal, whose refusal waits for the whole array: the value the
+    // literal takes its type 'toward' from, and the target and origin the array is checked against.
+    protected Expression? beside = null;
+    protected Type? toward = null;
+    protected Type? fixTarget = null;
+    protected LiteralOrigin? fixOrigin = null;
 
     protected constructor(this.fix, this.why);
 }
@@ -396,10 +472,11 @@ class DeferredLiteralFix {
     protected string besideType = "";
     protected bool settled = false;
     // Set for an argument of a call with several candidates, whose parameter settles the fix.
-    // 'refusal' and 'clause' build the sentence that names a 'float' parameter.
+    // 'refusal' and 'clause' build the sentence that names a parameter of the literal's type.
     protected bool awaitsParameter = false;
     protected string refusal = "";
     protected string clause = "";
+    protected Widening? widening = null;
 
     protected constructor(this.span, this.message, this.plain, this.suffixed, this.suffix);
 }
@@ -576,6 +653,14 @@ class BodyChecker implements NoreturnCalls {
     GreenNode? joinNode;
     Type? joinTarget;
     LiteralOrigin? joinOrigin;
+    // The outermost '?:' or switch expression whose values are being analyzed, and the nested one
+    // about to be analyzed as one of its values.
+    Expression? joinRoot;
+    GreenNode? joinChild;
+    List<JoinFailure> joinFailures;
+    List<HeldMismatch> joinMismatches;
+    // Set while a literal adapts to the type of an untyped literal beside it.
+    bool besideLiteral;
     // The arithmetic expression whose operands are being adapted, with its target and origin.
     BinaryExpressionNode? operandJoin;
     Type? operandTarget;
@@ -625,6 +710,8 @@ class BodyChecker implements NoreturnCalls {
     string obligationOwnerDisplay;
 
     List<PendingLiteralRange> pendingLiteralRanges;
+    // Literals whose join was refused with a fix that covers them, so they get no report of their own.
+    List<GreenNode> coveredLiterals;
 
     protected constructor(ModuleContext context, Map<string, ModuleContext> contextsByPath,
                 PreludeScope preludeScope, List<FileDiagnostic> collected) {
@@ -656,6 +743,11 @@ class BodyChecker implements NoreturnCalls {
         this.joinNode = null;
         this.joinTarget = null;
         this.joinOrigin = null;
+        this.joinRoot = null;
+        this.joinChild = null;
+        this.joinFailures = new List<JoinFailure>();
+        this.joinMismatches = new List<HeldMismatch>();
+        this.besideLiteral = false;
         this.operandJoin = null;
         this.operandTarget = null;
         this.operandOrigin = null;
@@ -687,6 +779,7 @@ class BodyChecker implements NoreturnCalls {
         this.obligationOwnerName = "";
         this.obligationOwnerDisplay = "";
         this.pendingLiteralRanges = new List<PendingLiteralRange>();
+        this.coveredLiterals = new List<GreenNode>();
     }
 
     protected run() {
@@ -1054,7 +1147,7 @@ class BodyChecker implements NoreturnCalls {
                     baseText = "base class '{this.names.of(direct)}', which declares no constructor and "
                         + "so runs the zero-argument constructor of '{this.names.of(owner)}'";
                 }
-                this.reporter.report("Constructor of '{this.names.nameOf(current)}' cannot initialize "
+                this.reporter.report("The constructor of '{this.names.nameOf(current)}' cannot initialize "
                     + baseText + ": " + clause, at);
             }
             return;
@@ -1062,7 +1155,7 @@ class BodyChecker implements NoreturnCalls {
         if (declared == null || chain.chooser() != receiver) {
             return;
         }
-        string opening = "Constructor of '{this.names.nameOf(current)}' does not call 'super(...)'";
+        string opening = "The constructor of '{this.names.nameOf(current)}' does not call 'super(...)'";
         this.reporter.report(types.implicitBaseRefusal(opening, chain, declared, declaredHasBody, "",
             this.names), at);
     }
@@ -1361,9 +1454,10 @@ class BodyChecker implements NoreturnCalls {
 
     // The refusal a type parameter written anywhere inside a lazy const's initializer reads.
     lazyTypeParameterRefusal(DeclaredType owner, Field field) -> string {
-        return "The initializer of lazy const '{this.names.nameOf(owner)}.{field.name()}' "
-            + "cannot use a type parameter, because one value is shared by every type "
-            + "argument. Remove 'lazy const' to give each instance its own '{field.name()}'.";
+        string ownerName = this.names.nameOf(owner);
+        return "The initializer of lazy const '{ownerName}.{field.name()}' cannot use a type parameter, "
+            + "because one lazy const value is shared by every type argument of '{ownerName}'. Remove "
+            + "'lazy const' to give each instance its own '{field.name()}'.";
     }
 
     fieldTypeOrError(List<Field>? fields, string name) -> Type {
@@ -1591,12 +1685,6 @@ class BodyChecker implements NoreturnCalls {
         return types.inheritedOrOwnField(convert.coreOf(objectType), name);
     }
 
-    // Why a null check on the value proves nothing for a later read, and the local copy that does.
-    // Null when the value reads no array element and no field that is not 'const'.
-    unstablePlaceGuidance(Expression value) -> string? {
-        return this.copiedGuidance(value, "null check", "check");
-    }
-
     // Why a type test on the value proves nothing for a later read, and the local copy that does.
     // Null when the value reads no array element and no field that is not 'const'.
     unstableTestGuidance(Expression value) -> string? {
@@ -1633,6 +1721,82 @@ class BodyChecker implements NoreturnCalls {
             return null;
         }
         return operandsAdvice([this.classifyOperand(operand, levels, "", written != null)]);
+    }
+
+    // The null guidance for 'value' of type 'type' in a use that takes one '?', or an empty string
+    // unless the type has more.
+    oneLevelGuidance(Expression value, Type type) -> string {
+        if (!(type is OptionalType) || !(type.inner() is OptionalType)) {
+            return "";
+        }
+        return this.nullGuidance(value, type, optionalLevels(type) - 1) ?? "";
+    }
+
+    // The null guidance for 'value' of type 'type' where a use takes it with 'levels' fewer '?'.
+    nullGuidance(Expression value, Type type, long levels) -> string? {
+        let branches = new List<Expression>();
+        this.collectNullableBranches(unwrapParentheses(value), branches);
+        if (branches.length() == 0 || !isJoin(unwrapParentheses(value))) {
+            let operand = this.classifyOperand(value, levels, "", false);
+            operand.everyLevel = levels == optionalLevels(type);
+            return operandsAdvice([operand]);
+        }
+        let operands = new List<NullableOperand>();
+        for (let branch in branches) {
+            long own = optionalLevels(this.recordedType(branch));
+            long used = own;
+            if (levels < own) {
+                used = levels;
+            }
+            let operand = this.classifyOperand(branch, used, "", false);
+            operand.everyLevel = used == own;
+            operands.push(operand);
+        }
+        NullableOperand[] classified = operands.toArray();
+        let advice = operandsAdvice(classified);
+        if (advice == null || advice.endsWith("'??'.") || advice.endsWith("once for each '?'.")) {
+            return advice;
+        }
+        string clause = fallbackAdvice(classified, true) ?? "";
+        if (clause.length == 0) {
+            return advice;
+        }
+        return "{advice.substring(0, advice.length - 1)}, or s{clause.substring(1)}";
+    }
+
+    // Adds to 'found' each value of the '?:' or switch 'value', through nested ones, whose type may
+    // be null.
+    collectNullableBranches(Expression value, List<Expression> found) {
+        switch (value) {
+            is TernaryExpressionNode ternary -> {
+                this.collectNullableBranches(unwrapParentheses(ternary.thenValue()), found);
+                this.collectNullableBranches(unwrapParentheses(ternary.elseValue()), found);
+            },
+            is SwitchExpressionNode join -> {
+                for (let arm in armsOfExpression(join)) {
+                    let body = armValue(arm);
+                    if (body != null) {
+                        this.collectNullableBranches(unwrapParentheses(body), found);
+                    }
+                }
+            },
+            default -> {
+                if (this.recordedType(value) is OptionalType) {
+                    found.push(value);
+                }
+            },
+        }
+    }
+
+    // 'opening', which the words 'may be null' continue, with the null guidance for 'value' of type
+    // 'type' in a use that takes none of its '?'.
+    maybeNullRefusal(string opening, Expression value, Type type) -> string {
+        long levels = optionalLevels(type);
+        string why = "{opening} may be null here.";
+        if (levels > 1) {
+            why = "{opening} may be null at more than one level.";
+        }
+        return this.withGuidance(why, this.nullGuidance(value, type, levels));
     }
 
     // Both operands of a binary operator and their fixes. Two locals that would share a name get
@@ -1769,9 +1933,11 @@ class BodyChecker implements NoreturnCalls {
             held = local + rest;
             spelling = copied + rest;
         }
-        return new NullableOperand(form, levels, spelling, held, local, declaration, words, callee,
-            writeBack, stores, guard, unwrapParentheses(operand) is CallExpressionNode,
+        let classified = new NullableOperand(form, levels, spelling, held, local, declaration, words,
+            callee, writeBack, stores, guard, unwrapParentheses(operand) is CallExpressionNode,
             containsCall(operand.green()));
+        classified.writes = writesBack;
+        return classified;
     }
 
     // A write through '?.' or '?[' as the step that the same write without its '?' lands in.
@@ -1934,18 +2100,15 @@ class BodyChecker implements NoreturnCalls {
         return false;
     }
 
-    // assignabilityHint with the mismatched value in hand: a possibly-null value read from a
-    // place a null check cannot narrow gets the local copy instead of the plain check suggestion.
+    // assignabilityHint with the mismatched value in hand, which a value that fits once its null is
+    // gone extends with the null guidance for the place it is read from.
     valueAssignabilityHint(Type target, Type source, Expression? value) -> string {
-        if (value != null && !(target is ErrorType) && !(target is OptionalType)
-                && source is OptionalType
-                && convert.isAssignableStrict(target, source.inner())) {
-            let guidance = this.unstablePlaceGuidance(value);
-            if (guidance != null) {
-                return " The value may be null here. {guidance}";
-            }
+        string hint = assignabilityHint(target, source, this.names);
+        long levels = nullLevelsAbove(target, source);
+        if (value == null || target is ErrorType || hint.length > 0 || levels == 0) {
+            return hint;
         }
-        return assignabilityHint(target, source, this.names);
+        return this.withGuidance(" The value may be null here.", this.nullGuidance(value, source, levels));
     }
 
     // Recognizes 'x == null' and 'x != null' over a narrowable path whose analyzed type is
@@ -3055,17 +3218,9 @@ class BodyChecker implements NoreturnCalls {
         Type iterable = this.analyzeExpression(node.iterable());
         Type element = this.store.errorType();
         if (!(iterable is ErrorType)) {
-            if (iterable is OptionalType && iterable.inner() is OptionalType) {
-                this.reporter.report("'for (... in ...)' cannot iterate "
-                    + "'{this.names.of(iterable)}' because it may be null at more than one "
-                    + "level. Unwrap one level at a time with a null check "
-                    + "('if (value != null)') or a fallback ('value ?? null'), until "
-                    + "'{this.names.of(convert.coreOf(iterable))}' remains.",
-                    node.iterable().span());
-            } else if (iterable is OptionalType) {
-                this.reporter.report("'for (... in ...)' cannot iterate "
-                    + "'{this.names.of(iterable)}' because it may be null. Check it for null "
-                    + "first ('if (value != null)'), or supply a fallback with '??'.",
+            if (iterable is OptionalType) {
+                this.reporter.report(this.maybeNullRefusal("'for (... in ...)' cannot iterate "
+                    + "'{this.names.of(iterable)}' because it", node.iterable(), iterable),
                     node.iterable().span());
             } else if (iterable is ArrayType) {
                 element = iterable.element();
@@ -3393,7 +3548,7 @@ class BodyChecker implements NoreturnCalls {
             return this.store.errorType();
         }
         this.noteSuffixedTarget(node, target, origin);
-        return this.adaptIntegerLiteral(node, target) ?? this.adaptCharLiteral(node, target)
+        return this.adaptIntegerLiteral(node, target, origin) ?? this.adaptCharLiteral(node, target)
             ?? this.adaptFloatLiteral(node, target, origin) ?? analyzed;
     }
 
@@ -3718,15 +3873,18 @@ class BodyChecker implements NoreturnCalls {
         return true;
     }
 
-    // Retypes an untyped integer literal to the integer type the target has without its '?'. Returns
-    // the new type, the error type when the value does not fit, or null when nothing adapts.
-    adaptIntegerLiteral(Expression node, Type target) -> Type? {
+    // Retypes an untyped integer literal to the integer type the target has without its '?', and
+    // returns the new type, the error type when it does not fit, or null. A literal that does not fit
+    // gets 'fix', or else the change at 'origin'.
+    adaptIntegerLiteral(Expression node, Type target, LiteralOrigin? origin = null,
+                        JoinText? fix = null) -> Type? {
         if (node is ParenthesizedExpressionNode) {
-            return this.adaptedInParentheses(node, this.adaptIntegerLiteral(node.inner(), target));
+            return this.adaptedInParentheses(node,
+                this.adaptIntegerLiteral(node.inner(), target, origin, fix));
         }
         Type core = convert.coreOf(target);
         if (core is PrimitiveType) {
-            return this.adaptIntegerLiteralTo(node, core);
+            return this.adaptIntegerLiteralTo(node, core, origin, fix);
         }
         return null;
     }
@@ -3741,7 +3899,8 @@ class BodyChecker implements NoreturnCalls {
     }
 
     // adaptIntegerLiteral for a target that is a primitive type.
-    adaptIntegerLiteralTo(Expression node, PrimitiveType target) -> Type? {
+    adaptIntegerLiteralTo(Expression node, PrimitiveType target, LiteralOrigin? origin,
+                          JoinText? fix) -> Type? {
         if (!convert.isIntegerType(target)) {
             return null;
         }
@@ -3759,9 +3918,36 @@ class BodyChecker implements NoreturnCalls {
             if (negative) {
                 sign = "-";
             }
-            this.reporter.report("Literal {sign}{literal.value().text()} does not fit in "
-                + "'{this.names.of(target)}' (range "
-                + "{literalvalues.integerRange(target.kind())}).", node.span());
+            string written = "{sign}{literal.value().text()}";
+            let widening = this.integerWidening(negative, magnitude, target);
+            let root = this.joinRoot;
+            if (this.isCoveredLiteral(unwrapParentheses(node).green())) {
+                this.result.setType(node.green(), this.store.errorType());
+                return this.store.errorType();
+            }
+            if (fix == null && root != null && isJoinLiteral(root, node)) {
+                let failure = new JoinFailure(node.span(), written, literal.value().text(), negative,
+                    magnitude, target, origin);
+                failure.besideLiteral = this.besideLiteral;
+                this.joinFailures.push(failure);
+            } else if (fix == null) {
+                this.reporter.report(integerTooLarge(written, widening, this.literalFix(origin, widening)),
+                    node.span());
+            } else if (fix.toward != null && root != null) {
+                let failure = new JoinFailure(node.span(), written, literal.value().text(), negative,
+                    magnitude, target, null);
+                failure.literal = node;
+                failure.beside = fix.beside;
+                failure.toward = fix.toward;
+                failure.fixTarget = fix.fixTarget;
+                failure.fixOrigin = fix.fixOrigin;
+                this.joinFailures.push(failure);
+            } else {
+                this.holdOrReport(node.span(), integerTooLarge(written, widening, fix.fix),
+                    integerTooLarge(written, widening, fix.why), integerTooLarge(written, widening, ""),
+                    fix.clause, widening);
+                this.coverJoinLiterals(fix, node);
+            }
             this.result.setType(node.green(), this.store.errorType());
             return this.store.errorType();
         }
@@ -3812,12 +3998,12 @@ class BodyChecker implements NoreturnCalls {
             }
             string written = "{sign}{literal.value().text()}";
             if (fix == null) {
-                string text = this.literalFix(origin);
+                string text = this.literalFix(origin, floatWidening());
                 this.reporter.report(floatTooLarge(written, magnitude, target.kind(), text), node.span());
             } else {
                 this.holdOrReport(node.span(), floatTooLarge(written, magnitude, target.kind(), fix.fix),
                     floatTooLarge(written, magnitude, target.kind(), fix.why),
-                    floatTooLarge(written, magnitude, target.kind(), ""), fix.clause);
+                    floatTooLarge(written, magnitude, target.kind(), ""), fix.clause, floatWidening());
             }
             this.result.setType(node.green(), this.store.errorType());
             return this.store.errorType();
@@ -3854,9 +4040,8 @@ class BodyChecker implements NoreturnCalls {
             if (negative) {
                 sign = "-";
             }
-            this.reporter.report("Literal {sign}{literal.value().text()} does not fit in "
-                + "'{this.names.of(target)}' (range "
-                + "{literalvalues.integerRange(target.kind())}).", node.span());
+            this.reporter.report(integerPastRange("{sign}{literal.value().text()}", negative, target.kind(),
+                this.names.of(target)), node.span());
             this.result.setType(node.green(), this.store.errorType());
             return;
         }
@@ -3887,8 +4072,9 @@ class BodyChecker implements NoreturnCalls {
         }
         ulong codepoint = literalvalues.charCodepoint(node.value().text());
         if (!literalvalues.magnitudeFits(false, codepoint, target.kind())) {
-            this.reporter.report("Character literal does not fit in '{this.names.of(target)}' (range "
-                + "{literalvalues.integerRange(target.kind())}).", node.span());
+            this.reporter.report("The code point of {node.value().text()}, {codepoint}, is too large for "
+                + "'{this.names.of(target)}', whose largest value is "
+                + "{literalvalues.integerLimit(target.kind())}.", node.span());
             this.result.setType(node.green(), this.store.errorType());
             return this.store.errorType();
         }
@@ -4001,7 +4187,8 @@ class BodyChecker implements NoreturnCalls {
         for (let pending in this.pendingLiteralRanges) {
             // Retyped by a target-typed position, which already judged the value there.
             let finalType = this.result.typeOf(pending.green);
-            if (finalType != null && finalType != pending.defaultType) {
+            if ((finalType != null && finalType != pending.defaultType)
+                    || this.isCoveredLiteral(pending.green)) {
                 continue;
             }
             string sign = "";
@@ -4010,17 +4197,16 @@ class BodyChecker implements NoreturnCalls {
             }
             string typeName = this.names.of(pending.defaultType);
             if (convert.isIntegerType(pending.defaultType)) {
+                string written = "{sign}{pending.text}";
                 string wider = widerIntegerHolding(pending.negative, pending.magnitude,
                     pending.defaultType.kind());
                 if (!pending.parsed || wider.length == 0) {
-                    this.reporter.report("Literal {sign}{pending.text} does not fit in any "
-                        + "integer type; the widest, 'ulong', holds up to "
-                        + "18446744073709551615.", pending.span);
+                    this.reporter.report(beyondEveryInteger(written, pending.negative), pending.span);
                 } else {
-                    this.reporter.report("Literal {sign}{pending.text} does not fit in "
-                        + "'{typeName}' (range "
-                        + "{literalvalues.integerRange(pending.defaultType.kind())}); declare "
-                        + "'{wider}' to hold it.", pending.span);
+                    string refusal = integerPastRange(written, pending.negative, pending.defaultType.kind(),
+                        typeName);
+                    this.reporter.report("{refusal} {typedLiteralFix(written, pending.text, wider)}",
+                        pending.span);
                 }
             } else {
                 double magnitude = literalvalues.floatMagnitude(pending.text);
@@ -4034,6 +4220,203 @@ class BodyChecker implements NoreturnCalls {
             }
         }
         this.pendingLiteralRanges = new List<PendingLiteralRange>();
+    }
+
+    // Reports the literals of the join 'root' that did not fit the type they were given, once, at the
+    // first of them: with the type that takes every literal and every integer value of the join.
+    reportJoinFailures(Expression root) {
+        let failures = this.joinFailures;
+        if (failures.length() == 0) {
+            return;
+        }
+        JoinFailure? uncovered = null;
+        for (let failure in failures) {
+            if (uncovered == null && !this.coversSpan(root, failure.span)) {
+                uncovered = failure;
+            }
+        }
+        if (uncovered == null) {
+            return;
+        }
+        let first = uncovered;
+        let literal = first.literal;
+        let beside = first.beside;
+        let toward = first.toward;
+        if (literal != null && beside != null && toward != null) {
+            this.reportArrayJoinLiteral(root, first, literal, beside, toward);
+            return;
+        }
+        PrimitiveKind kind = first.target.kind();
+        let widening = this.joinFailureWidening(root, first);
+        let literals = widening.literals ?? new List<Expression>();
+        let values = new List<Expression>();
+        collectJoinValues(root, values, true);
+        Expression? source = null;
+        for (let value in values) {
+            Type core = convert.coreOf(this.recordedType(value));
+            if (source == null && core is PrimitiveType && core.kind() == kind) {
+                source = value;
+            }
+        }
+        let origin = first.origin;
+        bool negativeUnsigned = (widening.negative || widening.lowNegative) && isUnsignedKind(kind);
+        string fix = "";
+        if (origin != null && !negativeUnsigned) {
+            fix = this.literalFix(origin, widening);
+        } else if (origin == null && source != null && !first.besideLiteral) {
+            Expression typed = unwrapParentheses(source);
+            string named = oneLineSpelling(typed);
+            string why = takesTypeFrom("'{named}'", this.names.of(first.target));
+            fix = why;
+            if (widening.wider.length > 0) {
+                string converted = converted(typed, widening.wider);
+                string? example = null;
+                if (!(root is ArrayLiteralExpressionNode)) {
+                    example = armExample(root, typed.green(), converted);
+                }
+                if (example == null) {
+                    let changed = new List<GreenNode>();
+                    for (let value in values) {
+                        Type core = convert.coreOf(this.recordedType(value));
+                        if (core is PrimitiveType && core.kind() == kind) {
+                            changed.push(unwrapParentheses(value).green());
+                        }
+                    }
+                    example = spelledConverting(root, changed, widening.wider);
+                }
+                fix = "{why} Convert '{named}' first ('{example}').";
+            }
+        } else if (origin == null && widening.wider.length > 0) {
+            fix = typedLiteralFix(first.written, first.text, widening.wider);
+        }
+        string refusal = integerPastRange(first.written, first.negative, kind, this.names.of(first.target));
+        if (fix.length > 0) {
+            refusal = "{refusal} {fix}";
+        }
+        this.reporter.report(refusal, first.span);
+        for (let literal in literals) {
+            if (literal.span().start != first.span.start
+                    || isPendingLiteral(this.pendingLiteralRanges, literal)) {
+                this.coveredLiterals.push(literal.green());
+            }
+        }
+    }
+
+    // Reports the literal 'first' of the array literal 'root', which takes its type 'toward' from
+    // 'beside', with the fix that converts every value of that type in the array.
+    reportArrayJoinLiteral(Expression root, JoinFailure first, Expression literal, Expression beside,
+                           Type toward) {
+        let widening = this.joinWidening(literal, toward, root);
+        if (widening == null) {
+            return;
+        }
+        string into = this.conversionType(first.fixTarget, widening);
+        string written = this.arrayConverted(root, toward, into);
+        let text = this.joinFix(beside, toward, written, "", first.fixTarget, first.fixOrigin, root,
+            widening);
+        this.reporter.report(integerTooLarge(first.written, widening, text.fix), first.span);
+        let literals = widening.literals ?? new List<Expression>();
+        for (let other in literals) {
+            if (other.span().start != first.span.start) {
+                this.coveredLiterals.push(other.green());
+            }
+        }
+    }
+
+    // The widening of the first kept literal 'first' of the join 'root': every literal of the join and
+    // the type that takes them and every integer value of the join.
+    joinFailureWidening(Expression root, JoinFailure first) -> Widening {
+        PrimitiveKind kind = first.target.kind();
+        let literals = new List<Expression>();
+        collectJoinLiterals(root, literals, true);
+        let values = new List<Expression>();
+        collectJoinValues(root, values, true);
+        let widening = new Widening(kind, this.names.of(first.target), "", first.negative, first.magnitude);
+        widening.joined = true;
+        spanJoinLiterals(widening, literals);
+        let kinds = new List<PrimitiveKind>();
+        for (let value in values) {
+            Type core = convert.coreOf(this.recordedType(value));
+            if (core is PrimitiveType && convert.isIntegerType(core)) {
+                kinds.push(core.kind());
+            }
+        }
+        widening.wider = commonIntegerHolding(kind, kinds.toArray(), widening);
+        return widening;
+    }
+
+    // Keeps with the literals of the join 'root' each literal of it that nothing gave a type to and
+    // that is too large for the type it falls back to, in source order.
+    keepPendingJoinLiterals(Expression root) {
+        let literals = new List<Expression>();
+        collectJoinLiterals(root, literals, true);
+        for (let pending in this.pendingLiteralRanges) {
+            let finalType = this.result.typeOf(pending.green);
+            if (!pending.parsed || !convert.isIntegerType(pending.defaultType)
+                    || (finalType != null && finalType != pending.defaultType)) {
+                continue;
+            }
+            for (let literal in literals) {
+                if (literal.green() == pending.green) {
+                    let failure = new JoinFailure(pending.span, "{pending.negative ? "-" : ""}{pending.text}",
+                        pending.text, pending.negative, pending.magnitude, pending.defaultType, null);
+                    failure.besideLiteral = true;
+                    this.insertJoinFailure(failure);
+                }
+            }
+        }
+    }
+
+    // Adds 'failure' to the literals the current join kept, in source order.
+    insertJoinFailure(JoinFailure failure) {
+        let ordered = new List<JoinFailure>();
+        bool placed = false;
+        for (let kept in this.joinFailures) {
+            if (!placed && failure.span.start < kept.span.start) {
+                ordered.push(failure);
+                placed = true;
+            }
+            ordered.push(kept);
+        }
+        if (!placed) {
+            ordered.push(failure);
+        }
+        this.joinFailures = ordered;
+    }
+
+    // Whether a literal of the join 'root' that starts where 'span' does is already covered by a fix.
+    coversSpan(Expression root, Span span) -> bool {
+        let literals = new List<Expression>();
+        collectJoinLiterals(root, literals, true);
+        for (let literal in literals) {
+            if (literal.span().start == span.start && this.isCoveredLiteral(literal.green())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Whether the literal belongs to a join already refused with a fix that covers it.
+    isCoveredLiteral(GreenNode green) -> bool {
+        for (let covered in this.coveredLiterals) {
+            if (covered == green) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Records the literals 'fix' covers besides 'reported', the one its refusal is reported at.
+    coverJoinLiterals(JoinText fix, Expression reported) {
+        let covered = fix.covered;
+        if (covered == null) {
+            return;
+        }
+        for (let literal in covered) {
+            if (literal.green() != unwrapParentheses(reported).green()) {
+                this.coveredLiterals.push(literal.green());
+            }
+        }
     }
 
     // True when the name belongs to an import that the link phase refused and reported.
@@ -4058,8 +4441,7 @@ class BodyChecker implements NoreturnCalls {
             }
             let ownerName = this.staticSuggestionOwner(name);
             if (ownerName != null) {
-                this.reporter.report("Statics are reached through the type name, even inside "
-                    + "'{ownerName}'; write '{ownerName}.{name}'.", node.name().span());
+                this.reporter.report(this.staticWithoutType(name, ownerName, false), node.name().span());
                 return this.store.errorType();
             }
             this.reporter.report("Undefined name '{name}'. Check the spelling, or declare it "
@@ -4185,20 +4567,25 @@ class BodyChecker implements NoreturnCalls {
         }
         string name = parameter.name();
         string ownerName = authority.name();
+        string kind = "";
         if (members.findField(types.staticFieldsOf(owner), name) != null) {
-            if (position == NamePosition.Call) {
-                return "'{name}' is the type parameter of '{ownerName}' here, not the static "
-                    + "const it declares, and neither one can be called. Remove the arguments "
-                    + "and write '{ownerName}.{name}' to read the static.";
-            }
-            return "'{name}' is the type parameter of '{ownerName}' here, not the static const "
-                + "it declares. Write '{ownerName}.{name}' to read the static.";
+            kind = "static const";
+        } else if (members.findMethodNamed(types.staticMethodsOf(owner), name) != null) {
+            kind = "static method";
+        } else {
+            return null;
         }
-        if (members.findMethodNamed(types.staticMethodsOf(owner), name) != null) {
-            return "'{name}' is the type parameter of '{ownerName}' here, not the static method "
-                + "it declares. Write '{this.names.of(owner)}.{name}(...)' to call the static.";
+        string refusal = "'{name}' means the type parameter of '{ownerName}' here, not the {kind} "
+            + "'{ownerName}' declares, because inside '{ownerName}' the name '{name}' always means the "
+            + "type parameter.";
+        if (kind == "static method") {
+            return "{refusal} Rename one of the two.";
         }
-        return null;
+        if (position == NamePosition.Call) {
+            return "{refusal} A static const is not called. Write '{ownerName}.{name}' to read it, or rename "
+                + "one of the two and remove the arguments.";
+        }
+        return "{refusal} Write '{ownerName}.{name}' to read the static const, or rename one of the two.";
     }
 
     // The meaning a type parameter took its name from, as the refusal names it, or null where
@@ -4536,6 +4923,31 @@ class BodyChecker implements NoreturnCalls {
         return authority.name();
     }
 
+    // The refusal of the static 'name' of the enclosing type 'ownerName', written without the type
+    // name in front. 'called' is true when the code calls it.
+    staticWithoutType(string name, string ownerName, bool called) -> string {
+        let owner = this.enclosingOwner;
+        string kind = "static method";
+        if (owner != null) {
+            let field = members.findField(types.staticFieldsOf(owner), name);
+            if (field != null && field.isLazy()) {
+                kind = "lazy const";
+            } else if (field != null) {
+                kind = "static const";
+            }
+        }
+        if (kind == "static method") {
+            return "'{name}' is a static method of '{ownerName}', and a static method is always called "
+                + "through its type name, even inside '{ownerName}'. Write '{ownerName}.{name}(...)'.";
+        }
+        string refusal = "'{name}' is a {kind} of '{ownerName}', and a {kind} is always read through its "
+            + "type name, even inside '{ownerName}'. Write '{ownerName}.{name}'.";
+        if (called) {
+            return "{refusal} A {kind} is not called, so remove the arguments as well.";
+        }
+        return refusal;
+    }
+
     analyzeThis(ThisExpressionNode node) -> Type {
         let receiver = this.thisType;
         if (receiver == null) {
@@ -4608,7 +5020,8 @@ class BodyChecker implements NoreturnCalls {
         Type? target = null;
         LiteralOrigin? origin = null;
         if (this.binaryNode == node.green()) {
-            if (isArithmeticOperator(operator)) {
+            if (isArithmeticOperator(operator) || operator == SyntaxKind.Ampersand
+                    || operator == SyntaxKind.Pipe || operator == SyntaxKind.Caret) {
                 target = this.binaryTarget;
                 origin = this.binaryOrigin;
             }
@@ -4706,18 +5119,15 @@ class BodyChecker implements NoreturnCalls {
     // Any other operand keeps its type.
     adaptedOperand(Expression node, Type type, Type toward, Expression other, string operatorText,
                    bool onRight) -> Type {
-        JoinText? fix = null;
-        if (floatLiteralOverflows(node, toward)) {
-            fix = this.operandFix(node, other, toward, operatorText, onRight);
-        }
+        let fix = this.operandLiteralFix(node, other, toward, operatorText, onRight);
         this.noteSuffixedOperand(node, other, toward, operatorText, onRight);
-        return this.adaptIntegerLiteral(node, toward) ?? this.adaptFloatLiteral(node, toward, null, fix)
-            ?? type;
+        return this.adaptIntegerLiteral(node, toward, null, fix)
+            ?? this.adaptFloatLiteral(node, toward, null, fix) ?? type;
     }
 
     // Holds the refusal 'message' for the join or call being analyzed, with 'plain' ending after the
     // why, or reports it outside both. 'refusal' and 'clause' are its first sentence and its why.
-    holdOrReport(Span span, string message, string plain, string refusal, string clause) {
+    holdOrReport(Span span, string message, string plain, string refusal, string clause, Widening widening) {
         let held = this.deferredFixes;
         if (held == null) {
             this.reporter.report(message, span);
@@ -4727,6 +5137,7 @@ class BodyChecker implements NoreturnCalls {
         fix.awaitsParameter = this.awaitingParameter;
         fix.refusal = refusal;
         fix.clause = clause;
+        fix.widening = widening;
         held.push(fix);
     }
 
@@ -4747,7 +5158,9 @@ class BodyChecker implements NoreturnCalls {
     // then passes to an enclosing join, or is reported when there is none.
     settleDeferred(List<DeferredLiteralFix> fixes, Expression? neighbour, Type neighbourType, string where) {
         for (let held in fixes) {
-            if (!held.settled && neighbour != null && isNullableFloat(neighbourType)) {
+            let widening = held.widening ?? floatWidening();
+            if (!held.settled && neighbour != null && neighbourType is OptionalType
+                    && sameCore(neighbourType, widening)) {
                 held.settled = true;
                 held.message = held.plain;
                 let suffixed = held.suffixed;
@@ -4787,7 +5200,7 @@ class BodyChecker implements NoreturnCalls {
         }
         string spelled = oneLineSpelling(unwrapParentheses(value));
         string removal = "remove the '{floatSuffixOf(value)}' from '{spelled}'";
-        string change = this.originChange(origin);
+        string change = this.originChange(origin, floatWidening());
         if (change.length > 0) {
             pending.fix = "{change} and {removal}.";
             return;
@@ -4908,9 +5321,10 @@ class BodyChecker implements NoreturnCalls {
             if (origin == null) {
                 return "";
             }
-            string change = this.originChange(origin);
+            string change = this.originChange(origin, floatWidening());
             if (change.length > 0) {
-                return "{change} and {removal}{also} ('{this.originExample(origin, join, bothRemoved)}').";
+                return "{change} and {removal}{also} ('{this.originExample(origin, join, bothRemoved,
+                    floatWidening())}').";
             }
             return this.suffixedWhere(value, origin);
         }
@@ -4920,16 +5334,16 @@ class BodyChecker implements NoreturnCalls {
         if (origin == null) {
             return "";
         }
-        string change = this.originChange(origin);
+        string change = this.originChange(origin, floatWidening());
         if (change.length > 0 && readsPlace(other, originPlace(origin))) {
-            string statement = this.originStatement(origin, join, suffixRemoved);
+            string statement = this.originStatement(origin, join, suffixRemoved, floatWidening());
             if (statement.length > 0) {
                 return "{change} and {removal} ('{statement}').";
             }
             return "{change} and {removal}.";
         }
         if (change.length > 0) {
-            string example = this.originExample(origin, join, converted);
+            string example = this.originExample(origin, join, converted, floatWidening());
             return "{change}, {removal} and convert '{named}' ('{example}').";
         }
         return this.suffixedWhere(value, origin);
@@ -4942,27 +5356,56 @@ class BodyChecker implements NoreturnCalls {
         if (noun.length == 0) {
             return "";
         }
-        return "The '{floatSuffixOf(value)}' makes the literal a 'float', and {noun} is a "
-            + "'{this.originType(origin)}' too.";
+        string type = this.originType(origin);
+        return "The '{floatSuffixOf(value)}' makes the literal a 'float', and {noun} is "
+            + "{typeArticle(type)} '{type}' too.";
     }
 
     // The text after a literal operand that takes its type from the other side of 'operatorText'.
     // The expression is checked against the target set at the operand origin, when it has one.
     operandFix(Expression literal, Expression other, Type toward, string operatorText,
-               bool onRight) -> JoinText {
-        string written = "{asDouble(other)} {operatorText} {oneLineSpelling(literal)}";
+               bool onRight, Widening widening) -> JoinText {
+        string into = this.conversionType(this.operandTarget, widening);
+        string written = "{converted(other, into)} {operatorText} {oneLineSpelling(literal)}";
         if (!onRight) {
-            written = "{oneLineSpelling(literal)} {operatorText} {asDouble(other)}";
+            written = "{oneLineSpelling(literal)} {operatorText} {converted(other, into)}";
         }
         return this.joinFix(other, toward, written, "both sides", this.operandTarget,
-            this.operandOrigin, this.operandJoin);
+            this.operandOrigin, this.operandJoin, widening);
+    }
+
+    // operandFix for the operand 'node' when it is a literal too large for 'toward', or null.
+    operandLiteralFix(Expression node, Expression other, Type toward, string operatorText,
+                      bool onRight) -> JoinText? {
+        let widening = this.joinWidening(node, toward);
+        if (widening == null) {
+            return null;
+        }
+        return this.operandFix(node, other, toward, operatorText, onRight, widening);
+    }
+
+    // The type a value beside a literal converts to so that the literal takes it: the type of
+    // 'target' when it takes the literal and every value beside it, and otherwise the wider type.
+    conversionType(Type? target, Widening widening) -> string {
+        if (target != null && takesLiteral(target, widening)) {
+            return this.names.of(convert.coreOf(target));
+        }
+        return widening.wider;
     }
 
     // The text after a literal that takes its type 'toward' from 'other' in 'join', whose code with
     // 'other' converted is 'written'. 'target' and 'origin' say what the join is checked against,
     // and 'both' names the values a removed suffix makes 'double'.
     joinFix(Expression other, Type toward, string written, string both, Type? target,
-            LiteralOrigin? origin, Expression? join) -> JoinText {
+            LiteralOrigin? origin, Expression? join, Widening widening) -> JoinText {
+        let text = this.joinFixText(other, toward, written, both, target, origin, join, widening);
+        text.covered = widening.literals;
+        return text;
+    }
+
+    // joinFix before it records the literals its fix covers.
+    joinFixText(Expression other, Type toward, string written, string both, Type? target,
+                LiteralOrigin? origin, Expression? join, Widening widening) -> JoinText {
         string named = oneLineSpelling(other);
         if (toward is OptionalType) {
             string why = takesTypeFrom("'{named}'", this.names.of(toward));
@@ -4970,7 +5413,10 @@ class BodyChecker implements NoreturnCalls {
         }
         string type = this.names.of(convert.coreOf(toward));
         string text = takesTypeFrom("'{named}'", type);
-        string advice = this.joinAdvice(other, type, text, written, both, target, origin, join);
+        if (widening.wider.length == 0) {
+            return new JoinText(text, text);
+        }
+        string advice = this.joinAdvice(other, type, text, written, both, target, origin, join, widening);
         let joined = new JoinText(advice, text);
         joined.clause = takesTypeClause("'{named}'", type);
         return joined;
@@ -4978,29 +5424,31 @@ class BodyChecker implements NoreturnCalls {
 
     // joinFix once the type 'toward' is known to have no '?': 'text' says where the type comes from.
     joinAdvice(Expression other, string type, string text, string written, string both, Type? target,
-               LiteralOrigin? origin, Expression? join) -> string {
+               LiteralOrigin? origin, Expression? join, Widening widening) -> string {
         string named = oneLineSpelling(other);
         string suffix = "";
         if (both.length > 0) {
             suffix = floatSuffixOf(other);
         }
-        if (target == null || isDoubleCore(target)) {
+        if (target == null || takesLiteral(target, widening)) {
             if (suffix.length > 0) {
                 return "{text} Remove the '{suffix}' from '{named}' so that {both} are 'double'.";
             }
             return "{text} Convert '{named}' first ('{written}').";
         }
-        if (origin == null) {
+        if (origin == null || (widening.joined && (widening.negative || widening.lowNegative)
+                && isUnsignedCore(origin.declared))) {
             return text;
         }
-        string change = this.originChange(origin);
+        let declaring = this.declarationWidening(origin, widening);
+        string change = this.originChange(origin, declaring);
         if (change.length > 0 && suffix.length > 0) {
             return "{text} {change} and remove the '{suffix}' from '{named}'.";
         }
         if (change.length > 0 && readsPlace(other, originPlace(origin))) {
             string statement = "";
             if (join != null) {
-                statement = this.originStatement(origin, join, oneLineSpelling(join));
+                statement = this.originStatement(origin, join, oneLineSpelling(join), declaring);
             }
             if (statement.length > 0) {
                 return "{text} {change} ('{statement}').";
@@ -5008,22 +5456,24 @@ class BodyChecker implements NoreturnCalls {
             return "{text} {change}.";
         }
         if (change.length > 0) {
-            string example = this.originExample(origin, join, written);
+            string example = this.originExample(origin, join, written, declaring);
             return "{text} {change} and convert '{named}' ('{example}').";
         }
         string noun = originNoun(origin);
         if (noun.length > 0) {
-            return "{takesTypeClause("'{named}'", type)}, and {noun} is a '{this.originType(origin)}' too.";
+            string declared = this.originType(origin);
+            return "{takesTypeClause("'{named}'", type)}, and {noun} is {typeArticle(declared)} '{declared}' "
+                + "too.";
         }
         return text;
     }
 
     // The text after a literal that does not fit the type set at 'origin'.
-    literalFix(LiteralOrigin? origin) -> string {
-        if (origin == null) {
+    literalFix(LiteralOrigin? origin, Widening widening) -> string {
+        if (origin == null || widening.wider.length == 0) {
             return "";
         }
-        string change = this.originChange(origin);
+        string change = this.originChange(origin, widening);
         if (change.length > 0 && origin.kind == OriginKind.Returned) {
             return "{change}.";
         }
@@ -5033,10 +5483,10 @@ class BodyChecker implements NoreturnCalls {
         return this.originWhere(origin);
     }
 
-    // The change that makes the declaration at 'origin' a 'double' one, or an empty string where
+    // The change that makes the declaration at 'origin' take the wider type, or an empty string where
     // no code can change the type in one edit.
-    originChange(LiteralOrigin origin) -> string {
-        string wider = this.doubleSpelling(origin.declared);
+    originChange(LiteralOrigin origin, Widening widening) -> string {
+        string wider = this.widerSpelling(origin.declared, widening);
         if (wider.length == 0) {
             return "";
         }
@@ -5073,8 +5523,8 @@ class BodyChecker implements NoreturnCalls {
 
     // The fixed code an example shows: the statement at 'origin' around 'written' when 'join' is its
     // whole value, and 'written' alone otherwise.
-    originExample(LiteralOrigin origin, Expression? join, string written) -> string {
-        string statement = this.originStatement(origin, join, written);
+    originExample(LiteralOrigin origin, Expression? join, string written, Widening widening) -> string {
+        string statement = this.originStatement(origin, join, written, widening);
         if (statement.length == 0) {
             return written;
         }
@@ -5083,12 +5533,12 @@ class BodyChecker implements NoreturnCalls {
 
     // The statement at 'origin' with 'written' as its value when 'join' is its whole value, or an
     // empty string.
-    originStatement(LiteralOrigin origin, Expression? join, string written) -> string {
+    originStatement(LiteralOrigin origin, Expression? join, string written, Widening widening) -> string {
         let whole = origin.whole;
         if (join == null || whole == null || unwrapParentheses(whole).green() != join.green()) {
             return "";
         }
-        string wider = this.doubleSpelling(origin.declared);
+        string wider = this.widerSpelling(origin.declared, widening);
         switch (origin.statement) {
             is VariableDeclarationNode declaration -> {
                 string modifier = "";
@@ -5117,27 +5567,88 @@ class BodyChecker implements NoreturnCalls {
         }
     }
 
-    // The type spelled with its 'float' changed to 'double', or an empty string when it has no
-    // 'float' under its '?' and '[]' levels.
-    doubleSpelling(Type type) -> string {
+    // The type spelled with the narrow type of 'widening' changed to its wider one, or an empty string
+    // when the narrow type is not under its '?' and '[]' levels.
+    widerSpelling(Type type, Widening widening) -> string {
         if (type is OptionalType) {
-            string inner = this.doubleSpelling(type.inner());
+            string inner = this.widerSpelling(type.inner(), widening);
             if (inner.length == 0) {
                 return "";
             }
             return "{inner}?";
         }
         if (type is ArrayType) {
-            string element = this.doubleSpelling(type.element());
+            string element = this.widerSpelling(type.element(), widening);
             if (element.length == 0) {
                 return "";
             }
             return "{element}[]";
         }
-        if (type is PrimitiveType && type.kind() == PrimitiveKind.Float) {
-            return "double";
+        if (type is PrimitiveType && type.kind() == widening.narrow) {
+            return widening.wider;
         }
         return "";
+    }
+
+    // The widening of an integer literal with 'magnitude' too large for 'target'.
+    integerWidening(bool negative, ulong magnitude, PrimitiveType target) -> Widening {
+        return new Widening(target.kind(), this.names.of(target),
+            widerIntegerHolding(negative, magnitude, target.kind()), negative, magnitude);
+    }
+
+    // The widening of the number literal 'value' when it is too large for the type 'target' has
+    // without its '?', or null.
+    overflowWidening(Expression value, Type target) -> Widening? {
+        Type core = convert.coreOf(target);
+        if (floatLiteralOverflows(value, target) && core is PrimitiveType
+                && core.kind() == PrimitiveKind.Float) {
+            return floatWidening();
+        }
+        if (floatLiteralOverflows(value, target)) {
+            return new Widening(PrimitiveKind.Double, "double", "", false, 0);
+        }
+        let literal = intLiteralOf(unwrapParentheses(value));
+        if (literal == null || !(core is PrimitiveType) || !convert.isIntegerType(core)) {
+            return null;
+        }
+        let magnitude = literalvalues.integerMagnitude(literal.value().text());
+        bool negative = isNegativeLiteral(unwrapParentheses(value));
+        if (magnitude == null || literalvalues.magnitudeFits(negative, magnitude, core.kind())) {
+            return null;
+        }
+        return this.integerWidening(negative, magnitude, core);
+    }
+
+    // overflowWidening for a literal beside a value of type 'target', whose wider type has every
+    // value of 'target' as well as every literal of the join 'root', or of the literal alone.
+    joinWidening(Expression value, Type target, Expression? root = null) -> Widening? {
+        let widening = this.overflowWidening(value, target);
+        if (widening == null || !convert.isIntegerType(convert.coreOf(target))) {
+            return widening;
+        }
+        let joined = new Widening(widening.narrow, widening.narrowName, "", widening.negative,
+            widening.magnitude);
+        joined.joined = true;
+        let literals = new List<Expression>();
+        collectJoinLiterals(root ?? value, literals, true);
+        spanJoinLiterals(joined, literals);
+        joined.wider = joinedIntegerHolding(joined);
+        joined.literals = literals;
+        return joined;
+    }
+
+    // The widening that changes the declaration at 'origin' to the wider type of 'widening'. A joined
+    // literal changes the declared type, which need not be the type beside it.
+    declarationWidening(LiteralOrigin origin, Widening widening) -> Widening {
+        Type core = convert.coreOf(origin.declared);
+        while (core is ArrayType) {
+            core = convert.coreOf(core.element());
+        }
+        if (!widening.joined || !(core is PrimitiveType) || !convert.isIntegerType(core)) {
+            return widening;
+        }
+        return new Widening(core.kind(), this.names.of(core), widening.wider, widening.negative,
+            widening.magnitude);
     }
 
     // The origin of the value a lambda returns, when the lambda's type is declared at 'holder'.
@@ -5150,10 +5661,10 @@ class BodyChecker implements NoreturnCalls {
     }
 
     // The origin of 'value', set by 'kind' at 'name' with type 'declared' in 'statement', or null
-    // when no floating-point literal in 'value' can need it.
+    // when no number literal in 'value' can need it.
     valueOrigin(OriginKind kind, string name, Type declared, Expression value,
                 SyntaxNode? statement = null) -> LiteralOrigin? {
-        if (!mayAdaptFloat(value)) {
+        if (!mayAdaptLiteral(value)) {
             return null;
         }
         let origin = new LiteralOrigin(kind, name, "", declared);
@@ -5190,10 +5701,10 @@ class BodyChecker implements NoreturnCalls {
     }
 
     // The origin of an argument passed as parameter 'index' of 'signature', or null when no
-    // floating-point literal in 'value' can need it. 'constructed' names the type of a constructor.
+    // number literal in 'value' can need it. 'constructed' names the type of a constructor.
     argumentOrigin(Expression value, Signature signature, long index, Type parameterType,
                    string constructed = "") -> LiteralOrigin? {
-        if (!mayAdaptFloat(value)) {
+        if (!mayAdaptLiteral(value)) {
             return null;
         }
         Parameter[] parameters = signature.parameters();
@@ -5207,7 +5718,7 @@ class BodyChecker implements NoreturnCalls {
     }
 
     // The text after a literal branch of a '?:' that takes its type from the other branch, whose
-    // type is 'toward', or an empty string when the branch is no floating-point literal. 'target' is
+    // type is 'toward', or null unless the branch is a literal too large for it. 'target' is
     // the type the '?:' is checked against, set at 'origin'.
     ternaryFix(TernaryExpressionNode node, bool literalThen, Type toward, Type? target,
                LiteralOrigin? origin) -> JoinText? {
@@ -5217,29 +5728,93 @@ class BodyChecker implements NoreturnCalls {
             literal = node.thenValue();
             other = node.elseValue();
         }
-        if (floatLiteralOf(unwrapParentheses(literal)) == null) {
+        let widening = this.joinWidening(literal, toward, this.joinRoot);
+        if (widening == null || isUntypedNumberLiteral(other)) {
             return null;
         }
         string condition = oneLineSpelling(node.condition());
-        string written = "{condition} ? {asDouble(other)} : {oneLineSpelling(literal)}";
+        string into = this.conversionType(target, widening);
+        string written = "{condition} ? {converted(other, into)} : {oneLineSpelling(literal)}";
         if (literalThen) {
-            written = "{condition} ? {oneLineSpelling(literal)} : {asDouble(other)}";
+            written = "{condition} ? {oneLineSpelling(literal)} : {converted(other, into)}";
         }
-        return this.joinFix(other, toward, written, "both branches", target, origin, node);
+        if (this.arrayJoinRoot() != null && widening.joined) {
+            return this.arrayJoinFix(other, toward, target, origin, widening);
+        }
+        return this.joinFix(other, toward, written, "both branches", target, origin, node, widening);
+    }
+
+    // The text after a literal element of the array literal 'node' that takes its type 'toward' from
+    // the first element.
+    elementFix(ArrayLiteralExpressionNode node, Type toward, Widening widening) -> JoinText {
+        let array = this.arrayJoinRoot();
+        if (array != null && array.green() != node.green() && widening.joined) {
+            return this.arrayJoinFix(node.elements(0), toward, null, null, widening);
+        }
+        string written = "[{converted(node.elements(0), widening.wider)}";
+        for (long i = 1; i < node.elementsCount(); i++) {
+            written = "{written}, {oneLineSpelling(node.elements(i))}";
+        }
+        string both = "";
+        if (node.elementsCount() == 2) {
+            both = "both elements";
+        }
+        return this.joinFix(node.elements(0), toward, "{written}]", both, null, null, node, widening);
+    }
+
+    // The fix of a literal of an array literal that takes its type 'toward' from 'beside', whose
+    // refusal waits until every value of the array is analyzed.
+    arrayJoinFix(Expression beside, Type toward, Type? target, LiteralOrigin? origin, Widening widening)
+            -> JoinText {
+        let text = new JoinText("", "");
+        text.beside = beside;
+        text.toward = toward;
+        text.fixTarget = target;
+        text.fixOrigin = origin;
+        text.covered = widening.literals;
+        return text;
+    }
+
+    // The array literal the current join is, when it is one.
+    arrayJoinRoot() -> Expression? {
+        let root = this.joinRoot;
+        if (root is ArrayLiteralExpressionNode) {
+            return root;
+        }
+        return null;
+    }
+
+    // The array literal 'array' spelled with each of its values of the type 'toward' converted to the
+    // type spelled 'into'.
+    arrayConverted(Expression array, Type toward, string into) -> string {
+        let values = new List<Expression>();
+        collectJoinValues(array, values, true);
+        let changed = new List<GreenNode>();
+        for (let value in values) {
+            if (convert.coreOf(this.recordedType(value)) == convert.coreOf(toward)) {
+                changed.push(value.green());
+            }
+        }
+        return spelledConverting(array, changed, into);
     }
 
     // The text after a literal arm that takes its type from the first arm before 'limit' that is
     // not an untyped number literal and has the core type of 'toward'. 'target' is the type the
     // switch is checked against, set at 'origin'.
     switchArmFix(List<Expression> values, List<SwitchArm> arms, long limit, Type toward,
-                 Type? target, LiteralOrigin? origin) -> JoinText? {
+                 Type? target, LiteralOrigin? origin, Widening widening) -> JoinText? {
         Type core = convert.coreOf(toward);
         for (long i = 0; i < limit; i++) {
             let value = values.get(i);
             Type analyzed = this.recordedType(value);
             if (!isUntypedNumberLiteral(value) && convert.coreOf(analyzed) == core) {
-                string written = "{armHead(arms.get(i))} -> {asDouble(value)}";
-                return this.joinFix(value, analyzed, written, onlyTypedArm(values, i), target, origin, null);
+                string into = this.conversionType(target, widening);
+                string written = "{armHead(arms.get(i))} -> {converted(value, into)}";
+                if (this.arrayJoinRoot() != null && widening.joined) {
+                    return this.arrayJoinFix(value, analyzed, target, origin, widening);
+                }
+                return this.joinFix(value, analyzed, written, onlyTypedArm(values, i), target, origin, null,
+                    widening);
             }
         }
         return null;
@@ -5390,8 +5965,11 @@ class BodyChecker implements NoreturnCalls {
     analyzeBitwise(Span span, SyntaxKind operator, string operatorText, Expression leftNode,
                            Expression rightNode, Type left, Type right, WriteTarget? written) -> Type {
         // A bitwise operator takes integers, so only an integer literal adapts to the other side.
-        Type checkedLeft = this.adaptIntegerLiteral(leftNode, right) ?? checkedSide(left, written);
-        Type checkedRight = this.adaptIntegerLiteral(rightNode, left) ?? right;
+        Type checkedLeft = this.adaptIntegerLiteral(leftNode, right, null,
+            this.operandLiteralFix(leftNode, rightNode, right, operatorText, false))
+            ?? checkedSide(left, written);
+        Type checkedRight = this.adaptIntegerLiteral(rightNode, left, null,
+            this.operandLiteralFix(rightNode, leftNode, left, operatorText, true)) ?? right;
         if (checkedLeft is ErrorType || checkedRight is ErrorType) {
             return this.store.errorType();
         }
@@ -5417,7 +5995,13 @@ class BodyChecker implements NoreturnCalls {
     analyzeShift(Span span, SyntaxKind operator, string operatorText, Expression leftNode,
                  Expression rightNode, Type left, Type right, WriteTarget? written) -> Type {
         Type checkedLeft = checkedSide(left, written);
-        Type distance = this.adaptIntegerLiteral(rightNode, checkedLeft) ?? right;
+        JoinText? why = null;
+        if (this.overflowWidening(rightNode, checkedLeft) != null) {
+            string text = takesTypeFrom("'{oneLineSpelling(leftNode)}'",
+                this.names.of(convert.coreOf(checkedLeft)));
+            why = new JoinText(text, text);
+        }
+        Type distance = this.adaptIntegerLiteral(rightNode, checkedLeft, null, why) ?? right;
         if (distance is ErrorType) {
             return this.store.errorType();
         }
@@ -6153,6 +6737,62 @@ class BodyChecker implements NoreturnCalls {
     }
 
     analyzeTernary(TernaryExpressionNode node, Type? target, LiteralOrigin? origin = null) -> Type {
+        let scope = this.beginJoin(node, false);
+        Type analyzed = this.analyzeTernaryValues(node, target, origin);
+        this.endJoin(node, scope);
+        return analyzed;
+    }
+
+    // Makes 'join' the join its values are analyzed in, unless it is a value of the current one and
+    // not 'alone', and returns what to restore afterwards.
+    beginJoin(Expression join, bool alone) -> JoinScope {
+        let scope = new JoinScope(this.joinRoot, this.joinFailures, this.joinMismatches, false);
+        if (alone || this.joinRoot == null || this.joinChild != join.green()) {
+            this.joinRoot = join;
+            this.joinFailures = new List<JoinFailure>();
+            this.joinMismatches = new List<HeldMismatch>();
+            scope.created = true;
+        }
+        this.joinChild = null;
+        return scope;
+    }
+
+    // Keeps the refusal 'message' of a value of the current join until the join ends, when the
+    // refusal of a literal of the join covers it, or reports it outside every join.
+    holdMismatch(string message, Span span) {
+        if (this.joinRoot == null) {
+            this.reporter.report(message, span);
+            return;
+        }
+        this.joinMismatches.push(new HeldMismatch(message, span));
+    }
+
+    // Ends the join 'join' began with 'scope', reporting the literals it kept when it is outermost.
+    endJoin(Expression join, JoinScope scope) {
+        if (scope.created) {
+            this.keepPendingJoinLiterals(join);
+            this.reportJoinFailures(join);
+            if (this.joinFailures.length() == 0) {
+                for (let mismatch in this.joinMismatches) {
+                    this.reporter.report(mismatch.message, mismatch.span);
+                }
+            }
+        }
+        this.joinRoot = scope.root;
+        this.joinFailures = scope.failures;
+        this.joinMismatches = scope.mismatches;
+    }
+
+    // Marks 'value' as the next value of the current join, when it is a join itself, or with 'arrays'
+    // an array literal, which the elements of an array literal share their join with.
+    noteJoinValue(Expression value, bool arrays = false) {
+        Expression core = unwrapParentheses(value);
+        if (isJoin(core) || (arrays && core is ArrayLiteralExpressionNode)) {
+            this.joinChild = core.green();
+        }
+    }
+
+    analyzeTernaryValues(TernaryExpressionNode node, Type? target, LiteralOrigin? origin) -> Type {
         Type? fixTarget = target;
         LiteralOrigin? fixOrigin = origin;
         if (target == null && this.joinNode == node.green()) {
@@ -6163,12 +6803,10 @@ class BodyChecker implements NoreturnCalls {
         Type condition = this.analyzeExpression(node.condition());
         Expression thenValue = node.thenValue();
         Expression elseValue = node.elseValue();
-        // A floating-point literal beside a branch with a type of its own takes that branch's type
-        // when it is a floating-point one, so it is analyzed without the target first.
-        bool thenJoins = floatLiteralOf(unwrapParentheses(thenValue)) != null
-            && !isUntypedNumberLiteral(elseValue);
-        bool elseJoins = floatLiteralOf(unwrapParentheses(elseValue)) != null
-            && !isUntypedNumberLiteral(thenValue);
+        // A number literal beside a branch with a type of its own takes that branch's type when it
+        // is one of the literal's family, so it is analyzed without the target first.
+        bool thenJoins = isUntypedNumberLiteral(thenValue) && !isUntypedNumberLiteral(elseValue);
+        bool elseJoins = isUntypedNumberLiteral(elseValue) && !isUntypedNumberLiteral(thenValue);
         Type? thenTarget = target;
         if (thenJoins) {
             thenTarget = null;
@@ -6183,6 +6821,7 @@ class BodyChecker implements NoreturnCalls {
         let outerDeferred = this.deferredFixes;
         let thenDeferred = new List<DeferredLiteralFix>();
         this.deferredFixes = thenDeferred;
+        this.noteJoinValue(thenValue);
         Type thenType = this.analyzeGuardedBranch(node.condition(), thenValue, true, thenTarget, origin);
         this.clearOperandContext();
         if (elseTarget == null) {
@@ -6190,6 +6829,7 @@ class BodyChecker implements NoreturnCalls {
         }
         let elseDeferred = new List<DeferredLiteralFix>();
         this.deferredFixes = elseDeferred;
+        this.noteJoinValue(elseValue);
         Type elseType = this.analyzeGuardedBranch(node.condition(), elseValue, false, elseTarget, origin);
         this.clearOperandContext();
         this.deferredFixes = outerDeferred;
@@ -6201,24 +6841,23 @@ class BodyChecker implements NoreturnCalls {
         }
         this.noteSuffixedBranch(node, true, elseType, fixTarget, fixOrigin);
         this.noteSuffixedBranch(node, false, thenType, fixTarget, fixOrigin);
-        if (target != null && thenJoins && !isTextualFloat(convert.coreOf(elseType))) {
-            thenType = this.adaptFloatLiteral(thenValue, target, origin) ?? thenType;
+        if (target != null && thenJoins && !joinsLiteral(thenValue, elseType)) {
+            thenType = this.adaptIntegerLiteral(thenValue, target, origin)
+                ?? this.adaptFloatLiteral(thenValue, target, origin) ?? thenType;
         }
-        if (target != null && elseJoins && !isTextualFloat(convert.coreOf(thenType))) {
-            elseType = this.adaptFloatLiteral(elseValue, target, origin) ?? elseType;
+        if (target != null && elseJoins && !joinsLiteral(elseValue, thenType)) {
+            elseType = this.adaptIntegerLiteral(elseValue, target, origin)
+                ?? this.adaptFloatLiteral(elseValue, target, origin) ?? elseType;
         }
-        JoinText? thenFix = null;
-        if (floatLiteralOverflows(thenValue, elseType)) {
-            thenFix = this.ternaryFix(node, true, elseType, fixTarget, fixOrigin);
-        }
-        JoinText? elseFix = null;
-        if (floatLiteralOverflows(elseValue, thenType)) {
-            elseFix = this.ternaryFix(node, false, thenType, fixTarget, fixOrigin);
-        }
-        Type adaptedThen = this.adaptIntegerLiteral(thenValue, elseType)
+        JoinText? thenFix = this.ternaryFix(node, true, elseType, fixTarget, fixOrigin);
+        JoinText? elseFix = this.ternaryFix(node, false, thenType, fixTarget, fixOrigin);
+        this.besideLiteral = isUntypedNumberLiteral(elseValue);
+        Type adaptedThen = this.adaptIntegerLiteral(thenValue, elseType, null, thenFix)
             ?? this.adaptFloatLiteral(thenValue, elseType, null, thenFix) ?? thenType;
-        Type adaptedElse = this.adaptIntegerLiteral(elseValue, thenType)
+        this.besideLiteral = isUntypedNumberLiteral(thenValue);
+        Type adaptedElse = this.adaptIntegerLiteral(elseValue, thenType, null, elseFix)
             ?? this.adaptFloatLiteral(elseValue, thenType, null, elseFix) ?? elseType;
+        this.besideLiteral = false;
         thenType = adaptedThen;
         elseType = adaptedElse;
         if (thenType is ErrorType || elseType is ErrorType) {
@@ -6228,7 +6867,7 @@ class BodyChecker implements NoreturnCalls {
         if (unified != null) {
             return unified;
         }
-        this.reporter.report("The two results of this '?:' are '{this.names.of(thenType)}' and "
+        this.holdMismatch("The two results of this '?:' are '{this.names.of(thenType)}' and "
             + "'{this.names.of(elseType)}', which have no common type. Give both branches the "
             + "same type.", node.span());
         return this.store.errorType();
@@ -6249,7 +6888,7 @@ class BodyChecker implements NoreturnCalls {
         Type right;
         if (left is OptionalType) {
             LiteralOrigin? origin = null;
-            if (mayAdaptFloat(node.right())) {
+            if (mayAdaptLiteral(node.right())) {
                 origin = new LiteralOrigin(OriginKind.Fallback, oneLineSpelling(node.left()), "",
                     left.inner());
             }
@@ -6348,7 +6987,7 @@ class BodyChecker implements NoreturnCalls {
         if (source is ErrorType || target is ErrorType) {
             return this.store.errorType();
         }
-        if (!this.checkClassTypeTest(source, target, false, node.span())) {
+        if (!this.checkClassTypeTest(node.value(), source, target, false, node.span())) {
             return this.store.errorType();
         }
         return this.store.primitive(PrimitiveKind.Bool);
@@ -6378,7 +7017,7 @@ class BodyChecker implements NoreturnCalls {
                 + "'{this.names.of(target)}' always succeeds; use 'as', not 'as?'.", node.span());
             return this.store.errorType();
         }
-        if (!this.checkClassTypeTest(source, target, true, node.span())) {
+        if (!this.checkClassTypeTest(node.value(), source, target, true, node.span())) {
             return this.store.errorType();
         }
         return this.store.optionalOf(target);
@@ -6387,7 +7026,7 @@ class BodyChecker implements NoreturnCalls {
     // The 'is' and 'as?' rule set: the target must be a plain class or interface, and the pair
     // must be able to succeed without always succeeding. Open-typed operands defer to each
     // instantiation.
-    checkClassTypeTest(Type source, Type target, bool isCast, Span span) -> bool {
+    checkClassTypeTest(Expression value, Type source, Type target, bool isCast, Span span) -> bool {
         string operator = "is";
         if (isCast) {
             operator = "as?";
@@ -6412,7 +7051,8 @@ class BodyChecker implements NoreturnCalls {
             this.recordObligation(new TypeTestObligation(source, target, isCast, span));
             return true;
         }
-        let issue = obligations.typeTestIssue(source, target, isCast, this.names);
+        let issue = obligations.typeTestIssue(source, target, isCast, this.names,
+            this.oneLevelGuidance(value, source));
         if (issue != null) {
             this.reporter.report(issue, span);
             return false;
@@ -6430,20 +7070,8 @@ class BodyChecker implements NoreturnCalls {
             return this.store.errorType();
         }
         if (objectType is OptionalType && convert.coreOf(objectType) is ArrayType) {
-            let guidance = this.unstablePlaceGuidance(node.object());
-            if (guidance != null) {
-                this.reporter.report("Cannot index '{this.names.of(objectType)}' because it may "
-                    + "be null. {guidance}", node.span());
-            } else if (objectType.inner() is OptionalType) {
-                this.reporter.report("Cannot index '{this.names.of(objectType)}' because it "
-                    + "may be null at more than one level. Unwrap one level with a null check "
-                    + "('if (value != null)') or a fallback ('value ?? null'), then index the "
-                    + "'{this.names.of(objectType.inner())}' that remains.", node.span());
-            } else {
-                this.reporter.report("Cannot index '{this.names.of(objectType)}' because it may "
-                    + "be null. Check it for null first ('if (value != null)'), or use '?[' to "
-                    + "index it only when it is present.", node.span());
-            }
+            this.reporter.report(this.maybeNullRefusal("Cannot index '{this.names.of(objectType)}' "
+                + "because it", node.object(), objectType), node.span());
             return this.store.errorType();
         }
         if (objectType is ArrayType) {
@@ -6473,10 +7101,10 @@ class BodyChecker implements NoreturnCalls {
         }
         Type inner = objectType.inner();
         if (inner is OptionalType) {
-            this.reporter.report("'?[' looks through one level of null, and the value on its "
-                + "left has type '{this.names.of(objectType)}'. Unwrap one level with a null "
-                + "check ('if (value != null)') or a fallback ('value ?? null'), then index "
-                + "the '{this.names.of(inner)}' that remains.", node.span());
+            this.reporter.report(this.withGuidance("'?[' checks for one level of null, but the value "
+                + "on its left has type '{this.names.of(objectType)}', which can be null at more "
+                + "than one level.", this.nullGuidance(node.object(), objectType,
+                optionalLevels(objectType) - 1)), node.span());
             return this.store.errorType();
         }
         if (inner is ArrayType) {
@@ -6515,7 +7143,8 @@ class BodyChecker implements NoreturnCalls {
             this.recordObligation(new InterpolationObligation(analyzed, hole.span()));
             return;
         }
-        let issue = obligations.interpolationIssue(analyzed, this.names);
+        let issue = obligations.interpolationIssue(analyzed, this.names,
+            this.oneLevelGuidance(hole, analyzed));
         if (issue != null) {
             this.reporter.report(issue, hole.span());
         }
@@ -6533,14 +7162,24 @@ class BodyChecker implements NoreturnCalls {
 
     // Array literal with no target type: the first element's type drives the rest.
     analyzeArrayLiteral(ArrayLiteralExpressionNode node) -> Type {
+        let scope = this.beginJoin(node, false);
+        Type analyzed = this.analyzeArrayElements(node);
+        this.endJoin(node, scope);
+        return analyzed;
+    }
+
+    // analyzeArrayLiteral once the array is the join its elements are analyzed in.
+    analyzeArrayElements(ArrayLiteralExpressionNode node) -> Type {
         if (node.elementsCount() == 0) {
             this.reporter.report("Cannot tell the element type from an empty array literal. "
                 + "Declare the type, for example 'int[] xs = [];'.", node.span());
             return this.store.errorType();
         }
+        this.noteJoinValue(node.elements(0), true);
         Type elementType = this.analyzeExpression(node.elements(0));
         if (elementType is ErrorType) {
             for (long i = 1; i < node.elementsCount(); i++) {
+                this.noteJoinValue(node.elements(i), true);
                 this.analyzeExpression(node.elements(i));
             }
             return this.store.errorType();
@@ -6549,17 +7188,33 @@ class BodyChecker implements NoreturnCalls {
             this.reporter.report("Cannot tell the element type from 'null' alone. Declare it, "
                 + "for example 'string?[] xs = [null, ...];'.", node.elements(0).span());
             for (long i = 1; i < node.elementsCount(); i++) {
+                this.noteJoinValue(node.elements(i), true);
                 this.analyzeExpression(node.elements(i));
             }
             return this.store.errorType();
         }
         for (long i = 1; i < node.elementsCount(); i++) {
-            Type actual = this.analyzeExpressionAdapt(node.elements(i), elementType);
+            Type actual = this.store.errorType();
+            this.noteJoinValue(node.elements(i), true);
+            let widening = this.joinWidening(node.elements(i), elementType, this.joinRoot);
+            if (widening != null && this.isCoveredLiteral(unwrapParentheses(node.elements(i)).green())) {
+                this.analyzeExpression(node.elements(i));
+                this.result.setType(unwrapParentheses(node.elements(i)).green(), this.store.errorType());
+                continue;
+            }
+            if (widening != null) {
+                let fix = this.elementFix(node, elementType, widening);
+                this.analyzeExpression(node.elements(i));
+                actual = this.adaptIntegerLiteral(node.elements(i), elementType, null, fix)
+                    ?? this.adaptFloatLiteral(node.elements(i), elementType, null, fix) ?? actual;
+            } else {
+                actual = this.analyzeExpressionAdapt(node.elements(i), elementType);
+            }
             if (actual is ErrorType) {
                 continue;
             }
             if (!convert.isAssignableStrict(elementType, actual)) {
-                this.reporter.report("Element {i + 1}: " + expectedGot(elementType, actual, this.names)
+                this.holdMismatch("Element {i + 1}: " + expectedGot(elementType, actual, this.names)
                     + "{this.valueAssignabilityHint(elementType, actual, node.elements(i))}",
                     node.elements(i).span());
             }
@@ -6574,23 +7229,46 @@ class BodyChecker implements NoreturnCalls {
         if (target is ErrorType) {
             return this.analyzeArrayLiteral(node);
         }
+        let scope = this.beginJoin(node, false);
+        Type analyzed = this.analyzeArrayElementsAdapt(node, target, origin);
+        this.endJoin(node, scope);
+        return analyzed;
+    }
+
+    // analyzeArrayLiteralAdapt once the array is the join its elements are analyzed in.
+    analyzeArrayElementsAdapt(ArrayLiteralExpressionNode node, Type target, LiteralOrigin? origin) -> Type {
         Type arrayType = convert.coreOf(target);
         if (arrayType is ArrayType) {
             Type elementType = arrayType.element();
             LiteralOrigin? elementOrigin = null;
-            if (origin != null && origin.kind != OriginKind.Parameter && origin.kind != OriginKind.Fallback) {
+            bool element = origin != null
+                && (origin.kind == OriginKind.Parameter || origin.kind == OriginKind.Fallback);
+            if (origin != null && element) {
+                elementOrigin = new LiteralOrigin(origin.kind, origin.name, origin.owner, elementType);
+                elementOrigin.constructed = origin.constructed;
+                elementOrigin.element = true;
+            } else if (origin != null) {
                 elementOrigin = new LiteralOrigin(origin.kind, origin.name, "", origin.declared);
             }
+            let mismatched = new List<long>();
+            let mismatchedTypes = new List<Type>();
             for (long i = 0; i < node.elementsCount(); i++) {
+                this.noteJoinValue(node.elements(i), true);
                 Type actual = this.analyzeExpressionAdapt(node.elements(i), elementType, elementOrigin);
-                if (actual is ErrorType) {
-                    continue;
+                if (!(actual is ErrorType) && !convert.isAssignableStrict(elementType, actual)) {
+                    mismatched.push(i);
+                    mismatchedTypes.push(actual);
                 }
-                if (!convert.isAssignableStrict(elementType, actual)) {
-                    this.reporter.report("Element {i + 1}: " + expectedGot(elementType, actual, this.names)
-                        + "{this.valueAssignabilityHint(elementType, actual, node.elements(i))}",
-                        node.elements(i).span());
-                }
+            }
+            // The refusal of a literal of the array reports the array once, as it does for a '?:',
+            // so an element that does not fit waits for the array and gets no report beside one.
+            for (long j = 0; j < mismatched.length(); j++) {
+                long i = mismatched.get(j);
+                Type actual = mismatchedTypes.get(j);
+                this.joinMismatches.push(new HeldMismatch("Element {i + 1}: "
+                    + expectedGot(elementType, actual, this.names)
+                    + "{this.valueAssignabilityHint(elementType, actual, node.elements(i))}",
+                    node.elements(i).span()));
             }
             return arrayType;
         }
@@ -7133,22 +7811,8 @@ class BodyChecker implements NoreturnCalls {
             return this.store.errorType();
         }
         if (objectType is OptionalType) {
-            let guidance = this.unstablePlaceGuidance(object);
-            if (guidance != null) {
-                this.reporter.report("Cannot read a member of '{this.names.of(objectType)}' "
-                    + "because it may be null here. {guidance}", node.span());
-            } else if (objectType.inner() is OptionalType) {
-                this.reporter.report("Cannot read a member of '{this.names.of(objectType)}' "
-                    + "because it may be null at more than one level. Unwrap one level at a "
-                    + "time with a null check ('if (value != null)') or a fallback "
-                    + "('value ?? null'), until "
-                    + "'{this.names.of(convert.coreOf(objectType))}' remains.", node.span());
-            } else {
-                this.reporter.report("Cannot read a member of '{this.names.of(objectType)}' "
-                    + "because it may be null here. Check it for null first "
-                    + "('if (value != null)'), read it with '?.' to get a nullable result, or "
-                    + "supply a fallback with '??'.", node.span());
-            }
+            this.reporter.report(this.maybeNullRefusal("Cannot read a member of "
+                + "'{this.names.of(objectType)}' because it", object, objectType), node.span());
             return this.store.errorType();
         }
         Type core = this.memberReceiverCore(objectType, name);
@@ -7321,10 +7985,10 @@ class BodyChecker implements NoreturnCalls {
         }
         Type inner = objectType.inner();
         if (inner is OptionalType) {
-            this.reporter.report("'?.' looks through one level of null, and the value on its "
-                + "left has type '{this.names.of(objectType)}'. Unwrap one level with a null "
-                + "check ('if (value != null)') or a fallback ('value ?? null'), then use '?.' "
-                + "on the '{this.names.of(inner)}' that remains.", node.span());
+            this.reporter.report(this.withGuidance("'?.' checks for one level of null, but the value "
+                + "on its left has type '{this.names.of(objectType)}', which can be null at more "
+                + "than one level.", this.nullGuidance(node.object(), objectType,
+                optionalLevels(objectType) - 1)), node.span());
             return this.store.errorType();
         }
         string name = node.member().text();
@@ -7506,8 +8170,7 @@ class BodyChecker implements NoreturnCalls {
             return this.store.errorType();
         }
         if (named is TypeParamType) {
-            this.reportTypeParameterHead(named, generic.span());
-            return this.store.errorType();
+            return named;
         }
         if (named is DeclaredType) {
             if (!named.isGeneric()) {
@@ -7525,11 +8188,12 @@ class BodyChecker implements NoreturnCalls {
         return this.store.errorType();
     }
 
-    reportTypeParameterHead(TypeParamType parameter, Span at) {
+    // Refuses 'written', a static named after the type parameter 'parameter'.
+    reportTypeParameterHead(TypeParamType parameter, string written, Span at) {
         string name = parameter.name();
-        this.reporter.report(this.typeParameterMessage(parameter, "Statics cannot be reached "
-            + "through a type parameter: '{name}' is a different type each time it is used, so "
-            + "'{name}.member' names nothing fixed. Write the type's own name instead.",
+        this.reporter.report(this.typeParameterMessage(parameter, "'{written}' names a static member "
+            + "through the type parameter '{name}', and '{name}' is a different type each time it is used, "
+            + "so '{written}' does not name one static member. Write the type's own name instead.",
             NamePosition.MemberHead), at);
     }
 
@@ -7542,7 +8206,7 @@ class BodyChecker implements NoreturnCalls {
             return this.store.errorType();
         }
         if (head is TypeParamType) {
-            this.reportTypeParameterHead(head, node.span());
+            this.reportTypeParameterHead(head, oneLineSpelling(node), node.span());
             return this.store.errorType();
         }
         this.result.setType(object.green(), head);
@@ -7600,7 +8264,7 @@ class BodyChecker implements NoreturnCalls {
     reportMissingStatic(Type head, DeclaredType owner, string name, Span at) {
         if (!(this.lookupMember(head, name) is MissingMember)) {
             this.reporter.report("'{name}' is an instance member of '{this.names.nameOf(owner)}', so it "
-                + "is reached through a value, not through the type name. Call '{name}' on a "
+                + "is used on a value, not on the type name. Call '{name}' on a "
                 + "value of type '{this.names.nameOf(owner)}'.", at);
             return;
         }
@@ -7613,8 +8277,8 @@ class BodyChecker implements NoreturnCalls {
                 if (declaring != null) {
                     declaringName = declaring.name();
                 }
-                this.reporter.report("Statics are not inherited: '{name}' is declared by "
-                    + "'{declaringName}', so it is reached only through that name. Write "
+                this.reporter.report("'{name}' is declared by '{declaringName}', and a static is not "
+                    + "inherited, so it is always written with '{declaringName}' in front. Write "
                     + "'{declaringName}.{name}'.", at);
                 return;
             }
@@ -7638,7 +8302,7 @@ class BodyChecker implements NoreturnCalls {
             return this.store.errorType();
         }
         if (head is TypeParamType) {
-            this.reportTypeParameterHead(head, node.span());
+            this.reportTypeParameterHead(head, oneLineSpelling(member), node.span());
             this.analyzeArgumentsOnly(arguments);
             return this.store.errorType();
         }
@@ -7766,10 +8430,13 @@ class BodyChecker implements NoreturnCalls {
             return this.store.errorType();
         }
         let argumentTypes = new List<Type>();
+        bool refusedArgument = false;
         for (long i = 0; i < arguments.argumentsCount(); i++) {
             let argument = arguments.arguments(i);
             if (argument is Expression) {
-                argumentTypes.push(this.analyzeExpression(argument));
+                Type analyzed = this.analyzeExpression(argument);
+                refusedArgument = refusedArgument || analyzed is ErrorType;
+                argumentTypes.push(analyzed);
             } else {
                 argumentTypes.push(this.store.errorType());
             }
@@ -7796,6 +8463,9 @@ class BodyChecker implements NoreturnCalls {
                 completedArguments.push(inferred);
                 completedInferences.push(inference);
             }
+        }
+        if (completedIndexes.length() == 0 && refusedArgument) {
+            return this.store.errorType();
         }
         if (completedIndexes.length() == 0) {
             this.reporter.report("Cannot tell the type arguments for "
@@ -7906,17 +8576,17 @@ class BodyChecker implements NoreturnCalls {
         long count = arguments.argumentsCount();
         long required = calls.requiredArgumentCount(signature);
         if (count < required || count > parameters.length) {
-            this.reporter.report("Method '{resolved.name()}' expects "
-                + "{calls.argumentCountText(signature)}, got {count}.", node.span());
+            this.reporter.report(calls.arityRefusal("Method '{resolved.name()}'", signature, count),
+                node.span());
         }
         for (long i = 0; i < count && i < parameters.length; i++) {
             let argument = arguments.arguments(i);
             if (argument is Expression) {
                 Type parameterType = parameters[i].type();
-                this.adaptIntegerLiteral(argument, parameterType);
+                let origin = this.argumentOrigin(argument, signature, i, parameterType);
+                this.adaptIntegerLiteral(argument, parameterType, origin);
                 this.adaptCharLiteral(argument, parameterType);
-                this.adaptFloatLiteral(argument, parameterType,
-                    this.argumentOrigin(argument, signature, i, parameterType));
+                this.adaptFloatLiteral(argument, parameterType, origin);
                 Type actual = argumentTypes.get(i);
                 let updated = this.result.typeOf(argument.green());
                 if (updated != null) {
@@ -7928,9 +8598,7 @@ class BodyChecker implements NoreturnCalls {
                     string provenance = "";
                     if (i < templateParameters.length) {
                         provenance = inference.provenance(templateParameters[i].type(),
-                            "write the type arguments on the type name, as in "
-                            + "'{this.names.nameOf(template)}<{typeParameterExample(template)}>"
-                            + ".{resolved.name()}(...)'", this.names);
+                            this.names.nameOf(template), ".{resolved.name()}(...)", this.names);
                     }
                     string hint = this.valueAssignabilityHint(parameterType, actual, argument);
                     this.reporter.report("Argument {i + 1}: " + expectedGot(parameterType, actual, this.names)
@@ -8172,10 +8840,11 @@ class BodyChecker implements NoreturnCalls {
                 finalType = this.analyzeExpressionAdapt(value, parameterType,
                     this.argumentOrigin(value, chosen.signature(), mapping[i], parameterType, constructed));
             } else if (value != null) {
-                this.adaptIntegerLiteral(value, parameterType);
+                let origin = this.argumentOrigin(value, chosen.signature(), mapping[i], parameterType,
+                    constructed);
+                this.adaptIntegerLiteral(value, parameterType, origin);
                 this.adaptCharLiteral(value, parameterType);
-                this.adaptFloatLiteral(value, parameterType,
-                    this.argumentOrigin(value, chosen.signature(), mapping[i], parameterType, constructed));
+                this.adaptFloatLiteral(value, parameterType, origin);
                 let updated = this.result.typeOf(value.green());
                 if (updated != null) {
                     finalType = updated;
@@ -8209,8 +8878,8 @@ class BodyChecker implements NoreturnCalls {
         long count = arguments.argumentsCount();
         long required = calls.requiredArgumentCount(signature);
         if (count < required || count > parameters.length) {
-            this.reporter.report("{kindWord} '{displayName}' expects "
-                + "{calls.argumentCountText(signature)}, got {count}.", callSpan);
+            this.reporter.report(calls.arityRefusal(calls.calleeSubject(kindWord, displayName), signature,
+                count), callSpan);
         }
         for (long i = 0; i < count; i++) {
             switch (arguments.arguments(i)) {
@@ -8281,7 +8950,7 @@ class BodyChecker implements NoreturnCalls {
     }
 
     // Settles the refusals held for arguments of a call with several candidates against the
-    // parameter the chosen candidate gave them. Beside a 'float' parameter the fix names the
+    // parameter the chosen candidate gave them. Beside a parameter of the literal's type the fix names the
     // parameter, and with no candidate chosen the refusal ends after the why.
     settleParameters(List<DeferredLiteralFix> held) {
         for (let fix in held) {
@@ -8298,15 +8967,19 @@ class BodyChecker implements NoreturnCalls {
             let suffixed = fix.suffixed;
             if (origin == null) {
                 fix.message = fix.plain;
-            } else if (isFloatCore(origin.declared) && suffixed != null) {
+                continue;
+            }
+            let widening = fix.widening ?? floatWidening();
+            string declared = this.originType(origin);
+            if (isFloatCore(origin.declared) && suffixed != null) {
                 string noun = parameterNoun(origin);
                 suffixed.fix = "The '{fix.suffix}' makes the literal a 'float', and {noun} is a "
-                    + "'{this.originType(origin)}' too.";
-            } else if (isFloatCore(origin.declared) && !fix.settled && fix.clause.length > 0
+                    + "'{declared}' too.";
+            } else if (sameCore(origin.declared, widening) && !fix.settled && fix.clause.length > 0
                     && fix.message != fix.plain) {
-                fix.message = "{fix.refusal} {fix.clause}, and {parameterNoun(origin)} is a "
-                    + "'{this.originType(origin)}' too.";
-            } else if (!isDoubleCore(origin.declared)) {
+                fix.message = "{fix.refusal} {fix.clause}, and {parameterNoun(origin)} is "
+                    + "{typeArticle(declared)} '{declared}' too.";
+            } else if (!takesLiteral(origin.declared, widening)) {
                 fix.message = fix.plain;
             }
         }
@@ -8429,17 +9102,8 @@ class BodyChecker implements NoreturnCalls {
                 typeArguments.span());
         }
         if (calleeType is OptionalType) {
-            string check = "if (value != null)";
-            if (calleeName.length > 0) {
-                check = "if ({calleeName} != null)";
-            }
-            string advice = "Check it for null first ('{check}'), or supply a fallback with '??'.";
-            let guidance = this.unstablePlaceGuidance(node.callee());
-            if (guidance != null) {
-                advice = guidance;
-            }
-            this.reporter.report("{subject} has type '{this.names.of(calleeType)}', which may be "
-                + "null here. {advice}", calleeSpan);
+            this.reporter.report(this.maybeNullRefusal("{subject} has type "
+                + "'{this.names.of(calleeType)}', which", node.callee(), calleeType), calleeSpan);
             this.analyzeArgumentsOnly(node.arguments());
             return this.store.errorType();
         }
@@ -8451,9 +9115,10 @@ class BodyChecker implements NoreturnCalls {
         let arguments = node.arguments();
         long count = arguments.argumentsCount();
         if (count != parameters.length) {
-            string expectedCount = argumentCountText(parameters.length);
-            this.reporter.report("{subject} has type '{this.names.of(calleeType)}', so the call "
-                + "takes {expectedCount}, got {count}.", node.span());
+            string[] unnamed = [];
+            this.reporter.report(calls.countRefusal("{subject} has type '{this.names.of(calleeType)}', "
+                + "so it takes", parameters.length, parameters.length, count, "argument", unnamed),
+                node.span());
         }
         for (long i = 0; i < count; i++) {
             switch (arguments.arguments(i)) {
@@ -8471,7 +9136,7 @@ class BodyChecker implements NoreturnCalls {
                     if (i < parameters.length) {
                         Type parameterType = parameters[i];
                         LiteralOrigin? origin = null;
-                        if (mayAdaptFloat(value)) {
+                        if (mayAdaptLiteral(value)) {
                             origin = new LiteralOrigin(OriginKind.Parameter, "", calleeName, parameterType);
                         }
                         Type actual = this.analyzeExpressionAdapt(value, parameterType, origin);
@@ -8509,8 +9174,7 @@ class BodyChecker implements NoreturnCalls {
             }
             let ownerName = this.staticSuggestionOwner(name);
             if (ownerName != null) {
-                this.reporter.report("Statics are called through the type name, even inside "
-                    + "'{ownerName}'; write '{ownerName}.{name}(...)'.", identifier.span());
+                this.reporter.report(this.staticWithoutType(name, ownerName, true), identifier.span());
                 this.analyzeArgumentsOnly(node.arguments());
                 return this.store.errorType();
             }
@@ -8854,8 +9518,7 @@ class BodyChecker implements NoreturnCalls {
         Type result = this.store.optionalOf(this.store.stringType());
         long count = arguments.argumentsCount();
         if (count != 1) {
-            this.reporter.report("'fromCString' expects exactly 1 argument, a handle a C "
-                + "function returned, got {count}.", callSpan);
+            this.reporter.report(fromCStringCountRefusal(count), callSpan);
             this.analyzeArgumentsOnly(arguments);
             return result;
         }
@@ -8915,7 +9578,7 @@ class BodyChecker implements NoreturnCalls {
         if (constructors.length() == 0) {
             if (arguments.argumentsCount() > 0) {
                 this.reporter.report("Base class '{baseName}' has no constructor, so "
-                    + "'super(...)' takes no arguments.", node.span());
+                    + "'super(...)' takes no arguments. Remove the arguments.", node.span());
             } else if (this.inConstructor && receiver != null && allConstructors.length() == 0) {
                 this.checkImplicitBaseChain(receiver, null, false, node.span());
             }
@@ -8985,13 +9648,8 @@ class BodyChecker implements NoreturnCalls {
         // 'hash' reads through the wrapper here.
         if (core is OptionalType) {
             if (name == "slice" && core.inner() is ArrayType) {
-                string advice = "Check it for null first ('if (value != null)').";
-                let guidance = this.unstablePlaceGuidance(object);
-                if (guidance != null) {
-                    advice = guidance;
-                }
-                this.reporter.report("Cannot call 'slice' on '{this.names.of(core)}' because "
-                    + "it may be null. {advice}", node.span());
+                this.reporter.report(this.maybeNullRefusal("Cannot call 'slice' on "
+                    + "'{this.names.of(core)}' because it", object, core), node.span());
                 this.analyzeArgumentsOnly(arguments);
                 return this.store.errorType();
             }
@@ -9141,7 +9799,9 @@ class BodyChecker implements NoreturnCalls {
 
     checkNoArguments(CallExpressionNode node, string name) {
         if (node.arguments().argumentsCount() > 0) {
-            this.reporter.report("'{name}' takes no arguments.", node.span());
+            string[] unnamed = [];
+            this.reporter.report(calls.countRefusal("'{name}' takes", 0, 0, node.arguments().argumentsCount(),
+                "argument", unnamed), node.span());
             this.analyzeArgumentsOnly(node.arguments());
         }
     }
@@ -9150,8 +9810,8 @@ class BodyChecker implements NoreturnCalls {
     checkRangeArguments(CallExpressionNode node, string name) {
         let arguments = node.arguments();
         if (arguments.argumentsCount() != 2) {
-            this.reporter.report("'{name}' expects 2 arguments (start and end), got "
-                + "{arguments.argumentsCount()}.", node.span());
+            this.reporter.report(calls.countRefusal("'{name}' takes", 2, 2, arguments.argumentsCount(),
+                "argument", ["start", "end"]), node.span());
             this.analyzeArgumentsOnly(arguments);
             return;
         }
@@ -9198,16 +9858,12 @@ class BodyChecker implements NoreturnCalls {
         if (explicitList != null) {
             long given = explicitList.argumentsCount();
             if (given != arity) {
-                string expected = "{arity} type arguments";
-                if (arity == 1) {
-                    expected = "1 type argument";
+                let names = new List<string>();
+                for (let parameter in typeParameters) {
+                    names.push(parameter.name());
                 }
-                string wasWere = "were";
-                if (given == 1) {
-                    wasWere = "was";
-                }
-                this.reporter.report("Generic function '{name}' expects {expected}, but "
-                    + "{given} {wasWere} given.", node.span());
+                this.reporter.report(calls.countRefusal("Generic function '{name}' takes", arity, arity,
+                    given, "type argument", names.toArray()), node.span());
                 this.analyzeArgumentsOnly(arguments);
                 return this.store.errorType();
             }
@@ -9220,10 +9876,13 @@ class BodyChecker implements NoreturnCalls {
         // parameter it fills, which is known once the type arguments are resolved. It offers
         // nothing to infer them from either.
         let argumentTypes = new List<Type>();
+        bool refusedArgument = false;
         for (long i = 0; i < arguments.argumentsCount(); i++) {
             let argument = arguments.arguments(i);
-            if (argument is Expression && !needsTargetType(argument)) {
-                argumentTypes.push(this.analyzeExpression(argument));
+            if (argument is Expression && !waitsForParameter(argument, explicitList != null)) {
+                Type analyzed = this.analyzeExpression(argument);
+                refusedArgument = refusedArgument || analyzed is ErrorType;
+                argumentTypes.push(analyzed);
             } else {
                 argumentTypes.push(this.store.errorType());
             }
@@ -9243,6 +9902,9 @@ class BodyChecker implements NoreturnCalls {
         let resolved = new List<Type>();
         for (long i = 0; i < arity; i++) {
             let argument = typeArguments.get(i);
+            if (argument == null && refusedArgument) {
+                return this.store.errorType();
+            }
             if (argument == null) {
                 this.reporter.report("Cannot tell the type argument "
                     + "'{typeParameters[i].name()}' for '{name}' from this call. Write it, for "
@@ -9267,8 +9929,7 @@ class BodyChecker implements NoreturnCalls {
         long count = arguments.argumentsCount();
         long required = calls.requiredArgumentCount(signature);
         if (count < required || count > parameters.length) {
-            this.reporter.report("Function '{name}' expects "
-                + "{calls.argumentCountText(signature)}, got {count}.", node.span());
+            this.reporter.report(calls.arityRefusal("Function '{name}'", signature, count), node.span());
             bounded = false;
         }
         for (long i = 0; i < count && i < parameters.length; i++) {
@@ -9278,10 +9939,10 @@ class BodyChecker implements NoreturnCalls {
                     resolvedArguments);
                 Type actual = argumentTypes.get(i);
                 let origin = this.argumentOrigin(argument, signature, i, parameterType);
-                if (needsTargetType(argument)) {
+                if (waitsForParameter(argument, explicitList != null)) {
                     actual = this.analyzeExpressionAdapt(argument, parameterType, origin);
                 } else {
-                    this.adaptIntegerLiteral(argument, parameterType);
+                    this.adaptIntegerLiteral(argument, parameterType, origin);
                     this.adaptFloatLiteral(argument, parameterType, origin);
                     let updated = this.result.typeOf(argument.green());
                     if (updated != null) {
@@ -9292,9 +9953,7 @@ class BodyChecker implements NoreturnCalls {
                         && !convert.isAssignableStrict(parameterType, actual)) {
                     string provenance = "";
                     if (explicitList == null) {
-                        provenance = inference.provenance(parameters[i].type(), "pass the type "
-                            + "arguments explicitly, as in "
-                            + "'{name}<{typeParameterNamesText(signature)}>(...)'", this.names);
+                        provenance = inference.provenance(parameters[i].type(), name, "(...)", this.names);
                     }
                     string hint = this.valueAssignabilityHint(parameterType, actual, argument);
                     this.reporter.report("Argument {i + 1}: " + expectedGot(parameterType, actual, this.names)
@@ -9325,8 +9984,8 @@ class BodyChecker implements NoreturnCalls {
         Parameter[] parameters = signature.parameters();
         long count = arguments.argumentsCount();
         if (count != parameters.length) {
-            this.reporter.report("External function '{name}' expects "
-                + "{calls.argumentCount(parameters.length)}, got {count}.", node.span());
+            this.reporter.report(calls.arityRefusal("External function '{name}'", signature, count),
+                node.span());
         }
         for (long i = 0; i < count; i++) {
             let argument = arguments.arguments(i);
@@ -9545,14 +10204,10 @@ class BodyChecker implements NoreturnCalls {
             if (arguments != null) {
                 this.checkDirectArguments("Constructor", shownName,
                     classConstructor.signature(), arguments, node.span(), this.names.of(t));
-            } else if (calls.requiredArgumentCount(classConstructor.signature()) > 0) {
-                this.reporter.report("Constructor '{shownName}' expects "
-                    + "{calls.argumentCountText(classConstructor.signature())}, got 0.",
-                    node.span());
             }
         } else if (argumentCount > 0) {
-            this.reporter.report("Class '{shownName}' has no constructor; use "
-                + "'new {shownName}()'.", node.span());
+            this.reporter.report("Class '{shownName}' declares no constructor, so 'new {shownName}(...)' "
+                + "takes no arguments. Write 'new {shownName}()'.", node.span());
             if (arguments != null) {
                 this.analyzeArgumentsOnly(arguments);
             }
@@ -9701,6 +10356,13 @@ class BodyChecker implements NoreturnCalls {
     // A switch used as a value. The target is the type its arms are checked against, and is null where the
     // surroundings offer none.
     analyzeSwitchExpression(SwitchExpressionNode node, Type? target, LiteralOrigin? origin = null) -> Type {
+        let scope = this.beginJoin(node, false);
+        Type analyzed = this.analyzeSwitchValues(node, target, origin);
+        this.endJoin(node, scope);
+        return analyzed;
+    }
+
+    analyzeSwitchValues(SwitchExpressionNode node, Type? target, LiteralOrigin? origin) -> Type {
         Type? fixTarget = target;
         LiteralOrigin? fixOrigin = origin;
         if (target == null && this.joinNode == node.green()) {
@@ -9723,11 +10385,10 @@ class BodyChecker implements NoreturnCalls {
         Type inner = convert.bareOf(scrutineeType);
         bool doublyNullable = !(scrutineeType is ErrorType) && inner is OptionalType;
         if (doublyNullable) {
-            this.reporter.report("Cannot switch on a value of type "
+            this.reporter.report(this.withGuidance("Cannot switch on a value of type "
                 + "'{this.names.of(scrutineeType)}': a 'null ->' arm covers one level of null, "
-                + "and this value may be null at more than one. Unwrap one level with a null "
-                + "check ('if (value != null)') or a fallback ('value ?? null'), then switch "
-                + "on the '{this.names.of(inner)}' that remains.", scrutinee.span());
+                + "and this value may be null at more than one.", this.nullGuidance(scrutinee,
+                scrutineeType, optionalLevels(scrutineeType) - 1)), scrutinee.span());
         }
         bool known = !(scrutineeType is ErrorType) && !doublyNullable;
         bool classScrutinee = known && types.isClassLike(inner);
@@ -9881,7 +10542,7 @@ class BodyChecker implements NoreturnCalls {
             Type neighbourType = this.store.errorType();
             for (long b = 0; b < armValues.length(); b++) {
                 let value = armValues.get(b);
-                bool nullable = value != null && isNullableFloat(this.recordedType(value));
+                bool nullable = value != null && isNullableNumber(this.recordedType(value));
                 if (b != a && value != null && neighbour == null && nullable) {
                     neighbour = value;
                     neighbourType = this.recordedType(value);
@@ -9940,16 +10601,21 @@ class BodyChecker implements NoreturnCalls {
                 unified = analyzed;
                 continue;
             }
-            this.adaptIntegerLiteral(expression, unified);
             JoinText? fix = null;
-            if (floatLiteralOverflows(expression, unified)) {
+            let widening = this.joinWidening(expression, unified, this.joinRoot);
+            if (widening != null) {
                 LiteralOrigin? fixOrigin = null;
                 if (fixTarget != null) {
                     fixOrigin = origin;
                 }
-                fix = this.switchArmFix(valueExpressions, valueArms, i, unified, fixTarget, fixOrigin);
+                fix = this.switchArmFix(valueExpressions, valueArms, i, unified, fixTarget, fixOrigin,
+                    widening);
             }
-            if (this.adaptFloatLiteral(expression, unified, null, fix) is ErrorType) {
+            this.besideLiteral = fix == null;
+            bool refused = this.adaptIntegerLiteral(expression, unified, null, fix) is ErrorType
+                || this.adaptFloatLiteral(expression, unified, null, fix) is ErrorType;
+            this.besideLiteral = false;
+            if (refused) {
                 return this.store.errorType();
             }
             Type adapted = this.recordedType(expression);
@@ -9958,7 +10624,7 @@ class BodyChecker implements NoreturnCalls {
             }
             let joined = convert.unifyValueTypes(unified, analyzed, this.store);
             if (joined == null) {
-                this.reporter.report("Switch arms produce '{this.names.of(unified)}' and "
+                this.holdMismatch("Switch arms produce '{this.names.of(unified)}' and "
                     + "'{this.names.of(analyzed)}', which have no common type. Give every arm "
                     + "the same type.", span);
                 return this.store.errorType();
@@ -9977,34 +10643,80 @@ class BodyChecker implements NoreturnCalls {
         return unified;
     }
 
-    // Adapts the literal arms analyzed without the target to the floating-point type of the other
-    // arms, or else to the target. Returns false when a literal does not fit.
+    // Adapts the literal arms analyzed without the target, or returns false when a literal does not
+    // fit. A floating-point literal takes the type of the other arms when it is a floating-point one,
+    // and an integer literal after an arm with a type of its own the type the arms before it join to
+    // when it is an integer one; either takes the target otherwise.
     adaptLiteralArms(List<Expression> values, List<SwitchArm> arms, Type target,
                      LiteralOrigin? origin) -> bool {
         Type? typed = this.typedArmsJoin(values);
         if (typed is ErrorType) {
             return true;
         }
+        Type? before = null;
+        bool typedBefore = false;
         for (long i = 0; i < values.length(); i++) {
             let value = values.get(i);
+            if (!isUntypedNumberLiteral(value)) {
+                before = this.joinedBefore(before, this.recordedType(value));
+                typedBefore = true;
+                continue;
+            }
             if (floatLiteralOf(unwrapParentheses(value)) == null) {
+                Type? adaptedInteger = null;
+                if (typedBefore && before != null && joinsLiteral(value, before)) {
+                    JoinText? fix = null;
+                    let widening = this.joinWidening(value, before, this.joinRoot);
+                    if (widening != null) {
+                        fix = this.switchArmFix(values, arms, i, before, target, origin, widening);
+                    }
+                    // With no arm of the joined type before it, that type is the target's, and so is
+                    // the literal's refusal.
+                    LiteralOrigin? through = null;
+                    if (fix == null) {
+                        through = origin;
+                    }
+                    adaptedInteger = this.adaptIntegerLiteral(value, before, through, fix);
+                } else {
+                    adaptedInteger = this.adaptIntegerLiteral(value, target, origin)
+                        ?? this.adaptFloatLiteral(value, target, origin);
+                }
+                if (adaptedInteger is ErrorType) {
+                    return false;
+                }
+                before = this.joinedBefore(before, this.recordedType(value));
                 continue;
             }
             Type? adapted = null;
-            if (typed != null && isTextualFloat(convert.coreOf(typed))) {
+            if (typed != null && joinsLiteral(value, typed)) {
                 JoinText? fix = null;
-                if (floatLiteralOverflows(value, typed)) {
-                    fix = this.switchArmFix(values, arms, values.length(), typed, target, origin);
+                let widening = this.joinWidening(value, typed, this.joinRoot);
+                if (widening != null) {
+                    fix = this.switchArmFix(values, arms, values.length(), typed, target, origin, widening);
                 }
-                adapted = this.adaptFloatLiteral(value, typed, null, fix);
+                adapted = this.adaptIntegerLiteral(value, typed, null, fix)
+                    ?? this.adaptFloatLiteral(value, typed, null, fix);
             } else {
-                adapted = this.adaptFloatLiteral(value, target, origin);
+                adapted = this.adaptIntegerLiteral(value, target, origin)
+                    ?? this.adaptFloatLiteral(value, target, origin);
             }
             if (adapted is ErrorType) {
                 return false;
             }
+            before = this.joinedBefore(before, this.recordedType(value));
         }
         return true;
+    }
+
+    // The type the arm values so far join to once 'next' joins them, or null when they have none.
+    joinedBefore(Type? before, Type next) -> Type? {
+        if (next is ErrorType) {
+            return before;
+        }
+        if (before == null) {
+            return next;
+        }
+        return convert.unifyValueTypes(before, next, this.store);
     }
 
     // The type the arm values that are not untyped number literals join to, or null when they have
@@ -10290,8 +11002,8 @@ class BodyChecker implements NoreturnCalls {
         return sawBlock;
     }
 
-    // With 'deferLiterals', a floating-point literal arm is analyzed without the target, so it can
-    // take the type of the arms that have one. 'origin' is where the target is set, and 'fixTarget'
+    // With 'deferLiterals', a number literal arm is analyzed without the target, so it can take the
+    // type of the arms that have one. 'origin' is where the target is set, and 'fixTarget'
     // is the target the arm values of a switch analyzed without one are judged against.
     walkArmBody(ArmBody body, bool requireValue, Type? target, List<Expression> sink,
                         List<Map<NarrowingPath, Type>> armNarrowings,
@@ -10311,7 +11023,10 @@ class BodyChecker implements NoreturnCalls {
                 return sawBlock;
             },
             is Expression expression -> {
-                bool deferred = deferLiterals && floatLiteralOf(unwrapParentheses(expression)) != null;
+                if (requireValue) {
+                    this.noteJoinValue(expression);
+                }
+                bool deferred = deferLiterals && isUntypedNumberLiteral(expression);
                 if (target != null && !deferred) {
                     this.analyzeExpressionAdapt(expression, target, origin);
                 } else {
@@ -10525,11 +11240,17 @@ parameterCountText(long count) -> string {
     return "{count} parameters";
 }
 
-argumentCountText(long count) -> string {
-    if (count == 1) {
-        return "1 argument";
+// The refusal of a 'fromCString' call that passes 'count' arguments.
+fromCStringCountRefusal(long count) -> string {
+    string refusal = "'fromCString' takes one argument, a handle a C function returned, but this call "
+        + "passes {diagnostics.countWord(count)}.";
+    if (count == 0) {
+        return "{refusal} Pass the handle.";
     }
-    return "{count} arguments";
+    if (count == 2) {
+        return "{refusal} Remove the extra argument.";
+    }
+    return "{refusal} Remove the extra arguments.";
 }
 
 // A lambda of the right arity, as a diagnostic shows the shape to write: '(a, b) -> ...'.
@@ -10589,6 +11310,12 @@ overflowsFloatWithin(Expression value) -> bool {
         return literalOverflows(literal, PrimitiveKind.Float);
     }
     return carriesOverflowingFloat(core);
+}
+
+// Whether an argument of a generic call is analyzed once its parameter type is known. With the type
+// arguments 'written', an array literal is too, so that its literals take the element type.
+waitsForParameter(Expression value, bool written) -> bool {
+    return needsTargetType(value) || (written && value is ArrayLiteralExpressionNode);
 }
 
 needsTargetType(Expression value) -> bool {
@@ -10695,10 +11422,14 @@ operandsAdvice(NullableOperand[] operands, string operatorText = "") -> string? 
         }
     }
     string advice = "";
+    string first = "";
     for (long i = 0; i < operands.length; i++) {
         let one = formAdvice([operands[i]], operatorText);
-        if (one != null && (i == 0 || !samePlace(operands[0], operands[i]))) {
+        if (one != null && (i == 0 || (!samePlace(operands[0], operands[i]) && one != first))) {
             advice = "{advice} {one}";
+        }
+        if (i == 0 && one != null) {
+            first = one;
         }
     }
     if (advice.length == 0) {
@@ -10718,7 +11449,7 @@ formAdvice(NullableOperand[] operands, string operatorText) -> string? {
             if (first.levels == 1) {
                 return "Check {names} for null first ('if ({condition})').";
             }
-            return "Check {names} for null{repeatedCheck(condition, first.levels)}.";
+            return "Check {names} for null{repeatedCheck(condition, first.levels, first.everyLevel)}.";
         },
         Copied -> {
             return copiedAdvice(operands, "null check", "check");
@@ -10729,10 +11460,75 @@ formAdvice(NullableOperand[] operands, string operatorText) -> string? {
         Guarded -> {
             return guardedAdvice(operands, operatorText);
         },
+        NoFix -> {
+            return fallbackAdvice(operands, false);
+        },
         default -> {
             return null;
         },
     }
+}
+
+// The advice for the values read where no statement can go, which only a '??' fallback can give a
+// value, or with 'any' for values of any form. A write gets none, because '??' makes no place.
+fallbackAdvice(NullableOperand[] operands, bool any) -> string? {
+    let first = operands[0];
+    let named = new List<string>();
+    for (let operand in operands) {
+        if (operand.writes || operand.levels == 0 || (!any && operand.form != OperandForm.NoFix)) {
+            return null;
+        }
+        named.push("'{operand.spelling}'");
+    }
+    string fallbacks = "a fallback for {named.get(0)}";
+    if (operands.length > 1) {
+        fallbacks = "fallbacks for {diagnostics.andJoined(named.toArray())}";
+    }
+    if (first.levels < 2) {
+        return "Supply {fallbacks} with '??'.";
+    }
+    string times = timesWord(first.levels);
+    if (!first.everyLevel) {
+        return "Supply {fallbacks} with '??' {times}.";
+    }
+    return "Supply {fallbacks} with '??' {times}, once for each '?'.";
+}
+
+// Whether the value is a '?:' or a switch expression.
+isJoin(Expression value) -> bool {
+    return value is TernaryExpressionNode || value is SwitchExpressionNode;
+}
+
+// The value an expression arm produces, or null for a block arm.
+armValue(SwitchArm arm) -> Expression? {
+    ArmBody? body = null;
+    switch (arm) {
+        is ValueArmNode value -> {
+            body = value.body();
+        },
+        is TypeArmNode typed -> {
+            body = typed.body();
+        },
+        is DefaultArmNode fallback -> {
+            body = fallback.body();
+        },
+        is ErrorSwitchArmNode ignored -> { },
+    }
+    if (body is Expression) {
+        return body;
+    }
+    return null;
+}
+
+// "twice", "three times" or "N times".
+timesWord(long levels) -> string {
+    if (levels == 2) {
+        return "twice";
+    }
+    if (levels == 3) {
+        return "three times";
+    }
+    return "{levels} times";
 }
 
 // The advice for one or two call results, or fields read from them, stored in locals to check.
@@ -10873,7 +11669,7 @@ localsFix(NullableOperand[] operands, string verb, bool forNull, string place) -
         }
     }
     string condition = joinedValues(operands, false, "", " != null", " && ");
-    checked = checked + repeatedCheck(condition, operands[0].levels);
+    checked = checked + repeatedCheck(condition, operands[0].levels, operands[0].everyLevel);
     if (place.length == 0) {
         return "{where} first ('{declarations}') and {checked}.";
     }
@@ -11253,23 +12049,21 @@ optionalLevels(Type type) -> long {
     return levels;
 }
 
-// The words that spell out one nested null check per '?' of 'condition', or nothing for one level.
-repeatedCheck(string condition, long levels) -> string {
+// The words that spell out 'levels' nested null checks of 'condition', or nothing for one level.
+// 'everyLevel' is true when the checks remove every '?' of the type.
+repeatedCheck(string condition, long levels, bool everyLevel) -> string {
     if (levels < 2) {
         return "";
     }
-    string times = "{levels} times";
-    if (levels == 2) {
-        times = "twice";
-    }
-    if (levels == 3) {
-        times = "three times";
-    }
+    string times = timesWord(levels);
     string opened = "";
     string closed = "";
     for (long i = 0; i < levels; i++) {
         opened = opened + "if ({condition}) \{ ";
         closed = closed + " \}";
+    }
+    if (!everyLevel) {
+        return " {times} ('{opened}...{closed}')";
     }
     return " {times}, once for each '?' ('{opened}...{closed}')";
 }
@@ -11298,8 +12092,8 @@ valueConformanceHint(Type target, Type source, TypeNames names) -> string {
 }
 
 // Guidance appended to an assignability failure: a value type flowing into an interface it
-// conforms to, or a source nullable at more levels than the slot it flows into, each of which has
-// to be unwrapped. It opens with a space, because the sentence before it ends with a full stop.
+// conforms to, or 'null' flowing into a type without '?'. It opens with a space, because the
+// sentence before it ends with a full stop.
 assignabilityHint(Type target, Type source, TypeNames names) -> string {
     if (target is ErrorType) {
         return "";
@@ -11308,30 +12102,25 @@ assignabilityHint(Type target, Type source, TypeNames names) -> string {
     if (conformance.length > 0) {
         return conformance;
     }
-    if (source is OptionalType) {
-        long levels = 0;
-        Type remaining = source;
-        while (remaining is OptionalType) {
-            remaining = remaining.inner();
-            levels++;
-            if (!convert.isAssignableStrict(target, remaining)) {
-                continue;
-            }
-            if (levels == 1) {
-                return " The value may be null here; check it first "
-                    + "('if (value != null)'), or supply a fallback with '??'.";
-            }
-            return " The value may be null at {levels} levels, and each one has to be "
-                + "unwrapped: check it for null ('if (value != null)') or supply a fallback "
-                + "('value ?? null'), once per level.";
-        }
-        return "";
-    }
     if (source is NullType && !(target is OptionalType)) {
         return " '{names.of(target)}' can never be null; write the type as "
             + "'{names.nullableOf(target)}' if it should allow null.";
     }
     return "";
+}
+
+// How many '?' levels 'source' loses before a value of it fits 'target', or 0 when none does.
+nullLevelsAbove(Type target, Type source) -> long {
+    long levels = 0;
+    Type remaining = source;
+    while (remaining is OptionalType) {
+        remaining = remaining.inner();
+        levels++;
+        if (convert.isAssignableStrict(target, remaining)) {
+            return levels;
+        }
+    }
+    return 0;
 }
 
 typeParameterNamesText(Signature signature) -> string {
@@ -11393,17 +12182,32 @@ takesTypeFrom(string from, string type) -> string {
 
 // The sentence of 'takesTypeFrom' without its full stop, for a clause to follow it.
 takesTypeClause(string from, string type) -> string {
-    return "The literal takes its type from {from}, a '{type}'";
+    return "The literal takes its type from {from}, {typeArticle(type)} '{type}'";
+}
+
+// "an" before a type name that starts with a vowel sound, as 'int' does, and "a" otherwise.
+typeArticle(string type) -> string {
+    if (type.startsWith("i") || type.startsWith("a") || type.startsWith("e") || type.startsWith("o")
+            || type.startsWith("I") || type.startsWith("A") || type.startsWith("E") || type.startsWith("O")) {
+        return "an";
+    }
+    return "a";
 }
 
 // The parameter or the '??' value that sets the type at 'origin', or an empty string for any other
-// origin.
+// origin. An element origin names the element type of either.
 originNoun(LiteralOrigin origin) -> string {
     switch (origin.kind) {
         Parameter -> {
+            if (origin.element) {
+                return "the element type of {parameterNoun(origin)}";
+            }
             return parameterNoun(origin);
         },
         Fallback -> {
+            if (origin.element) {
+                return "the element type of '{origin.name}'";
+            }
             return "the value of '{origin.name}'";
         },
         default -> {
@@ -11494,9 +12298,310 @@ readsPlace(Expression value, string place) -> bool {
     return false;
 }
 
-// Whether the type is a 'float' under at least one '?'.
-isNullableFloat(Type type) -> bool {
-    return type is OptionalType && isFloatCore(type);
+// Whether the type is a number type under at least one '?'.
+isNullableNumber(Type type) -> bool {
+    return type is OptionalType && convert.isNumericType(convert.coreOf(type));
+}
+
+// The widening of a 'float' literal too large for 'float'.
+floatWidening() -> Widening {
+    return new Widening(PrimitiveKind.Float, "float", "double", false, 0);
+}
+
+// Whether the type has the narrow type of 'widening' under its '?' levels.
+sameCore(Type type, Widening widening) -> bool {
+    Type core = convert.coreOf(type);
+    return core is PrimitiveType && core.kind() == widening.narrow;
+}
+
+// Whether the type under its '?' levels takes the literal of 'widening', and every value beside a
+// joined one.
+takesLiteral(Type type, Widening widening) -> bool {
+    Type core = convert.coreOf(type);
+    if (!(core is PrimitiveType)) {
+        return false;
+    }
+    if (widening.narrow == PrimitiveKind.Float || widening.narrow == PrimitiveKind.Double) {
+        return core.kind() == PrimitiveKind.Double;
+    }
+    if (!convert.isIntegerType(core) || (widening.joined && !holdsEveryValue(core.kind(), widening.narrow))) {
+        return false;
+    }
+    return fitsJoinLiterals(widening, core.kind());
+}
+
+// Whether the integer kind takes the literal of 'widening' and, for a joined one, every literal of
+// its join.
+fitsJoinLiterals(Widening widening, PrimitiveKind kind) -> bool {
+    if (!literalvalues.magnitudeFits(widening.negative, widening.magnitude, kind)) {
+        return false;
+    }
+    if (!widening.joined) {
+        return true;
+    }
+    if (widening.beyond || !literalvalues.magnitudeFits(false, widening.high, kind)) {
+        return false;
+    }
+    return !widening.lowNegative || literalvalues.magnitudeFits(true, widening.low, kind);
+}
+
+// Adds to 'found' each untyped integer literal that is a value of the join 'value', through nested
+// '?:' and switch values and, at the 'top', the elements of an array literal.
+collectJoinLiterals(Expression value, List<Expression> found, bool top) {
+    let leaves = new List<Expression>();
+    joinLeaves(value, leaves, top);
+    for (let leaf in leaves) {
+        if (intLiteralOf(leaf) != null) {
+            found.push(leaf);
+        }
+    }
+}
+
+// collectJoinLiterals for the values of the join that are no untyped integer literal.
+collectJoinValues(Expression value, List<Expression> found, bool top) {
+    let leaves = new List<Expression>();
+    joinLeaves(value, leaves, top);
+    for (let leaf in leaves) {
+        if (intLiteralOf(leaf) == null) {
+            found.push(leaf);
+        }
+    }
+}
+
+// Adds to 'found' each value of the join 'value' that is no join itself, through nested '?:' and
+// switch values and, at the 'top' or inside an array literal, the elements of an array literal.
+joinLeaves(Expression value, List<Expression> found, bool top) {
+    Expression core = unwrapParentheses(value);
+    switch (core) {
+        is ArrayLiteralExpressionNode array -> {
+            if (!top) {
+                found.push(core);
+                return;
+            }
+            for (long i = 0; i < array.elementsCount(); i++) {
+                let element = array.elements(i);
+                joinLeaves(element, found, unwrapParentheses(element) is ArrayLiteralExpressionNode);
+            }
+        },
+        is TernaryExpressionNode ternary -> {
+            joinLeaves(ternary.thenValue(), found, false);
+            joinLeaves(ternary.elseValue(), found, false);
+        },
+        is SwitchExpressionNode join -> {
+            for (let arm in armsOfExpression(join)) {
+                let body = armValue(arm);
+                if (body != null) {
+                    joinLeaves(body, found, false);
+                }
+            }
+        },
+        default -> {
+            found.push(core);
+        },
+    }
+}
+
+// Whether a report of 'literal' waits among 'pending', the literals nothing gave a type to.
+isPendingLiteral(List<PendingLiteralRange> pending, Expression literal) -> bool {
+    for (let range in pending) {
+        if (range.green == literal.green()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Whether 'node' is an untyped integer literal among the values of the join 'root'.
+isJoinLiteral(Expression root, Expression node) -> bool {
+    let literals = new List<Expression>();
+    collectJoinLiterals(root, literals, true);
+    for (let literal in literals) {
+        if (literal.green() == unwrapParentheses(node).green()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Records on 'widening' the most negative and the largest of the literals.
+spanJoinLiterals(Widening widening, List<Expression> literals) {
+    for (let literal in literals) {
+        let token = intLiteralOf(literal);
+        let magnitude = token == null ? null : literalvalues.integerMagnitude(token.value().text());
+        if (magnitude == null) {
+            widening.beyond = true;
+        } else if (isNegativeLiteral(literal) && (!widening.lowNegative || magnitude > widening.low)) {
+            widening.lowNegative = true;
+            widening.low = magnitude;
+        } else if (!isNegativeLiteral(literal) && magnitude > widening.high) {
+            widening.high = magnitude;
+        }
+    }
+    widening.literals = literals;
+}
+
+// The integer type a suggestion names for the literals of a join given the type 'from': the
+// narrowest wider one of the same signedness that takes every literal and every value of each kind
+// in 'kinds', or else the narrowest of the other signedness at least as wide. Empty when none does.
+commonIntegerHolding(PrimitiveKind from, PrimitiveKind[] kinds, Widening widening) -> string {
+    if (from == PrimitiveKind.Char) {
+        return "";
+    }
+    PrimitiveKind[] signed = [PrimitiveKind.Short, PrimitiveKind.Int, PrimitiveKind.Long];
+    PrimitiveKind[] unsigned = [PrimitiveKind.UShort, PrimitiveKind.UInt, PrimitiveKind.ULong];
+    PrimitiveKind[] same = signed;
+    PrimitiveKind[] other = unsigned;
+    if (isUnsignedKind(from)) {
+        same = unsigned;
+        other = signed;
+    }
+    long width = integerWidth(from);
+    for (let kind in same) {
+        if (integerWidth(kind) > width && takesJoin(kind, kinds, widening)) {
+            return primitiveKindName(kind);
+        }
+    }
+    for (let kind in other) {
+        if (integerWidth(kind) >= width && takesJoin(kind, kinds, widening)) {
+            return primitiveKindName(kind);
+        }
+    }
+    return "";
+}
+
+// Whether the integer kind takes every literal of 'widening' and every value of each kind in 'kinds'.
+takesJoin(PrimitiveKind kind, PrimitiveKind[] kinds, Widening widening) -> bool {
+    for (let inner in kinds) {
+        if (inner != kind && !holdsEveryValue(kind, inner)) {
+            return false;
+        }
+    }
+    return fitsJoinLiterals(widening, kind);
+}
+
+// The arm of a switch in the join 'value' whose value is 'leaf', written with 'replacement' as its
+// value, or null when no switch arm has that value.
+armExample(Expression value, GreenNode leaf, string replacement) -> string? {
+    Expression core = unwrapParentheses(value);
+    switch (core) {
+        is SwitchExpressionNode join -> {
+            for (let arm in armsOfExpression(join)) {
+                let body = armValue(arm);
+                if (body != null && unwrapParentheses(body).green() == leaf) {
+                    return "{armHead(arm)} -> {replacement}";
+                }
+                if (body != null) {
+                    let inner = armExample(body, leaf, replacement);
+                    if (inner != null) {
+                        return inner;
+                    }
+                }
+            }
+        },
+        is TernaryExpressionNode ternary -> {
+            return armExample(ternary.thenValue(), leaf, replacement)
+                ?? armExample(ternary.elseValue(), leaf, replacement);
+        },
+        default -> { },
+    }
+    return null;
+}
+
+// The value spelled on one line with each of its parts in 'changed' converted to the type 'into'.
+spelledConverting(Expression value, List<GreenNode> changed, string into) -> string {
+    for (let part in changed) {
+        if (unwrapParentheses(value).green() == part) {
+            return converted(unwrapParentheses(value), into);
+        }
+    }
+    switch (value) {
+        is ParenthesizedExpressionNode inner -> {
+            return "({spelledConverting(inner.inner(), changed, into)})";
+        },
+        is TernaryExpressionNode ternary -> {
+            string then = spelledConverting(ternary.thenValue(), changed, into);
+            return "{oneLineSpelling(ternary.condition())} ? {then} : "
+                + spelledConverting(ternary.elseValue(), changed, into);
+        },
+        is ArrayLiteralExpressionNode array -> {
+            string elements = "";
+            for (long i = 0; i < array.elementsCount(); i++) {
+                if (i > 0) {
+                    elements = "{elements}, ";
+                }
+                elements = elements + spelledConverting(array.elements(i), changed, into);
+            }
+            return "[{elements}]";
+        },
+        is SwitchExpressionNode join -> {
+            string arms = "";
+            for (let arm in armsOfExpression(join)) {
+                let body = armValue(arm);
+                string spelled = "...";
+                if (body != null) {
+                    spelled = spelledConverting(body, changed, into);
+                }
+                arms = "{arms} {armHead(arm)} -> {spelled},";
+            }
+            return "switch ({oneLineSpelling(join.scrutinee())}) \{{arms} \}";
+        },
+        default -> {
+            return oneLineSpelling(value);
+        },
+    }
+}
+
+// Whether the type is an unsigned integer type under its '?' levels.
+isUnsignedCore(Type type) -> bool {
+    Type core = convert.coreOf(type);
+    return core is PrimitiveType && isUnsignedKind(core.kind());
+}
+
+// Whether the integer kind has no negative values.
+isUnsignedKind(PrimitiveKind kind) -> bool {
+    return kind == PrimitiveKind.Byte || kind == PrimitiveKind.UShort || kind == PrimitiveKind.UInt
+        || kind == PrimitiveKind.ULong || kind == PrimitiveKind.Char;
+}
+
+// Whether every value of the integer kind 'inner' is a value of the integer kind 'outer'.
+holdsEveryValue(PrimitiveKind outer, PrimitiveKind inner) -> bool {
+    if (outer == PrimitiveKind.Char) {
+        return inner == PrimitiveKind.Char;
+    }
+    long innerWidth = integerWidth(inner);
+    if (inner == PrimitiveKind.Char) {
+        innerWidth = 21;
+    }
+    if (isUnsignedKind(inner) && !isUnsignedKind(outer)) {
+        return integerWidth(outer) > innerWidth;
+    }
+    if (!isUnsignedKind(inner) && isUnsignedKind(outer)) {
+        return false;
+    }
+    return integerWidth(outer) >= innerWidth;
+}
+
+// The narrowest integer type with every value of the type beside a joined literal and every literal
+// of its join among its values, preferring the signedness of the type beside it at each width. Empty
+// when no integer type has them all.
+joinedIntegerHolding(Widening widening) -> string {
+    PrimitiveKind beside = widening.narrow;
+    PrimitiveKind[] signed = [PrimitiveKind.Short, PrimitiveKind.Int, PrimitiveKind.Long];
+    PrimitiveKind[] unsigned = [PrimitiveKind.UShort, PrimitiveKind.UInt, PrimitiveKind.ULong];
+    for (long i = 0; i < 3; i++) {
+        PrimitiveKind first = signed[i];
+        PrimitiveKind second = unsigned[i];
+        if (isUnsignedKind(beside)) {
+            first = unsigned[i];
+            second = signed[i];
+        }
+        for (let kind in [first, second]) {
+            if (kind != beside && holdsEveryValue(kind, beside) && fitsJoinLiterals(widening, kind)) {
+                return primitiveKindName(kind);
+            }
+        }
+    }
+    return "";
 }
 
 // Whether the type is 'float' under its '?' levels.
@@ -11511,13 +12616,14 @@ unsuffixedSpelling(Expression literal) -> string {
     return spelled.substring(0, spelled.length - 1);
 }
 
-// Whether the value is a floating-point literal, or a '?:', switch, lambda, array literal or
-// operator that can contain one, under its parentheses and sign.
-mayAdaptFloat(Expression value) -> bool {
+// Whether the value is a number literal, or a '?:', switch, lambda, array literal or operator that
+// can contain one, under its parentheses and sign.
+mayAdaptLiteral(Expression value) -> bool {
     Expression core = operandCore(value);
     if (core is LiteralExpressionNode) {
         SyntaxKind kind = core.value().kind();
-        return kind == SyntaxKind.FloatLiteral || kind == SyntaxKind.DoubleLiteral;
+        return kind == SyntaxKind.FloatLiteral || kind == SyntaxKind.DoubleLiteral
+            || kind == SyntaxKind.IntLiteral;
     }
     return core is TernaryExpressionNode || core is SwitchExpressionNode || core is LambdaExpressionNode
         || core is ArrayLiteralExpressionNode || core is BinaryExpressionNode;
@@ -11541,6 +12647,16 @@ onlyTypedArm(List<Expression> values, long index) -> string {
         return "both arms";
     }
     return "all arms";
+}
+
+// Whether the untyped number literal 'literal' takes the type 'beside' has, as a floating-point
+// literal takes a floating-point type and an integer literal an integer type.
+joinsLiteral(Expression literal, Type beside) -> bool {
+    Type core = convert.coreOf(beside);
+    if (floatLiteralOf(unwrapParentheses(literal)) != null) {
+        return isTextualFloat(core);
+    }
+    return convert.isIntegerType(core);
 }
 
 // Whether the expression is a number literal with no suffix, which takes its type from where it
@@ -11735,20 +12851,103 @@ isNegativeLiteral(Expression node) -> bool {
     return false;
 }
 
-// The narrowest integer kind past `from` that holds the value, for a suggestion. Empty when no
-// integer kind does, which is the only case with nothing to reach for.
+// The integer type a suggestion names for a value too large for 'from': the narrowest wider one of
+// the same signedness that takes it, or else the narrowest of the other signedness at least as wide.
+// Empty when no integer type takes the value, and for 'char'.
 widerIntegerHolding(bool negative, ulong magnitude, PrimitiveKind from) -> string {
-    bool fromIsLong = from == PrimitiveKind.Long;
-    if (negative) {
-        if (!fromIsLong && magnitude <= 9223372036854775808) {
-            return "long";
-        }
+    if (from == PrimitiveKind.Char) {
         return "";
     }
-    if (!fromIsLong && magnitude <= 9223372036854775807) {
-        return "long";
+    bool unsigned = from == PrimitiveKind.Byte || from == PrimitiveKind.UShort || from == PrimitiveKind.UInt
+        || from == PrimitiveKind.ULong;
+    PrimitiveKind[] same = [PrimitiveKind.Short, PrimitiveKind.Int, PrimitiveKind.Long];
+    PrimitiveKind[] other = [PrimitiveKind.UShort, PrimitiveKind.UInt, PrimitiveKind.ULong];
+    if (unsigned) {
+        same = other;
+        other = [PrimitiveKind.Short, PrimitiveKind.Int, PrimitiveKind.Long];
     }
-    return "ulong";
+    long width = integerWidth(from);
+    for (let kind in same) {
+        if (integerWidth(kind) > width && literalvalues.magnitudeFits(negative, magnitude, kind)) {
+            return primitiveKindName(kind);
+        }
+    }
+    for (let kind in other) {
+        if (integerWidth(kind) >= width && literalvalues.magnitudeFits(negative, magnitude, kind)) {
+            return primitiveKindName(kind);
+        }
+    }
+    return "";
+}
+
+// The bits an integer kind has.
+integerWidth(PrimitiveKind kind) -> long {
+    return switch (kind) {
+        Byte -> 8,
+        Short, UShort -> 16,
+        Int, UInt -> 32,
+        default -> 64,
+    };
+}
+
+// The name an integer kind is written with.
+primitiveKindName(PrimitiveKind kind) -> string {
+    return switch (kind) {
+        Short -> "short",
+        UShort -> "ushort",
+        Int -> "int",
+        UInt -> "uint",
+        Long -> "long",
+        default -> "ulong",
+    };
+}
+
+// The sentence stating that an integer literal, spelled 'written', is past the range of the kind
+// spelled 'name'.
+integerPastRange(string written, bool negative, PrimitiveKind kind, string name) -> string {
+    if (negative) {
+        return "Literal {written} is below the smallest value of '{name}', which is "
+            + "{literalvalues.integerLimit(kind, true)}.";
+    }
+    return "Literal {written} is too large for '{name}', whose largest value is "
+        + "{literalvalues.integerLimit(kind)}.";
+}
+
+// The refusal of an integer literal, spelled 'written', past the range of the narrow type of
+// 'widening'. A literal a wider type takes gets 'fix'.
+integerTooLarge(string written, Widening widening, string fix) -> string {
+    string refusal = integerPastRange(written, widening.negative, widening.narrow, widening.narrowName);
+    if (widening.wider.length > 0 && fix.length > 0) {
+        return "{refusal} {fix}";
+    }
+    if (widening.wider.length == 0 && widening.negative && widening.narrow != PrimitiveKind.Long
+            && widening.narrow != PrimitiveKind.Char) {
+        return "{refusal} It is below the smallest value of 'long' too, which is -9223372036854775808.";
+    }
+    return refusal;
+}
+
+// The refusal of an integer literal, spelled 'written', that no integer type takes.
+beyondEveryInteger(string written, bool negative) -> string {
+    if (negative) {
+        return "Literal {written} is below the smallest value of every integer type. The lowest, "
+            + "'long', has -9223372036854775808 as its smallest value.";
+    }
+    return "Literal {written} is too large for every integer type. The widest, 'ulong', has "
+        + "18446744073709551615 as its largest value.";
+}
+
+// The fix for an integer literal, spelled 'written' and written 'text' without its sign, that
+// nothing gives a type to, which the type 'wider' takes.
+typedLiteralFix(string written, string text, string wider) -> string {
+    string digits = written;
+    if (text.endsWith("L") || text.endsWith("l")) {
+        digits = written.substring(0, written.length - 1);
+    }
+    if (wider == "long") {
+        return "Write '{digits}L' to make it a 'long'.";
+    }
+    return "Write '{digits} as {wider}'.";
 }
 
 // The unsuffixed floating-point literal a value is written as, behind an optional sign. A

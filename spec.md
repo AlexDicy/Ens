@@ -1251,7 +1251,7 @@ A cast counts as naming a type: a literal whose value the target holds adapts to
 ```ens
 byte b = 5;              // OK - 5 fits in byte
 long n = 5;              // OK - 5 fits in long
-byte big = 300;          // error: 300 does not fit in 'byte' (range from 0 to 255)
+byte big = 300;          // error: 300 is too large for 'byte', whose largest value is 255
 ```
 
 Floating-point literals follow the same rule in their own family: one written without a type suffix adapts to the surrounding type when that type is `float` or `double`, and with no context it defaults to `double`.
@@ -1392,7 +1392,7 @@ int kept = word >> 1;           // -4: '>>' copies the sign bit
 int dropped = word >>> 1;       // 2147483644: '>>>' fills with zeros
 
 byte mask = 0x0F;
-byte bits = mask & 300;         // error: 300 does not fit in 'byte' (range 0..255)
+byte bits = mask & 300;         // error: 300 is too large for 'byte', whose largest value is 255
 bool ready = ~true;             // error: '~' flips the bits of an integer, got 'bool'
 ```
 
