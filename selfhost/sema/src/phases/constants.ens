@@ -28,6 +28,7 @@ import ModuleContext from context;
 import ImportedType from phases.link;
 import ImportedNamespace from phases.link;
 import phases.members;
+import model.hierarchy;
 import model.literalvalues;
 import ConstantValue from model.literalvalues;
 import ConstantKind from model.literalvalues;
@@ -552,6 +553,11 @@ class ConstantEvaluator {
         }
         let field = members.findField(typemembers.staticFieldsOf(named), memberName);
         if (field == null) {
+            let inherited = this.baseStaticField(named, memberName);
+            if (inherited != null) {
+                this.reportBaseStatic(item, member, inherited);
+                return null;
+            }
             this.reportNotConstant(item, member.span(),
                 "'{this.memberPath(item, named, memberName)}' is "
                 + "not a static const");
@@ -578,6 +584,37 @@ class ConstantEvaluator {
         }
         this.evaluateItem(target);
         return field.constantValue();
+    }
+
+    // The static field a base class of 'named' declares under this name, or null when none does.
+    baseStaticField(DeclaredType named, string memberName) -> Field? {
+        Type? current = hierarchy.baseOf(named);
+        while (current != null) {
+            let field = members.findField(typemembers.staticFieldsOf(current), memberName);
+            if (field != null) {
+                return field;
+            }
+            current = hierarchy.baseOf(current);
+        }
+        return null;
+    }
+
+    // A base class's static written through a subclass. A lazy const gets the lazy refusal instead,
+    // because it is no constant through any type name.
+    reportBaseStatic(ConstantItem item, MemberExpressionNode member, Field inherited) {
+        string memberName = member.member().text();
+        let names = this.namesOf(item);
+        let declaring = types.authorityOf(inherited.definingType());
+        if (declaring == null) {
+            return;
+        }
+        if (inherited.isLazy()) {
+            this.reportNotConstant(item, member.span(), "'{names.nameOf(declaring)}.{memberName}' is a "
+                + "lazy const, whose value is built on its first read at run time");
+            return;
+        }
+        this.report(item, typenames.staticNotInheritedMessage(memberName, declaring, names),
+            member.member().span());
     }
 
     // The class or struct an initializer's type-name head resolves to: the file's imported
@@ -654,23 +691,12 @@ class ConstantEvaluator {
     // The fix for a static const read through a module name: the name this file already has for
     // the type, or the import that gives it one.
     importFix(ConstantItem item, string modulePath, string typeName, string memberName) -> string {
-        let names = this.namesOf(item);
         let declared = item.context.resolver().typeStore().findDeclared(modulePath, typeName);
         if (declared == null) {
             return "Module '{modulePath}' has no type named '{typeName}'. Check the spelling, or "
                 + "import '{typeName}' from the module that declares it.";
         }
-        let already = names.nameFor(declared);
-        if (already != null) {
-            return "Write '{already}.{memberName}'.";
-        }
-        string bound = typenames.freeNameFor(declared, names);
-        string binding = typeName;
-        if (bound != typeName) {
-            binding = "{typeName} as {bound}";
-        }
-        return "Write 'import {binding} from {names.importPathOf(declared)};' and then "
-            + "'{bound}.{memberName}'.";
+        return typenames.qualifiedMemberFix(declared, memberName, this.namesOf(item));
     }
 
     evaluateIdentifier(ConstantItem item, IdentifierExpressionNode identifier) {
