@@ -1393,7 +1393,7 @@ int dropped = word >>> 1;       // 2147483644: '>>>' fills with zeros
 
 byte mask = 0x0F;
 byte bits = mask & 300;         // error: 300 is too large for 'byte', whose largest value is 255
-bool ready = ~true;             // error: '~' flips the bits of an integer, got 'bool'
+bool ready = ~true;             // error: '~' flips the bits of an integer, but 'true' has type 'bool'
 ```
 
 The logical operators `&&` and `||` require `bool` operands and short-circuit: the right side is evaluated only when it can change the result, so `a != null && a.ready()` is safe.
