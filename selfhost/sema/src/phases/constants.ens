@@ -43,6 +43,7 @@ import StringType from model.types;
 import PrimitiveType from model.types;
 import PrimitiveKind from model.types;
 import DeclaredType from model.types;
+import EnumType from model.types;
 import Visibility from model.types;
 import List from @std.collections.list;
 import Map from @std.collections.map;
@@ -525,7 +526,7 @@ class ConstantEvaluator {
             is IdentifierExpressionNode identifier -> {
                 named = this.resolveTypeName(item, identifier.name().text());
                 if (named == null) {
-                    this.reportUnknownHead(item, identifier.name().text(), member.span());
+                    this.reportUnknownHead(item, identifier.name().text(), memberName, member.span());
                     return null;
                 }
             },
@@ -537,7 +538,11 @@ class ConstantEvaluator {
                     named = this.resolveTypeName(item, headName);
                 }
                 if (named == null) {
-                    this.reportUnknownHead(item, headName, member.span());
+                    this.reportUnknownHead(item, headName, memberName, member.span());
+                    return null;
+                }
+                if (members.findField(typemembers.staticFieldsOf(named), memberName) == null) {
+                    this.reportMissingStaticConst(item, member, named);
                     return null;
                 }
                 this.report(item, "A static const never depends on type arguments. Read it "
@@ -553,14 +558,7 @@ class ConstantEvaluator {
         }
         let field = members.findField(typemembers.staticFieldsOf(named), memberName);
         if (field == null) {
-            let inherited = this.baseStaticField(named, memberName);
-            if (inherited != null) {
-                this.reportBaseStatic(item, member, inherited);
-                return null;
-            }
-            this.reportNotConstant(item, member.span(),
-                "'{this.memberPath(item, named, memberName)}' is "
-                + "not a static const");
+            this.reportMissingStaticConst(item, member, named);
             return null;
         }
         if (field.isLazy()) {
@@ -586,6 +584,19 @@ class ConstantEvaluator {
         return field.constantValue();
     }
 
+    // The member names no static const of 'named': a base class's static is refused as written
+    // through a subclass, and any other name as no static const.
+    reportMissingStaticConst(ConstantItem item, MemberExpressionNode member, DeclaredType named) {
+        string memberName = member.member().text();
+        let inherited = this.baseStaticField(named, memberName);
+        if (inherited != null) {
+            this.reportBaseStatic(item, member, inherited);
+            return;
+        }
+        this.reportNotConstant(item, member.span(),
+            "'{this.memberPath(item, named, memberName)}' is not a static const");
+    }
+
     // The static field a base class of 'named' declares under this name, or null when none does.
     baseStaticField(DeclaredType named, string memberName) -> Field? {
         Type? current = hierarchy.baseOf(named);
@@ -608,6 +619,10 @@ class ConstantEvaluator {
         if (declaring == null) {
             return;
         }
+        string followUp = typenames.staticNotInheritedFollowUp(memberName, declaring, names);
+        if (!this.referenceVisible(item, inherited, member.member().span(), followUp)) {
+            return;
+        }
         if (inherited.isLazy()) {
             this.reportNotConstant(item, member.span(), "'{names.nameOf(declaring)}.{memberName}' is a "
                 + "lazy const, whose value is built on its first read at run time");
@@ -620,22 +635,27 @@ class ConstantEvaluator {
     // The class or struct an initializer's type-name head resolves to: the file's imported
     // names, then the module's own declarations, matching how a body resolves the same head.
     resolveTypeName(ConstantItem item, string name) -> DeclaredType? {
+        let declared = this.resolveDeclared(item, name);
+        if (declared == null) {
+            return null;
+        }
+        return this.asStaticOwner(declared);
+    }
+
+    // The declared type a head names, whether or not it can carry statics.
+    resolveDeclared(ConstantItem item, string name) -> DeclaredType? {
         if (name.length == 0) {
             return null;
         }
         let imported = item.context.linkTable().binding(name);
         if (imported is ImportedType) {
-            return this.asStaticOwner(imported.target());
+            return imported.target();
         }
         if (imported is ImportedNamespace) {
             return null;
         }
         let store = item.context.resolver().typeStore();
-        let declared = store.findDeclared(item.context.module().canonicalPath(), name);
-        if (declared != null) {
-            return this.asStaticOwner(declared);
-        }
-        return null;
+        return store.findDeclared(item.context.module().canonicalPath(), name);
     }
 
     asStaticOwner(DeclaredType declared) -> DeclaredType? {
@@ -645,9 +665,33 @@ class ConstantEvaluator {
         return declared;
     }
 
-    reportUnknownHead(ConstantItem item, string headName, Span span) {
+    // A head that names no class or struct: a type parameter, a type that declares no statics, or
+    // nothing this file can name.
+    reportUnknownHead(ConstantItem item, string headName, string memberName, Span span) {
         if (this.namesOwnerTypeParameter(item, headName)) {
             this.reportNotConstant(item, span, typeParameterClause(headName, this.ownerName(item)));
+            return;
+        }
+        let declared = this.resolveDeclared(item, headName);
+        if (declared is EnumType) {
+            string enumName = this.namesOf(item).nameOf(declared);
+            bool known = false;
+            for (let each in declared.memberNames()) {
+                if (each == memberName) {
+                    known = true;
+                }
+            }
+            if (!known) {
+                this.reportNotConstant(item, span, "'{memberName}' is not a member of enum '{enumName}'");
+                return;
+            }
+            this.reportNotConstant(item, span, "'{enumName}.{memberName}' is a member of enum '{enumName}', "
+                + "and a static const can only have a number type, 'char', 'bool' or 'string'");
+            return;
+        }
+        if (declared != null) {
+            this.report(item, typenames.noStaticMembersMessage(declared, memberName, this.namesOf(item)),
+                span);
             return;
         }
         this.reportNotConstant(item, span, "'{headName}' is not a class or struct this file "
@@ -720,7 +764,7 @@ class ConstantEvaluator {
 
     // Whether the referring initializer may read the target field, under the ordinary member
     // access rules with the referring type standing for the access site.
-    referenceVisible(ConstantItem item, Field field, Span at) -> bool {
+    referenceVisible(ConstantItem item, Field field, Span at, string followUp = "") -> bool {
         let defining = types.authorityOf(field.definingType());
         if (defining == null) {
             return true;
@@ -750,7 +794,11 @@ class ConstantEvaluator {
                 problem = "'{field.name()}' is public inside {packageName}, so another package "
                     + "cannot read it.";
             }
-            this.report(item, "{problem} Mark it '{needed}' to read it here.", at);
+            string after = "";
+            if (followUp.length > 0) {
+                after = " {followUp}";
+            }
+            this.report(item, "{problem} Mark it '{needed}' to read it here.{after}", at);
         }
         return allowed;
     }
