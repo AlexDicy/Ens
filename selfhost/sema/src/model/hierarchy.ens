@@ -1,0 +1,469 @@
+// How types relate: base and interface walks, subclass and conformance tests, type-argument
+// bounds, whether a conditional member exists, and primitive widening.
+import GreenNode from @ens.frontend.syntax.green;
+import model.typemembers;
+import MemberConstraint from model.typemembers;
+import Method from model.typemembers;
+import model.types;
+import PrimitiveKind from model.types;
+import Type from model.types;
+import PrimitiveType from model.types;
+import ErrorType from model.types;
+import DeclaredType from model.types;
+import ClassType from model.types;
+import InterfaceType from model.types;
+import StructType from model.types;
+import PrimitiveBinding from model.types;
+import TypeParamType from model.types;
+import InstantiationType from model.types;
+import TypeStore from model.types;
+import List from @std.collections.list;
+import Set from @std.collections.set;
+
+// The next link of the inheritance chain: a class's base class, or the interface an interface
+// extends. A filled instantiation continues through its rebound base; an unfilled one falls back
+// to its template's base.
+export baseOf(Type type) -> Type? {
+    switch (type) {
+        is ClassType classType -> {
+            return classType.base();
+        },
+        is InterfaceType interfaceType -> {
+            return interfaceType.base();
+        },
+        is InstantiationType instantiation -> {
+            if (instantiation.isFilled()) {
+                return instantiation.base();
+            }
+            switch (instantiation.template()) {
+                is ClassType template -> {
+                    return template.base();
+                },
+                is InterfaceType template -> {
+                    return template.base();
+                },
+                default -> {
+                    return null;
+                },
+            }
+        },
+        default -> {
+            return null;
+        },
+    }
+}
+
+// The interfaces a type's own 'implements' clause names, substituted once it is filled. An unfilled
+// instantiation gives its template's, whose types still mention the template's parameters.
+export interfacesOf(Type type) -> Type[] {
+    switch (type) {
+        is ClassType classType -> {
+            return classType.interfaces();
+        },
+        is StructType structType -> {
+            return structType.interfaces();
+        },
+        is PrimitiveBinding binding -> {
+            return binding.interfaces();
+        },
+        is InstantiationType instantiation -> {
+            if (instantiation.isFilled()) {
+                return instantiation.interfaces();
+            }
+            return interfacesOf(instantiation.template());
+        },
+        default -> {
+            let bound = types.bindingOf(type);
+            if (bound != null) {
+                return bound.interfaces();
+            }
+            return [];
+        },
+    }
+}
+
+// True when derived is ancestor or reaches it through its base chain.
+export isSubclassOf(Type derived, Type ancestor) -> bool {
+    let seen = new Set<Type>();
+    Type? current = derived;
+    while (current != null && seen.add(current)) {
+        if (current == ancestor) {
+            return true;
+        }
+        let declared = types.authorityOf(current);
+        if (declared == null) {
+            return false;
+        }
+        if (declared == ancestor) {
+            return true;
+        }
+        current = baseOf(current);
+    }
+    return false;
+}
+
+// Whether every possible value of 'derived' is a subclass of 'ancestor'. A type parameter as the
+// ancestor matches only itself, because each instantiation may name a different class.
+export isAlwaysSubclassOf(Type derived, Type ancestor) -> bool {
+    if (derived == ancestor) {
+        return true;
+    }
+    if (derived is TypeParamType) {
+        for (let bound in derived.bounds()) {
+            if (isSubclassOf(bound, ancestor)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    return isSubclassOf(derived, ancestor);
+}
+
+// A type parameter's class bound, or the type itself when it is not a parameter. This is the
+// type to judge by where possibility is enough.
+export boundClassOf(Type type) -> Type {
+    if (type is TypeParamType) {
+        for (let bound in type.bounds()) {
+            if (types.isClassLike(bound)) {
+                return bound;
+            }
+        }
+    }
+    return type;
+}
+
+// isAlwaysSubclassOf under a conditional member's constraint scope, where the restated
+// parameter carries extra bounds.
+export isAlwaysSubclassOfUnder(Type derived, Type ancestor, GreenNode? scopeOwner,
+                               MemberConstraint[] scopeConstraints) -> bool {
+    if (isAlwaysSubclassOf(derived, ancestor)) {
+        return true;
+    }
+    for (let bound in extraBoundsFor(derived, scopeOwner, scopeConstraints)) {
+        if (isSubclassOf(bound, ancestor)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+export boundClassOfUnder(Type type, GreenNode? scopeOwner, MemberConstraint[] scopeConstraints) -> Type {
+    Type reduced = boundClassOf(type);
+    if (reduced == type && type is TypeParamType) {
+        for (let bound in extraBoundsFor(type, scopeOwner, scopeConstraints)) {
+            if (types.isClassLike(bound)) {
+                return bound;
+            }
+        }
+    }
+    return reduced;
+}
+
+// An interface together with every ancestor its 'extends' chain reaches, nearest first.
+export interfaceLadderOf(Type interfaceType) -> Type[] {
+    let ladder = new List<Type>();
+    let seen = new Set<Type>();
+    Type? current = interfaceType;
+    while (current != null && seen.add(current)) {
+        ladder.push(current);
+        current = baseOf(current);
+    }
+    return ladder.toArray();
+}
+
+// The type itself and every class or interface a value of it also is, nearest first and each once.
+export conformanceLadderOf(Type type) -> Type[] {
+    let ladder = new List<Type>();
+    let seen = new Set<Type>();
+    Type? current = type;
+    while (current != null && seen.add(current)) {
+        ladder.push(current);
+        for (let implemented in interfacesOf(current)) {
+            for (let ancestor in interfaceLadderOf(implemented)) {
+                if (seen.add(ancestor)) {
+                    ladder.push(ancestor);
+                }
+            }
+        }
+        current = baseOf(current);
+    }
+    return ladder.toArray();
+}
+
+// The nearest instantiation of 'template' a value of 'type' is or conforms to, or null.
+export conformingInstantiationOf(Type type, DeclaredType template) -> InstantiationType? {
+    for (let level in conformanceLadderOf(type)) {
+        if (level is InstantiationType && level.template() == template) {
+            return level;
+        }
+    }
+    return null;
+}
+
+// True when source reaches the interface: source is the interface itself or extends it, or a
+// class in source's chain implements it or an interface extending it. A struct reaches one
+// through its own 'implements' clause and a primitive through the conformances its binding
+// declares. For both of those the result is a compile-time judgment only, because nothing gives
+// a value type an interface value.
+export conformsTo(Type source, Type interfaceType) -> bool {
+    let seen = new Set<Type>();
+    Type? current = source;
+    while (current != null && seen.add(current)) {
+        if (current == interfaceType) {
+            return true;
+        }
+        for (let implemented in interfacesOf(current)) {
+            for (let ancestor in interfaceLadderOf(implemented)) {
+                if (ancestor == interfaceType) {
+                    return true;
+                }
+            }
+        }
+        let declared = types.authorityOf(current);
+        if (declared == null) {
+            return false;
+        }
+        if (declared == interfaceType) {
+            return true;
+        }
+        current = baseOf(current);
+    }
+    return false;
+}
+
+export isSubclassOrConforms(Type source, Type target) -> bool {
+    if (types.isInterfaceLike(target)) {
+        return conformsTo(source, target);
+    }
+    return isSubclassOf(source, target);
+}
+
+// Whether one type argument satisfies one bound: a class or interface value through the subclass
+// chain or conformance, a struct or a primitive through the conformances it declares, and a
+// type-parameter argument through its own declared bounds plus the extra bounds the enclosing
+// conditional member's constraints put in scope. The one home for the judgment; the resolver's
+// bound checks and the conditional-member existence checks both call this.
+export satisfiesBound(Type argument, Type bound, Type[] extraArgumentBounds) -> bool {
+    if (types.isClassLike(argument)) {
+        return isSubclassOrConforms(argument, bound);
+    }
+    if (types.isInterfaceLike(bound) && (types.isStructLike(argument) || types.bindingOf(argument) != null)) {
+        return conformsTo(argument, bound);
+    }
+    if (argument is TypeParamType) {
+        for (let own in argument.bounds()) {
+            if (own == bound || isSubclassOrConforms(own, bound)) {
+                return true;
+            }
+        }
+        for (let own in extraArgumentBounds) {
+            if (own == bound || isSubclassOrConforms(own, bound)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// The extra bounds the active conditional member's constraints add to this type when it is one
+// of the constrained parameters, or none. scopeOwner is the declaration whose parameters the
+// active constraints restate; null outside any conditional member's scope.
+export extraBoundsFor(Type argument, GreenNode? scopeOwner, MemberConstraint[] scopeConstraints)
+        -> Type[] {
+    if (argument is TypeParamType && scopeOwner != null && argument.owner() == scopeOwner) {
+        for (let constraint in scopeConstraints) {
+            if (constraint.parameterIndex() == argument.index()) {
+                return constraint.bounds();
+            }
+        }
+    }
+    return [];
+}
+
+// One constraint an owner's type arguments fail: the constrained parameter, the bound as the
+// member declares it, and the bound with the owner's arguments substituted in, for diagnostics.
+export class FailedConstraint {
+    long failedIndex;
+    Type declaredBound;
+    Type substitutedBound;
+
+    public constructor(this.failedIndex, this.declaredBound, this.substitutedBound);
+
+    export parameterIndex() -> long {
+        return this.failedIndex;
+    }
+
+    export bound() -> Type {
+        return this.declaredBound;
+    }
+
+    export boundHere() -> Type {
+        return this.substitutedBound;
+    }
+}
+
+// The first constraint of a conditional member that these type arguments fail, or null when
+// every one holds (an unconditional member always holds). The arguments are the template's own
+// parameters when judging the template itself, and an instantiation's arguments otherwise.
+export firstFailedConstraint(TypeStore store, Method method, DeclaredType template,
+                             Type[] arguments, GreenNode? scopeOwner,
+                             MemberConstraint[] scopeConstraints) -> FailedConstraint? {
+    for (let constraint in method.constraints()) {
+        long index = constraint.parameterIndex();
+        if (index >= arguments.length) {
+            continue;
+        }
+        Type argument = arguments[index];
+        if (argument is ErrorType) {
+            continue;
+        }
+        for (let bound in constraint.bounds()) {
+            Type here = store.substitute(bound, template.declaration(), arguments);
+            if (!satisfiesBound(argument, here,
+                    extraBoundsFor(argument, scopeOwner, scopeConstraints))) {
+                return new FailedConstraint(index, bound, here);
+            }
+        }
+    }
+    return null;
+}
+
+// The type arguments a type is spelled at: an instantiation's own, and the template's parameters
+// standing for themselves on the template or on any other declared type.
+export typeArgumentsOf(Type owner) -> Type[] {
+    if (owner is InstantiationType) {
+        return owner.arguments();
+    }
+    let template = types.authorityOf(owner);
+    if (template == null) {
+        return [];
+    }
+    TypeParamType[] parameters = template.typeParameterTypes();
+    let arguments = new List<Type>();
+    for (let parameter in parameters) {
+        arguments.push(parameter);
+    }
+    return arguments.toArray();
+}
+
+// Whether a member exists on the type that defines it: an unconditional member always does; a
+// conditional one only where the defining type's arguments satisfy every constraint. The scope
+// carries the enclosing conditional member's constraints, so a body may use members its own
+// constraint unlocks; pass none outside a body.
+export memberExistsOn(TypeStore store, Method method, GreenNode? scopeOwner,
+                      MemberConstraint[] scopeConstraints) -> bool {
+    if (!method.isConditional()) {
+        return true;
+    }
+    let owner = method.definingType();
+    let template = types.authorityOf(owner);
+    if (template == null) {
+        return true;
+    }
+    return firstFailedConstraint(store, method, template, typeArgumentsOf(owner), scopeOwner,
+        scopeConstraints) == null;
+}
+
+export memberExistsOn(TypeStore store, Method method) -> bool {
+    return memberExistsOn(store, method, null, []);
+}
+
+// True when the template declares any conditional member, instance or static; the plan and the
+// harvest only pay the per-member filter for templates that need it.
+export hasConditionalMembers(DeclaredType template) -> bool {
+    let methods = typemembers.methodsOf(template);
+    if (methods != null) {
+        for (long i = 0; i < methods.length(); i++) {
+            if (methods.get(i).isConditional()) {
+                return true;
+            }
+        }
+    }
+    let statics = typemembers.staticMethodsOf(template);
+    if (statics != null) {
+        for (long i = 0; i < statics.length(); i++) {
+            if (statics.get(i).isConditional()) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Lossless primitive widening, the implicit numeric conversion the language allows.
+export widensTo(Type from, Type to) -> bool {
+    if (from is PrimitiveType && to is PrimitiveType) {
+        return kindWidensTo(from.kind(), to.kind());
+    }
+    return false;
+}
+
+kindWidensTo(PrimitiveKind from, PrimitiveKind to) -> bool {
+    if (from == to) {
+        return false;
+    }
+    if (isIntegerKind(from) && isIntegerKind(to)) {
+        long fromWidth = integerBitWidth(from);
+        long toWidth = integerBitWidth(to);
+        if (isSignedKind(from)) {
+            return isSignedKind(to) && toWidth > fromWidth;
+        }
+        return toWidth > fromWidth;
+    }
+    // A 'char' is a code point rather than a quantity: arithmetic on it in integers is
+    // meaningful, but as a floating-point number it has no use, so it converts only where the
+    // program requests it with 'as'.
+    if (isIntegerKind(from) && isFloatKind(to)) {
+        if (from == PrimitiveKind.Char) {
+            return false;
+        }
+        long mantissa = 53;
+        if (floatBitWidth(to) == 32) {
+            mantissa = 24;
+        }
+        return integerBitWidth(from) <= mantissa;
+    }
+    if (isFloatKind(from) && isFloatKind(to)) {
+        return floatBitWidth(from) < floatBitWidth(to);
+    }
+    return false;
+}
+
+isIntegerKind(PrimitiveKind kind) -> bool {
+    return switch (kind) {
+        Byte, Short, UShort, Int, UInt, Long, ULong, Char -> true,
+        default -> false,
+    };
+}
+
+isSignedKind(PrimitiveKind kind) -> bool {
+    return switch (kind) {
+        Short, Int, Long -> true,
+        default -> false,
+    };
+}
+
+isFloatKind(PrimitiveKind kind) -> bool {
+    return switch (kind) {
+        Float, Double, Decimal -> true,
+        default -> false,
+    };
+}
+
+integerBitWidth(PrimitiveKind kind) -> long {
+    return switch (kind) {
+        Byte -> 8,
+        Short, UShort -> 16,
+        Int, UInt, Char -> 32,
+        Long, ULong -> 64,
+        default -> 0,
+    };
+}
+
+floatBitWidth(PrimitiveKind kind) -> long {
+    return switch (kind) {
+        Float -> 32,
+        Double -> 64,
+        default -> 0,
+    };
+}

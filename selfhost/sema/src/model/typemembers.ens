@@ -1,0 +1,921 @@
+// The members a type declares: parameters, signatures, fields and methods, the queries that
+// find them on a type, and the base constructor a class's constructor runs by default.
+import GreenNode from @ens.frontend.syntax.green;
+import Span from @ens.frontend.support.source;
+import model.hierarchy;
+import ConstantValue from model.literalvalues;
+import model.typenames;
+import TypeNames from model.typenames;
+import model.types;
+import Visibility from model.types;
+import Type from model.types;
+import OptionalType from model.types;
+import ArrayType from model.types;
+import FunctionType from model.types;
+import DeclaredType from model.types;
+import ClassType from model.types;
+import InterfaceType from model.types;
+import StructType from model.types;
+import PrimitiveBinding from model.types;
+import TypeParamType from model.types;
+import InstantiationType from model.types;
+import support.diagnostics;
+import List from @std.collections.list;
+import Set from @std.collections.set;
+import StringBuilder from @std.text.stringbuilder;
+
+export class Parameter {
+    string parameterName;
+    Type parameterType;
+    bool fieldShorthand;
+    bool outParameter;
+    bool defaulted;
+    Span parameterSpan;
+
+    public constructor(string name, Type type, bool bindsField, bool isOut, bool hasDefault, Span span) {
+        this.parameterName = name;
+        this.parameterType = type;
+        this.fieldShorthand = bindsField;
+        this.outParameter = isOut;
+        this.defaulted = hasDefault;
+        this.parameterSpan = span;
+    }
+
+    export name() -> string {
+        return this.parameterName;
+    }
+
+    export type() -> Type {
+        return this.parameterType;
+    }
+
+    // True for the 'this.field' constructor shorthand.
+    export bindsField() -> bool {
+        return this.fieldShorthand;
+    }
+
+    export isOut() -> bool {
+        return this.outParameter;
+    }
+
+    export hasDefault() -> bool {
+        return this.defaulted;
+    }
+
+    export span() -> Span {
+        return this.parameterSpan;
+    }
+}
+
+// A resolved callable signature. Declared throws types are resolved here; whether they are valid
+// exception types is checked by a later pass, so the reference spans are kept alongside.
+export class Signature {
+    string signatureName;
+    Parameter[] signatureParameters;
+    Type signatureReturnType;
+    bool marksThrows;
+    bool marksNoreturn;
+    Type[] resolvedThrowsTypes;
+    Span[] resolvedThrowsSpans;
+    TypeParamType[] signatureTypeParameters;
+    GreenNode? declarationNode;
+    Span signatureNameSpan;
+
+    public constructor(string name, Parameter[] parameters, Type returnType, bool declaresThrows,
+                bool declaresNoreturn, Type[] throwsTypes, Span[] throwsSpans,
+                TypeParamType[] typeParameters, GreenNode? declaration, Span nameSpan) {
+        this.signatureName = name;
+        this.signatureParameters = parameters;
+        this.signatureReturnType = returnType;
+        this.marksThrows = declaresThrows;
+        this.marksNoreturn = declaresNoreturn;
+        this.resolvedThrowsTypes = throwsTypes;
+        this.resolvedThrowsSpans = throwsSpans;
+        this.signatureTypeParameters = typeParameters;
+        this.declarationNode = declaration;
+        this.signatureNameSpan = nameSpan;
+    }
+
+    export name() -> string {
+        return this.signatureName;
+    }
+
+    export parameters() -> Parameter[] {
+        return this.signatureParameters;
+    }
+
+    export returnType() -> Type {
+        return this.signatureReturnType;
+    }
+
+    export declaresThrows() -> bool {
+        return this.marksThrows;
+    }
+
+    // True when the callable is declared 'noreturn': it never completes normally, so a call to
+    // it in statement position ends the path exactly as 'panic' does.
+    export isNoreturn() -> bool {
+        return this.marksNoreturn;
+    }
+
+    export throwsTypes() -> Type[] {
+        return this.resolvedThrowsTypes;
+    }
+
+    export throwsTypeSpans() -> Span[] {
+        return this.resolvedThrowsSpans;
+    }
+
+    export typeParameters() -> TypeParamType[] {
+        return this.signatureTypeParameters;
+    }
+
+    export isGeneric() -> bool {
+        return this.signatureTypeParameters.length > 0;
+    }
+
+    export declaration() -> GreenNode? {
+        return this.declarationNode;
+    }
+
+    export nameSpan() -> Span {
+        return this.signatureNameSpan;
+    }
+}
+
+// The signature of a function nothing declares, which code generation synthesizes and calls itself.
+// It takes no parameters and never throws, and only a trace and a diagnostic read its name.
+export synthesizedSignature(string name, Type returnType, Span nameSpan) -> Signature {
+    return new Signature(name, [], returnType, false, false, [], [], [], null, nameSpan);
+}
+
+// True when the two signatures take exactly the same parameter types. Types are interned, so
+// type equality is reference identity.
+public sameParameterTypes(Signature first, Signature second) -> bool {
+    Parameter[] left = first.parameters();
+    Parameter[] right = second.parameters();
+    if (left.length != right.length) {
+        return false;
+    }
+    for (long i = 0; i < left.length; i++) {
+        if (left[i].type() != right[i].type()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// One field of a struct or class. Flattened class layouts share the base class's Field objects, so
+// definingType still names the class, or generic instantiation, that declared the field. A static
+// const field takes no layout slot, and its value is the evaluated constant the constants phase
+// fills in. Instantiations of a generic type share the template's Field object, because neither
+// its type nor its initializer may mention a type parameter. A lazy const field builds its value
+// on the first read instead.
+export class Field {
+    string fieldName;
+    Type fieldType;
+    Visibility fieldVisibility;
+    bool weakField;
+    bool constField;
+    bool staticMarked;
+    bool lazyMarked;
+    bool defaulted;
+    Span fieldNameSpan;
+    Type definingDeclaration;
+    ConstantValue? evaluatedConstant;
+
+    public constructor(string name, Type type, Visibility visibility, bool isWeak, bool isConst,
+                bool isStatic, bool isLazy, bool hasDefault, Span nameSpan, Type definingType) {
+        this.fieldName = name;
+        this.fieldType = type;
+        this.fieldVisibility = visibility;
+        this.weakField = isWeak;
+        this.constField = isConst;
+        this.staticMarked = isStatic;
+        this.lazyMarked = isLazy;
+        this.defaulted = hasDefault;
+        this.fieldNameSpan = nameSpan;
+        this.definingDeclaration = definingType;
+    }
+
+    export name() -> string {
+        return this.fieldName;
+    }
+
+    export type() -> Type {
+        return this.fieldType;
+    }
+
+    export visibility() -> Visibility {
+        return this.fieldVisibility;
+    }
+
+    export isWeak() -> bool {
+        return this.weakField;
+    }
+
+    export isConst() -> bool {
+        return this.constField;
+    }
+
+    export isStatic() -> bool {
+        return this.staticMarked;
+    }
+
+    export isLazy() -> bool {
+        return this.lazyMarked;
+    }
+
+    export hasDefault() -> bool {
+        return this.defaulted;
+    }
+
+    export nameSpan() -> Span {
+        return this.fieldNameSpan;
+    }
+
+    export definingType() -> Type {
+        return this.definingDeclaration;
+    }
+
+    // The evaluated value of a static const field, or null until the constants phase fills it
+    // (or when the initializer failed to evaluate).
+    export constantValue() -> ConstantValue? {
+        return this.evaluatedConstant;
+    }
+
+    public setConstantValue(ConstantValue value) {
+        this.evaluatedConstant = value;
+    }
+}
+
+// One constraint a conditional member places on an enclosing type parameter: which parameter it
+// restates, by index, and the extra bounds the member requires of it. The bounds stay written in
+// the template's own terms; judging them for an instantiation substitutes its arguments in.
+export class MemberConstraint {
+    long constrainedIndex;
+    Type[] requiredBounds;
+
+    public constructor(this.constrainedIndex, this.requiredBounds);
+
+    export parameterIndex() -> long {
+        return this.constrainedIndex;
+    }
+
+    export bounds() -> Type[] {
+        return this.requiredBounds;
+    }
+}
+
+// A member the compiler implements, which a primitive binding names with a bodiless declaration.
+// The set is what 'string' cannot be written in Ens over: one byte, all of the bytes, and the two
+// unchecked forms whose caller has done the validating. Everything else a binding declares is
+// ordinary Ens code over these.
+export enum PrimitiveIntrinsic {
+    StringByteAt,
+    StringToBytes,
+    StringFromBytesUnchecked,
+    StringSliceUnchecked,
+}
+
+// One method of a struct, class, or interface. Constructors are stored under the name
+// 'constructor' and destructors under 'destructor', so overload checks treat them uniformly. A
+// static method takes no receiver, never dispatches, and is stored in the owner's staticMethods
+// list. A conditional member exists only on instantiations that satisfy its constraints, and every
+// list keeps it in place parallel to the template's, so consumers call memberExistsOn first.
+export class Method {
+    Signature methodSignature;
+    Visibility methodVisibility;
+    bool constructorMethod;
+    bool destructorMethod;
+    bool overrideMarked;
+    bool finalMarked;
+    bool abstractMarked;
+    bool staticMarked;
+    bool bodied;
+    MemberConstraint[] methodConstraints;
+    Type definingDeclaration;
+    PrimitiveIntrinsic? namedIntrinsic;
+
+    public constructor(Signature signature, Visibility visibility, bool isConstructor, bool isDestructor,
+                bool isOverride, bool isFinal, bool isAbstract, bool isStatic, bool hasBody,
+                MemberConstraint[] constraints, Type definingType) {
+        this.methodSignature = signature;
+        this.methodVisibility = visibility;
+        this.constructorMethod = isConstructor;
+        this.destructorMethod = isDestructor;
+        this.overrideMarked = isOverride;
+        this.finalMarked = isFinal;
+        this.abstractMarked = isAbstract;
+        this.staticMarked = isStatic;
+        this.bodied = hasBody;
+        this.methodConstraints = constraints;
+        this.definingDeclaration = definingType;
+        this.namedIntrinsic = null;
+    }
+
+    export name() -> string {
+        return this.methodSignature.name();
+    }
+
+    export signature() -> Signature {
+        return this.methodSignature;
+    }
+
+    export visibility() -> Visibility {
+        return this.methodVisibility;
+    }
+
+    export isConstructor() -> bool {
+        return this.constructorMethod;
+    }
+
+    export isDestructor() -> bool {
+        return this.destructorMethod;
+    }
+
+    export isOverride() -> bool {
+        return this.overrideMarked;
+    }
+
+    export isFinal() -> bool {
+        return this.finalMarked;
+    }
+
+    export isAbstract() -> bool {
+        return this.abstractMarked;
+    }
+
+    export isStatic() -> bool {
+        return this.staticMarked;
+    }
+
+    export isNoreturn() -> bool {
+        return this.methodSignature.isNoreturn();
+    }
+
+    public hasBody() -> bool {
+        return this.bodied;
+    }
+
+    export constraints() -> MemberConstraint[] {
+        return this.methodConstraints;
+    }
+
+    export isConditional() -> bool {
+        return this.methodConstraints.length > 0;
+    }
+
+    export definingType() -> Type {
+        return this.definingDeclaration;
+    }
+
+    // The intrinsic this member names, for the bodiless binding members the compiler implements,
+    // and null for every member written in Ens. Code generation reads it in place of a body.
+    export intrinsic() -> PrimitiveIntrinsic? {
+        return this.namedIntrinsic;
+    }
+
+    public setIntrinsic(PrimitiveIntrinsic named) {
+        this.namedIntrinsic = named;
+    }
+}
+
+// The fields a type stores, or null for types without fields. A filled instantiation exposes
+// its substituted fields; an unfilled one has none to expose yet.
+export fieldsOf(Type type) -> List<Field>? {
+    switch (type) {
+        is ClassType classType -> {
+            return classType.fields();
+        },
+        is StructType structType -> {
+            return structType.fields();
+        },
+        is InstantiationType instantiation -> {
+            if (instantiation.isFilled()) {
+                return instantiation.fields();
+            }
+            return null;
+        },
+        default -> {
+            return null;
+        },
+    }
+}
+
+// The field a name reaches on a type, or null when the name reaches none of its fields.
+export inheritedOrOwnField(Type owner, string name) -> Field? {
+    let fields = fieldsOf(owner);
+    if (fields == null) {
+        return null;
+    }
+    long slot = fieldSlotOf(fields, owner, name);
+    if (slot < 0) {
+        return null;
+    }
+    return fields.get(slot);
+}
+
+// The position in a type's layout of the field a name reaches, or -1 when the name reaches none
+// of its fields. That position is the index a field address carries.
+export inheritedOrOwnFieldIndex(Type owner, string name) -> long {
+    let fields = fieldsOf(owner);
+    if (fields == null) {
+        return -1;
+    }
+    return fieldSlotOf(fields, owner, name);
+}
+
+// The position of the field the owning type reaches under a name, searched most derived first,
+// so a subclass field takes the name ahead of the base field whose name it reuses. A private
+// field of a base class is not inherited, so a type that did not declare it reaches no field
+// under that name, which leaves the name free for a field, a method or a static of its own.
+fieldSlotOf(List<Field> fields, Type owner, string name) -> long {
+    for (long i = fields.length() - 1; i >= 0; i--) {
+        let field = fields.get(i);
+        if (field.name() != name) {
+            continue;
+        }
+        if (field.definingType() != owner && field.visibility() == Visibility.Private) {
+            return -1;
+        }
+        return i;
+    }
+    return -1;
+}
+
+// The number of leading fields a flattened layout inherits from its base class. Zero for any
+// type without a base, so own fields are those at this index and after.
+export baseFieldCount(Type type) -> long {
+    switch (type) {
+        is ClassType classType -> {
+            return classType.baseFieldCount();
+        },
+        is InstantiationType instantiation -> {
+            return instantiation.baseFieldCount();
+        },
+        default -> {
+            return 0;
+        },
+    }
+}
+
+// The static methods a type declares itself, or null for types that cannot carry statics. A
+// filled instantiation exposes its substituted statics; an unfilled one has none to expose yet.
+export staticMethodsOf(Type type) -> List<Method>? {
+    switch (type) {
+        is ClassType classType -> {
+            return classType.staticMethods();
+        },
+        is StructType structType -> {
+            return structType.staticMethods();
+        },
+        is PrimitiveBinding binding -> {
+            return binding.staticMethods();
+        },
+        is InstantiationType instantiation -> {
+            if (instantiation.isFilled()) {
+                return instantiation.staticMethods();
+            }
+            return null;
+        },
+        default -> {
+            let bound = types.bindingOf(type);
+            if (bound != null) {
+                return bound.staticMethods();
+            }
+            return null;
+        },
+    }
+}
+
+// The type-level const fields a type declares, static and lazy alike, or null for types that
+// cannot carry statics. An instantiation shares its template's fields, because neither kind of
+// type-level field ever mentions a type parameter.
+export staticFieldsOf(Type type) -> List<Field>? {
+    switch (type) {
+        is ClassType classType -> {
+            return classType.staticFields();
+        },
+        is StructType structType -> {
+            return structType.staticFields();
+        },
+        is PrimitiveBinding binding -> {
+            return binding.staticFields();
+        },
+        is InstantiationType instantiation -> {
+            return staticFieldsOf(instantiation.template());
+        },
+        default -> {
+            let bound = types.bindingOf(type);
+            if (bound != null) {
+                return bound.staticFields();
+            }
+            return null;
+        },
+    }
+}
+
+// The methods a type declares itself, or null for types without methods.
+export methodsOf(Type type) -> List<Method>? {
+    switch (type) {
+        is ClassType classType -> {
+            return classType.methods();
+        },
+        is StructType structType -> {
+            return structType.methods();
+        },
+        is InterfaceType interfaceType -> {
+            return interfaceType.methods();
+        },
+        is PrimitiveBinding binding -> {
+            return binding.methods();
+        },
+        is InstantiationType instantiation -> {
+            if (instantiation.isFilled()) {
+                return instantiation.methods();
+            }
+            return null;
+        },
+        default -> {
+            let bound = types.bindingOf(type);
+            if (bound != null) {
+                return bound.methods();
+            }
+            return null;
+        },
+    }
+}
+
+// The method a name reaches on a type, most derived first, or null when the name reaches none of
+// its methods. A private method of a base class is not inherited, so a type that did not declare
+// it reaches no method under that name, which leaves the name free for a method or a static of
+// its own.
+export inheritedOrOwnMethod(Type owner, string name) -> Method? {
+    Type? current = owner;
+    while (current != null) {
+        let methods = methodsOf(current);
+        if (methods != null) {
+            for (long i = 0; i < methods.length(); i++) {
+                let method = methods.get(i);
+                if (method.name() != name || method.isConstructor() || method.isDestructor()) {
+                    continue;
+                }
+                if (method.definingType() != owner && method.visibility() == Visibility.Private) {
+                    continue;
+                }
+                return method;
+            }
+        }
+        current = hierarchy.baseOf(current);
+    }
+    return null;
+}
+
+// The number of leading parameters without defaults: the least a call must supply.
+export requiredParameterCount(Signature signature) -> long {
+    Parameter[] parameters = signature.parameters();
+    long required = 0;
+    for (long i = 0; i < parameters.length; i++) {
+        if (parameters[i].hasDefault()) {
+            break;
+        }
+        required++;
+    }
+    return required;
+}
+
+// The constructors a class declares, in declaration order.
+public constructorsOf(Type classType) -> List<Method> {
+    let found = new List<Method>();
+    let methods = methodsOf(classType);
+    if (methods != null) {
+        for (long i = 0; i < methods.length(); i++) {
+            if (methods.get(i).isConstructor()) {
+                found.push(methods.get(i));
+            }
+        }
+    }
+    return found;
+}
+
+// The base constructor a class's constructor runs when no 'super(...)' names one. It belongs to
+// the nearest base class that declares constructors.
+export final class ImplicitBaseConstructor {
+    Type? declaringBase;
+    Type choosingClass;
+    Method? chosenConstructor;
+    Method? firstReachable;
+    Method? firstUnreachable;
+
+    protected constructor(this.declaringBase, this.choosingClass, this.chosenConstructor,
+                          this.firstReachable, this.firstUnreachable);
+
+    // The nearest base class that declares constructors, or null when no base class declares one.
+    export owner() -> Type? {
+        return this.declaringBase;
+    }
+
+    // The class whose own constructor calls the chosen one, directly below the owner. It is the
+    // class asked about, or a base of it that declares no constructor. With no owner, it is the
+    // last class of the chain.
+    public chooser() -> Type {
+        return this.choosingClass;
+    }
+
+    // The constructor that runs, or null when the owner has none the chooser can call with no arguments.
+    export chosen() -> Method? {
+        return this.chosenConstructor;
+    }
+
+    // The owner's first constructor the chooser can call, whatever arguments it takes.
+    public reachable() -> Method? {
+        return this.firstReachable;
+    }
+
+    // The owner's first constructor that takes no arguments and that the chooser cannot call.
+    public unreachable() -> Method? {
+        return this.firstUnreachable;
+    }
+}
+
+// The base constructor the constructor of 'classType' runs when no 'super(...)' names one. The
+// owner's first zero-parameter constructor that the chooser can call wins, else its first one that
+// the chooser can call whose parameters all take defaults. Code generation runs the winner and
+// sema checks the same one, so the two never latch onto different constructors.
+export implicitBaseConstructor(Type classType) -> ImplicitBaseConstructor {
+    Type chooser = classType;
+    let seen = new Set<Type>();
+    Type? current = hierarchy.baseOf(classType);
+    while (current != null && seen.add(current)) {
+        let constructors = constructorsOf(current);
+        if (constructors.length() > 0) {
+            return chooseBaseConstructor(chooser, current, constructors);
+        }
+        chooser = current;
+        current = hierarchy.baseOf(current);
+    }
+    return new ImplicitBaseConstructor(null, chooser, null, null, null);
+}
+
+// The implicit choice among the constructors that 'owner' declares, judged from 'chooser'.
+chooseBaseConstructor(Type chooser, Type owner, List<Method> constructors) -> ImplicitBaseConstructor {
+    Method? zeroParameter = null;
+    Method? defaulted = null;
+    Method? reachable = null;
+    Method? unreachable = null;
+    for (long i = 0; i < constructors.length(); i++) {
+        let candidate = constructors.get(i);
+        bool takesNoArguments = requiredParameterCount(candidate.signature()) == 0;
+        if (!reachesConstructor(chooser, owner, candidate)) {
+            if (takesNoArguments && unreachable == null) {
+                unreachable = candidate;
+            }
+            continue;
+        }
+        if (reachable == null) {
+            reachable = candidate;
+        }
+        if (!takesNoArguments) {
+            continue;
+        }
+        if (candidate.signature().parameters().length == 0) {
+            if (zeroParameter == null) {
+                zeroParameter = candidate;
+            }
+        } else if (defaulted == null) {
+            defaulted = candidate;
+        }
+    }
+    return new ImplicitBaseConstructor(owner, chooser, zeroParameter ?? defaulted, reachable, unreachable);
+}
+
+// Whether code in 'chooser' may call a constructor that 'owner' declares.
+reachesConstructor(Type chooser, Type owner, Method candidate) -> bool {
+    let site = types.authorityOf(chooser);
+    let defining = types.authorityOf(owner);
+    if (site == null || defining == null) {
+        return true;
+    }
+    return types.memberAccessAllowed(candidate.visibility(), defining, site, site.modulePath(),
+        site.packagePrefix());
+}
+
+// The refusal for a chain whose owner has no constructor its chooser can call with no arguments.
+// 'opening' names what runs the chain. 'declared' is the constructor that leaves out 'super(...)'.
+// It is null for a class that declares no constructor, and the fix then declares one marked
+// 'marker'. The text is empty for a chain with no owner.
+public implicitBaseRefusal(string opening, ImplicitBaseConstructor chain, Signature? declared,
+                           bool declaredHasBody, string marker, TypeNames names) -> string {
+    let owner = chain.owner();
+    if (owner == null) {
+        return "";
+    }
+    string baseName = names.of(owner);
+    string text = "{opening}, so it would run the zero-argument constructor of its base class "
+        + "'{baseName}', ";
+    let unreachable = chain.unreachable();
+    if (unreachable == null) {
+        text = text + "which declares none.";
+    } else if (unreachable.visibility() == Visibility.Private) {
+        text = text + "which is private to '{baseName}'.";
+    } else {
+        text = text + "which is public inside package '{packageOf(owner)}' but not exported.";
+    }
+    let reachable = chain.reachable();
+    if (reachable != null) {
+        return "{text} {superCallFix(reachable, declared, declaredHasBody, marker, names, true)}.";
+    }
+    Method marked = unreachable ?? constructorsOf(owner).get(0);
+    string widened = "'protected' so a subclass can call it";
+    if (marked.visibility() == Visibility.Public) {
+        widened = "'export' so a subclass in another package can call it";
+    }
+    string markFix = "{text} Mark '{constructorDisplay(marked, names)}' in '{baseName}' as {widened}";
+    if (unreachable != null) {
+        return markFix + ".";
+    }
+    return "{markFix}, then {superCallFix(marked, declared, declaredHasBody, marker, names, false)}.";
+}
+
+// The package a declared type belongs to, or empty for a type that belongs to none.
+packageOf(Type type) -> string {
+    let declared = types.authorityOf(type);
+    if (declared == null) {
+        return "";
+    }
+    return declared.packagePrefix();
+}
+
+// A constructor as a diagnostic names it: 'constructor(int, string)'.
+constructorDisplay(Method method, TypeNames names) -> string {
+    let builder = new StringBuilder();
+    builder.append("constructor(");
+    Parameter[] parameters = method.signature().parameters();
+    for (long i = 0; i < parameters.length; i++) {
+        if (i > 0) {
+            builder.append(", ");
+        }
+        builder.append(names.of(parameters[i].type()));
+    }
+    builder.append(")");
+    return builder.toString();
+}
+
+// The fix that passes 'target' its parameters without defaults through 'super(...)'. With no
+// 'declared' constructor, the fix declares one marked 'marker'. A declared constructor starts its
+// body with the call, or gains a body that does, and takes the parameters it lacks. A name it
+// already uses for something else gets a number after it. Each type this file has no name for
+// comes with an import.
+superCallFix(Method target, Signature? declared, bool declaredHasBody, string marker,
+             TypeNames names, bool opensSentence) -> string {
+    let taken = new Set<string>();
+    if (declared != null) {
+        for (let parameter in declared.parameters()) {
+            taken.add(parameter.name());
+        }
+    }
+    let passed = new List<string>();
+    let addedTypes = new List<Type>();
+    let addedNames = new List<string>();
+    Parameter[] parameters = target.signature().parameters();
+    long required = requiredParameterCount(target.signature());
+    for (long i = 0; i < required; i++) {
+        let wanted = parameters[i];
+        if (declared != null && takesParameter(declared, wanted)) {
+            passed.push(wanted.name());
+            continue;
+        }
+        string name = freeParameterName(wanted.name(), taken);
+        taken.add(name);
+        passed.push(name);
+        addedTypes.push(wanted.type());
+        addedNames.push(name);
+    }
+    let unnamed = new List<DeclaredType>();
+    for (long i = 0; i < addedTypes.length(); i++) {
+        collectUnnamed(addedTypes.get(i), names, unnamed);
+    }
+    TypeNames spelling = names;
+    let imports = new List<string>();
+    for (long i = 0; i < unnamed.length(); i++) {
+        let imported = unnamed.get(i);
+        string bound = typenames.freeNameFor(imported, spelling);
+        string binding = imported.name();
+        if (bound != imported.name()) {
+            binding = "{imported.name()} as {bound}";
+        }
+        imports.push("'import {binding} from {names.importPathOf(imported)};'");
+        spelling = spelling.importing(imported, bound);
+    }
+    let listed = new StringBuilder();
+    for (long i = 0; i < addedTypes.length(); i++) {
+        if (i > 0) {
+            listed.append(", ");
+        }
+        listed.append("{spelling.of(addedTypes.get(i))} {addedNames.get(i)}");
+    }
+    string arguments = string.joined(passed.toArray(), ", ");
+    string call = "super({arguments});";
+    string fix = "";
+    if (declared == null) {
+        string prefix = "";
+        if (marker.length > 0) {
+            prefix = marker + " ";
+        }
+        fix = "declare a constructor that calls 'super(...)', as in "
+            + "'{prefix}constructor({listed.toString()}) \{ {call} \}'";
+    } else {
+        fix = "start this constructor's body with '{call}'";
+        if (!declaredHasBody) {
+            fix = "give this constructor a body that starts with '{call}'";
+        }
+        if (addedTypes.length() > 0) {
+            fix = fix + " and add '{listed.toString()}' to its parameters";
+        }
+    }
+    if (imports.length() > 0) {
+        fix = fix + ", with {diagnostics.andJoined(imports.toArray())} at the top of the file";
+    }
+    if (opensSentence) {
+        return typenames.capitalizedAscii(fix);
+    }
+    return fix;
+}
+
+// The name itself when the constructor does not use it yet, else the name with the first number
+// from 2 up that it does not use.
+freeParameterName(string name, Set<string> taken) -> string {
+    if (!taken.contains(name)) {
+        return name;
+    }
+    long suffix = 2;
+    while (taken.contains("{name}{suffix}")) {
+        suffix++;
+    }
+    return "{name}{suffix}";
+}
+
+// Whether the constructor already takes a parameter of this name and type that its body can pass
+// on. A 'this.field' parameter sets a field instead.
+takesParameter(Signature declared, Parameter wanted) -> bool {
+    for (let parameter in declared.parameters()) {
+        if (!parameter.bindsField() && parameter.name() == wanted.name()
+                && parameter.type() == wanted.type()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Adds each declared type the type mentions that this file has no name for, once.
+collectUnnamed(Type type, TypeNames names, List<DeclaredType> found) {
+    switch (type) {
+        is OptionalType optional -> {
+            collectUnnamed(optional.inner(), names, found);
+        },
+        is ArrayType array -> {
+            collectUnnamed(array.element(), names, found);
+        },
+        is FunctionType functionType -> {
+            for (let parameter in functionType.parameterTypes()) {
+                collectUnnamed(parameter, names, found);
+            }
+            for (let thrown in functionType.thrownTypes()) {
+                collectUnnamed(thrown, names, found);
+            }
+            collectUnnamed(functionType.returnType(), names, found);
+        },
+        is InstantiationType instantiation -> {
+            collectUnnamed(instantiation.template(), names, found);
+            for (let argument in instantiation.arguments()) {
+                collectUnnamed(argument, names, found);
+            }
+        },
+        is DeclaredType declared -> {
+            if (names.nameFor(declared) == null && !found.contains(declared)) {
+                found.push(declared);
+            }
+        },
+        default -> { },
+    }
+}
+
+// A struct's own text form, or null when it declares none. Both an explicit '.toString()' and an
+// interpolation hole call this one check to determine whether a struct renders itself instead of
+// rendering its JSON form. Only a 'toString' taking no parameters is the text form, and that one is
+// held to 'toString() -> string' without 'throws', so it always stands in; one that takes
+// parameters is an ordinary method.
+export declaredToString(Type type) -> Method? {
+    let methods = methodsOf(type);
+    if (methods == null) {
+        return null;
+    }
+    for (long i = 0; i < methods.length(); i++) {
+        let method = methods.get(i);
+        if (method.name() == "toString" && method.signature().parameters().length == 0) {
+            return method;
+        }
+    }
+    return null;
+}
