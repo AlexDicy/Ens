@@ -1,0 +1,151 @@
+// The refusals a type earns for '==', a hash or a key, checked through whole programs.
+import @std.testing;
+import ProgramAnalysis from pipeline;
+import sema_support;
+import FakeFileLoader from sema_support;
+import Stage from sema_support;
+
+analyzeOne(string text) -> ProgramAnalysis throws {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main.ens", text);
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Bodies]);
+    return analysis;
+}
+
+analyzeWithCollections(string text) -> ProgramAnalysis {
+    let loader = new FakeFileLoader();
+    loader.addCollections();
+    loader.add("/proj/src/main.ens", text);
+    return sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+}
+
+test "a handle compares by identity wherever '==' reaches it, and still has no hash" {
+    let analysis = try analyzeOne("external type Handle;\n"
+        + "struct Slot \{\n"
+        + "    Handle handle;\n"
+        + "    Handle? spare;\n"
+        + "    Handle[] extras;\n"
+        + "\}\n"
+        + "compare(Slot left, Slot right, Handle[] some, Handle[] others, Handle? maybe,\n"
+        + "        Handle sure) -> bool \{\n"
+        + "    return left == right && some == others && maybe == sure && sure != maybe;\n"
+        + "\}\n"
+        + "hashSlot(Slot slot) -> long \{\n"
+        + "    return slot.hash();\n"
+        + "\}\n"
+        + "hashExtras(Handle[] extras) -> long \{\n"
+        + "    return extras.hash();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let diagnostics = analysis.bodyDiagnostics();
+    try testing.assertEqual(diagnostics.length, 2L);
+    try sema_support.assertDiagnostic(diagnostics, 0, "/proj/src/main.ens",
+        "Struct 'Slot' cannot be hashed. Field 'handle' has type 'Handle', which has no hash; an "
+        + "external type's contents belong to the C library, so Ens has nothing of it to hash. "
+        + "Hash the fields you need directly instead.");
+    try sema_support.assertDiagnostic(diagnostics, 1, "/proj/src/main.ens",
+        "'Handle[]' cannot be hashed: an array hashes element by element, and its element type "
+        + "'Handle' has no hash; an external type's contents belong to the C library, so Ens has "
+        + "nothing of it to hash. Hash a value you keep beside the elements instead.");
+}
+
+test "a refused key is reported at its mention and never reaches the container's own hash" {
+    let analysis = analyzeWithCollections("import Map from @std.collections.map;\n"
+        + "external type Handle;\n"
+        + "struct Registry \{\n"
+        + "    Map<Handle, int>? byHandle;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let diagnostics = analysis.signatureDiagnostics();
+    try testing.assertEqual(diagnostics.length, 1L);
+    try sema_support.assertDiagnostic(diagnostics, 0, "/proj/src/main.ens", "Cannot use 'Handle' "
+        + "as a Map key: an external type's contents belong to the C library, so Ens has nothing "
+        + "of it to hash. Wrap the handle in a class, which hashes by identity, or key by a value "
+        + "you keep beside it.");
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Signatures]);
+}
+
+// A sorted container finds a key by the order the key's own 'compareTo' gives, which the real
+// 'SortedMap' requires through the bound on its default constructor. What the key's fields hold
+// is therefore never judged, while a bare array stays refused, since its own contents can change.
+test "a sorted container accepts a struct key whose fields can change but no bare array" {
+    let analysis = analyzeWithCollections("import SortedMap from @std.collections.sortedmap;\n"
+        + "struct Ranked \{\n"
+        + "    int[] steps;\n"
+        + "    int rank;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let byRanked = new SortedMap<Ranked, string>();\n"
+        + "    let bySteps = new SortedMap<int[], string>();\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Bodies]);
+    let diagnostics = analysis.bodyDiagnostics();
+    try testing.assertEqual(diagnostics.length, 1L);
+    try sema_support.assertDiagnostic(diagnostics, 0, "/proj/src/main.ens",
+        "Cannot use 'int[]' as a SortedMap key: an array's contents, and so its place in the "
+        + "order, can change while it is in the map. Key by a value whose contents cannot change, "
+        + "such as a string or an integer.");
+}
+
+test "a floating-point value refused a hash or a key is sent to the canonical bits" {
+    let analysis = analyzeWithCollections("import Map from @std.collections.map;\n"
+        + "import Set from @std.collections.set;\n"
+        + "struct Reading \{\n"
+        + "    protected double value;\n"
+        + "    protected int sensor;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let byNumber = new Map<double, string>();\n"
+        + "    let widths = new Set<float>();\n"
+        + "    let byReading = new Map<Reading, int>();\n"
+        + "    double measure = 1.5;\n"
+        + "    long hashedNumber = measure.hash();\n"
+        + "    Reading reading = \{value: 1.5, sensor: 1\};\n"
+        + "    long hashedReading = reading.hash();\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Bodies]);
+    let diagnostics = analysis.bodyDiagnostics();
+    try testing.assertEqual(diagnostics.length, 5L);
+    try sema_support.assertDiagnostic(diagnostics, 0, "/proj/src/main.ens",
+        "Cannot use 'double' as a Map key: a NaN, the value a calculation such as 0.0 / 0.0 "
+        + "produces, is not equal to any value, including itself, so nothing could find it again, "
+        + "and negative zero is equal to zero but hashes differently, so one key would become two "
+        + "entries. Use a SortedMap, which finds a key by its order rather than by its hash, or "
+        + "key by a struct of your own whose 'equals' compares the number with 'compareTo(...) == "
+        + "0' and whose 'hash' returns 'toCanonicalBits() as long'.");
+    try sema_support.assertDiagnostic(diagnostics, 1, "/proj/src/main.ens",
+        "Cannot use 'float' as a Set element: a NaN, the value a calculation such as 0.0 / 0.0 "
+        + "produces, is not equal to any value, including itself, so nothing could find it again, "
+        + "and negative zero is equal to zero but hashes differently, so one key would become two "
+        + "entries. Use a SortedMap, which finds a key by its order rather than by its hash, or "
+        + "key by a struct of your own whose 'equals' compares the number with 'compareTo(...) == "
+        + "0' and whose 'hash' returns 'toCanonicalBits() as long'.");
+    try sema_support.assertDiagnostic(diagnostics, 2, "/proj/src/main.ens",
+        "Cannot use 'Reading' as a Map key: its field 'value' has type 'double', which has no "
+        + "hash; a NaN, the value a calculation such as 0.0 / 0.0 produces, is not equal to any "
+        + "value, including itself, so nothing could find it again, and negative zero is equal to "
+        + "zero but hashes differently, so one key would become two entries. Key by the fields "
+        + "that are not floating-point numbers, or give 'Reading' its own 'equals' and 'hash', "
+        + "comparing each floating-point field with 'compareTo(...) == 0' and hashing it with "
+        + "'toCanonicalBits() as long'.");
+    try sema_support.assertDiagnostic(diagnostics, 3, "/proj/src/main.ens",
+        "Cannot hash a value of type 'double': a NaN, the value a calculation such as 0.0 / 0.0 "
+        + "produces, is not equal to any value, including itself, so nothing could find it again, "
+        + "and negative zero is equal to zero but hashes differently, so one key would become two "
+        + "entries. Hash the number's 'toCanonicalBits() as long' instead, which gives every NaN "
+        + "the same hash and the two zeros different ones.");
+    try sema_support.assertDiagnostic(diagnostics, 4, "/proj/src/main.ens",
+        "Struct 'Reading' cannot be hashed. Field 'value' has type 'double', which has no hash; a "
+        + "NaN, the value a calculation such as 0.0 / 0.0 produces, is not equal to any value, "
+        + "including itself, so nothing could find it again, and negative zero is equal to zero "
+        + "but hashes differently, so one key would become two entries. Give 'Reading' its own "
+        + "'equals' and 'hash', comparing each floating-point field with 'compareTo(...) == 0' and "
+        + "hashing it with 'toCanonicalBits() as long'.");
+}
