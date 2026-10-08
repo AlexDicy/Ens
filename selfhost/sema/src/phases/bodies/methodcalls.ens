@@ -1,0 +1,501 @@
+// Method calls through '.', '?.' and 'super', and the calls built into strings, arrays and primitives,
+// such as 'toString()' and 'hash()'.
+import Expression from @ens.frontend.syntax.generated.nodes;
+import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SuperExpressionNode from @ens.frontend.syntax.generated.nodes;
+import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
+import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SafeMemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import GreenNode from @ens.frontend.syntax.green;
+import Span from @ens.frontend.support.source;
+import phases.calls;
+import CallCandidate from phases.calls;
+import model.capabilities;
+import model.convert;
+import phases.bodies.functioncalls;
+import phases.bodies.staticmembers;
+import phases.bodies.memberaccess;
+import MemberPosition from phases.bodies.memberaccess;
+import phases.bodies.operators;
+import phases.bodies.nullguidance;
+import phases.bodies.wording;
+import model.hierarchy;
+import model.typemembers;
+import Method from model.typemembers;
+import model.types;
+import Type from model.types;
+import ErrorType from model.types;
+import StringType from model.types;
+import OptionalType from model.types;
+import ArrayType from model.types;
+import FunctionType from model.types;
+import PrimitiveKind from model.types;
+import EnumType from model.types;
+import TypeParamType from model.types;
+import InterpolationObligation from phases.obligations;
+import HashObligation from phases.obligations;
+import List from @std.collections.list;
+import phases.bodies;
+import BodyChecker from phases.bodies;
+import NamespaceName from phases.bodies;
+
+public analyzeMemberCall(BodyChecker checker, CallExpressionNode node, MemberExpressionNode member,
+                         Type? expected) -> Type {
+    let object = member.object();
+    string memberName = member.member().text();
+    if (object is IdentifierExpressionNode) {
+        let resolution = checker.resolveName(object.name().text());
+        if (resolution is NamespaceName) {
+            let handled = functioncalls.analyzeNamespaceFunctionCall(checker, node, member,
+                resolution.targetModulePath(), memberName);
+            if (handled != null) {
+                return handled;
+            }
+        }
+    }
+    let staticHead = staticmembers.resolveStaticHead(checker, object);
+    if (staticHead != null) {
+        return staticmembers.analyzeStaticCall(checker, node, member, staticHead, expected);
+    }
+    let intercepted = interceptBuiltinCall(checker, node, object, memberName);
+    if (intercepted != null) {
+        return intercepted;
+    }
+    Type memberType = memberaccess.analyzeMemberValue(checker, member, MemberPosition.Covered);
+    checker.result().setType(member.green(), memberType);
+    let method = checker.result().methodOf(member.green());
+    if (method == null) {
+        if (convert.coreOf(memberType) is FunctionType) {
+            return functioncalls.analyzeFunctionValueCall(checker, node, memberType, memberName,
+                member.member().span());
+        }
+        reportUncallableMember(checker, member.green(), member.member().span(), memberName, memberType);
+        functioncalls.analyzeArgumentsOnly(checker, node.arguments());
+        return checker.store().errorType();
+    }
+    return finishMethodCall(checker, node, member.green(), member.member().span(), memberName,
+        object, method, false);
+}
+
+// The member resolved to a value rather than a method: an enum member or a field. The value
+// path reported nothing, because reading the member is fine; only calling it is not.
+reportUncallableMember(BodyChecker checker, GreenNode member, Span span, string name, Type memberType) {
+    if (memberType is ErrorType) {
+        return;
+    }
+    if (checker.result().memberAccessDeniedAt(member)) {
+        return;
+    }
+    if (memberType is EnumType && checker.result().enumConstantOf(member) != null) {
+        string enumName = checker.names().nameOf(memberType);
+        checker.reporter().report("'{name}' is a member of enum '{enumName}', not a method. Remove the "
+            + "parentheses, as in '{enumName}.{name}'.", span);
+        return;
+    }
+    checker.reporter().report("'{name}' is a field of type '{checker.names().of(memberType)}', not "
+        + "a method. Read it without parentheses.", span);
+}
+
+public analyzeSafeMemberCall(BodyChecker checker, CallExpressionNode node, SafeMemberExpressionNode member)
+                             -> Type {
+    let object = member.object();
+    if (object is IdentifierExpressionNode) {
+        let resolution = checker.resolveName(object.name().text());
+        if (resolution is NamespaceName) {
+            checker.reporter().report("'{object.name().text()}' is a module name, which is never null, so "
+                + "'?.' cannot follow it. Replace '?.' with '.'.", node.span());
+            functioncalls.analyzeArgumentsOnly(checker, node.arguments());
+            return checker.store().errorType();
+        }
+    }
+    Type memberType = memberaccess.analyzeSafeMemberValue(checker, member, MemberPosition.Covered);
+    checker.result().setType(member.green(), memberType);
+    let method = checker.result().methodOf(member.green());
+    if (method == null) {
+        reportUncallableMember(checker, member.green(), member.member().span(),
+            member.member().text(), memberType);
+        functioncalls.analyzeArgumentsOnly(checker, node.arguments());
+        return checker.store().errorType();
+    }
+    return finishMethodCall(checker, node, member.green(), member.member().span(),
+        member.member().text(), object, method, true);
+}
+
+// Resolves the method a receiver's call picks: overloads and named arguments go through
+// full resolution; the single-candidate path checks directly. A safe call wraps a
+// non-void result optional.
+finishMethodCall(BodyChecker checker, CallExpressionNode node, GreenNode memberGreen, Span memberSpan,
+                 string name, Expression object, Method primary, bool isSafe)
+                 -> Type {
+    Type receiverCore = checker.store().errorType();
+    let objectType = checker.result().typeOf(object.green());
+    if (objectType != null) {
+        Type receiverType = objectType;
+        if (isSafe && receiverType is OptionalType) {
+            receiverType = receiverType.inner();
+        }
+        receiverCore = memberaccess.memberReceiverCore(checker, receiverType, name);
+    }
+    let allCandidates = memberaccess.methodCandidates(receiverCore, name);
+    let candidates = memberaccess.existingOnly(checker, allCandidates);
+    let arguments = node.arguments();
+    if (candidates.length() < allCandidates.length()
+            && memberaccess.reportUnmetConstraintCall(checker, allCandidates, candidates, arguments,
+                node.span())) {
+        functioncalls.analyzeArgumentsOnly(checker, arguments);
+        return checker.store().errorType();
+    }
+    if (candidates.length() > 1 || functioncalls.usesNamedArguments(arguments)) {
+        let built = functioncalls.buildCallShape(checker, arguments, candidates.length() == 1);
+        let callCandidates = new List<CallCandidate>();
+        for (long i = 0; i < candidates.length(); i++) {
+            let candidate = candidates.get(i);
+            callCandidates.push(new CallCandidate(candidate.signature(), candidate,
+                memberaccess.isAccessAllowed(checker, candidate.visibility(), candidate.definingType())));
+        }
+        if (callCandidates.length() == 0) {
+            callCandidates.push(new CallCandidate(primary.signature(), primary, true));
+        }
+        let resolved = calls.resolveCall(callCandidates, built.shape(), checker.reporter(),
+            node.span(), name, "Method", checker.names());
+        if (resolved.failed()) {
+            return checker.store().errorType();
+        }
+        let chosen = resolved.chosen();
+        if (chosen == null) {
+            return checker.store().errorType();
+        }
+        let chosenMethod = chosen.method();
+        if (chosenMethod != null) {
+            if (!chosen.isAccessible()) {
+                memberaccess.checkMemberAccess(checker, name, chosenMethod.visibility(),
+                    chosenMethod.definingType(), memberSpan);
+            }
+            checker.result().setMethod(memberGreen, chosenMethod);
+        }
+        Type returned = functioncalls.checkResolvedArguments(checker, built, resolved, node.green());
+        if (isSafe) {
+            return wrapSafeResult(checker, returned);
+        }
+        return returned;
+    }
+    Type returned = functioncalls.checkDirectArguments(checker, "Method", name, primary.signature(),
+        arguments, node.span());
+    if (isSafe) {
+        return wrapSafeResult(checker, returned);
+    }
+    return returned;
+}
+
+// A void safe call is a statement: it runs only when the receiver is non-null and
+// produces no value.
+wrapSafeResult(BodyChecker checker, Type returned) -> Type {
+    if (returned is ErrorType || types.isVoidType(returned)) {
+        return returned;
+    }
+    return safeResultOf(checker, returned);
+}
+
+// The type '?.' and '?[' produce. Both produce 'null' when the receiver is absent, and a
+// value that is already nullable carries that result in the level it has: its own null means
+// "nothing here" just as well, so the operator adds no second level and a chain through a
+// nullable member keeps working. This is only about the level these operators add; a value
+// that is doubly nullable is still rejected by the operators themselves.
+public safeResultOf(BodyChecker checker, Type value) -> Type {
+    if (value is OptionalType) {
+        return value;
+    }
+    return checker.store().optionalOf(value);
+}
+
+public analyzeSuperCall(BodyChecker checker, CallExpressionNode node, SuperExpressionNode chained) -> Type {
+    checker.analyzeExpression(chained);
+    checker.frame().noteSuperCall();
+    Type voidType = checker.store().primitive(PrimitiveKind.Void);
+    if (!checker.frame().inConstructor() && checker.frame().thisType() != null) {
+        checker.reporter().report("'super(...)' can only be called from a constructor.", node.span());
+    }
+    Type? base = null;
+    let receiver = checker.frame().thisType();
+    if (receiver != null) {
+        base = hierarchy.baseOf(receiver);
+    }
+    if (base == null) {
+        functioncalls.analyzeArgumentsOnly(checker, node.arguments());
+        return voidType;
+    }
+    string baseName = checker.names().of(base);
+    let baseAuthority = types.authorityOf(base);
+    if (baseAuthority != null) {
+        baseName = baseAuthority.name();
+    }
+    let allConstructors = typemembers.constructorsOf(base);
+    let constructors = memberaccess.existingOnly(checker, allConstructors);
+    let arguments = node.arguments();
+    if (constructors.length() < allConstructors.length()
+            && memberaccess.reportUnmetConstraintCall(checker, allConstructors, constructors, arguments,
+                node.span())) {
+        functioncalls.analyzeArgumentsOnly(checker, arguments);
+        return voidType;
+    }
+    if (constructors.length() == 0) {
+        if (arguments.argumentsCount() > 0) {
+            checker.reporter().report("Base class '{baseName}' declares no constructor, so 'super(...)' "
+                + "takes no arguments. Write 'super()', or remove the call.", node.span());
+        } else if (checker.frame().inConstructor() && receiver != null && allConstructors.length() == 0) {
+            checker.checkImplicitBaseChain(receiver, null, false, node.span());
+        }
+        functioncalls.analyzeArgumentsOnly(checker, arguments);
+        return voidType;
+    }
+    if (constructors.length() > 1 || functioncalls.usesNamedArguments(arguments)) {
+        let built = functioncalls.buildCallShape(checker, arguments, constructors.length() == 1);
+        let candidates = new List<CallCandidate>();
+        for (long i = 0; i < constructors.length(); i++) {
+            candidates.push(new CallCandidate(constructors.get(i).signature(),
+                constructors.get(i), memberaccess.isAccessAllowed(checker, constructors.get(i).visibility(),
+                    constructors.get(i).definingType())));
+        }
+        let resolved = calls.resolveCall(candidates, built.shape(), checker.reporter(),
+            node.span(), baseName, "Base constructor", checker.names());
+        if (resolved.failed()) {
+            return voidType;
+        }
+        let chosen = resolved.chosen();
+        if (chosen != null) {
+            let chosenMethod = chosen.method();
+            if (chosenMethod != null) {
+                if (!chosen.isAccessible()) {
+                    memberaccess.checkConstructorAccess(checker, base, chosenMethod, node.span(), true);
+                }
+                checker.result().setMethod(chained.green(), chosenMethod);
+            }
+            functioncalls.checkResolvedArguments(checker, built, resolved, node.green());
+        }
+        return voidType;
+    }
+    let baseConstructor = constructors.get(0);
+    memberaccess.checkConstructorAccess(checker, base, baseConstructor, node.span(), true);
+    checker.result().setMethod(chained.green(), baseConstructor);
+    functioncalls.checkDirectArguments(checker, "Base constructor", baseName, baseConstructor.signature(),
+        arguments, node.span());
+    return voidType;
+}
+
+// The built-in members of strings, arrays, and primitives, intercepted before general
+// member resolution; a record declaring its own member of the same name falls through
+// (null result) to normal resolution, and so does a primitive whose binding declares one.
+interceptBuiltinCall(BodyChecker checker, CallExpressionNode node, Expression object, string name) -> Type? {
+    if (name != "toString" && name != "slice" && name != "hash") {
+        return null;
+    }
+    Type objectType = checker.analyzeExpression(object);
+    if (objectType is ErrorType) {
+        functioncalls.analyzeArgumentsOnly(checker, node.arguments());
+        return checker.store().errorType();
+    }
+    Type core = objectType;
+    let arguments = node.arguments();
+    if (convert.coreOf(core) is FunctionType) {
+        functioncalls.analyzeArgumentsOnly(checker, arguments);
+        return operators.reportFunctionMember(checker, name, core, node.span());
+    }
+    // The standard library's binding handles a call it declares a member for, so the
+    // compiler's own member of that name steps aside there.
+    if (bindingDeclares(checker, core, name, arguments.argumentsCount(), false)) {
+        return null;
+    }
+    // An optional hashes as its payload does while present, whatever its inner type, so only
+    // 'hash' reads through the wrapper here.
+    if (core is OptionalType) {
+        if (name == "slice" && core.inner() is ArrayType) {
+            checker.reporter().report(nullguidance.maybeNullRefusal(checker, "Cannot call 'slice' on "
+                + "'{checker.names().of(core)}' because it", object, core), node.span());
+            functioncalls.analyzeArgumentsOnly(checker, arguments);
+            return checker.store().errorType();
+        }
+        if (name != "hash") {
+            return null;
+        }
+    }
+    if (name == "toString") {
+        if (convert.isIntegerType(core) || convert.isBoolType(core) || core is StringType
+                || convert.isEnumLike(core) || bodies.isTextualFloat(core)) {
+            checkNoArguments(checker, node, "toString");
+            return checker.store().stringType();
+        }
+        if (types.isDecimalType(core)) {
+            checker.reporter().report("Internal: 'toString' on 'decimal'.", node.span());
+            functioncalls.analyzeArgumentsOnly(checker, arguments);
+            return checker.store().errorType();
+        }
+        // A struct whose own toString cannot take this call serializes to its JSON form; one
+        // whose toString matches it falls through to normal resolution.
+        if (types.isStructLike(core) && !declaresToStringFor(checker, core, arguments.argumentsCount())) {
+            checkNoArguments(checker, node, "toString");
+            if (convert.containsTypeParam(core)) {
+                checker.recordObligation(new InterpolationObligation(core, node.span()));
+            } else {
+                let issue = capabilities.structJsonabilityIssue(core, checker.names());
+                if (issue != null) {
+                    checker.reporter().report(issue, node.span());
+                }
+            }
+            return checker.store().stringType();
+        }
+        // The call is legal exactly where interpolating the array is.
+        if (core is ArrayType) {
+            checkNoArguments(checker, node, "toString");
+            if (convert.containsTypeParam(core)) {
+                checker.recordObligation(new InterpolationObligation(core, node.span()));
+            } else {
+                let issue = capabilities.interpolationIssue(core, checker.names());
+                if (issue != null) {
+                    checker.reporter().report(issue, node.span());
+                }
+            }
+            return checker.store().stringType();
+        }
+        // A class or interface value whose chain has no toString for this call produces
+        // its runtime type's text form; a chain whose toString matches it falls through to
+        // normal resolution.
+        if (types.isClassLike(core) && !declaresToStringFor(checker, core, arguments.argumentsCount())) {
+            checkNoArguments(checker, node, "toString");
+            return checker.store().stringType();
+        }
+        // A bare type parameter defers the judgment to each instantiation, exactly like a
+        // hole; a bound that declares toString resolves the call against the contract.
+        if (core is TypeParamType) {
+            bool declaresToString = false;
+            for (let bound in memberaccess.effectiveBoundsOf(checker, core)) {
+                if (anyAcceptsArgumentCount(memberaccess.methodCandidates(bound, "toString"),
+                        arguments.argumentsCount())) {
+                    declaresToString = true;
+                }
+            }
+            if (declaresToString) {
+                return null;
+            }
+            checkNoArguments(checker, node, "toString");
+            checker.recordObligation(new InterpolationObligation(core, node.span()));
+            return checker.store().stringType();
+        }
+        return null;
+    }
+    if (name == "slice") {
+        if (core is ArrayType) {
+            checkRangeArguments(checker, node, "slice");
+            return core;
+        }
+        return null;
+    }
+    if (types.isVoidType(core)) {
+        checker.reporter().report("{wording.sideNamed(object, "This call")} returns no value, so there is "
+            + "nothing to call 'hash' on.", node.span());
+        functioncalls.analyzeArgumentsOnly(checker, arguments);
+        return checker.store().errorType();
+    }
+    if (!(core is OptionalType) && declaresHash(checker, core)) {
+        return null;
+    }
+    checkNoArguments(checker, node, "hash");
+    checkHashable(checker, core, node.span());
+    return checker.store().primitive(PrimitiveKind.Long);
+}
+
+// Whether a 'toString' the receiver's chain declares takes a call of this argument count.
+// Only a 'toString' taking no parameters is a type's text form, so a call with no arguments
+// reaches the built-in form past one that takes parameters, and a call carrying arguments
+// reaches that method.
+declaresToStringFor(BodyChecker checker, Type receiver, long argumentCount) -> bool {
+    return anyAcceptsArgumentCount(memberaccess.availableMethods(checker, receiver, "toString"),
+        argumentCount);
+}
+
+// Whether the standard library's binding declares a member for a call of this name and argument count
+// itself. A declaration whose parameter list matches the compiler's own member replaces it,
+// and one that differs is an overload the compiler never provided, so both read the same way
+// here: what the binding declares wins, and what it does not the compiler still provides.
+bindingDeclares(BodyChecker checker, Type receiver, string name, long argumentCount, bool isStatic) -> bool {
+    let binding = types.bindingOf(receiver);
+    if (binding == null) {
+        return false;
+    }
+    let declared = isStatic ? binding.staticMethods() : binding.methods();
+    for (long i = 0; i < declared.length(); i++) {
+        let signature = declared.get(i).signature();
+        if (signature.name() == name && calls.acceptsArgumentCount(signature, argumentCount)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Whether a written 'hash' exists on this receiver: a bound of a type parameter, or a member
+// of a record; anything else gets the synthesized content hash.
+declaresHash(BodyChecker checker, Type core) -> bool {
+    if (core is TypeParamType) {
+        for (let bound in memberaccess.effectiveBoundsOf(checker, core)) {
+            if (memberaccess.methodCandidates(bound, "hash").length() > 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+    return memberaccess.isRecordLike(core)
+        && memberaccess.availableMethods(checker, core, "hash").length() > 0;
+}
+
+// The synthesized content hash needs every leaf the receiver folds to have a hash. A receiver
+// mentioning a type parameter is judged per instantiation.
+checkHashable(BodyChecker checker, Type receiver, Span span) {
+    if (convert.containsTypeParam(receiver)) {
+        checker.recordObligation(new HashObligation(receiver, span));
+        return;
+    }
+    let issue = capabilities.hashabilityIssue(receiver, checker.names());
+    if (issue != null) {
+        checker.reporter().report(issue, span);
+    }
+}
+
+checkNoArguments(BodyChecker checker, CallExpressionNode node, string name) {
+    if (node.arguments().argumentsCount() > 0) {
+        string[] unnamed = [];
+        checker.reporter().report(calls.countRefusal("'{name}' takes", 0, 0,
+            node.arguments().argumentsCount(), "argument", unnamed), node.span());
+        functioncalls.analyzeArgumentsOnly(checker, node.arguments());
+    }
+}
+
+// Array slicing takes a start and an end index.
+checkRangeArguments(BodyChecker checker, CallExpressionNode node, string name) {
+    let arguments = node.arguments();
+    if (arguments.argumentsCount() != 2) {
+        checker.reporter().report(calls.countRefusal("'{name}' takes", 2, 2, arguments.argumentsCount(),
+            "argument", ["start", "end"]), node.span());
+        functioncalls.analyzeArgumentsOnly(checker, arguments);
+        return;
+    }
+    for (long i = 0; i < arguments.argumentsCount(); i++) {
+        let argument = arguments.arguments(i);
+        if (argument is Expression) {
+            Type actual = checker.analyzeExpression(argument);
+            if (!(actual is ErrorType) && !convert.isIntegerType(actual)) {
+                checker.reporter().report("'{name}' takes integer indexes, but "
+                    + "{wording.sideNamed(argument, "this index")} has type '{checker.names().of(actual)}'.",
+                    argument.span());
+            }
+        }
+    }
+}
+
+// Whether one of these declarations takes a call of this argument count.
+anyAcceptsArgumentCount(List<Method> candidates, long argumentCount) -> bool {
+    for (long i = 0; i < candidates.length(); i++) {
+        if (calls.acceptsArgumentCount(candidates.get(i).signature(), argumentCount)) {
+            return true;
+        }
+    }
+    return false;
+}
