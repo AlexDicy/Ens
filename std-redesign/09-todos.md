@@ -142,6 +142,8 @@ A static method of a generic base read through a raw generic subclass, `Mid.make
 A method or function name passed to an overloaded callee is analyzed before a parameter is chosen, so `over(Plain.make)` with `over((int) -> int)` beside `over(string)` gets "Call it as 'Plain.make(...)'" where only the function-typed parameter could take it; once overload resolution records the chosen parameter, the name-as-value refusal should read it and suggest the lambda (found 2026-09-27 by review 11).
 "and no 'wrap' method does" is broader than what was compared: `text(Branch.wrap)` with `Branch extends Root<int>` and a `(string) -> string` target is judged against `Root<int>.wrap` only, so the text should name the instantiation, "and 'Root<int>.wrap' does not" (found 2026-09-27 by review 11).
 Three texts found beside the lambda fixes: the lambda-throws refusal's example says '(() -> void throws X)' even when the target returns 'int'; `staticWithoutType` outside function positions always writes '(...)', even for a method with no parameters; inside a subclass a bare inherited static reads "Undefined function 'make'" and a bare instance method "Undefined name 'count'" (found 2026-09-27).
+Extending a class that is 'final' also reports "'super' cannot be used in 'Square', because 'Square' has no base class." for the subclass's constructor, a consequence of the refused 'extends' rather than a second problem (rule 12; found 2026-10-08 by review 13).
+The signature phase pushes each class onto its base's `directSubclasses()` list (`declaredtypes.ens:821`), so one module's phase writes into a `ClassType` another module owns; that is shared mutable state across modules, which per-module parallel work cannot have, so the lists should be built after the barrier from each module's own results (found 2026-10-08 by review 13).
 
 ## The language server's replacement
 
@@ -168,6 +170,7 @@ It refuses `(x) = 1;` with "Left side of assignment must be an assignable expres
 Its own `buildNarrowingPath` at `lsp/frontend/semantic/Analyzer.cpp:4051` still has member and subscript arms, so the editor narrows a mutable field or an array element after a null check where the compiler, as of 2026-09-22, narrows stable places only.
 Its analyzer at `lsp/frontend/semantic/Analyzer.cpp:249-258` (calls at `:1467` and `:1501`) still makes every unmarked member private to its type, so the editor refuses the file-private member uses the compiler accepts since 2026-09-23.
 Its constructor-chain check near `lsp/frontend/semantic/Analyzer.cpp:3649` looks only at the immediate base, so a class with no constructor over a constructor-less middle class whose base needs arguments, which the compiler refuses since 2026-09-23, passes in the editor.
+Its `protectedMemberReach` at `lsp/frontend/semantic/Analyzer.cpp:5432` still treats a `sealed` class like a `final` one, so the editor accepts the protected-member leak through an open subclass of a sealed class that the compiler refuses as of 2026-10-08, and its own leak texts keep the older wording.
 
 ## Reminders
 
