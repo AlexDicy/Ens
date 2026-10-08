@@ -108,6 +108,9 @@ import ExitScope from model.flow;
 import NoreturnCalls from model.flow;
 import model.literalvalues;
 import phases.members;
+import phases.bodies.definiteassignment;
+import AssignmentFlow from phases.bodies.definiteassignment;
+import AssignmentState from phases.bodies.definiteassignment;
 import phases.bodies.wording;
 import model.narrow;
 import NarrowingPath from model.narrow;
@@ -223,27 +226,6 @@ class NarrowingFact {
     protected bool narrowsWhenTrue;
 
     protected constructor(this.path, this.proven, this.narrowsWhenTrue);
-}
-
-// An assignment to one field of 'this', kept with the place that wrote it, so a second
-// assignment to a 'const' field can point back at an earlier one.
-public final class FieldWrite {
-    protected Field field;
-    protected Span span;
-
-    protected constructor(this.field, this.span);
-}
-
-// A snapshot of definite-assignment state at one program point: the locals and this-fields
-// assigned so far, the this-field assignments that may have run on some path reaching it, and
-// whether the path has already left through a return, throw, break, continue, or panic.
-public final class AssignmentFlow {
-    protected List<LocalBinding> assigned;
-    protected List<Field> assignedFields;
-    protected List<FieldWrite> maybeAssignedWrites;
-    protected bool terminated;
-
-    protected constructor(this.assigned, this.assignedFields, this.maybeAssignedWrites, this.terminated);
 }
 
 // How a refusal describes a field or element that can change, as in "'t.count' is a field".
@@ -1244,438 +1226,6 @@ public final class CallableFrame {
     public leaveCatchClause() {
         this.inCatch = false;
     }
-}
-
-// Which locals and own fields are definitely assigned on the path being checked, which own
-// fields may already be assigned, and the states that leave the loops around it through 'break'.
-public final class AssignmentState {
-    Reporter reporter;
-    TypeNames names;
-
-    List<LocalBinding> assignedLocals;
-    List<LocalBinding> trackedLocals;
-    List<List<AssignmentFlow>> breakFlows;
-    bool flowTerminated;
-    bool isUnconditional;
-    LocalBinding? targetBinding;
-
-    // The class whose constructor body is being analyzed, or null outside a constructor.
-    // assignedThisFields is the current flow's set of own fields definitely assigned, and
-    // ctorSeededThisWrites is the entry state each catch clause resets to on the exception path.
-    // maybeAssignedThisWrites is the assignments that may have run on some path reaching here,
-    // which is what holds a 'const' field to one write and names the earlier place a second
-    // assignment is reported against. ctorEscapedMaybeWrites accumulates that set wherever an
-    // exception can leave the body, so a catch clause has what may already be written.
-    Type? fieldOwner;
-    List<Field> assignedThisFields;
-    List<FieldWrite> ctorSeededThisWrites;
-    List<FieldWrite> maybeAssignedThisWrites;
-    List<FieldWrite> ctorEscapedMaybeWrites;
-
-    public constructor(Reporter reporter, TypeNames names) {
-        this.reporter = reporter;
-        this.names = names;
-        this.assignedLocals = new List<LocalBinding>();
-        this.trackedLocals = new List<LocalBinding>();
-        this.breakFlows = new List<List<AssignmentFlow>>();
-        this.flowTerminated = false;
-        this.isUnconditional = true;
-        this.targetBinding = null;
-        this.fieldOwner = null;
-        this.assignedThisFields = new List<Field>();
-        this.ctorSeededThisWrites = new List<FieldWrite>();
-        this.maybeAssignedThisWrites = new List<FieldWrite>();
-        this.ctorEscapedMaybeWrites = new List<FieldWrite>();
-    }
-
-    public reset() {
-        this.assignedLocals = new List<LocalBinding>();
-        this.trackedLocals = new List<LocalBinding>();
-        this.breakFlows = new List<List<AssignmentFlow>>();
-        this.flowTerminated = false;
-        this.isUnconditional = true;
-        this.targetBinding = null;
-        this.fieldOwner = null;
-        this.assignedThisFields = new List<Field>();
-        this.ctorSeededThisWrites = new List<FieldWrite>();
-        this.maybeAssignedThisWrites = new List<FieldWrite>();
-        this.ctorEscapedMaybeWrites = new List<FieldWrite>();
-    }
-
-    // The state inside a lambda's body: the enclosing locals' assignments carry in, and it is
-    // outside any loop and any constructor.
-    public forLambda() -> AssignmentState {
-        let derived = new AssignmentState(this.reporter, this.names);
-        derived.assignedLocals = this.copyBindings(this.assignedLocals);
-        derived.trackedLocals = this.copyBindings(this.trackedLocals);
-        derived.assignedThisFields = this.assignedThisFields;
-        derived.ctorSeededThisWrites = this.ctorSeededThisWrites;
-        derived.maybeAssignedThisWrites = this.maybeAssignedThisWrites;
-        derived.ctorEscapedMaybeWrites = this.ctorEscapedMaybeWrites;
-        return derived;
-    }
-
-    public constructorFieldOwner() -> Type? {
-        return this.fieldOwner;
-    }
-
-    public unconditionalPosition() -> bool {
-        return this.isUnconditional;
-    }
-
-    public setUnconditionalPosition(bool unconditional) {
-        this.isUnconditional = unconditional;
-    }
-
-    public assignmentTarget() -> LocalBinding? {
-        return this.targetBinding;
-    }
-
-    public setAssignmentTarget(LocalBinding? target) {
-        this.targetBinding = target;
-    }
-
-    public terminate() {
-        this.flowTerminated = true;
-    }
-
-    public beginLoop() {
-        this.breakFlows.push(new List<AssignmentFlow>());
-    }
-
-    public endLoop() -> List<AssignmentFlow> {
-        return this.breakFlows.pop();
-    }
-
-    public noteBreak() {
-        if (!this.flowTerminated && this.breakFlows.length() > 0) {
-            this.breakFlows.get(this.breakFlows.length() - 1).push(this.snapshot());
-        }
-        this.flowTerminated = true;
-    }
-
-    public enterConstructor(Type receiver) {
-        this.fieldOwner = receiver;
-    }
-
-    public seedField(Field field, Span span) {
-        if (!this.fieldsContain(this.assignedThisFields, field)) {
-            this.assignedThisFields.push(field);
-            this.ctorSeededThisWrites.push(new FieldWrite(field, span));
-        }
-    }
-
-    public finishSeeding() {
-        this.maybeAssignedThisWrites = this.copyWrites(this.ctorSeededThisWrites);
-    }
-
-    // The catch body runs on the exception path, where the try body may have thrown before
-    // assigning any local or field, so only the caught variable and the fields assigned
-    // before the body (the this-field parameters) carry in as definitely assigned. What may
-    // be assigned is the opposite union: everything written before any point the body could
-    // have thrown from.
-    public enterCatchPath() {
-        this.assignedLocals = new List<LocalBinding>();
-        this.assignedThisFields = this.writtenFields(this.ctorSeededThisWrites);
-        this.maybeAssignedThisWrites = this.copyWrites(this.ctorSeededThisWrites);
-        for (long i = 0; i < this.ctorEscapedMaybeWrites.length(); i++) {
-            let escaped = this.ctorEscapedMaybeWrites.get(i);
-            if (!this.writesContain(this.maybeAssignedThisWrites, escaped.field)) {
-                this.maybeAssignedThisWrites.push(escaped);
-            }
-        }
-        this.breakFlows = new List<List<AssignmentFlow>>();
-        this.flowTerminated = false;
-    }
-
-    // The assignment to this field that may already have run on a path reaching here, or null.
-    public possibleWriteOf(Field field) -> FieldWrite? {
-        return this.writeTo(this.maybeAssignedThisWrites, field);
-    }
-
-    public trackLocal(LocalBinding binding, bool assigned) {
-        if (!bindingsContain(this.trackedLocals, binding)) {
-            this.trackedLocals.push(binding);
-        }
-        if (assigned && !bindingsContain(this.assignedLocals, binding)) {
-            this.assignedLocals.push(binding);
-        }
-    }
-
-    public markAssigned(LocalBinding binding) {
-        if (this.flowTerminated) {
-            return;
-        }
-        if (bindingsContain(this.trackedLocals, binding) && !bindingsContain(this.assignedLocals, binding)) {
-            this.assignedLocals.push(binding);
-        }
-    }
-
-    fieldsContain(List<Field> set, Field field) -> bool {
-        for (long i = 0; i < set.length(); i++) {
-            if (set.get(i) == field) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    copyFields(List<Field> set) -> List<Field> {
-        let copy = new List<Field>();
-        for (long i = 0; i < set.length(); i++) {
-            copy.push(set.get(i));
-        }
-        return copy;
-    }
-
-    copyWrites(List<FieldWrite> set) -> List<FieldWrite> {
-        let copy = new List<FieldWrite>();
-        for (long i = 0; i < set.length(); i++) {
-            copy.push(set.get(i));
-        }
-        return copy;
-    }
-
-    writesContain(List<FieldWrite> set, Field field) -> bool {
-        return this.writeTo(set, field) != null;
-    }
-
-    // The recorded assignment to this field, or null where the set holds none.
-    writeTo(List<FieldWrite> set, Field field) -> FieldWrite? {
-        for (long i = 0; i < set.length(); i++) {
-            if (set.get(i).field == field) {
-                return set.get(i);
-            }
-        }
-        return null;
-    }
-
-    // The fields a set of assignments names, in the order they were recorded.
-    writtenFields(List<FieldWrite> set) -> List<Field> {
-        let fields = new List<Field>();
-        for (long i = 0; i < set.length(); i++) {
-            fields.push(set.get(i).field);
-        }
-        return fields;
-    }
-
-    public markThisFieldAssigned(Field field) {
-        if (this.flowTerminated || this.fieldOwner == null) {
-            return;
-        }
-        if (!this.fieldsContain(this.assignedThisFields, field)) {
-            this.assignedThisFields.push(field);
-        }
-    }
-
-    public markThisFieldMaybeAssigned(Field field, Span at) {
-        if (this.flowTerminated || this.fieldOwner == null) {
-            return;
-        }
-        if (!this.writesContain(this.maybeAssignedThisWrites, field)) {
-            this.maybeAssignedThisWrites.push(new FieldWrite(field, at));
-        }
-    }
-
-    // Called where an exception can leave the constructor body: whatever may be assigned here
-    // may be assigned when a catch clause starts. A throw inside a catch clause leaves the
-    // constructor altogether, so it feeds no other clause's entry state.
-    public noteThrowEscapePoint(bool inCatchClause) {
-        if (this.flowTerminated || this.fieldOwner == null || inCatchClause) {
-            return;
-        }
-        for (long i = 0; i < this.maybeAssignedThisWrites.length(); i++) {
-            let write = this.maybeAssignedThisWrites.get(i);
-            if (!this.writesContain(this.ctorEscapedMaybeWrites, write.field)) {
-                this.ctorEscapedMaybeWrites.push(write);
-            }
-        }
-    }
-
-    // Reports every own field left unassigned on the path reaching span when the field needed an
-    // assignment, meaning a non-defaultable one or a 'const' one without a default, and credits
-    // them so the same field is not reported twice.
-    public checkConstructorFieldsAssigned(Span span) {
-        let owner = this.fieldOwner;
-        if (owner == null || this.flowTerminated) {
-            return;
-        }
-        let fields = typemembers.fieldsOf(owner);
-        if (fields == null) {
-            return;
-        }
-        let missing = new List<Field>();
-        let missingConst = new List<Field>();
-        for (long i = typemembers.baseFieldCount(owner); i < fields.length(); i++) {
-            let field = fields.get(i);
-            if (field.type() is ErrorType) {
-                continue;
-            }
-            if (field.hasDefault()) {
-                continue;
-            }
-            if (this.fieldsContain(this.assignedThisFields, field)) {
-                continue;
-            }
-            if (field.isConst()) {
-                missingConst.push(field);
-            } else if (!convert.isDefaultable(field.type())) {
-                missing.push(field);
-            }
-        }
-        string owningName = this.names.of(owner);
-        string kindWord = "class";
-        let authority = types.authorityOf(owner);
-        if (authority != null) {
-            owningName = authority.name();
-            kindWord = typenames.kindWordOf(authority);
-        }
-        if (missing.length() > 0) {
-            string they = "they";
-            if (missing.length() == 1) {
-                they = "it";
-            }
-            this.reporter.report(fieldListSubject(missing) + " of {kindWord} '{owningName}' "
-                + "cannot be null, and {they} " + fieldListVerb(missing) + " not assigned on every "
-                + "path through this constructor. Assign " + fieldListPronoun(missing)
-                + " on every path, for example 'this.{missing.get(0).name()} = ...;'.", span);
-        }
-        if (missingConst.length() > 0) {
-            this.reporter.report(fieldListSubject(missingConst) + " of {kindWord} "
-                + "'{owningName}' " + fieldListVerb(missingConst) + " 'const' with no default "
-                + "value and " + fieldListVerb(missingConst) + " not assigned on every path "
-                + "through this constructor. Assign " + fieldListPronoun(missingConst)
-                + " on every path, for example 'this.{missingConst.get(0).name()} = ...;'.",
-                span);
-        }
-        for (long i = 0; i < missing.length(); i++) {
-            this.assignedThisFields.push(missing.get(i));
-        }
-        for (long i = 0; i < missingConst.length(); i++) {
-            this.assignedThisFields.push(missingConst.get(i));
-        }
-    }
-
-    public checkDefiniteAssignment(LocalBinding binding, Span span) {
-        if (this.flowTerminated) {
-            return;
-        }
-        let target = this.targetBinding;
-        if (target != null && target == binding) {
-            return;
-        }
-        if (!bindingsContain(this.trackedLocals, binding) || bindingsContain(this.assignedLocals, binding)) {
-            return;
-        }
-        this.reporter.report("Variable '{binding.name()}' is used before it is assigned a "
-            + "value. Assign it on every path that leads to this line, for example "
-            + "'{binding.name()} = ...;'.", span);
-        this.assignedLocals.push(binding);
-    }
-
-    copyBindings(List<LocalBinding> set) -> List<LocalBinding> {
-        let copy = new List<LocalBinding>();
-        for (long i = 0; i < set.length(); i++) {
-            copy.push(set.get(i));
-        }
-        return copy;
-    }
-
-    public snapshot() -> AssignmentFlow {
-        return new AssignmentFlow(this.copyBindings(this.assignedLocals),
-            this.copyFields(this.assignedThisFields),
-            this.copyWrites(this.maybeAssignedThisWrites), this.flowTerminated);
-    }
-
-    public restore(AssignmentFlow flow) {
-        this.assignedLocals = this.copyBindings(flow.assigned);
-        this.assignedThisFields = this.copyFields(flow.assignedFields);
-        this.maybeAssignedThisWrites = this.copyWrites(flow.maybeAssignedWrites);
-        this.flowTerminated = flow.terminated;
-    }
-
-    unionWritesInto(List<FieldWrite> target, List<FieldWrite> source) {
-        for (long i = 0; i < source.length(); i++) {
-            if (!this.writesContain(target, source.get(i).field)) {
-                target.push(source.get(i));
-            }
-        }
-    }
-
-    // The join of several branch out-states: a local or field is definitely assigned after the
-    // join only when it is assigned on every branch that can fall through, and may be assigned
-    // when any falling-through branch may have assigned it. A terminated branch cannot reach the
-    // join, so it drops out. When every branch terminates the join is unreachable, so it stays
-    // terminated and credits every branch's writes to avoid reports in the dead code that follows.
-    public join(List<AssignmentFlow> flows) -> AssignmentFlow {
-        let result = new List<LocalBinding>();
-        let resultFields = new List<Field>();
-        let resultMaybeWrites = new List<FieldWrite>();
-        bool anySurvivor = false;
-        for (long i = 0; i < flows.length(); i++) {
-            let flow = flows.get(i);
-            if (flow.terminated) {
-                continue;
-            }
-            this.unionWritesInto(resultMaybeWrites, flow.maybeAssignedWrites);
-            if (!anySurvivor) {
-                result = this.copyBindings(flow.assigned);
-                resultFields = this.copyFields(flow.assignedFields);
-                anySurvivor = true;
-            } else {
-                let both = new List<LocalBinding>();
-                for (long j = 0; j < result.length(); j++) {
-                    if (bindingsContain(flow.assigned, result.get(j))) {
-                        both.push(result.get(j));
-                    }
-                }
-                result = both;
-                let bothFields = new List<Field>();
-                for (long j = 0; j < resultFields.length(); j++) {
-                    if (this.fieldsContain(flow.assignedFields, resultFields.get(j))) {
-                        bothFields.push(resultFields.get(j));
-                    }
-                }
-                resultFields = bothFields;
-            }
-        }
-        if (!anySurvivor) {
-            for (long i = 0; i < flows.length(); i++) {
-                let flow = flows.get(i);
-                for (long j = 0; j < flow.assigned.length(); j++) {
-                    if (!bindingsContain(result, flow.assigned.get(j))) {
-                        result.push(flow.assigned.get(j));
-                    }
-                }
-                for (long j = 0; j < flow.assignedFields.length(); j++) {
-                    if (!this.fieldsContain(resultFields, flow.assignedFields.get(j))) {
-                        resultFields.push(flow.assignedFields.get(j));
-                    }
-                }
-                this.unionWritesInto(resultMaybeWrites, flow.maybeAssignedWrites);
-            }
-        }
-        return new AssignmentFlow(result, resultFields, resultMaybeWrites, !anySurvivor);
-    }
-
-    // Sets the assignment state after a loop to the join of every way it can exit normally. When
-    // nothing can exit, the loop runs forever and the code after it is unreachable.
-    public finishLoop(List<AssignmentFlow> exits) {
-        if (exits.length() == 0) {
-            this.flowTerminated = true;
-        } else {
-            this.restore(this.join(exits));
-        }
-    }
-}
-
-bindingsContain(List<LocalBinding> set, LocalBinding binding) -> bool {
-    for (long i = 0; i < set.length(); i++) {
-        if (set.get(i) == binding) {
-            return true;
-        }
-    }
-    return false;
 }
 
 // The targets a literal is judged against while the code around it is analyzed: the expression
@@ -4082,10 +3632,10 @@ public final class BodyChecker implements NoreturnCalls {
         this.assignment().restore(this.assignment().join(flows));
 
         let survivors = new List<Map<NarrowingPath, Type>>();
-        if (!afterThen.terminated) {
+        if (!afterThen.terminated()) {
             survivors.push(thenFacts);
         }
-        if (!afterElse.terminated) {
+        if (!afterElse.terminated()) {
             survivors.push(elseFacts);
         }
         this.applyNarrowingJoin(entryFacts, survivors);
@@ -7680,7 +7230,7 @@ public final class BodyChecker implements NoreturnCalls {
         let earlier = this.assignment().possibleWriteOf(field);
         if (earlier != null) {
             this.reporter().report("Field '{name}' is 'const' and may already be assigned when "
-                + "this line runs. Remove one of the assignments.", node.span(), earlier.span,
+                + "this line runs. Remove one of the assignments.", node.span(), earlier.span(),
                 "'{name}' is assigned here");
             return true;
         }
@@ -7793,12 +7343,12 @@ public final class BodyChecker implements NoreturnCalls {
     // declaration that lets it change. The value an 'is' arm matched has no declaration to change.
     constantRefusal(string opening, LocalBinding binding) -> string {
         string name = binding.name();
-        if (bindingsContain(this.armBindings, binding)) {
+        if (definiteassignment.bindingsContain(this.armBindings, binding)) {
             return "{opening}, because '{name}' is the value this 'is' arm matched, and it cannot change. "
                 + "Copy it into a variable if it needs to change, as in 'let changed = {name};'.";
         }
         string fix = "Remove 'const' from its declaration";
-        if (bindingsContain(this.untypedConstants, binding)) {
+        if (definiteassignment.bindingsContain(this.untypedConstants, binding)) {
             fix = "Replace 'const' with 'let' in its declaration";
         }
         return "{opening}, because '{name}' is declared 'const'. {fix} if it needs to change.";
@@ -12170,7 +11720,7 @@ public final class BodyChecker implements NoreturnCalls {
         this.narrowing.restoreLayers(entryLayers);
         let survivors = new List<Map<NarrowingPath, Type>>();
         for (long i = 0; i < armFlows.length(); i++) {
-            if (!armFlows.get(i).terminated) {
+            if (!armFlows.get(i).terminated()) {
                 survivors.push(armNarrowings.get(i));
             }
         }
@@ -12794,40 +12344,6 @@ fieldIndexNamed(List<Field> fields, string name) -> long {
         }
     }
     return -1;
-}
-
-// "Field 'a'" or "Fields 'a', 'b' and 'c'", for a diagnostic naming several fields at once.
-fieldListSubject(List<Field> fields) -> string {
-    string subject = "Fields ";
-    if (fields.length() == 1) {
-        subject = "Field ";
-    }
-    for (long i = 0; i < fields.length(); i++) {
-        if (i > 0) {
-            if (i + 1 == fields.length()) {
-                subject = subject + " and ";
-            } else {
-                subject = subject + ", ";
-            }
-        }
-        subject = subject + "'{fields.get(i).name()}'";
-    }
-    return subject;
-}
-
-fieldListVerb(List<Field> fields) -> string {
-    if (fields.length() == 1) {
-        return "is";
-    }
-    return "are";
-}
-
-// "it" or "them", so a fix worded for several fields agrees with fieldListSubject.
-fieldListPronoun(List<Field> fields) -> string {
-    if (fields.length() == 1) {
-        return "it";
-    }
-    return "them";
 }
 
 structDisplayName(Type structType, TypeNames names) -> string {
