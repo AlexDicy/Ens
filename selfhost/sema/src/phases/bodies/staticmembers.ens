@@ -1,0 +1,1036 @@
+// Statics written after a type name, as in 'Counter.limit' or 'Box<int>.make()': the type before
+// the '.', the static calls and the type arguments inferred for them, and the texts that show the
+// type arguments a call leaves out.
+import Expression from @ens.frontend.syntax.generated.nodes;
+import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
+import GenericNameExpressionNode from @ens.frontend.syntax.generated.nodes;
+import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ArgumentListNode from @ens.frontend.syntax.generated.nodes;
+import NamedArgumentNode from @ens.frontend.syntax.generated.nodes;
+import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import GreenNode from @ens.frontend.syntax.green;
+import Span from @ens.frontend.support.source;
+import phases.calls;
+import ArgumentValue from phases.calls;
+import CallShape from phases.calls;
+import CallCandidate from phases.calls;
+import TypeArgumentInference from phases.inference;
+import model.convert;
+import phases.members;
+import phases.bodies.memberaccess;
+import phases.bodies.functionvalues;
+import FieldMember from phases.bodies.memberaccess;
+import MissingMember from phases.bodies.memberaccess;
+import MemberPosition from phases.bodies.memberaccess;
+import NamePosition from phases.bodies.memberaccess;
+import LambdaFit from phases.bodies.functionvalues;
+import LambdaFix from phases.bodies.functionvalues;
+import StaticCallText from phases.bodies.memberaccess;
+import phases.bodies.literalfixes;
+import phases.bodies.literaltyping;
+import phases.bodies.nullguidance;
+import phases.bodies.wording;
+import phases.bodies.narrowing;
+import model.hierarchy;
+import FailedConstraint from model.hierarchy;
+import model.typemembers;
+import Method from model.typemembers;
+import Parameter from model.typemembers;
+import Signature from model.typemembers;
+import model.typenames;
+import model.types;
+import Type from model.types;
+import ErrorType from model.types;
+import StringType from model.types;
+import FunctionType from model.types;
+import PrimitiveType from model.types;
+import DeclaredType from model.types;
+import EnumType from model.types;
+import InstantiationType from model.types;
+import TypeParamType from model.types;
+import ArrayType from model.types;
+import OptionalType from model.types;
+import Visibility from model.types;
+import List from @std.collections.list;
+import phases.bodies;
+import BodyChecker from phases.bodies;
+import LocalName from phases.bodies;
+import TypeParameterName from phases.bodies;
+import FunctionName from phases.bodies;
+import TypeName from phases.bodies;
+import BuiltShape from phases.bodies;
+
+// What a member access's written head names when it is a type rather than a value: the
+// declared type of a bare name, the instantiation of a 'Name<Args>' head, or a type
+// parameter, which the static paths then reject by name. Null when the head is a value (or
+// a namespace or enum, which the callers handled first); the error type when the head named
+// a type but its arguments did not resolve, after a diagnostic.
+public resolveStaticHead(BodyChecker checker, Expression object) -> Type? {
+    switch (object) {
+        is IdentifierExpressionNode identifier -> {
+            return staticHeadNamed(checker, identifier.name().text());
+        },
+        is GenericNameExpressionNode generic -> {
+            return resolveGenericHead(checker, generic);
+        },
+        default -> {
+            return null;
+        },
+    }
+}
+
+// The type a bare head name stands for: a primitive's own keyword names the primitive, and
+// unqualified resolution decides the rest, so a local or a module function of that name
+// leaves no type head. A type parameter in scope stands for itself. Enums stay with the
+// enum-member path.
+staticHeadNamed(BodyChecker checker, string name) -> Type? {
+    if (name.length == 0) {
+        return null;
+    }
+    let primitive = types.primitiveNamed(checker.store(), name);
+    if (primitive != null) {
+        return primitive;
+    }
+    let resolution = checker.resolveName(name);
+    if (resolution is TypeParameterName) {
+        return resolution.parameter();
+    }
+    if (resolution is TypeName && !(resolution.target() is EnumType)) {
+        return resolution.target();
+    }
+    return null;
+}
+
+// A 'Name<Args>' head: the name must be a generic type visible in this file, and the written
+// arguments instantiate it, bounds checked by the resolver.
+resolveGenericHead(BodyChecker checker, GenericNameExpressionNode generic) -> Type? {
+    let head = generic.head();
+    if (!(head is IdentifierExpressionNode)) {
+        checker.reporter().report("Type arguments go after a type's name, and "
+            + "{wording.sideNamed(head, "this expression")} is not one.", generic.typeArguments().span());
+        return checker.store().errorType();
+    }
+    string name = head.name().text();
+    let named = staticHeadNamed(checker, name);
+    string written = wording.greenSpelling(generic.typeArguments().green());
+    if (named == null) {
+        let resolution = checker.resolveName(name);
+        if (resolution == null) {
+            string importFix = "Check the spelling, or import it.";
+            let module = standardModuleExporting(checker, name);
+            if (module != null) {
+                importFix = "Check the spelling, or import it, as in 'import {name} from @{module};'.";
+            }
+            checker.reporter().report("Undefined name '{name}'. {importFix}", head.span());
+        } else if (resolution is TypeName) {
+            checker.reporter().report("Type '{name}' is not generic, so it takes no type arguments. Remove "
+                + "'{written}'.", generic.typeArguments().span());
+        } else if (resolution is LocalName) {
+            checker.reporter().report("'{name}' is a value, not a type, so it cannot take type arguments.",
+                head.span());
+        } else if (resolution is FunctionName) {
+            checker.reporter().report("'{name}' is a function, not a type, so it cannot take type "
+                + "arguments.", head.span());
+        } else {
+            checker.reporter().report("'{name}' is not a type, so it cannot take type arguments.",
+                head.span());
+        }
+        return checker.store().errorType();
+    }
+    if (named is TypeParamType) {
+        return named;
+    }
+    if (named is DeclaredType) {
+        if (!named.isGeneric()) {
+            checker.reporter().report("Type '{name}' is not generic, so it takes no type arguments. Remove "
+                + "'{written}'.", generic.typeArguments().span());
+            return checker.store().errorType();
+        }
+        Type instantiated = checker.resolver().instantiateGeneric(named, name,
+            generic.typeArguments(), generic.span());
+        if (!(instantiated is ErrorType)) {
+            checker.result().setType(generic.green(), instantiated);
+        }
+        return instantiated;
+    }
+    return checker.store().errorType();
+}
+
+// The module of the standard library that exports a type named 'name', or null when none or more
+// than one of the modules in this program does.
+standardModuleExporting(BodyChecker checker, string name) -> string? {
+    string? found = null;
+    for (let context in checker.contextsByPath().values()) {
+        string path = context.module().canonicalPath();
+        if (!path.startsWith("std.")) {
+            continue;
+        }
+        let declared = context.declarations().typeNamed(name);
+        if (declared == null || declared.visibility() != Visibility.Export) {
+            continue;
+        }
+        if (found != null) {
+            return null;
+        }
+        found = path;
+    }
+    return found;
+}
+
+// Refuses 'written', a static named after the type parameter 'parameter'.
+reportTypeParameterHead(BodyChecker checker, TypeParamType parameter, string written, Span at) {
+    string name = parameter.name();
+    checker.reporter().report(checker.typeParameterMessage(parameter, "'{written}' names a static member "
+        + "through the type parameter '{name}', and '{name}' is a different type each time it is used, "
+        + "so '{written}' does not name one static member. Write the type's own name instead.",
+        NamePosition.MemberHead), at);
+}
+
+// A member read whose head is a type name: a static const resolves to its constant value, a
+// static method is refused as a name that is not a value, and everything else explains where
+// the member actually is declared.
+public analyzeStaticMemberValue(BodyChecker checker, MemberExpressionNode node, Expression object, Type head,
+                                MemberPosition position = MemberPosition.Read,
+                                FunctionType? wanted = null) -> Type {
+    if (head is ErrorType) {
+        return checker.store().errorType();
+    }
+    if (head is TypeParamType) {
+        reportTypeParameterHead(checker, head, wording.oneLineSpelling(node), node.span());
+        return checker.store().errorType();
+    }
+    checker.result().setType(object.green(), head);
+    string name = node.member().text();
+    let owner = types.authorityOf(head);
+    if (owner == null || typemembers.staticFieldsOf(head) == null) {
+        reportStaticsUnsupported(checker, head, name, node.span());
+        return checker.store().errorType();
+    }
+    let field = members.findField(typemembers.staticFieldsOf(head), name);
+    if (field != null) {
+        memberaccess.checkMemberAccess(checker, name, field.visibility(), field.definingType(),
+            node.member().span());
+        checker.result().setStaticConstField(node.green(), field);
+        return narrowing.narrowedFieldType(checker, node, field.type());
+    }
+    let statics = memberaccess.availableStatics(checker, head, name);
+    if (statics.length() > 0) {
+        // A head written with type arguments keeps them, so the call this names resolves
+        // the way the written head did.
+        string ownerName = checker.names().nameOf(owner);
+        if (head is InstantiationType) {
+            ownerName = checker.names().of(head);
+        }
+        string subject = "'{name}' is a static method of '{ownerName}'";
+        if (wanted != null && position == MemberPosition.Read) {
+            let fix = functionvalues.lambdaFix(checker, "method", name,
+                reachedSignatures(checker, statics, wanted), wanted, checker.names().plainNameOf(owner));
+            checker.reporter().report(functionvalues.functionValueRefusal(subject, fix, "{ownerName}.{name}"),
+                node.member().span());
+            return checker.store().errorType();
+        }
+        string call = memberaccess.methodCallText("{ownerName}.{name}", statics);
+        checker.reporter().report(memberaccess.methodAsValueMessage(subject, call, position),
+            node.member().span());
+        return checker.store().errorType();
+    }
+    reportMissingStatic(checker, head, owner, name, node.member().span(), -1, wanted);
+    return checker.store().errorType();
+}
+
+// Interfaces and external types carry no statics, and neither does a primitive the standard
+// library declares no members for. An enum never reaches here, because its own member lookup
+// resolves first.
+reportStaticsUnsupported(BodyChecker checker, Type head, string name, Span at) {
+    string shown = checker.names().of(head);
+    if (types.isDecimalType(head)) {
+        checker.reporter().report("'decimal' is a reserved word and not a usable type yet. Use 'double' for "
+            + "fractional values, or an integer scaled by hand (a 'long' count of cents, say) where the "
+            + "value has to be exact.", at);
+        return;
+    }
+    if (head is StringType || head is PrimitiveType) {
+        checker.reporter().report("'{shown}' has no static members. Call '{name}' on a value of "
+            + "type '{shown}' instead.", at);
+        return;
+    }
+    checker.reporter().report(typenames.noStaticMembersMessage(head, name, checker.names()), at);
+}
+
+// The member is not a static of the named type: an instance member is reached through a
+// value, a base class's static through the base's own name, and anything else is unknown.
+// 'argumentCount' is -1 for a read, and 'wanted' is the function type a read is expected to have.
+reportMissingStatic(BodyChecker checker, Type head, DeclaredType owner, string name, Span at,
+                    long argumentCount = -1, FunctionType? wanted = null) {
+    let member = memberaccess.lookupMember(checker, head, name);
+    if (!(member is MissingMember)) {
+        string ownerShown = checker.names().nameOf(owner);
+        string use = "Call '{name}' on";
+        if (member is FieldMember) {
+            use = "Read '{name}' from";
+        }
+        checker.reporter().report("'{name}' belongs to each '{ownerShown}' value, not to the type "
+            + "'{ownerShown}', so it is used through a value. {use} a value of type '{ownerShown}'.", at);
+        return;
+    }
+    Type? current = hierarchy.baseOf(head);
+    while (current != null) {
+        let field = members.findField(typemembers.staticFieldsOf(current), name);
+        let statics = memberaccess.staticsNamed(current, name);
+        if (field != null || statics.length() > 0) {
+            let declaring = types.authorityOf(current);
+            if (declaring == null) {
+                return;
+            }
+            Type spelledHead = declaring;
+            if (field == null) {
+                spelledHead = memberaccess.staticMethodHead(current, declaring);
+            }
+            string followUp = "";
+            string message = "";
+            LambdaFix? fix = null;
+            if (field == null && argumentCount < 0 && wanted != null) {
+                fix = functionvalues.lambdaFix(checker, "method", name,
+                    reachedSignatures(checker, statics, wanted), wanted,
+                    checker.names().plainNameOf(declaring));
+            }
+            if (fix != null && fix.fit() != LambdaFit.Called) {
+                string spelling = typenames.qualifiedMemberSpelling(spelledHead, name, checker.names(),
+                    fix.before(), fix.after());
+                string fixText = functionvalues.nameNotValueText(fix, spelling);
+                followUp = "{typenames.staticNotInheritedLead(declaring, checker.names())}. {fixText}";
+                message = "{typenames.staticNotInheritedReason(name, declaring, checker.names())} {fixText}";
+            } else {
+                // A method's name is not a value, so a read of static methods is spelled as a call.
+                string prefix = "";
+                string suffix = "";
+                if (field == null && argumentCount < 0) {
+                    let call = new StaticCallText(statics);
+                    prefix = call.prefix();
+                    suffix = call.suffix();
+                }
+                followUp = typenames.staticNotInheritedFollowUp(name, declaring, spelledHead,
+                    checker.names(), prefix, suffix);
+                message = typenames.staticNotInheritedMessage(name, declaring, spelledHead, checker.names(),
+                    prefix, suffix);
+            }
+            if (field != null && !memberaccess.checkMemberAccess(checker, name, field.visibility(),
+                    field.definingType(), at, followUp)) {
+                return;
+            }
+            if (field == null
+                    && !checkStaticsAccess(checker, name, statics, argumentCount, at, followUp, wanted)) {
+                return;
+            }
+            if (field == null) {
+                message = message + usableOverloadsNote(checker, name, statics, argumentCount, wanted);
+            }
+            checker.reporter().report(message, at);
+            return;
+        }
+        current = hierarchy.baseOf(current);
+    }
+    if (memberaccess.reportFirstUnmet(checker,
+            memberaccess.missingConditional(checker, memberaccess.staticsNamed(head, name)), at)) {
+        return;
+    }
+    checker.reporter().report("Type '{checker.names().nameOf(owner)}' has no static member '{name}'.", at);
+}
+
+// The static methods of 'statics' that a call with 'argumentCount' arguments can reach, -1 for a
+// read, or all of them when it reaches none. A read expected to have the function type 'wanted'
+// reaches the ones a lambda of that type can call.
+reachedOverloads(BodyChecker checker, List<Method> statics, long argumentCount,
+                 FunctionType? wanted = null) -> List<Method> {
+    let reached = new List<Method>();
+    for (let method in statics) {
+        bool reaches = argumentCount < 0 || takesArgumentCount(method, argumentCount);
+        if (wanted != null) {
+            reaches = functionvalues.fitsFunctionType(method.signature(), wanted.parameterTypes(),
+                wanted.returnType());
+        }
+        if (reaches) {
+            reached.push(method);
+        }
+    }
+    if (reached.length() == 0) {
+        return statics;
+    }
+    return reached;
+}
+
+// Whether code here can use one of the static methods 'statics' named 'name' that the call can
+// reach, reporting the refusal when it can use none. A single reached method is named by its
+// parameter types when the others have another visibility.
+checkStaticsAccess(BodyChecker checker, string name, List<Method> statics, long argumentCount, Span at,
+                   string followUp, FunctionType? wanted = null) -> bool {
+    let reached = reachedOverloads(checker, statics, argumentCount, wanted);
+    for (let method in reached) {
+        if (memberaccess.isAccessAllowed(checker, method.visibility(), method.definingType())) {
+            return true;
+        }
+    }
+    let first = reached.get(0);
+    for (let method in reached) {
+        if (method.visibility() != first.visibility()) {
+            reportUnusableOverloads(checker, name, reached, argumentCount, at, followUp);
+            return false;
+        }
+    }
+    string shown = name;
+    for (let method in statics) {
+        if (method.visibility() != first.visibility()) {
+            shown = overloadSpelling(checker, name, first);
+        }
+    }
+    memberaccess.checkMemberAccess(checker, shown, first.visibility(), first.definingType(), at, followUp);
+    return false;
+}
+
+// The sentence, opening with a space, that names the reached overloads of 'name' code here can
+// use when the call can also mean one it cannot, or empty when it can use every reached one.
+usableOverloadsNote(BodyChecker checker, string name, List<Method> statics, long argumentCount,
+                    FunctionType? wanted = null) -> string {
+    let usable = new List<string>();
+    let reached = reachedOverloads(checker, statics, argumentCount, wanted);
+    for (let method in reached) {
+        if (memberaccess.isAccessAllowed(checker, method.visibility(), method.definingType())) {
+            usable.push(overloadSpelling(checker, name, method));
+        }
+    }
+    if (usable.length() == reached.length()) {
+        return "";
+    }
+    string taking = takingPhrase(checker, reached, argumentCount);
+    return " Of the '{name}' methods{taking}, code here can use only {wording.quotedList(usable)}.";
+}
+
+// The signatures of the static methods of 'statics' a lambda given 'wanted' can call, the ones code
+// here can use first.
+public reachedSignatures(BodyChecker checker, List<Method> statics, FunctionType wanted) -> Signature[] {
+    let usable = new List<Signature>();
+    let others = new List<Signature>();
+    for (let method in reachedOverloads(checker, statics, -1, wanted)) {
+        if (memberaccess.isAccessAllowed(checker, method.visibility(), method.definingType())) {
+            usable.push(method.signature());
+        } else {
+            others.push(method.signature());
+        }
+    }
+    for (let signature in others) {
+        usable.push(signature);
+    }
+    return usable.toArray();
+}
+
+// ' that take 1 argument' where every method of 'reached' takes the call's 'argumentCount'
+// arguments, and empty for a read and where the call reaches none of them.
+takingPhrase(BodyChecker checker, List<Method> reached, long argumentCount) -> string {
+    if (argumentCount < 0) {
+        return "";
+    }
+    for (let method in reached) {
+        if (!takesArgumentCount(method, argumentCount)) {
+            return "";
+        }
+    }
+    if (argumentCount == 1) {
+        return " that take 1 argument";
+    }
+    return " that take {argumentCount} arguments";
+}
+
+// One overload of the static method 'name', by its parameter types: 'name(int, string)'.
+overloadSpelling(BodyChecker checker, string name, Method method) -> string {
+    let parameterTypes = new List<string>();
+    for (let parameter in method.signature().parameters()) {
+        parameterTypes.push(checker.names().of(parameter.type()));
+    }
+    return "{name}({string.joined(parameterTypes.toArray(), ", ")})";
+}
+
+// The refusal of the static methods 'reached' named 'name' when a call can mean any of them, code
+// here can use none, and their visibilities differ. Each is named with what keeps it out of reach.
+reportUnusableOverloads(BodyChecker checker, string name, List<Method> reached, long argumentCount, Span at,
+                        string followUp) {
+    let defining = reached.get(0).definingType();
+    string owner = checker.names().of(defining);
+    string kind = "type";
+    let authority = types.authorityOf(defining);
+    if (authority != null) {
+        owner = authority.name();
+        kind = typenames.kindWordOf(authority);
+    }
+    string fix = "export";
+    string packageName = "its own package";
+    if (authority != null) {
+        if (authority.packagePrefix() == checker.packagePrefix()) {
+            fix = "public";
+        }
+        if (authority.packagePrefix().length > 0) {
+            packageName = "package '{authority.packagePrefix()}'";
+        }
+    }
+    string listed = "";
+    for (long i = 0; i < reached.length(); i++) {
+        let method = reached.get(i);
+        string reason = "is private to '{owner}'";
+        if (method.visibility() == Visibility.Protected) {
+            reason = "is 'protected' in '{owner}'";
+        } else if (method.visibility() == Visibility.Public) {
+            reason = "is public inside {packageName} but not exported";
+        }
+        if (i > 0 && i == reached.length() - 1) {
+            listed = listed + " and ";
+        } else if (i > 0) {
+            listed = listed + ", ";
+        }
+        listed = listed + "'{overloadSpelling(checker, name, method)}' {reason}";
+    }
+    string taking = takingPhrase(checker, reached, argumentCount);
+    checker.reporter().report("None of the '{name}' methods of {kind} '{owner}'{taking} can be used here: "
+        + "{listed}. Mark the one you want to use '{fix}'. {followUp}", at);
+}
+
+// A call whose head is a type name: 'List<int>.withCapacity(8)', 'List.of(items)', or
+// 'Path.parse(text)'. A concrete head resolves like any single-receiver call; a bare
+// generic head first determines the type arguments from the call's own arguments and the
+// expected type, the same two sources a generic function call and an aggregate literal use.
+public analyzeStaticCall(BodyChecker checker, CallExpressionNode node, MemberExpressionNode member, Type head,
+                         Type? expected) -> Type {
+    let arguments = node.arguments();
+    if (head is ErrorType) {
+        checker.analyzeArgumentsOnly(arguments);
+        return checker.store().errorType();
+    }
+    if (head is TypeParamType) {
+        reportTypeParameterHead(checker, head, wording.oneLineSpelling(member), node.span());
+        checker.analyzeArgumentsOnly(arguments);
+        return checker.store().errorType();
+    }
+    checker.result().setType(member.object().green(), head);
+    string name = member.member().text();
+    let owner = types.authorityOf(head);
+    if (owner == null || typemembers.staticFieldsOf(head) == null) {
+        reportStaticsUnsupported(checker, head, name, node.span());
+        checker.analyzeArgumentsOnly(arguments);
+        return checker.store().errorType();
+    }
+    let writtenOnMethod = node.typeArguments();
+    if (writtenOnMethod != null) {
+        string written = wording.greenSpelling(writtenOnMethod.green());
+        if (owner.isGeneric()) {
+            string listed = concreteTypeArguments(owner.typeParameters().length);
+            if (writtenOnMethod.argumentsCount() == owner.typeParameters().length) {
+                listed = written.substring(1, written.length - 1);
+            }
+            checker.reporter().report("Type arguments are never written after a method name. Write them "
+                + "after the type name, as in '{checker.names().nameOf(owner)}<{listed}>.{name}"
+                + "{bodies.argumentsSpelling(arguments)}'.", writtenOnMethod.span());
+        } else {
+            checker.reporter().report("Type arguments are never written after a method name, and "
+                + "'{checker.names().nameOf(owner)}' is not generic. Remove '{written}'.",
+                writtenOnMethod.span());
+        }
+        checker.analyzeArgumentsOnly(arguments);
+        return checker.store().errorType();
+    }
+    let constField = members.findField(typemembers.staticFieldsOf(head), name);
+    if (constField != null) {
+        checker.reporter().report("'{checker.names().nameOf(owner)}.{name}' is a "
+            + "{members.typeLevelFieldWord(constField)}, not a method. Remove the "
+            + "parentheses.", node.span());
+        checker.analyzeArgumentsOnly(arguments);
+        return checker.store().errorType();
+    }
+    if (head is DeclaredType && head.isGeneric()) {
+        return analyzeInferredStaticCall(checker, node, member, head, name, expected);
+    }
+    let allCandidates = memberaccess.staticsNamed(head, name);
+    let candidates = memberaccess.existingOnly(checker, allCandidates);
+    if (candidates.length() < allCandidates.length()
+            && memberaccess.reportUnmetConstraintCall(checker, allCandidates, candidates, arguments,
+                node.span())) {
+        checker.analyzeArgumentsOnly(arguments);
+        return checker.store().errorType();
+    }
+    if (candidates.length() == 0) {
+        reportMissingStatic(checker, head, owner, name, member.member().span(), arguments.argumentsCount());
+        checker.analyzeArgumentsOnly(arguments);
+        return checker.store().errorType();
+    }
+    return finishStaticCall(checker, node, member, name, candidates);
+}
+
+// Resolves a static call against a concrete owner, mirroring finishMethodCall: overloads
+// and named arguments through full resolution, the single candidate checked directly.
+finishStaticCall(BodyChecker checker, CallExpressionNode node, MemberExpressionNode member, string name,
+                 List<Method> candidates) -> Type {
+    let arguments = node.arguments();
+    if (candidates.length() > 1 || bodies.usesNamedArguments(arguments)) {
+        let built = checker.buildCallShape(arguments, candidates.length() == 1);
+        let callCandidates = new List<CallCandidate>();
+        for (long i = 0; i < candidates.length(); i++) {
+            let candidate = candidates.get(i);
+            callCandidates.push(new CallCandidate(candidate.signature(), candidate,
+                memberaccess.isAccessAllowed(checker, candidate.visibility(), candidate.definingType())));
+        }
+        let resolved = calls.resolveCall(callCandidates, built.shape(), checker.reporter(),
+            node.span(), name, "Method", checker.names());
+        if (resolved.failed()) {
+            return checker.store().errorType();
+        }
+        let chosen = resolved.chosen();
+        if (chosen == null) {
+            return checker.store().errorType();
+        }
+        let chosenMethod = chosen.method();
+        if (chosenMethod != null) {
+            if (!chosen.isAccessible()) {
+                memberaccess.checkMemberAccess(checker, name, chosenMethod.visibility(),
+                    chosenMethod.definingType(), member.member().span());
+            }
+            checker.result().setMethod(member.green(), chosenMethod);
+        }
+        return checker.checkResolvedArguments(built, resolved, node.green());
+    }
+    let single = candidates.get(0);
+    memberaccess.checkMemberAccess(checker, name, single.visibility(), single.definingType(),
+        member.member().span());
+    checker.result().setMethod(member.green(), single);
+    return checker.checkDirectArguments("Method", name, single.signature(), arguments, node.span());
+}
+
+// A static call on a generic type written without its type arguments. Each candidate infers
+// them independently: from the arguments whose parameter is exactly one of the type's own
+// parameters (the generic-function rule), then from the expected type when it is an
+// instantiation of the same template. Explicit arguments never reach here; they resolve on
+// the type name.
+analyzeInferredStaticCall(BodyChecker checker, CallExpressionNode node, MemberExpressionNode member,
+                          DeclaredType template, string name, Type? expected) -> Type {
+    let arguments = node.arguments();
+    let templateStatics = typemembers.staticMethodsOf(template);
+    if (templateStatics == null) {
+        checker.analyzeArgumentsOnly(arguments);
+        return checker.store().errorType();
+    }
+    let indexes = new List<long>();
+    for (long i = 0; i < templateStatics.length(); i++) {
+        if (templateStatics.get(i).name() == name) {
+            indexes.push(i);
+        }
+    }
+    if (indexes.length() == 0) {
+        reportMissingStatic(checker, template, template, name, member.member().span(),
+            arguments.argumentsCount());
+        checker.analyzeArgumentsOnly(arguments);
+        return checker.store().errorType();
+    }
+    if (bodies.usesNamedArguments(arguments)) {
+        string templateName = checker.names().nameOf(template);
+        string listed = concreteTypeArguments(template.typeParameters().length);
+        string example = "'{templateName}<{listed}>.{name}{bodies.argumentsSpelling(arguments)}'";
+        let open = openTypeParameter(template, templateStatics, indexes);
+        if (open.length > 0) {
+            checker.reporter().report("When the type arguments of '{templateName}' come from the arguments, "
+                + "the call cannot name its arguments, and no argument gives '{open}' a type. Write the "
+                + "type arguments after '{templateName}', as in {example}.", node.span());
+        } else {
+            checker.reporter().report("When the type arguments of '{templateName}' come from the arguments, "
+                + "the call cannot name its arguments. Pass the arguments in order, or write the type "
+                + "arguments after '{templateName}', as in {example}.", node.span());
+        }
+        checker.analyzeArgumentsOnly(arguments);
+        return checker.store().errorType();
+    }
+    let argumentTypes = new List<Type>();
+    bool refusedArgument = false;
+    for (long i = 0; i < arguments.argumentsCount(); i++) {
+        let argument = arguments.arguments(i);
+        if (argument is Expression) {
+            Type analyzed = checker.analyzeExpression(argument);
+            refusedArgument = refusedArgument || analyzed is ErrorType;
+            argumentTypes.push(analyzed);
+        } else {
+            argumentTypes.push(checker.store().errorType());
+        }
+    }
+    let owner = template.declaration();
+    TypeParamType[] typeParameters = template.typeParameterTypes();
+    long arity = typeParameters.length;
+    Type[] contextArguments = [];
+    if (expected != null) {
+        Type core = convert.coreOf(expected);
+        if (core is InstantiationType && core.template() == template) {
+            contextArguments = core.arguments();
+        }
+    }
+    let completedIndexes = new List<long>();
+    let completedArguments = new List<Type[]>();
+    let completedInferences = new List<TypeArgumentInference>();
+    for (long c = 0; c < indexes.length(); c++) {
+        let inference = inferTypeArguments(checker, templateStatics.get(indexes.get(c)), owner,
+            arity, argumentTypes, contextArguments);
+        let inferred = inference.bindings();
+        if (inferred != null) {
+            completedIndexes.push(indexes.get(c));
+            completedArguments.push(inferred);
+            completedInferences.push(inference);
+        }
+    }
+    if (completedIndexes.length() == 0 && refusedArgument) {
+        return checker.store().errorType();
+    }
+    if (completedIndexes.length() == 0) {
+        string templateName = checker.names().nameOf(template);
+        checker.reporter().report(unshownTypeArguments("'{templateName}'", template.typeParameters(),
+            "{templateName}<", ">.{name}{bodies.argumentsSpelling(arguments)}",
+            exampleTypeArgument(arguments)), node.span());
+        return checker.store().errorType();
+    }
+    let boundedIndexes = new List<long>();
+    let boundedArguments = new List<Type[]>();
+    let boundedInferences = new List<TypeArgumentInference>();
+    for (long c = 0; c < completedIndexes.length(); c++) {
+        Type[] vector = completedArguments.get(c);
+        bool satisfied = true;
+        for (long k = 0; k < arity; k++) {
+            if (!checker.resolver().boundsSatisfied(typeParameters[k], vector)) {
+                satisfied = false;
+            }
+        }
+        if (satisfied && unmetStaticConstraint(checker,
+                templateStatics.get(completedIndexes.get(c)), template, vector) != null) {
+            satisfied = false;
+        }
+        if (satisfied) {
+            boundedIndexes.push(completedIndexes.get(c));
+            boundedArguments.push(vector);
+            boundedInferences.push(completedInferences.get(c));
+        }
+    }
+    if (boundedIndexes.length() == 0) {
+        Type[] vector = completedArguments.get(0);
+        bool declaredHold = true;
+        for (long k = 0; k < arity; k++) {
+            if (!checker.resolver().checkArgumentBounds(typeParameters[k], vector, node.span())) {
+                declaredHold = false;
+            }
+        }
+        if (declaredHold) {
+            let candidate = templateStatics.get(completedIndexes.get(0));
+            let failed = unmetStaticConstraint(checker, candidate, template, vector);
+            if (failed != null) {
+                checker.reporter().report(memberaccess.unmetConstraintMessage(checker, candidate, template,
+                    vector, failed), node.span());
+            }
+        }
+        return checker.store().errorType();
+    }
+    if (boundedIndexes.length() == 1) {
+        return checkInferredStaticCall(checker, node, member, template,
+            boundedIndexes.get(0), boundedArguments.get(0), argumentTypes,
+            templateStatics.get(boundedIndexes.get(0)), boundedInferences.get(0));
+    }
+    return selectInferredStaticCall(checker, node, member, template, name, boundedIndexes,
+        boundedArguments, argumentTypes);
+}
+
+// The first constraint a conditional static fails at this inferred type-argument vector, or
+// null for an unconditional or satisfied candidate; the candidate is only a candidate where
+// it exists.
+unmetStaticConstraint(BodyChecker checker, Method candidate, DeclaredType template, Type[] vector)
+                      -> FailedConstraint? {
+    if (!candidate.isConditional()) {
+        return null;
+    }
+    return hierarchy.firstFailedConstraint(checker.store(), candidate, template, vector,
+        checker.resolver().activeConstraintOwner(), checker.resolver().activeConstraints());
+}
+
+// The arguments fill what they can and the expected type fills the rest. A slot neither
+// fills leaves the inference incomplete and fails the candidate.
+inferTypeArguments(BodyChecker checker, Method candidate, GreenNode owner, long arity,
+                   List<Type> argumentTypes, Type[] contextArguments) -> TypeArgumentInference {
+    let inference = new TypeArgumentInference(checker.store(), owner, arity);
+    Parameter[] parameters = candidate.signature().parameters();
+    for (long i = 0; i < argumentTypes.length() && i < parameters.length; i++) {
+        inference.unifyArgument(i, parameters[i].type(), argumentTypes.get(i));
+    }
+    for (long i = 0; i < arity && i < contextArguments.length; i++) {
+        inference.fillFromContext(i, contextArguments[i]);
+    }
+    return inference;
+}
+
+// The single inferred candidate: instantiate, then check the arguments against the
+// substituted signature the way a generic function call does, without re-analyzing them.
+checkInferredStaticCall(BodyChecker checker, CallExpressionNode node, MemberExpressionNode member,
+                        DeclaredType template, long staticIndex, Type[] typeArguments,
+                        List<Type> argumentTypes, Method templateCandidate,
+                        TypeArgumentInference inference) -> Type {
+    if (!checker.resolver().acceptsKeyType(template, typeArguments, node.span())) {
+        return checker.store().errorType();
+    }
+    let instantiation = checker.store().instantiationOf(template, typeArguments);
+    checker.resolver().recordInstantiationMention(instantiation, node.span());
+    let resolved = staticAtIndex(checker, instantiation, staticIndex);
+    if (resolved == null) {
+        return checker.store().errorType();
+    }
+    checker.result().setType(member.object().green(), instantiation);
+    memberaccess.checkMemberAccess(checker, resolved.name(), resolved.visibility(),
+        resolved.definingType(), member.member().span());
+    checker.result().setMethod(member.green(), resolved);
+    let signature = resolved.signature();
+    Parameter[] parameters = signature.parameters();
+    let arguments = node.arguments();
+    long count = arguments.argumentsCount();
+    long required = calls.requiredArgumentCount(signature);
+    if (count < required || count > parameters.length) {
+        checker.reporter().report(calls.arityRefusal("Method '{resolved.name()}'", signature, count),
+            node.span());
+    }
+    for (long i = 0; i < count && i < parameters.length; i++) {
+        let argument = arguments.arguments(i);
+        if (argument is Expression) {
+            Type parameterType = parameters[i].type();
+            let origin = literalfixes.argumentOrigin(checker, argument, signature, i, parameterType);
+            literaltyping.adaptIntegerLiteral(checker, argument, parameterType, origin);
+            literaltyping.adaptCharLiteral(checker, argument, parameterType);
+            literaltyping.adaptFloatLiteral(checker, argument, parameterType, origin);
+            Type actual = argumentTypes.get(i);
+            let updated = checker.result().typeOf(argument.green());
+            if (updated != null) {
+                actual = updated;
+            }
+            if (!(parameterType is ErrorType) && !(actual is ErrorType)
+                    && !convert.isAssignableStrict(parameterType, actual)) {
+                Parameter[] templateParameters = templateCandidate.signature().parameters();
+                string provenance = "";
+                if (i < templateParameters.length) {
+                    provenance = inference.provenance(templateParameters[i].type(),
+                        checker.names().nameOf(template), ".{resolved.name()}(...)", checker.names());
+                }
+                string hint = nullguidance.valueAssignabilityHint(checker, parameterType, actual, argument);
+                checker.reporter().report(bodies.argumentMismatch("{i + 1}", "'{resolved.name()}'",
+                    parameters[i].name(), parameterType, actual, checker.names()) + "{hint}{provenance}",
+                    argument.span());
+            }
+        }
+    }
+    return signature.returnType();
+}
+
+// Several candidates inferred complete vectors: rank their substituted signatures over the
+// already-analyzed arguments and let overload resolution pick.
+selectInferredStaticCall(BodyChecker checker, CallExpressionNode node, MemberExpressionNode member,
+                         DeclaredType template, string name, List<long> staticIndexes,
+                         List<Type[]> vectors, List<Type> argumentTypes) -> Type {
+    let arguments = node.arguments();
+    let shape = new CallShape();
+    let values = new List<Expression?>();
+    for (long i = 0; i < arguments.argumentsCount(); i++) {
+        switch (arguments.arguments(i)) {
+            is Expression value -> {
+                Type analyzed = argumentTypes.get(i);
+                let updated = checker.result().typeOf(value.green());
+                if (updated != null) {
+                    analyzed = updated;
+                }
+                shape.positional().push(checker.argumentValueOf("", value, analyzed));
+                values.push(value);
+            },
+            default -> {
+                shape.markErrorArgument();
+                shape.positional().push(new ArgumentValue("", checker.store().errorType(),
+                    false, false, 0, false, node.span()));
+                values.push(null);
+            },
+        }
+    }
+    let built = new BuiltShape(shape, values);
+    let callCandidates = new List<CallCandidate>();
+    let resolvedMethods = new List<Method>();
+    let resolvedOwners = new List<Type>();
+    for (long c = 0; c < staticIndexes.length(); c++) {
+        if (!checker.resolver().acceptsKeyType(template, vectors.get(c), node.span())) {
+            return checker.store().errorType();
+        }
+        let instantiation = checker.store().instantiationOf(template, vectors.get(c));
+        checker.resolver().recordInstantiationMention(instantiation, node.span());
+        let resolved = staticAtIndex(checker, instantiation, staticIndexes.get(c));
+        if (resolved == null) {
+            continue;
+        }
+        resolvedMethods.push(resolved);
+        resolvedOwners.push(instantiation);
+        callCandidates.push(new CallCandidate(resolved.signature(), resolved,
+            memberaccess.isAccessAllowed(checker, resolved.visibility(), resolved.definingType())));
+    }
+    if (callCandidates.length() == 0) {
+        return checker.store().errorType();
+    }
+    let resolution = calls.resolveCall(callCandidates, built.shape(), checker.reporter(),
+        node.span(), name, "Method", checker.names());
+    if (resolution.failed()) {
+        return checker.store().errorType();
+    }
+    let chosen = resolution.chosen();
+    if (chosen == null) {
+        return checker.store().errorType();
+    }
+    let chosenMethod = chosen.method();
+    if (chosenMethod != null) {
+        for (long c = 0; c < resolvedMethods.length(); c++) {
+            if (resolvedMethods.get(c) == chosenMethod) {
+                checker.result().setType(member.object().green(), resolvedOwners.get(c));
+            }
+        }
+        if (!chosen.isAccessible()) {
+            memberaccess.checkMemberAccess(checker, name, chosenMethod.visibility(),
+                chosenMethod.definingType(), member.member().span());
+        }
+        checker.result().setMethod(member.green(), chosenMethod);
+    }
+    return checker.checkResolvedArguments(built, resolution, node.green());
+}
+
+// The instantiation's static at a template list position; the lists fill in parallel, so
+// a miss is a compiler bug rather than a user error.
+staticAtIndex(BodyChecker checker, InstantiationType instantiation, long index) -> Method? {
+    checker.store().ensureFilled(instantiation);
+    let statics = typemembers.staticMethodsOf(instantiation);
+    if (statics == null || index >= statics.length()) {
+        panic("Internal: instantiation '{checker.names().of(instantiation)}' has no static at "
+            + "position {index}");
+    }
+    return statics.get(index);
+}
+
+// A 'Name<Args>' head reached as a value: the parser only builds it before a '.', so this
+// is a recovery path, but it still explains itself.
+public analyzeGenericNameValue(BodyChecker checker, GenericNameExpressionNode generic) -> Type {
+    checker.reporter().report("'{wording.oneLineSpelling(generic)}' is a type, not a value. Write one of "
+        + "its static members after it.", generic.span());
+    return checker.store().errorType();
+}
+
+// The first type parameter of 'template' that no parameter of any of the statics at 'indexes'
+// mentions, so no argument can give it a type, or empty when each one mentions them all.
+openTypeParameter(DeclaredType template, List<Method> statics, List<long> indexes) -> string {
+    string[] names = template.typeParameters();
+    for (long p = 0; p < names.length; p++) {
+        for (let index in indexes) {
+            bool mentioned = false;
+            for (let parameter in statics.get(index).signature().parameters()) {
+                if (mentionsTypeParameter(parameter.type(), template.declaration(), p)) {
+                    mentioned = true;
+                }
+            }
+            if (!mentioned) {
+                return names[p];
+            }
+        }
+    }
+    return "";
+}
+
+// Whether 'type' mentions the type parameter at 'index' of the declaration 'owner'.
+mentionsTypeParameter(Type type, GreenNode owner, long index) -> bool {
+    switch (type) {
+        is TypeParamType parameter -> {
+            return parameter.owner() == owner && parameter.index() == index;
+        },
+        is ArrayType array -> {
+            return mentionsTypeParameter(array.element(), owner, index);
+        },
+        is OptionalType optional -> {
+            return mentionsTypeParameter(optional.inner(), owner, index);
+        },
+        is FunctionType function -> {
+            for (let parameter in function.parameterTypes()) {
+                if (mentionsTypeParameter(parameter, owner, index)) {
+                    return true;
+                }
+            }
+            return mentionsTypeParameter(function.returnType(), owner, index);
+        },
+        is InstantiationType instantiation -> {
+            for (let argument in instantiation.arguments()) {
+                if (mentionsTypeParameter(argument, owner, index)) {
+                    return true;
+                }
+            }
+            return false;
+        },
+        default -> {
+            return false;
+        },
+    }
+}
+
+// The type an example writes for a type argument the call leaves open: 'int', or 'int?' when an
+// argument is 'null', which only a nullable type takes.
+public exampleTypeArgument(ArgumentListNode? arguments) -> string {
+    if (arguments == null) {
+        return "int";
+    }
+    for (long i = 0; i < arguments.argumentsCount(); i++) {
+        switch (arguments.arguments(i)) {
+            is NamedArgumentNode named -> {
+                if (wording.isNullLiteral(wording.unwrapParentheses(named.value()))) {
+                    return "int?";
+                }
+            },
+            is Expression value -> {
+                if (wording.isNullLiteral(wording.unwrapParentheses(value))) {
+                    return "int?";
+                }
+            },
+            default -> {},
+        }
+    }
+    return "int";
+}
+
+// One 'int' for each of 'count' type parameters, as an example writes them: "int, int".
+concreteTypeArguments(long count) -> string {
+    string listed = "";
+    for (long i = 0; i < count; i++) {
+        if (i > 0) {
+            listed = listed + ", ";
+        }
+        listed = listed + "int";
+    }
+    return listed;
+}
+
+// The refusal of a call to the generic 'subject' that shows none of its type arguments 'parameters'.
+// The example writes 'example' for each, between 'head' and 'tail'.
+public unshownTypeArguments(string subject, string[] parameters, string head, string tail, string example)
+        -> string {
+    string listed = "";
+    for (long i = 0; i < parameters.length; i++) {
+        if (i > 0) {
+            listed = listed + ", ";
+        }
+        listed = listed + example;
+    }
+    if (parameters.length == 1) {
+        return "{subject} is generic, and this call does not show what its type argument '{parameters[0]}' "
+            + "is. Write it, as in '{head}{listed}{tail}'.";
+    }
+    let quoted = new List<string>();
+    for (let parameter in parameters) {
+        quoted.push(parameter);
+    }
+    return "{subject} is generic, and this call does not show what its type arguments "
+        + "{wording.quotedList(quoted)} are. Write them, as in '{head}{listed}{tail}'.";
+}
+
+// Whether a call with 'count' arguments can reach 'method', counting its optional parameters.
+takesArgumentCount(Method method, long count) -> bool {
+    return count >= typemembers.requiredParameterCount(method.signature())
+        && count <= method.signature().parameters().length;
+}

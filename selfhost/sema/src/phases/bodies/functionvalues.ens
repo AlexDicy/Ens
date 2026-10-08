@@ -1,0 +1,343 @@
+// A method or function named where a function value is expected: the lambda that makes it one, and
+// the refusal when no lambda can be written, such as for 'this' of a struct.
+import Expression from @ens.frontend.syntax.generated.nodes;
+import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ThisExpressionNode from @ens.frontend.syntax.generated.nodes;
+import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import support.diagnostics;
+import model.convert;
+import phases.bodies.wording;
+import model.hierarchy;
+import model.typemembers;
+import Method from model.typemembers;
+import Parameter from model.typemembers;
+import Signature from model.typemembers;
+import model.typenames;
+import TypeNames from model.typenames;
+import model.types;
+import Type from model.types;
+import FunctionType from model.types;
+import TypeStore from model.types;
+import List from @std.collections.list;
+import Set from @std.collections.set;
+import BodyChecker from phases.bodies;
+
+// How a lambda makes a method or function a value of the function type expected where its name is
+// written: a candidate fits it, the lambda has no text to suggest, no candidate takes what the
+// function type passes and returns what it returns, a call returns a value of the function type
+// itself, the lambda would call it on a struct's 'this', which a lambda cannot capture, or the lambda
+// it is written in was refused that 'this' already.
+public enum LambdaFit {
+    Fits,
+    Unwritten,
+    Mismatched,
+    Called,
+    StructThis,
+    Refused,
+}
+
+// The lambda that makes a method or function a value of the function type expected where its name is
+// written. 'kind' is "method" or "function", as the refusal names what was written.
+public final class LambdaFix {
+    protected string kind;
+    protected LambdaFit lambdaFit;
+    // The text written before and after the head of the call, as '(a) -> ' and '(a)' for a lambda.
+    protected string textBefore;
+    protected string textAfter;
+    // The sentence, opening with a space, that lists what the call throws in the function type, or
+    // empty.
+    protected string throwsNote;
+    // The sentence after the refusal where no lambda is written: what the function type takes and
+    // returns, or why a lambda cannot capture a struct's 'this'.
+    protected string detail;
+
+    protected constructor(this.kind, this.lambdaFit, this.textBefore, this.textAfter, this.throwsNote,
+                          this.detail);
+
+    public fit() -> LambdaFit {
+        return this.lambdaFit;
+    }
+
+    public before() -> string {
+        return this.textBefore;
+    }
+
+    public after() -> string {
+        return this.textAfter;
+    }
+}
+
+// The lambda that makes the method or function 'name' a value of the function type 'target', calling
+// the first of 'candidates' that takes what 'target' passes and returns what it returns. A parameter of
+// the lambda is named after the candidate's, and never after a name of 'taken'.
+lambdaFixFor(string kind, string name, Signature[] candidates, FunctionType target, Set<string> taken,
+             TypeNames names, TypeStore store, Type? errorClass) -> LambdaFix {
+    Type[] passed = target.parameterTypes();
+    // A candidate with a type parameter in its types has types that only a call to it decides.
+    bool generic = false;
+    for (let signature in candidates) {
+        if (signature.isGeneric() || mentionsTypeParameter(signature)) {
+            generic = true;
+            continue;
+        }
+        if (!fitsFunctionType(signature, passed, target.returnType())) {
+            continue;
+        }
+        let used = taken.copy();
+        let parameterNames = new List<string>();
+        Parameter[] parameters = signature.parameters();
+        for (long i = 0; i < passed.length; i++) {
+            string chosen = typemembers.freeParameterName(parameters[i].name(), used);
+            used.add(chosen);
+            parameterNames.push(chosen);
+        }
+        string listed = "({string.joined(parameterNames.toArray(), ", ")})";
+        string before = "{listed} -> ";
+        if (signature.declaresThrows()) {
+            before = before + "try ";
+        }
+        string throwsNote = unlistedThrowsNote(name, signature, target, names, store, errorClass);
+        return new LambdaFix(kind, LambdaFit.Fits, before, listed, throwsNote, "");
+    }
+    for (let signature in candidates) {
+        if (!signature.isGeneric() && !mentionsTypeParameter(signature)
+                && typemembers.requiredParameterCount(signature) == 0
+                && !types.isVoidType(signature.returnType())
+                && convert.isAssignableStrict(target, signature.returnType())) {
+            string before = "";
+            if (signature.declaresThrows()) {
+                before = "try ";
+            }
+            return new LambdaFix(kind, LambdaFit.Called, before, "()", "", "");
+        }
+    }
+    if (generic) {
+        return unwrittenLambda(kind);
+    }
+    return new LambdaFix(kind, LambdaFit.Mismatched, "", "", "", "A function of type "
+        + "'{functionTypeText(target, names)}' takes {passedText(passed, names)} and returns "
+        + "{returnedText(target.returnType(), names)}, and no '{name}' {kind} does.");
+}
+
+// Whether a parameter or the return of the signature has a type parameter in its type.
+mentionsTypeParameter(Signature signature) -> bool {
+    for (let parameter in signature.parameters()) {
+        if (convert.containsTypeParam(parameter.type())) {
+            return true;
+        }
+    }
+    return convert.containsTypeParam(signature.returnType());
+}
+
+// The fix that says a lambda is a value without the text of one.
+public unwrittenLambda(string kind) -> LambdaFix {
+    return new LambdaFix(kind, LambdaFit.Unwritten, "", "", "", "");
+}
+
+// The refusal of a lambda calling a method of the struct 'shown' on 'this'.
+public structThisLambda(string shown) -> LambdaFix {
+    return new LambdaFix("method", LambdaFit.StructThis, "", "", "", structThisAdvice(shown));
+}
+
+// The refusal of a method named inside a lambda that was refused the struct's 'this' it is read on.
+public refusedLambda() -> LambdaFix {
+    return new LambdaFix("method", LambdaFit.Refused, "", "", "", "");
+}
+
+// Why a lambda cannot capture 'this' of the struct 'shown', and what to write instead.
+public structThisAdvice(string shown) -> string {
+    return "'{shown}' is a struct, so the lambda would work on a copy of it. Copy the fields the lambda "
+        + "needs into locals, or make '{shown}' a class.";
+}
+
+// Whether a lambda refuses to capture a receiver of this type as 'this': a struct, which a lambda
+// would copy.
+public refusesThisCapture(Type receiver) -> bool {
+    return !types.isClassLike(receiver) && types.bindingOf(receiver) == null;
+}
+
+// Whether a lambda given the parameter types 'passed' can call a method or function of the signature
+// with them and return its result where 'returned' is expected.
+public fitsFunctionType(Signature signature, Type[] passed, Type returned) -> bool {
+    Parameter[] parameters = signature.parameters();
+    if (passed.length < typemembers.requiredParameterCount(signature) || passed.length > parameters.length) {
+        return false;
+    }
+    for (long i = 0; i < passed.length; i++) {
+        if (parameters[i].isOut() || !convert.isAssignableStrict(parameters[i].type(), passed[i])) {
+            return false;
+        }
+    }
+    if (types.isVoidType(returned)) {
+        return true;
+    }
+    return !types.isVoidType(signature.returnType())
+        && convert.isAssignableStrict(returned, signature.returnType());
+}
+
+// The sentence, opening with a space, that lists what the call to 'name' throws in the function type
+// 'target', which does not list it yet. Empty where 'target' lists it, and where 'target' has a list
+// that only the body of 'name' can be judged against.
+unlistedThrowsNote(string name, Signature signature, FunctionType target, TypeNames names,
+                   TypeStore store, Type? errorClass) -> string {
+    if (!signature.declaresThrows()) {
+        return "";
+    }
+    Type[] listed = target.thrownTypes();
+    Type[] thrown = signature.throwsTypes();
+    let missing = new List<Type>();
+    if (thrown.length == 0 && listed.length == 0 && errorClass != null) {
+        missing.push(errorClass);
+    }
+    for (let raised in thrown) {
+        bool covered = false;
+        for (let allowed in listed) {
+            if (hierarchy.isSubclassOf(raised, allowed)) {
+                covered = true;
+            }
+        }
+        if (!covered) {
+            missing.push(raised);
+        }
+    }
+    if (missing.length() == 0) {
+        return "";
+    }
+    let widenedThrown = new List<Type>();
+    for (let allowed in listed) {
+        widenedThrown.push(allowed);
+    }
+    for (let raised in missing) {
+        widenedThrown.push(raised);
+    }
+    Type widened = store.functionOf(target.parameterTypes(), target.returnType(), widenedThrown.toArray());
+    string note = " The function type it is given to, '{functionTypeText(target, names)}', must also list "
+        + "what '{name}' throws";
+    if (!names.canSpell(widened)) {
+        return note + ".";
+    }
+    return "{note}, as in '{functionTypeText(widened, names)}'.";
+}
+
+// A function type as code writes it, in parentheses where it carries a 'throws' list.
+functionTypeText(Type type, TypeNames names) -> string {
+    if (type is FunctionType && type.thrownTypes().length > 0) {
+        return "({names.of(type)})";
+    }
+    return names.of(type);
+}
+
+// What a function taking the parameter types 'passed' takes, as in "an 'int' and a 'string'".
+passedText(Type[] passed, TypeNames names) -> string {
+    if (passed.length == 0) {
+        return "nothing";
+    }
+    let items = new List<string>();
+    for (let type in passed) {
+        items.push(articledTypeText(type, names));
+    }
+    return diagnostics.andJoined(items.toArray());
+}
+
+// What a function returning 'returned' returns, as in "an 'int'".
+returnedText(Type returned, TypeNames names) -> string {
+    if (types.isVoidType(returned)) {
+        return "nothing";
+    }
+    return articledTypeText(returned, names);
+}
+
+articledTypeText(Type type, TypeNames names) -> string {
+    string spelled = functionTypeText(type, names);
+    return "{typenames.typeArticle(spelled)} '{spelled}'";
+}
+
+// The sentences that refuse the name of a method or function written where the function type of 'fix'
+// is expected, as the sentence after the one that names the method or the function. 'spelling' is the
+// quoted code that writes the lambda.
+public nameNotValueText(LambdaFix fix, string spelling) -> string {
+    string refusal = "A {fix.kind}'s name is not a value";
+    return switch (fix.fit()) {
+        Fits -> "{refusal}, so write a lambda that calls it: {spelling}.{fix.throwsNote}",
+        Unwritten -> "{refusal}, so write a lambda that calls it.",
+        Called -> "{refusal}, so call it: {spelling}.",
+        StructThis -> "{refusal}. A lambda cannot capture 'this' here either: {fix.detail}",
+        Refused -> "{refusal}.",
+        Mismatched -> "{refusal}. {fix.detail}",
+    };
+}
+
+// The refusal of a method or function named where the function type of 'fix' is expected, after
+// 'subject', which names it. The call is written behind 'head'.
+public functionValueRefusal(string subject, LambdaFix fix, string head) -> string {
+    string spelling = "'{fix.before()}{head}{fix.after()}'";
+    string refusal = "{subject}, and a {fix.kind}'s name is not a value";
+    return switch (fix.fit()) {
+        Fits -> "{refusal}. Write a lambda that calls it instead: {spelling}.{fix.throwsNote}",
+        Unwritten -> "{refusal}. Write a lambda that calls it instead.",
+        Called -> "{refusal}. Call it as {spelling}.",
+        StructThis -> "{refusal}. A lambda cannot capture 'this' here either: {fix.detail}",
+        Refused -> "{refusal}.",
+        Mismatched -> "{refusal}. {fix.detail}",
+    };
+}
+
+// Whether a lambda can write 'receiver' again in the call it makes: a name, 'this' of a class, or a
+// field of one, none of which runs code when it is read again.
+public isRepeatablePath(Expression receiver, Type? thisType) -> bool {
+    Expression core = wording.unwrapParentheses(receiver);
+    if (core is IdentifierExpressionNode) {
+        return true;
+    }
+    if (core is ThisExpressionNode) {
+        return thisType != null && !refusesThisCapture(thisType);
+    }
+    if (core is MemberExpressionNode) {
+        return isRepeatablePath(core.object(), thisType);
+    }
+    return false;
+}
+
+// Whether 'receiver' is 'this' of a struct, or a field read from it, which a lambda cannot capture.
+public rootsAtStructThis(Expression receiver, Type? thisType) -> bool {
+    Expression core = wording.unwrapParentheses(receiver);
+    if (core is ThisExpressionNode) {
+        return thisType != null && refusesThisCapture(thisType);
+    }
+    if (core is MemberExpressionNode) {
+        return rootsAtStructThis(core.object(), thisType);
+    }
+    return false;
+}
+
+// The name a lambda repeating 'receiver' reads first, or empty where that is 'this'.
+public pathRoot(Expression receiver) -> string {
+    Expression core = wording.unwrapParentheses(receiver);
+    if (core is IdentifierExpressionNode) {
+        return core.name().text();
+    }
+    if (core is MemberExpressionNode) {
+        return pathRoot(core.object());
+    }
+    return "";
+}
+
+// The signatures of 'methods', in their order.
+public signaturesOf(List<Method> methods) -> Signature[] {
+    let found = new List<Signature>();
+    for (let method in methods) {
+        found.push(method.signature());
+    }
+    return found.toArray();
+}
+
+// The lambda that makes the method or function 'name' a value of the function type 'wanted'. The
+// lambda's call is written behind a head that starts with the name 'head', which no parameter of the
+// lambda may hide.
+public lambdaFix(BodyChecker checker, string kind, string name, Signature[] candidates, FunctionType wanted,
+                 string head) -> LambdaFix {
+    let taken = new Set<string>();
+    taken.add(head);
+    return lambdaFixFor(kind, name, candidates, wanted, taken, checker.names(), checker.store(),
+        checker.resolver().errorClass());
+}
