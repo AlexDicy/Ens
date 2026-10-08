@@ -206,3 +206,495 @@ test "an obligation inside a conditional member is judged only where the member 
         + "    let items = new Duo<Item>(new Item(1), new Item(2));\n"
         + "    let told = items.tell();\n"));
 }
+
+test "constructor visibility gates new expressions and super chains" {
+    let analysis = try sema_support.analyzeOne("public class Locked \{\n"
+        + "    constructor();\n"
+        + "\}\n"
+        + "class Guarded \{\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "class Opened extends Guarded \{\n"
+        + "    protected constructor() \{\n"
+        + "        super();\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let locked = new Locked();\n"
+        + "    let guarded = new Guarded();\n"
+        + "    let opened = new Opened();\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let found = analysis.bodyDiagnostics();
+    try testing.assertEqual(found.length, 1L);
+    try sema_support.assertDiagnostic(found, 0, "/proj/src/main.ens",
+        "The constructor of 'Locked' is private, so only code inside 'Locked' can call it. Mark it "
+        + "'public' to construct 'Locked' here.");
+}
+
+test "a public member, constructor or function stops at its package boundary" {
+    let loader = new FakeFileLoader();
+    loader.add("/ens.package", "workspace \{\n"
+        + "    member \"proj\";\n"
+        + "    member \"proj/vendor/acme\";\n"
+        + "\}\n");
+    loader.add("/proj/ens.package", "package demo.app \{\n    ens \"0.1\";\n    dependency acme;\n\}\n");
+    loader.add("/proj/vendor/acme/ens.package", "package acme \{ ens \"0.1\"; \}\n");
+    loader.add("/proj/vendor/acme/src/parts.ens",
+        "export class Gear \{\n"
+        + "    public int teeth = 3;\n"
+        + "    export constructor();\n"
+        + "\}\n"
+        + "export class Latched \{\n"
+        + "    public constructor();\n"
+        + "\}\n"
+        + "public hidden() -> int \{ return 1; \}\n"
+        + "export shipped() -> int \{ return 2; \}\n");
+    loader.add("/proj/src/main.ens",
+        "import Gear from @acme.parts;\n"
+        + "import Latched from @acme.parts;\n"
+        + "import @acme.parts;\n"
+        + "main() -> int \{\n"
+        + "    let gear = new Gear();\n"
+        + "    let latched = new Latched();\n"
+        + "    return gear.teeth + parts.hidden() + parts.shipped();\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Bodies]);
+    let found = analysis.bodyDiagnostics();
+    try sema_support.assertDiagnostic(found, 0, "/proj/src/main.ens",
+        "The constructor of 'Latched' is public inside package 'acme' but not exported. Mark it "
+        + "'export' in module 'acme.parts' to construct 'Latched' from another package.");
+    try sema_support.assertDiagnostic(found, 1, "/proj/src/main.ens",
+        "'teeth' of 'Gear' is public inside package 'acme' but not exported. Mark it 'export' in "
+        + "module 'acme.parts' to use it from another package.");
+    try sema_support.assertDiagnostic(found, 2, "/proj/src/main.ens",
+        "Function 'hidden' is public inside package 'acme' but not exported. Mark it 'export' in "
+        + "module 'acme.parts' to use it from another package.");
+    try testing.assertEqual(found.length, 3L);
+}
+
+// A module-qualified name in a value position reads as what it is. A function this file can
+// reach reads as a function, one it cannot reach as a visibility refusal, a name the module does
+// not declare as absent, and a type as a type its module does not reach. The call in the message
+// keeps the module as this file writes it, and the example is left out where this file has no
+// name for the function's own types.
+test "a module-qualified name in a value position reports what it is" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/lib/vault.ens",
+        "public class Vault \{\n"
+        + "    public constructor();\n"
+        + "\}\n");
+    loader.add("/proj/src/lib/parts.ens",
+        "import Vault from lib.vault;\n"
+        + "public class Widget \{\n"
+        + "    public constructor();\n"
+        + "\}\n"
+        + "class Secret \{\n"
+        + "\}\n"
+        + "public shown(int value) -> int \{\n"
+        + "    return value;\n"
+        + "\}\n"
+        + "hidden() -> int \{\n"
+        + "    return 1;\n"
+        + "\}\n"
+        + "public keeper() -> Vault \{\n"
+        + "    return new Vault();\n"
+        + "\}\n");
+    loader.add("/proj/src/main.ens",
+        "import lib.parts as parts;\n"
+        + "main() -> int \{\n"
+        + "    let visible = parts.shown;\n"
+        + "    let unspellable = parts.keeper;\n"
+        + "    let unreachable = parts.hidden;\n"
+        + "    let absent = parts.nosuch;\n"
+        + "    let hiddenType = parts.Secret;\n"
+        + "    let heldType = parts.Widget;\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Bodies]);
+    let reported = analysis.bodyDiagnostics();
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "'parts.shown' is a function, and a function's name is not a value. Call it as "
+        + "'parts.shown(...)', or wrap it in a lambda, as in '(int) -> int callback = (value) -> "
+        + "parts.shown(value);'.");
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
+        "'parts.keeper' is a function, and a function's name is not a value. Call it as 'parts.keeper()', "
+        + "or wrap it in a lambda.");
+    try sema_support.assertDiagnostic(reported, 2, "/proj/src/main.ens",
+        "Function 'hidden' is private to module 'lib.parts', so only that file can use it. Mark "
+        + "it 'public' to use it from other modules in the package.");
+    try sema_support.assertDiagnostic(reported, 3, "/proj/src/main.ens",
+        "'nosuch' is not declared in module 'lib.parts'.");
+    try sema_support.assertDiagnostic(reported, 4, "/proj/src/main.ens",
+        "Type 'Secret' is private to module 'lib.parts', so only that file can use it. Mark it "
+        + "'public' to use it from other modules in the package.");
+    try sema_support.assertDiagnostic(reported, 5, "/proj/src/main.ens",
+        "'parts.Widget' writes a type after a module name, and only a function can be written "
+        + "after a module name. Write 'import Widget from lib.parts;' and then write 'Widget'.");
+    try testing.assertEqual(reported.length, 6L);
+}
+
+// The refusal does not branch on what kind of type the module declares, so a class, an
+// interface, an enum and a struct all read the same sentence, in a value position, as a static
+// head, as an enum head and as a constructor call.
+test "a module-qualified type name reads one refusal whatever the type is" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/lib/parts.ens", sema_support.classKinds() + sema_support.valueKinds());
+    loader.add("/proj/src/main.ens",
+        "import lib.parts as parts;\n"
+        + "main() -> int \{\n"
+        + "    let a = parts.Counter;\n"
+        + "    let b = parts.Shown;\n"
+        + "    let c = parts.Vault.open();\n"
+        + "    let d = parts.Kind.Large;\n"
+        + "    let e = parts.Made(1);\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Bodies]);
+    let reported = analysis.bodyDiagnostics();
+    string[] refused = ["Counter", "Shown", "Vault", "Kind", "Made"];
+    for (long i = 0; i < refused.length; i++) {
+        try sema_support.assertDiagnostic(reported, i, "/proj/src/main.ens",
+            "'parts.{refused[i]}' writes a type after a module name, and only a function can be "
+            + "written after a module name. Write 'import {refused[i]} from lib.parts;' and then "
+            + "write '{refused[i]}'.");
+    }
+    try testing.assertEqual(reported.length, 5L);
+}
+
+// A method is reached by calling it, through 'this', through a value, or through '?.'. The name
+// on its own is refused in each of the three, and a write to it is refused as a write, whether
+// the write is an assignment or a '++'.
+test "a method's name is not a value" {
+    let analysis = try sema_support.analyzeOne("public class Counter \{\n"
+        + "    int count;\n"
+        + "\n"
+        + "    public constructor() \{\n"
+        + "        this.count = 0;\n"
+        + "    \}\n"
+        + "\n"
+        + "    public bump(int by) -> int \{\n"
+        + "        this.count = this.count + by;\n"
+        + "        return this.count;\n"
+        + "    \}\n"
+        + "\n"
+        + "    public readsItsOwn() \{\n"
+        + "        let held = this.bump;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let counter = new Counter();\n"
+        + "    let named = counter.bump;\n"
+        + "    Counter? maybe = counter;\n"
+        + "    let safe = maybe?.bump;\n"
+        + "    counter.bump = 3;\n"
+        + "    maybe?.bump = 3;\n"
+        + "    (counter.bump) = 3;\n"
+        + "    counter.bump++;\n"
+        + "    return counter.bump(1);\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string[] calls = ["this.bump(...)", "counter.bump(...)", "maybe?.bump(...)"];
+    for (long i = 0; i < 3; i++) {
+        try sema_support.assertDiagnostic(reported, i, "/proj/src/main.ens",
+            "'bump' is a method of 'Counter', and a method's name is not a value. Call it as '{calls[i]}'.");
+    }
+    try sema_support.assertDiagnostic(reported, 3, "/proj/src/main.ens",
+        "'bump' is a method of 'Counter', so it cannot be assigned.");
+    // A '?.' left side reports its own refusal beside the method's, since checking for null
+    // would not leave a write that works either. A parenthesized left side names the same
+    // place, so it reports the method's refusal alone.
+    try sema_support.assertDiagnostic(reported, 4, "/proj/src/main.ens",
+        "'?.' cannot appear on the left side of '=', because there is nothing to write to "
+        + "when 'maybe' is null.");
+    for (long i = 5; i < 8; i++) {
+        try sema_support.assertDiagnostic(reported, i, "/proj/src/main.ens",
+            "'bump' is a method of 'Counter', so it cannot be assigned.");
+    }
+    try testing.assertEqual(reported.length, 8L);
+}
+
+// 'length' reports how much an array or a string holds, and neither has storage under that
+// name, so a write to it is refused on a local, through a compound operator, through '++' and
+// '--', on the result of a call, and on a 'T[]' inside a generic. The refusal names the type
+// rather than the expression, so it reads the same for a value no name reaches, and an array's
+// shows the replacement its element type allows.
+test "'length' cannot be assigned" {
+    let analysis = try sema_support.analyzeOne("lengthOf<T>(T[] items) \{\n"
+        + "    items.length = 3;\n"
+        + "\}\n"
+        + "names() -> string[] \{\n"
+        + "    return [\"a\"];\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    int[] slots = new int[2];\n"
+        + "    string text = \"ab\";\n"
+        + "    slots.length = 3;\n"
+        + "    slots.length += 1;\n"
+        + "    slots.length++;\n"
+        + "    --slots.length;\n"
+        + "    text.length = 3;\n"
+        + "    text.length--;\n"
+        + "    names().length = 3;\n"
+        + "    lengthOf<int>(new int[1]);\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string ofInts = "'slots.length' is the number of elements in 'slots', so it cannot be assigned. An "
+        + "array keeps the length it was created with. Create a new array of the size you need, as in "
+        + "'new int[...]'.";
+    string ofText = "'length' is the number of bytes in the string, so it cannot be assigned. A string "
+        + "never changes once it is created, so build the text you need and assign that.";
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "'items.length' is the number of elements in 'items', so it cannot be assigned. An array keeps "
+        + "the length it was created with. Create a new array of the size you need, either by listing "
+        + "every element, as in '[a, b]', or with 'T[] itemsResized = new T[size];' followed by 'for "
+        + "(long i = 0; i < itemsResized.length; i++) \{ itemsResized[i] = ...; \}'.");
+    for (long i = 1; i < 5; i++) {
+        try sema_support.assertDiagnostic(reported, i, "/proj/src/main.ens", ofInts);
+    }
+    try sema_support.assertDiagnostic(reported, 5, "/proj/src/main.ens", ofText);
+    try sema_support.assertDiagnostic(reported, 6, "/proj/src/main.ens", ofText);
+    try sema_support.assertDiagnostic(reported, 7, "/proj/src/main.ens",
+        "'names().length' is the number of elements in 'names()', so it cannot be assigned. An array "
+        + "keeps the length it was created with. Create a new array of the size you need, either by "
+        + "listing every element, as in '[a, b]', or with 'string[] resized = new string[size];' followed "
+        + "by 'for (long i = 0; i < resized.length; i++) \{ resized[i] = ...; \}'.");
+    try testing.assertEqual(reported.length, 8L);
+}
+
+// The 'length' refusal on an array shows how to create one of a new size. 'new T[size]' stands
+// alone where a new slot's zero value is a valid element on every level it allocates, and any
+// other element is created by listing every element or by the declaration and its fill loop.
+// The declaration takes a fresh name from the array's own, or 'resized' when it has none.
+test "the 'length' refusal shows a replacement the element type allows" {
+    let analysis = try sema_support.analyzeOne("enum Color \{ Red, Green, \}\n"
+        + "class Box \{ protected constructor(); \}\n"
+        + "struct Point \{ int x; \}\n"
+        + "struct Named \{ protected string name; \}\n"
+        + "class Table \{\n"
+        + "    protected string[] rows = [\"a\"];\n"
+        + "    protected constructor();\n"
+        + "    protected grow() \{ this.rows.length = 4; \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    Box[] boxes = [new Box()];\n"
+        + "    boxes.length = 2;\n"
+        + "    Box?[] maybeBoxes = [null];\n"
+        + "    maybeBoxes.length = 2;\n"
+        + "    int[][] grid = new int[2][2];\n"
+        + "    grid.length = 3;\n"
+        + "    string[][] table = [[\"a\"]];\n"
+        + "    table.length = 3;\n"
+        + "    table[0].length = 3;\n"
+        + "    int[]?[] rows = new int[2][];\n"
+        + "    rows.length = 3;\n"
+        + "    Point[] points = new Point[1];\n"
+        + "    points.length = 2;\n"
+        + "    Named[] names = [\{name: \"a\"\}];\n"
+        + "    names.length = 2;\n"
+        + "    Color[] colors = [Color.Red];\n"
+        + "    colors.length = 2;\n"
+        + "    (() -> int)[] makers = [() -> 1];\n"
+        + "    makers.length = 2;\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        lengthRefusal("this.rows", filledReplacement("string[]", "string", "rowsResized")));
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
+        lengthRefusal("boxes", filledReplacement("Box[]", "Box", "boxesResized")));
+    try sema_support.assertDiagnostic(reported, 2, "/proj/src/main.ens",
+        lengthRefusal("maybeBoxes", "as in 'new Box?[...]'"));
+    try sema_support.assertDiagnostic(reported, 3, "/proj/src/main.ens",
+        lengthRefusal("grid", "as in 'new int[...][...]'"));
+    try sema_support.assertDiagnostic(reported, 4, "/proj/src/main.ens",
+        lengthRefusal("table", filledReplacement("string[][]", "string[]", "tableResized")));
+    try sema_support.assertDiagnostic(reported, 5, "/proj/src/main.ens",
+        lengthRefusal("table[0]", filledReplacement("string[]", "string", "resized")));
+    try sema_support.assertDiagnostic(reported, 6, "/proj/src/main.ens",
+        lengthRefusal("rows", "as in 'new int[]?[...]'"));
+    try sema_support.assertDiagnostic(reported, 7, "/proj/src/main.ens",
+        lengthRefusal("points", "as in 'new Point[...]'"));
+    try sema_support.assertDiagnostic(reported, 8, "/proj/src/main.ens",
+        lengthRefusal("names", filledReplacement("Named[]", "Named", "namesResized")));
+    try sema_support.assertDiagnostic(reported, 9, "/proj/src/main.ens",
+        lengthRefusal("colors", filledReplacement("Color[]", "Color", "colorsResized")));
+    try sema_support.assertDiagnostic(reported, 10, "/proj/src/main.ens",
+        lengthRefusal("makers", filledReplacement("(() -> int)[]", "(() -> int)", "makersResized")));
+    try testing.assertEqual(reported.length, 11L);
+}
+
+// The refusal of a write to the 'length' of the array 'array', ending in 'replacement'.
+lengthRefusal(string array, string replacement) -> string {
+    return "'{array}.length' is the number of elements in '{array}', so it cannot be assigned. An array "
+        + "keeps the length it was created with. Create a new array of the size you need, {replacement}.";
+}
+
+// The replacement for an array whose slots cannot start as zero, declared as 'name'.
+filledReplacement(string holder, string element, string name) -> string {
+    return "either by listing every element, as in '[a, b]', or with '{holder} {name} = new "
+        + "{element}[size];' followed by 'for (long i = 0; i < {name}.length; i++) \{ {name}[i] = ...; \}'";
+}
+
+// A 'protected' member or constructor used from another file names the files and types that can use
+// it. A module name takes no '?.', and a loop over a class that is not iterable names the element type
+// the loop declares.
+test "a refusal across files names who can use the member and what to write instead" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/lib/parts.ens", "public class Guarded \{\n"
+        + "    protected int guarded = 0;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\}\n"
+        + "\n"
+        + "public class Open \{\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "\n"
+        + "public ping() -> int \{\n"
+        + "    return 1;\n"
+        + "\}\n");
+    loader.add("/proj/src/main.ens", "import Guarded from lib.parts;\n"
+        + "import Open from lib.parts;\n"
+        + "import lib.parts;\n"
+        + "\n"
+        + "class Bag \{\n"
+        + "\}\n"
+        + "\n"
+        + "main() -> int \{\n"
+        + "    let g = new Guarded();\n"
+        + "    int read = g.guarded;\n"
+        + "    let o = new Open();\n"
+        + "    int n = parts?.ping();\n"
+        + "    for (int each in new Bag()) \{\n"
+        + "    \}\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Bodies]);
+    let reported = analysis.bodyDiagnostics();
+    string file = "/proj/src/main.ens";
+    try sema_support.assertDiagnostic(reported, 0, file, "'guarded' is 'protected' in class 'Guarded', so "
+        + "only code in the file that declares 'Guarded' and in subclasses of 'Guarded' can use it. Mark "
+        + "it 'public' to use it here.");
+    try sema_support.assertDiagnostic(reported, 1, file, "The constructor of 'Open' is 'protected', so "
+        + "only code in the file that declares 'Open' and in subclasses of 'Open' can call it. Mark it "
+        + "'public' to construct 'Open' here.");
+    try sema_support.assertDiagnostic(reported, 2, file, "'parts' is a module name, which is never null, so "
+        + "'?.' cannot follow it. Replace '?.' with '.'.");
+    try sema_support.assertDiagnostic(reported, 3, file, "'Bag' cannot be used in 'for (... in ...)', "
+        + "because it does not implement 'Iterable' from '@std.collections.iterator'. Declare 'class Bag "
+        + "implements Iterable<int>' and give it the method 'override makeIterator() -> Iterator<int>'.");
+    try testing.assertEqual(reported.length, 4L);
+}
+
+// A 'final' class has no subclasses, so a refusal of its 'protected' members names the declaring file
+// alone.
+test "a protected member of a final class is usable only in the file that declares the class" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/lib/parts.ens", "public final class Vault \{\n"
+        + "    protected int value;\n"
+        + "\n"
+        + "    protected constructor(this.value);\n"
+        + "\n"
+        + "    protected bump() \{\n"
+        + "        this.value = this.value + 1;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "\n"
+        + "public makeVault() -> Vault \{\n"
+        + "    return new Vault(1);\n"
+        + "\}\n");
+    loader.add("/proj/src/main.ens", "import Vault from lib.parts;\n"
+        + "import lib.parts;\n"
+        + "\n"
+        + "main() -> int \{\n"
+        + "    let made = new Vault(3);\n"
+        + "    Vault held = parts.makeVault();\n"
+        + "    held.bump();\n"
+        + "    return held.value;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Bodies]);
+    let reported = analysis.bodyDiagnostics();
+    string file = "/proj/src/main.ens";
+    try sema_support.assertDiagnostic(reported, 0, file, "The constructor of 'Vault' is 'protected', so "
+        + "only code in the file that declares 'Vault' can call it. Mark it 'public' to construct "
+        + "'Vault' here.");
+    try sema_support.assertDiagnostic(reported, 1, file, "'bump' is 'protected' in class 'Vault', so only "
+        + "code in the file that declares 'Vault' can use it. Mark it 'public' to use it here.");
+    try sema_support.assertDiagnostic(reported, 2, file, "'value' is 'protected' in class 'Vault', so "
+        + "only code in the file that declares 'Vault' can use it. Mark it 'public' to use it here.");
+    try testing.assertEqual(reported.length, 3L);
+}
+
+// A 'sealed' class keeps its subclasses in its own file, but an open subclass there can be extended
+// anywhere, so a refusal of its 'protected' members still names subclasses.
+test "a protected member of a sealed class names the file and the subclasses that can use it" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/lib/tree.ens", "public sealed class Shape \{\n"
+        + "    protected int sides = 0;\n"
+        + "\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "\n"
+        + "public class Polygon extends Shape \{\n"
+        + "    public constructor() \{\n"
+        + "        super();\n"
+        + "    \}\n"
+        + "\}\n");
+    loader.add("/proj/src/main.ens", "import Shape from lib.tree;\n"
+        + "import Polygon from lib.tree;\n"
+        + "\n"
+        + "class Square extends Polygon \{\n"
+        + "    constructor() \{\n"
+        + "        super();\n"
+        + "    \}\n"
+        + "\n"
+        + "    protected count() -> int \{\n"
+        + "        return this.sides;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "\n"
+        + "main() -> int \{\n"
+        + "    let shape = new Shape();\n"
+        + "    return shape.sides;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Bodies]);
+    let reported = analysis.bodyDiagnostics();
+    string file = "/proj/src/main.ens";
+    try sema_support.assertDiagnostic(reported, 0, file, "The constructor of 'Shape' is 'protected', so "
+        + "only code in the file that declares 'Shape' and in subclasses of 'Shape' can call it. Mark it "
+        + "'public' to construct 'Shape' here.");
+    try sema_support.assertDiagnostic(reported, 1, file, "'sides' is 'protected' in class 'Shape', so only "
+        + "code in the file that declares 'Shape' and in subclasses of 'Shape' can use it. Mark it 'public' "
+        + "to use it here.");
+    try testing.assertEqual(reported.length, 2L);
+}
+
+// A struct has no subclasses, so a 'protected' member of one is usable only in the file that
+// declares the struct.
+test "a 'protected' struct member names the file that declares the struct" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/lib/parts.ens", "public struct Tally \{\n"
+        + "    protected int count = 0;\n"
+        + "\}\n");
+    loader.add("/proj/src/main.ens", "import Tally from lib.parts;\n"
+        + "\n"
+        + "main() -> int \{\n"
+        + "    Tally t = \{\};\n"
+        + "    return t.count;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Bodies]);
+    let reported = analysis.bodyDiagnostics();
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens", "'count' is 'protected' in struct "
+        + "'Tally', so only code in the file that declares 'Tally' can use it. Mark it 'public' to use it "
+        + "here.");
+    try testing.assertEqual(reported.length, 1L);
+}

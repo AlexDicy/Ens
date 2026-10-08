@@ -1,5 +1,7 @@
 import @std.testing;
 import sema_support;
+import FakeFileLoader from sema_support;
+import Stage from sema_support;
 
 // A write-back operator on a target no write can change reports that the target cannot change, and
 // not the target's own null. What the value side of the write reports stays beside it.
@@ -250,4 +252,915 @@ test "a write through '?.' on a field copies the field before the check" {
         + "{nothing} 'rows[0]' is null. Copy 'rows[0]' into a local first ('let value = rows[0];') and "
         + "check the local, as in 'if (value != null) \{ value.plain -= ...; \}'.");
     try testing.assertEqual(reported.length, 2L);
+}
+
+// An enum's members are its constants, so a write naming one is refused, whether the write is
+// an assignment, a compound operator or a '++'; a read of the same name is not. A variable of
+// the enum's type is refused by '++' for not being a number, which is what it is.
+test "an enum's constant cannot be assigned" {
+    let analysis = try sema_support.analyzeOne("enum Color \{\n"
+        + "    Red,\n"
+        + "    Green,\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    Color hue = Color.Red;\n"
+        + "    Color.Red = Color.Green;\n"
+        + "    Color.Green += 1;\n"
+        + "    Color.Red++;\n"
+        + "    hue++;\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string refusesRed = "'Red' is a member of enum 'Color', so it cannot be assigned.";
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens", refusesRed);
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
+        "'Green' is a member of enum 'Color', so it cannot be assigned.");
+    try sema_support.assertDiagnostic(reported, 2, "/proj/src/main.ens", refusesRed);
+    try sema_support.assertDiagnostic(reported, 3, "/proj/src/main.ens",
+        "'++' works only on numbers, and 'hue' has type 'Color'. Use it on an integer or a "
+        + "floating-point variable, for example 'count++'.");
+    try testing.assertEqual(reported.length, 4L);
+}
+
+// Parentheses name the place they hold, so every rule about that place applies through them and
+// they add no refusal of their own. A 'const' field written twice, one written outside its
+// constructor, and one a '++' would change each report their own refusal.
+test "the rules about a place apply through its parentheses" {
+    let analysis = try sema_support.analyzeOne("public class Holder \{\n"
+        + "    public const int value;\n"
+        + "\n"
+        + "    public constructor() \{\n"
+        + "        this.value = 1;\n"
+        + "        (this.value) = 99;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let held = new Holder();\n"
+        + "    (held.value) = 99;\n"
+        + "    (held.value)++;\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "Field 'value' is 'const' and may already be assigned when this line runs. Remove one "
+        + "of the assignments.");
+    // The note lands on the assignment the flow analysis found, which is the earlier one.
+    let earlier = try sema_support.relatedOf(reported[0]);
+    try testing.assertEqual(earlier.note(), "'value' is assigned here");
+    try testing.assertTrue(earlier.span().start < reported[0].span().start,
+        "the note points at the earlier assignment");
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
+        "Cannot assign a new value to field 'value': it is 'const', so it is assigned exactly "
+        + "once, inside a constructor of 'Holder' as 'this.value = ...'. Remove 'const' from "
+        + "the field if it needs to change.");
+    try sema_support.assertDiagnostic(reported, 2, "/proj/src/main.ens",
+        "The '++' operator cannot change field 'value': a 'const' field is assigned once when "
+        + "the object is constructed and never again. Remove 'const' from the field if it needs to change.");
+    try testing.assertEqual(reported.length, 3L);
+}
+
+// Parentheses around a place are transparent at every nesting depth and on either side of a
+// member or an index hop, for an assignment, a compound assignment, a '++' and a '--' alike. A
+// struct local's member write needs the object to be a place, which it is through parentheses
+// too, and a write through 'this' still counts as one for the field rules.
+test "a parenthesized place is the place it holds" {
+    let analysis = try sema_support.analyzeOne("struct Point \{\n"
+        + "    protected int x = 1;\n"
+        + "\}\n"
+        + "public class Held \{\n"
+        + "    public int value = 0;\n"
+        + "    public int count = 0;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    public writeThroughParentheses() \{\n"
+        + "        (this.value) = 11;\n"
+        + "        ((this).count)++;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    int x = 1;\n"
+        + "    (x) = 3;\n"
+        + "    ((x)) = 4;\n"
+        + "    (((x))) = 5;\n"
+        + "    (x) += 1;\n"
+        + "    (x)++;\n"
+        + "    --(x);\n"
+        + "    int[] slots = [1, 2, 3];\n"
+        + "    (slots[0]) = 6;\n"
+        + "    (slots[x + 1]) = 7;\n"
+        + "    (slots)[2] = 8;\n"
+        + "    (slots[0])++;\n"
+        + "    Point point = \{\};\n"
+        + "    (point).x = 2;\n"
+        + "    (point).x += 3;\n"
+        + "    (point).x++;\n"
+        + "    let held = new Held();\n"
+        + "    (held).value = 1;\n"
+        + "    (held.value) = 2;\n"
+        + "    (held.count)++;\n"
+        + "    held.writeThroughParentheses();\n"
+        + "    return x;\n"
+        + "\}\n");
+    try sema_support.assertProgramClean(analysis);
+}
+
+// A left side that names no storage at all keeps the message saying what a left side has to be,
+// with or without parentheses, since removing them would leave the same refusal.
+test "a left side that names no storage keeps the message that says so" {
+    let analysis = try sema_support.analyzeOne("value() -> int \{\n"
+        + "    return 1;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    int x = 1;\n"
+        + "    value() = 3;\n"
+        + "    1 = 3;\n"
+        + "    (value()) = 3;\n"
+        + "    (x as long) = 3;\n"
+        + "    5++;\n"
+        + "    return x;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string[] written = ["value()", "1", "value()", "x as long"];
+    for (long i = 0; i < 4; i++) {
+        try sema_support.assertDiagnostic(reported, i, "/proj/src/main.ens",
+            "'{written[i]}' is not a variable, a field or an array element, so it cannot be assigned.");
+    }
+    try sema_support.assertDiagnostic(reported, 4, "/proj/src/main.ens",
+        "'5' is not a variable, a field or an array element, so '++' cannot change it.");
+    try testing.assertEqual(reported.length, 5L);
+}
+
+// Parentheses anywhere but around a write target are ordinary grouping.
+test "parentheses around a value, a condition and a call are untouched" {
+    let analysis = try sema_support.analyzeOne("adds(int a, int b) -> int \{\n"
+        + "    return a + b;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    int x = (1 + 2) * 3;\n"
+        + "    x = (x);\n"
+        + "    if ((x > 3) && (x < 100)) \{\n"
+        + "        x = (adds(x, 1));\n"
+        + "    \}\n"
+        + "    while ((x) < 20) \{\n"
+        + "        x = x + (1);\n"
+        + "    \}\n"
+        + "    int[] slots = [1, 2, 3];\n"
+        + "    slots[(0)] = (adds(1, 2));\n"
+        + "    (slots)[1] = 4;\n"
+        + "    return (x) - (adds(0, 0));\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+}
+
+// 'this' names the object a method runs on, and no line can point it at a different one. A
+// class, a struct, a constructor, a destructor and a compound operator reach one refusal, which
+// redirects the write to a field, and parentheses around 'this' report that refusal rather than
+// the one that says to remove them.
+test "'this' cannot be assigned" {
+    let analysis = try sema_support.analyzeOne("public class Box \{\n"
+        + "    public int value = 0;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    public constructor(Box other) \{\n"
+        + "        this = other;\n"
+        + "    \}\n"
+        + "\n"
+        + "    destructor() \{\n"
+        + "        this = new Box();\n"
+        + "    \}\n"
+        + "\n"
+        + "    public replace(Box other) \{\n"
+        + "        this = other;\n"
+        + "        (this) = other;\n"
+        + "        this += other;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public struct Point \{\n"
+        + "    public int x = 0;\n"
+        + "\n"
+        + "    public replace(Point other) \{\n"
+        + "        this = other;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string plain = "'this' is not a variable, so it cannot be assigned. Assign the fields that "
+        + "should change, as in 'this.value = ...'.";
+    for (long i = 0; i < 4; i++) {
+        try sema_support.assertDiagnostic(reported, i, "/proj/src/main.ens", plain);
+    }
+    try sema_support.assertDiagnostic(reported, 4, "/proj/src/main.ens",
+        "'this' is not a variable, so it cannot be assigned. Assign the fields that should "
+        + "change, as in 'this.value += ...'.");
+    try sema_support.assertDiagnostic(reported, 5, "/proj/src/main.ens",
+        "'this' is not a variable, so it cannot be assigned. Assign the fields that should "
+        + "change, as in 'this.x = ...'.");
+    try testing.assertEqual(reported.length, 6L);
+}
+
+// The field the refusal names is one the writing code can reach: a 'const' field takes its value
+// at construction, a 'static' one is reached through the type name, and a private field of a
+// base class is out of reach, so the refusal stops after saying what happened. An inherited
+// field the subclass can reach is named like one of its own.
+test "assigning 'this' names a field only where there is one to name" {
+    let analysis = try sema_support.analyzeOne("public class Frozen \{\n"
+        + "    public const int kept = 1;\n"
+        + "    public static const int shared = 2;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    public replace(Frozen other) \{\n"
+        + "        this = other;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class Base \{\n"
+        + "    int hidden = 0;\n"
+        + "    public int shown = 0;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\}\n"
+        + "public class Derived extends Base \{\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    public replace(Derived other) \{\n"
+        + "        this = other;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "'this' is not a variable, so it cannot be assigned.");
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
+        "'this' is not a variable, so it cannot be assigned. Assign the fields that should "
+        + "change, as in 'this.shown = ...'.");
+    try testing.assertEqual(reported.length, 2L);
+}
+
+// A member of a built-in type runs on a value, so '++', '--' and a compound operator reach the
+// same refusal as a plain assignment there, and none of them names a field, because a built-in
+// type has none.
+test "a primitive's member cannot write the value it runs on" {
+    let loader = new FakeFileLoader();
+    loader.addToCore("primitive int \{\n"
+        + "    export replaced() \{\n"
+        + "        this = 5;\n"
+        + "    \}\n"
+        + "\n"
+        + "    export stepped() \{\n"
+        + "        this++;\n"
+        + "        --this;\n"
+        + "    \}\n"
+        + "\n"
+        + "    export grown() \{\n"
+        + "        this += 1;\n"
+        + "    \}\n"
+        + "\}\n");
+    loader.add("/proj/src/main.ens", "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Bodies]);
+    let reported = analysis.bodyDiagnostics();
+    string core = "/stdlib/std/src/core.ens";
+    try sema_support.assertDiagnostic(reported, 0, core,
+        "'this' is not a variable, so it cannot be assigned.");
+    try sema_support.assertDiagnostic(reported, 1, core,
+        "'this' is not a variable, so '++' cannot change it.");
+    try sema_support.assertDiagnostic(reported, 2, core,
+        "'this' is not a variable, so '--' cannot change it.");
+    try sema_support.assertDiagnostic(reported, 3, core,
+        "'this' is not a variable, so it cannot be assigned.");
+    try testing.assertEqual(reported.length, 4L);
+}
+
+// 'super' names the same object as 'this', seen as its base class, so it is refused the same way
+// and the example reaches a field of the base, which the line after '++' writes to cleanly.
+// '++' and '--' on it keep the message about numbers, because a base class is never a number.
+test "'super' cannot be assigned" {
+    let analysis = try sema_support.analyzeOne("public class Base \{\n"
+        + "    public int value = 0;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\}\n"
+        + "public class Derived extends Base \{\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    public constructor(Base other) \{\n"
+        + "        super = other;\n"
+        + "    \}\n"
+        + "\n"
+        + "    public replace(Base other) \{\n"
+        + "        super = other;\n"
+        + "        (super) = other;\n"
+        + "        super += other;\n"
+        + "        super++;\n"
+        + "        super.value = other.value;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class Sealed \{\n"
+        + "    int hidden = 0;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\}\n"
+        + "public class Reopened extends Sealed \{\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    public replace(Sealed other) \{\n"
+        + "        super = other;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string plain = "'super' is not a variable, so it cannot be assigned. Assign the fields that "
+        + "should change, as in 'super.value = ...'.";
+    for (long i = 0; i < 3; i++) {
+        try sema_support.assertDiagnostic(reported, i, "/proj/src/main.ens", plain);
+    }
+    try sema_support.assertDiagnostic(reported, 3, "/proj/src/main.ens",
+        "'super' is not a variable, so it cannot be assigned. Assign the fields that should "
+        + "change, as in 'super.value += ...'.");
+    try sema_support.assertDiagnostic(reported, 4, "/proj/src/main.ens",
+        "'super' is not a variable, so '++' cannot change it. Change a field instead, as in "
+        + "'super.value++'.");
+    // 'Sealed' keeps its only field to itself, so 'Reopened' can name none through 'super' and the
+    // refusal names no field.
+    try sema_support.assertDiagnostic(reported, 5, "/proj/src/main.ens",
+        "'super' is not a variable, so it cannot be assigned.");
+    try testing.assertEqual(reported.length, 6L);
+}
+
+// Where the keyword reaches no type at all, the write is not refused a second time: a static
+// method, a function, and a class with no base class each report what the keyword needs, once,
+// with or without parentheses around it.
+test "assigning a keyword that reaches no type reports only that" {
+    let analysis = try sema_support.analyzeOne("public class Lone \{\n"
+        + "    public int value = 0;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    public replace(Lone other) \{\n"
+        + "        super = other;\n"
+        + "    \}\n"
+        + "\n"
+        + "    public static swap(Lone other) \{\n"
+        + "        this = other;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "replaceFree(Lone other) \{\n"
+        + "    this = other;\n"
+        + "    (this) = other;\n"
+        + "    super = other;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "'super' cannot be used in 'Lone', because 'Lone' has no base class. Remove 'super', or give "
+            + "'Lone' a base class with 'extends'.");
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
+        "'this' is the object a method was called on, and a static method is not called on an object. "
+        + "Take the object as a parameter, or remove 'static'.");
+    string inFunction = "'this' is the object a method was called on, so it is only available inside a "
+        + "method. Pass the object as a parameter, or move this code into a method.";
+    try sema_support.assertDiagnostic(reported, 2, "/proj/src/main.ens", inFunction);
+    try sema_support.assertDiagnostic(reported, 3, "/proj/src/main.ens", inFunction);
+    try sema_support.assertDiagnostic(reported, 4, "/proj/src/main.ens",
+        "'super' is the part of the object a method was called on that its base class declares, so it is "
+        + "only available inside a method. Move this code into a method of the subclass.");
+    try testing.assertEqual(reported.length, 5L);
+}
+
+// '?.' and '?[' read null when what stands in front of them is null, so a write through either
+// has nowhere to store into. The refusal names the operator the line used and the value to check,
+// and spells that line without its '?' inside a null check.
+test "a write through safe navigation is refused for the null it may find" {
+    let analysis = try sema_support.analyzeOne("public class Inner \{\n"
+        + "    public int value = 0;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\}\n"
+        + "public class Outer \{\n"
+        + "    public Inner? inner = null;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    Inner? maybe = null;\n"
+        + "    int[]? slots = null;\n"
+        + "    maybe?.value = 3;\n"
+        + "    slots?[0] = 4;\n"
+        + "    (maybe?.value) = 5;\n"
+        + "    let held = new Outer();\n"
+        + "    held.inner?.value = 6;\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string member = "'?.' cannot appear on the left side of '=', because there is nothing "
+        + "to write to when 'maybe' is null. Check for null first, as in 'if (maybe != null) "
+        + "\{ maybe.value = ...; \}'.";
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens", member);
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
+        "'?[' cannot appear on the left side of '=', because there is nothing to write to "
+        + "when 'slots' is null. Check for null first, as in "
+        + "'if (slots != null) \{ slots[0] = ...; \}'.");
+    // Parentheses around a safe write report the write, not the parentheses, since removing them
+    // leaves the same refusal.
+    try sema_support.assertDiagnostic(reported, 2, "/proj/src/main.ens", member);
+    try sema_support.assertDiagnostic(reported, 3, "/proj/src/main.ens",
+        "'?.' cannot appear on the left side of '=', because there is nothing to write to when "
+        + "'held.inner' is null. Copy 'held.inner' into a local first ('let inner = held.inner;') and "
+        + "check the local, as in 'if (inner != null) \{ inner.value = ...; \}'.");
+    try testing.assertEqual(reported.length, 4L);
+}
+
+// A compound operator names itself in the refusal, and no other problem is reported beside it.
+// The value checked is named on its own where the rest of the write is too long to quote, and
+// nothing is named where the value itself is.
+test "a safe write names what it can and stops where it cannot" {
+    let analysis = try sema_support.analyzeOne("public class Inner \{\n"
+        + "    public int value = 0;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\}\n"
+        + "public class Outer \{\n"
+        + "    public Inner? inner = null;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    Inner? maybe = null;\n"
+        + "    int[]? slots = null;\n"
+        + "    int i = 0;\n"
+        + "    maybe?.value += 1;\n"
+        + "    slots?[i + 1] = 7;\n"
+        + "    Outer? outer = null;\n"
+        + "    outer?.inner?.value = 8;\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "'?.' cannot appear on the left side of '+=', because there is nothing to write to when "
+        + "'maybe' is null. Check for null first, as in 'if (maybe != null) "
+        + "\{ maybe.value += ...; \}'.");
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
+        "'?[' cannot appear on the left side of '=', because there is nothing to write to "
+        + "when 'slots' is null. Check for null first, then write the same line without "
+        + "the '?'.");
+    try sema_support.assertDiagnostic(reported, 2, "/proj/src/main.ens",
+        "'?.' cannot appear on the left side of '=', because there is nothing to write to when "
+        + "'outer?.inner' is null. Copy 'outer?.inner' into a local first ('let inner = outer?.inner;') "
+        + "and check the local, as in 'if (inner != null) \{ inner.value = ...; \}'.");
+    try testing.assertEqual(reported.length, 3L);
+}
+
+// '++' and '--' on a safe read get the refusal every write through '?.' gets, with the example
+// spelling the same step without its '?'.
+test "'++' on a safe read is refused as a write through '?.'" {
+    let analysis = try sema_support.analyzeOne("public class Inner \{\n"
+        + "    public int value = 0;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    Inner? maybe = null;\n"
+        + "    maybe?.value++;\n"
+        + "    --maybe?.value;\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "'++' cannot change 'maybe?.value' through '?.', because there is nothing to write to when "
+        + "'maybe' is null. Check for null first, as in 'if (maybe != null) \{ maybe.value++; \}'.");
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
+        "'--' cannot change 'maybe?.value' through '?.', because there is nothing to write to when "
+        + "'maybe' is null. Check for null first, as in 'if (maybe != null) \{ --maybe.value; \}'.");
+    try testing.assertEqual(reported.length, 2L);
+}
+
+// Reading through '?.' and '?[' stays legal everywhere a value is read: in a chain, as a call
+// receiver, inside '??', in a condition, and as a call argument. So does what the refusal
+// suggests: the null check for a local and a parameter, including an array a local holds, and
+// the local copy for a field.
+test "safe reads and the null check the refusal suggests stay legal" {
+    let analysis = try sema_support.analyzeOne("public class Inner \{\n"
+        + "    public int value = 0;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    public doubled() -> int \{\n"
+        + "        return this.value * 2;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class Outer \{\n"
+        + "    public Inner? inner = null;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    public write() -> int \{\n"
+        + "        let inner = this.inner;\n"
+        + "        if (inner != null) \{\n"
+        + "            inner.value = 1;\n"
+        + "        \}\n"
+        + "        return this.inner?.value ?? 0;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "takes(int given) -> int \{\n"
+        + "    return given;\n"
+        + "\}\n"
+        + "throughParameter(Inner? given) -> int \{\n"
+        + "    if (given != null) \{\n"
+        + "        given.value = 2;\n"
+        + "    \}\n"
+        + "    return given?.value ?? 0;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    Inner? maybe = new Inner();\n"
+        + "    int[]? slots = [1, 2, 3];\n"
+        + "    Outer? outer = new Outer();\n"
+        + "    if (maybe != null) \{\n"
+        + "        maybe.value = 3;\n"
+        + "    \}\n"
+        + "    if (slots != null) \{\n"
+        + "        slots[0] = 4;\n"
+        + "    \}\n"
+        + "    int total = takes(maybe?.value ?? 0);\n"
+        + "    total = total + (outer?.inner?.value ?? 0);\n"
+        + "    total = total + (outer?.inner?.doubled() ?? 0);\n"
+        + "    total = total + (slots?[1] ?? 0);\n"
+        + "    if (maybe?.value != null) \{\n"
+        + "        total = total + 1;\n"
+        + "    \}\n"
+        + "    return total + throughParameter(maybe);\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+}
+
+// A write through '?.' or '?[' always gets the refusal of the write. When the operator also refuses
+// the target's type without its '?', that refusal is reported beside it, as the same write on a
+// value that cannot be null reports it.
+test "a write through '?.' whose operator refuses the type reports the write and the type" {
+    let analysis = try sema_support.analyzeOne("public class Inner \{\n"
+        + "    public int count = 0;\n"
+        + "    public string name = \"a\";\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    Inner? maybe = null;\n"
+        + "    string[]? words = null;\n"
+        + "    maybe?.name++;\n"
+        + "    maybe?.name -= 1;\n"
+        + "    words?[0] -= 1;\n"
+        + "    maybe?.count -= 1;\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string file = "/proj/src/main.ens";
+    string safe = "cannot appear on the left side of '-=', because there is nothing to write to when";
+    try sema_support.assertDiagnostic(reported, 0, file, "'++' cannot change 'maybe?.name' through "
+        + "'?.', because there is nothing to write to when 'maybe' is null. Check for null first, as "
+        + "in 'if (maybe != null) \{ maybe.name++; \}'.");
+    try sema_support.assertDiagnostic(reported, 1, file, "'++' works only on numbers, and 'maybe?.name' "
+        + "has type 'string'. Use it on an integer or a floating-point variable, for example 'count++'.");
+    try sema_support.assertDiagnostic(reported, 2, file, "'?.' {safe} 'maybe' is null. Check for null "
+        + "first, as in 'if (maybe != null) \{ maybe.name -= ...; \}'.");
+    try sema_support.assertDiagnostic(reported, 3, file,
+        "'-=' needs numbers on both sides, but 'maybe?.name' has type 'string'.");
+    try sema_support.assertDiagnostic(reported, 4, file, "'?[' {safe} 'words' is null. Check for null "
+        + "first, as in 'if (words != null) \{ words[0] -= ...; \}'.");
+    try sema_support.assertDiagnostic(reported, 5, file,
+        "'-=' needs numbers on both sides, but 'words?[0]' has type 'string'.");
+    try sema_support.assertDiagnostic(reported, 6, file, "'?.' {safe} 'maybe' is null. Check for null "
+        + "first, as in 'if (maybe != null) \{ maybe.count -= ...; \}'.");
+    try testing.assertEqual(reported.length, 7L);
+}
+
+// A write through '?.' or '?[' also gets what the same write without the '?' gets, so a slot that
+// is nullable itself names its local copy, and a 'const' field names its 'const'.
+test "a write through '?.' or '?[' keeps the refusal the write without the '?' gets" {
+    let analysis = try sema_support.analyzeOne("public class Counted \{\n"
+        + "    public int? count = 1;\n"
+        + "    public const int fixed = 1;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    Counted? counted = null;\n"
+        + "    int?[]? slots = null;\n"
+        + "    counted?.count++;\n"
+        + "    slots?[0] += 1;\n"
+        + "    counted?.fixed += 1;\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string file = "/proj/src/main.ens";
+    string nothing = "because there is nothing to write to when";
+    try sema_support.assertDiagnostic(reported, 0, file, "'++' cannot change 'counted?.count' through "
+        + "'?.', {nothing} 'counted' is null. Check for null first, as in 'if (counted != null) \{ "
+        + "counted.count++; \}'.");
+    // A slot that can be null is refused for its null only once the '?' is gone.
+    try sema_support.assertDiagnostic(reported, 1, file, "'?[' cannot appear on the left side of '+=', "
+        + "{nothing} 'slots' is null. Check for null first, as in 'if (slots != null) \{ slots[0] += "
+        + "...; \}'.");
+    try sema_support.assertDiagnostic(reported, 2, file, "'?.' cannot appear on the left side of '+=', "
+        + "{nothing} 'counted' is null. Check for null first, as in 'if (counted != null) \{ counted.fixed "
+        + "+= ...; \}'.");
+    try sema_support.assertDiagnostic(reported, 3, file, "Cannot use '+=' on field 'fixed': a 'const' "
+        + "field is assigned once when the object is constructed and never again. Remove 'const' "
+        + "from the field if it needs to change.");
+    try testing.assertEqual(reported.length, 4L);
+}
+
+// A write through '?.' onto a field that cannot be null is checked as the same write without the
+// '?'. So its texts name the field's own type, and the '?.' adds only the refusal of the write.
+test "a write through '?.' names the type of the field it lands in" {
+    let analysis = try sema_support.analyzeOne("public class Counter \{\n"
+        + "    public int plainCount = 0;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\}\n"
+        + "writes(Counter? maybe, int? p) \{\n"
+        + "    maybe?.plainCount += \"a\";\n"
+        + "    maybe?.plainCount += p;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string file = "/proj/src/main.ens";
+    string safe = "'?.' cannot appear on the left side of '+=', because there is nothing to write to "
+        + "when 'maybe' is null. Check for null first, as in 'if (maybe != null) \{ maybe.plainCount "
+        + "+= ...; \}'.";
+    try sema_support.assertDiagnostic(reported, 0, file, safe);
+    try sema_support.assertDiagnostic(reported, 1, file, "Cannot store the result of '+=' back into "
+        + "'maybe?.plainCount', whose type is 'int': adding 'string' to 'int' produces 'string'. Declare "
+        + "field 'plainCount' as 'string'.");
+    try sema_support.assertDiagnostic(reported, 2, file, safe);
+    try sema_support.assertDiagnostic(reported, 3, file, "'+=' needs numbers on both sides, but 'p' has "
+        + "type 'int?'. Check 'p' for null first ('if (p != null)').");
+    try testing.assertEqual(reported.length, 4L);
+}
+
+// '++' and '--' on 'this' or 'super' name a number field, spelled with the operator where the code
+// writes it. A type with no such field gets the refusal alone.
+test "'++' on 'this' or 'super' names a number field to change instead" {
+    let analysis = try sema_support.analyzeOne("public class Base \{\n"
+        + "    public string name = \"a\";\n"
+        + "    public int value = 0;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\}\n"
+        + "public class Derived extends Base \{\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    public bump() \{\n"
+        + "        --super;\n"
+        + "        this++;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class Named \{\n"
+        + "    public string name = \"a\";\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    public bump() \{\n"
+        + "        this++;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string file = "/proj/src/main.ens";
+    try sema_support.assertDiagnostic(reported, 0, file, "'super' is not a variable, so '--' cannot "
+        + "change it. Change a field instead, as in '--super.value'.");
+    try sema_support.assertDiagnostic(reported, 1, file, "'this' is not a variable, so '++' cannot "
+        + "change it. Change a field instead, as in 'this.value++'.");
+    try sema_support.assertDiagnostic(reported, 2, file,
+        "'this' is not a variable, so '++' cannot change it.");
+    try testing.assertEqual(reported.length, 3L);
+}
+
+// In a field default or a lambda written as one expression, no statement can go, so a write through
+// '?.' gets no copy to make. '++' through '?.' has the type of the field it changes, as '+=' has.
+test "a write through '?.' where no statement can go ends after the refusal" {
+    let analysis = try sema_support.analyzeOne("class Leaf \{\n"
+        + "    int count = 1;\n"
+        + "\n"
+        + "    constructor();\n"
+        + "\}\n"
+        + "\n"
+        + "class Branch \{\n"
+        + "    Leaf? inner = new Leaf();\n"
+        + "    () -> int bump = () -> inner?.count++;\n"
+        + "    () -> int added = () -> inner?.count += 1;\n"
+        + "\n"
+        + "    constructor();\n"
+        + "\}\n"
+        + "\n"
+        + "writes(Branch b, Leaf? leaf) \{\n"
+        + "    () -> int changed = () -> leaf?.count++;\n"
+        + "    () -> int copied = () -> b.inner?.count += 1;\n"
+        + "\}\n"
+        + "\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string file = "/proj/src/main.ens";
+    try sema_support.assertDiagnostic(reported, 0, file, "'++' cannot change 'inner?.count' through '?.', "
+        + "because there is nothing to write to when 'inner' is null.");
+    try sema_support.assertDiagnostic(reported, 1, file, "'?.' cannot appear on the left side of '+=', "
+        + "because there is nothing to write to when 'inner' is null.");
+    try sema_support.assertDiagnostic(reported, 2, file, "'++' cannot change 'leaf?.count' through '?.', "
+        + "because there is nothing to write to when 'leaf' is null.");
+    try sema_support.assertDiagnostic(reported, 3, file, "'?.' cannot appear on the left side of '+=', "
+        + "because there is nothing to write to when 'b.inner' is null.");
+    try testing.assertEqual(reported.length, 4L);
+}
+
+// A compound write on 'this' names a number field as its example. A result that cannot be stored back
+// into an array element names the array to declare.
+test "a compound write names the field to change and the array to declare" {
+    let analysis = try sema_support.analyzeOne("class Leaf \{\n"
+        + "    int? total = 1;\n"
+        + "    int count = 1;\n"
+        + "\n"
+        + "    constructor();\n"
+        + "\n"
+        + "    grow() \{\n"
+        + "        this += 1;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "\n"
+        + "store(int[] counts) \{\n"
+        + "    counts[0] += \"x\";\n"
+        + "\}\n"
+        + "\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string file = "/proj/src/main.ens";
+    try sema_support.assertDiagnostic(reported, 0, file, "'this' is not a variable, so it cannot be "
+        + "assigned. Assign the fields that should change, as in 'this.count += ...'.");
+    try sema_support.assertDiagnostic(reported, 1, file, "Cannot store the result of '+=' back into "
+        + "'counts[0]', whose type is 'int': adding 'string' to 'int' produces 'string'. Declare 'counts' "
+        + "as 'string[]'.");
+    try testing.assertEqual(reported.length, 2L);
+}
+
+// A write through '?.' on a call result names the call. No statement can go in a 'for' update
+// clause, so a write through '?.' there ends after the refusal.
+test "a write through '?.' names the call in front and ends in a for update" {
+    let analysis = try sema_support.analyzeOne("class Inner \{\n"
+        + "    int f = 0;\n"
+        + "\n"
+        + "    constructor();\n"
+        + "\}\n"
+        + "\n"
+        + "class Box \{\n"
+        + "    Inner? inner = null;\n"
+        + "\n"
+        + "    constructor();\n"
+        + "\}\n"
+        + "\n"
+        + "make() -> Inner? \{\n"
+        + "    return null;\n"
+        + "\}\n"
+        + "\n"
+        + "writes(Box box) \{\n"
+        + "    make()?.f++;\n"
+        + "    make()?.f = 1;\n"
+        + "    for (int i = 0; i < 3; box.inner?.f++) \{\n"
+        + "    \}\n"
+        + "\}\n"
+        + "\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string file = "/proj/src/main.ens";
+    try sema_support.assertDiagnostic(reported, 0, file, "'++' cannot change 'make()?.f' through '?.', "
+        + "because there is nothing to write to when 'make()' is null. Store the result of 'make()' in a "
+        + "local first ('let makeResult = make();') and check the local, as in 'if (makeResult != null) \{ "
+        + "makeResult.f++; \}'.");
+    try sema_support.assertDiagnostic(reported, 1, file, "'?.' cannot appear on the left side of '=', "
+        + "because there is nothing to write to when 'make()' is null. Store the result of 'make()' in a "
+        + "local first ('let makeResult = make();') and check the local, as in 'if (makeResult != null) \{ "
+        + "makeResult.f = ...; \}'.");
+    try sema_support.assertDiagnostic(reported, 2, file, "'++' cannot change 'box.inner?.f' through '?.', "
+        + "because there is nothing to write to when 'box.inner' is null.");
+    try testing.assertEqual(reported.length, 3L);
+}
+
+// The fix for a write through a second '?.' or '?[' copies the value in front of it into a local. A
+// copy made before a loop never changes, so a field or element in a loop condition gets no copy advice.
+test "a write through two '?' copies the value in front, and a loop condition gets no copy" {
+    let analysis = try sema_support.analyzeOne("class Tally \{\n"
+        + "    int? count = 1;\n"
+        + "    int?[] slots = [1];\n"
+        + "\n"
+        + "    constructor();\n"
+        + "\}\n"
+        + "\n"
+        + "class Inner \{\n"
+        + "    int value = 0;\n"
+        + "    int f = 0;\n"
+        + "\n"
+        + "    constructor();\n"
+        + "\}\n"
+        + "\n"
+        + "class Outer \{\n"
+        + "    Inner? inner = null;\n"
+        + "\n"
+        + "    constructor();\n"
+        + "\}\n"
+        + "\n"
+        + "writes(Outer? outer, Outer? mb, Inner?[]? slots) \{\n"
+        + "    outer?.inner?.value = 6;\n"
+        + "    mb?.inner?.f++;\n"
+        + "    slots?[0]?.f++;\n"
+        + "\}\n"
+        + "\n"
+        + "loops(Tally t) \{\n"
+        + "    while (t.count < 3) \{\n"
+        + "    \}\n"
+        + "    for (int i = 0; i < t.slots[0]; i++) \{\n"
+        + "    \}\n"
+        + "\}\n"
+        + "\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string file = "/proj/src/main.ens";
+    try sema_support.assertDiagnostic(reported, 0, file, "'?.' cannot appear on the left side of '=', "
+        + "because there is nothing to write to when 'outer?.inner' is null. Copy 'outer?.inner' into a "
+        + "local first ('let inner = outer?.inner;') and check the local, as in 'if (inner != null) \{ "
+        + "inner.value = ...; \}'.");
+    try sema_support.assertDiagnostic(reported, 1, file, "'++' cannot change 'mb?.inner?.f' through '?.', "
+        + "because there is nothing to write to when 'mb?.inner' is null. Copy 'mb?.inner' into a local "
+        + "first ('let inner = mb?.inner;') and check the local, as in 'if (inner != null) \{ inner.f++; "
+        + "\}'.");
+    try sema_support.assertDiagnostic(reported, 2, file, "'++' cannot change 'slots?[0]?.f' through '?.', "
+        + "because there is nothing to write to when 'slots?[0]' is null. Copy 'slots?[0]' into a local "
+        + "first ('let value = slots?[0];') and check the local, as in 'if (value != null) \{ value.f++; "
+        + "\}'.");
+    try sema_support.assertDiagnostic(reported, 3, file, "'<' compares numbers, but 't.count' has type "
+        + "'int?'. Supply a fallback for 't.count' with '??'.");
+    try sema_support.assertDiagnostic(reported, 4, file, "'<' compares numbers, but 't.slots[0]' has type "
+        + "'int?'. Supply a fallback for 't.slots[0]' with '??'.");
+    try testing.assertEqual(reported.length, 5L);
+}
+
+// The fix of the '?.' writes the same line inside a null check, so the null of the slot is refused
+// only once the '?' is gone. A refusal of the types or of the other side still stands beside it.
+test "a write through '?.' to a slot that can be null keeps every refusal but the one of that null" {
+    let analysis = try sema_support.analyzeOne("class Counted \{\n"
+        + "    int? count = 1;\n"
+        + "    string? label = null;\n"
+        + "\n"
+        + "    constructor();\n"
+        + "\}\n"
+        + "\n"
+        + "main() -> int \{\n"
+        + "    Counted? counted = null;\n"
+        + "    counted?.count += 1;\n"
+        + "    counted?.count += \"a\";\n"
+        + "    counted?.count++;\n"
+        + "    int? step = null;\n"
+        + "    counted?.count += step;\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string file = "/proj/src/main.ens";
+    try sema_support.assertDiagnostic(reported, 0, file,
+        "'?.' cannot appear on the left side of '+=', because there is nothing to write to when 'counted' "
+        + "is null. Check for null first, as in 'if (counted != null) \{ counted.count += ...; \}'.");
+    try sema_support.assertDiagnostic(reported, 1, file,
+        "'?.' cannot appear on the left side of '+=', because there is nothing to write to when 'counted' "
+        + "is null. Check for null first, as in 'if (counted != null) \{ counted.count += ...; \}'.");
+    try sema_support.assertDiagnostic(reported, 2, file,
+        "Cannot store the result of '+=' back into 'counted?.count', whose type is 'int?': adding "
+        + "'string' to 'int' produces 'string'. Declare field 'count' as 'string?'.");
+    try sema_support.assertDiagnostic(reported, 3, file,
+        "'++' cannot change 'counted?.count' through '?.', because there is nothing to write to when "
+        + "'counted' is null. Check for null first, as in 'if (counted != null) \{ counted.count++; \}'.");
+    try sema_support.assertDiagnostic(reported, 4, file,
+        "'?.' cannot appear on the left side of '+=', because there is nothing to write to when 'counted' "
+        + "is null. Check for null first, as in 'if (counted != null) \{ counted.count += ...; \}'.");
+    try sema_support.assertDiagnostic(reported, 5, file,
+        "'+=' needs numbers on both sides, but 'step' has type 'int?'. Check 'step' for null first ('if "
+        + "(step != null)').");
+    try testing.assertEqual(reported.length, 6L);
 }

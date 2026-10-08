@@ -2,6 +2,7 @@ import @std.testing;
 import FakeFileLoader from sema_support;
 import Stage from sema_support;
 import sema_support;
+import ProgramAnalysis from pipeline;
 
 test "noreturn rejects a return type and a return statement" {
     let loader = new FakeFileLoader();
@@ -97,5 +98,136 @@ test "noreturn functions and methods pass when every path ends" {
         + "    protected override noreturn halt() \{ panic(\"halt\"); \}\n"
         + "\}\n");
     let analysis = sema_support.analyzeAll(loader, "/proj/src", ["app.ens"]);
+    try sema_support.assertProgramClean(analysis);
+}
+
+test "a 'this.field' parameter reaches a base field exactly where a body write reaches it" {
+    let loader = new FakeFileLoader();
+    loader.add("/ens.package", "workspace \{\n"
+        + "    member \"proj\";\n"
+        + "    member \"proj/vendor/acme\";\n"
+        + "\}\n");
+    loader.add("/proj/ens.package", "package demo.app \{\n    ens \"0.1\";\n    dependency acme;\n\}\n");
+    loader.add("/proj/vendor/acme/ens.package", "package acme \{ ens \"0.1\"; \}\n");
+    loader.add("/proj/vendor/acme/src/parts.ens",
+        "export class Gear \{\n"
+        + "    public int ratio = 2;\n"
+        + "    protected int wear = 3;\n"
+        + "    export int serial = 4;\n"
+        + "    protected constructor();\n"
+        + "\}\n");
+    // 'Reaches' binds the two tiers a subclass in another package can write, so the public
+    // field is the only one of the three a shorthand parameter cannot reach.
+    loader.add("/proj/src/main.ens",
+        "import Gear from @acme.parts;\n"
+        + "class Reaches extends Gear \{\n"
+        + "    protected constructor(this.wear, this.serial);\n"
+        + "\}\n"
+        + "class Shorthand extends Gear \{\n"
+        + "    protected constructor(this.ratio);\n"
+        + "\}\n"
+        + "class BodyWrite extends Gear \{\n"
+        + "    protected constructor() \{\n"
+        + "        this.ratio = 5;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Bodies]);
+    let found = analysis.bodyDiagnostics();
+    try testing.assertEqual(found.length, 2L);
+    // A shorthand parameter writes the field, so both refusals read the same sentence.
+    try testing.assertEqual(found[0].message(), found[1].message());
+    try testing.assertEqual(found[0].message(),
+        "'ratio' of 'Gear' is public inside package 'acme' but not exported. Mark it 'export' "
+        + "in module 'acme.parts' to use it from another package.");
+}
+
+// Test declarations belong to a '_test.ens' file, so a body of one is analyzed under that name.
+analyzeTests(string text) -> ProgramAnalysis throws {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/unit_test.ens", text);
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["unit_test.ens"]);
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Bodies]);
+    return analysis;
+}
+
+test "a test body is checked from a clean flow state, whatever came before it" {
+    let narrowed = try analyzeTests(
+        "class Door \{ protected int code; protected constructor(); \}\n"
+        + "class Missing extends Error \{\n"
+        + "    protected constructor(string message) \{ super(message); \}\n"
+        + "\}\n"
+        + "opened(bool yes) -> Door? \{\n"
+        + "    if (yes) \{\n"
+        + "        return new Door();\n"
+        + "    \}\n"
+        + "    return null;\n"
+        + "\}\n"
+        + "test \"a throwing check narrows what follows it\" \{\n"
+        + "    let door = opened(true);\n"
+        + "    if (door == null) \{\n"
+        + "        throw new Missing(\"nothing\");\n"
+        + "    \}\n"
+        + "    let code = door.code;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(narrowed.bodyDiagnostics());
+
+    let unassigned = try analyzeTests("answer() -> long \{\n"
+        + "    return 1;\n"
+        + "\}\n"
+        + "test \"a local read before it is assigned\" \{\n"
+        + "    long value;\n"
+        + "    print(\"\{value\}\");\n"
+        + "\}\n");
+    try sema_support.assertDiagnostic(unassigned.bodyDiagnostics(), 0, "/proj/src/unit_test.ens",
+        "Variable 'value' is used before it is assigned a value. Assign it on every path that leads to "
+        + "this line, for example 'value = ...;'.");
+    try testing.assertEqual(unassigned.bodyDiagnostics().length, 1L);
+}
+
+// A field default and a parameter default are built once per instantiation, where each type
+// parameter stands for one written type argument. So both write one as a type argument, as an
+// array element, as a lambda's parameter type, and as the argument of a generic type's static.
+test "a type parameter is a type inside a field default and a parameter default" {
+    let loader = new FakeFileLoader();
+    loader.addCollections();
+    loader.add("/proj/src/main.ens",
+        "import List from @std.collections.list;\n"
+        + "public class Zero<T> \{\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    public static count() -> long \{\n"
+        + "        return 0;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class Kept<Tag> \{\n"
+        + "    public List<Tag> items = new List<Tag>();\n"
+        + "    public Tag?[] slots = new Tag?[2];\n"
+        + "    public (Tag) -> long weigh = (held) -> 1;\n"
+        + "    public long zeroed = Zero<Tag>.count();\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    public counts(List<Tag> more = new List<Tag>()) -> long \{\n"
+        + "        return 0;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public struct Pair<Left> \{\n"
+        + "    public List<Left> lefts = new List<Left>();\n"
+        + "    public Left carried;\n"
+        + "\n"
+        + "    public constructor(this.carried);\n"
+        + "\}\n"
+        + "carries<Value>(List<Value> items = new List<Value>()) -> long \{\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let kept = new Kept<int>();\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
     try sema_support.assertProgramClean(analysis);
 }

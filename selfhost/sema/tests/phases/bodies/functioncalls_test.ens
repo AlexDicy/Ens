@@ -211,3 +211,574 @@ test "an operator argument of an overloaded call names the parameter the call re
         + "'value' of 'scale' is a 'float' too.");
     try testing.assertEqual(reported.length, 12L);
 }
+
+test "argument arity and types check against the signature" {
+    let analysis = try sema_support.analyzeOne("add(int a, int b) -> int \{\n"
+        + "    return a + b;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    add(1);\n"
+        + "    add(1, \"two\");\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "Function 'add' takes two arguments, but this call passes one. Add an argument for 'b'.");
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
+        "Argument 2 of 'add' has type 'string', but parameter 'b' has type 'int'.");
+    try testing.assertEqual(reported.length, 2L);
+}
+
+// A defaulted parameter makes the count a range, and one count and a range read as the same
+// sentence with the number the signature allows in it.
+test "an arity failure names the range a signature with defaults accepts" {
+    let analysis = try sema_support.analyzeOne("span(int a, int b = 2, int c = 3) -> int \{\n"
+        + "    return a + b + c;\n"
+        + "\}\n"
+        + "one(int a) \{ \}\n"
+        + "main() -> int \{\n"
+        + "    span(1, 2, 3, 4);\n"
+        + "    one(1, 2);\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "Function 'span' takes one to three arguments, but this call passes four. Remove the extra "
+        + "argument.");
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
+        "Function 'one' takes one argument, but this call passes two. Remove the extra argument.");
+    try testing.assertEqual(reported.length, 2L);
+}
+
+test "named arguments map to parameters and reject unknown names" {
+    let clean = try sema_support.analyzeOne("area(int width, int height = 2) -> int \{\n"
+        + "    return width * height;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return area(height: 3, width: 4) - area(width: 12);\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(clean.bodyDiagnostics());
+    let broken = try sema_support.analyzeOne("area(int width, int height = 2) -> int \{\n"
+        + "    return width * height;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return area(depth: 3);\n"
+        + "\}\n");
+    try sema_support.assertDiagnostic(broken.bodyDiagnostics(), 0, "/proj/src/main.ens",
+        "Function 'area' has no parameter named 'depth'. Its parameters are 'width' and 'height'. "
+        + "Change 'depth:' to one of 'width:' or 'height:'.");
+    try testing.assertEqual(broken.bodyDiagnostics().length, 1L);
+    let listed = try sema_support.analyzeOne("box(int width, int height, int depth) -> int \{\n"
+        + "    return width * height * depth;\n"
+        + "\}\n"
+        + "none() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return box(width: 1, height: 2, length: 3) + none(size: 1);\n"
+        + "\}\n");
+    try sema_support.assertDiagnostic(listed.bodyDiagnostics(), 0, "/proj/src/main.ens",
+        "Function 'box' has no parameter named 'length'. Its parameters are 'width', 'height' and "
+        + "'depth'. Change 'length:' to 'depth:'.");
+    try sema_support.assertDiagnostic(listed.bodyDiagnostics(), 1, "/proj/src/main.ens",
+        "Function 'none' has no parameter named 'size'. It takes no parameters. Remove the "
+        + "argument 'size: ...'.");
+    try testing.assertEqual(listed.bodyDiagnostics().length, 2L);
+}
+
+test "an overloaded call types a literal that names no type of its own from the parameter" {
+    let clean = try sema_support.analyzeOne("count(string[] names) -> long \{\n"
+        + "    return names.length;\n"
+        + "\}\n"
+        + "count(string[] names, string label) -> long \{\n"
+        + "    return names.length + label.length;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return (count([]) + count([], \"x\")) as int;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(clean.bodyDiagnostics());
+    let broken = try sema_support.analyzeOne("count(string[] names) -> long \{\n"
+        + "    return names.length;\n"
+        + "\}\n"
+        + "count(long amount, string label) -> long \{\n"
+        + "    return amount + label.length;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return count([], \"x\") as int;\n"
+        + "\}\n");
+    try sema_support.assertDiagnostic(broken.bodyDiagnostics(), 0, "/proj/src/main.ens",
+        "Cannot assign an array literal to 'long', which is not an array type.");
+    try testing.assertEqual(broken.bodyDiagnostics().length, 1L);
+}
+
+test "generic calls infer, check bounds, and substitute returns" {
+    let clean = try sema_support.analyzeOne("first<T>(T[] items, T fallback) -> T \{\n"
+        + "    if (items.length > 0) \{\n"
+        + "        return items[0];\n"
+        + "    \}\n"
+        + "    return fallback;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    int chosen = first<int>([1, 2], 3);\n"
+        + "    return chosen;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(clean.bodyDiagnostics());
+    let broken = try sema_support.analyzeOne("pick<T>() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return pick();\n"
+        + "\}\n");
+    try sema_support.assertDiagnostic(broken.bodyDiagnostics(), 0, "/proj/src/main.ens",
+        "'pick' is generic, and this call does not show what its type argument 'T' is. Write it, as in "
+        + "'pick<int>()'.");
+    try testing.assertEqual(broken.bodyDiagnostics().length, 1L);
+    let structural = try sema_support.analyzeOne("class Box<T> \{\n"
+        + "    protected T value;\n"
+        + "    protected constructor(this.value);\n"
+        + "\}\n"
+        + "interface Source<T> \{\n"
+        + "    read() -> T;\n"
+        + "\}\n"
+        + "class Ticker implements Source<int> \{\n"
+        + "    protected constructor();\n"
+        + "    protected override read() -> int \{\n"
+        + "        return 4;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "unbox<T>(Box<T> box) -> T \{\n"
+        + "    return box.value;\n"
+        + "\}\n"
+        + "readFrom<T>(Source<T> source) -> T \{\n"
+        + "    return source.read();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    int unboxed = unbox(new Box<int>(3));\n"
+        + "    int ticked = readFrom(new Ticker());\n"
+        + "    return unboxed + ticked;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(structural.bodyDiagnostics());
+    let conflicting = try sema_support.analyzeOne("interface Source<T> \{\n"
+        + "    read() -> T;\n"
+        + "\}\n"
+        + "class Ticker implements Source<int> \{\n"
+        + "    protected constructor();\n"
+        + "    protected override read() -> int \{\n"
+        + "        return 4;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "readBoth<T>(Source<T> source, T other) -> T \{\n"
+        + "    return other;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let mixed = readBoth(new Ticker(), \"x\");\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertDiagnostic(conflicting.bodyDiagnostics(), 0, "/proj/src/main.ens",
+        "Argument 2 of 'readBoth' has type 'string', but parameter 'other' has type 'int'. 'T' is 'int' "
+        + "in this call, taken from argument 1. To choose it yourself, write 'readBoth<int>(...)' and "
+        + "change 'int' to the type you want.");
+    try testing.assertEqual(conflicting.bodyDiagnostics().length, 1L);
+}
+
+test "this binds a generic function's parameter as the class at its own type parameters" {
+    string shared = "class Box<T> \{\n"
+        + "    protected T value;\n"
+        + "    protected constructor(this.value);\n"
+        + "    protected same() -> Box<T> \{\n"
+        + "        return identity(this);\n"
+        + "    \}\n"
+        + "    protected twice() -> Pair<Box<T>> \{\n"
+        + "        return pair(this, this);\n"
+        + "    \}\n"
+        + "    protected orOther(Box<T> other) -> Box<T> \{\n"
+        + "        return first(this, other);\n"
+        + "    \}\n"
+        + "\}\n"
+        + "class Pair<T> \{\n"
+        + "    protected T left;\n"
+        + "    protected T right;\n"
+        + "    protected constructor(this.left, this.right);\n"
+        + "\}\n"
+        + "identity<T>(T value) -> T \{\n"
+        + "    return value;\n"
+        + "\}\n"
+        + "pair<T>(T left, T right) -> Pair<T> \{\n"
+        + "    return new Pair<T>(left, right);\n"
+        + "\}\n"
+        + "first<T>(T one, T two) -> T \{\n"
+        + "    return one;\n"
+        + "\}\n";
+    let clean = try sema_support.analyzeOne(shared + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(clean.bodyDiagnostics());
+    let mixed = try sema_support.analyzeOne(shared + "class Crate<T> \{\n"
+        + "    protected Box<T> inner;\n"
+        + "    protected constructor(this.inner);\n"
+        + "    protected mixed() -> Crate<T> \{\n"
+        + "        return first(this, new Crate<int>(new Box<int>(1)));\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertDiagnostic(mixed.bodyDiagnostics(), 0, "/proj/src/main.ens",
+        "Argument 2 of 'first' has type 'Crate<int>', but parameter 'two' has type 'Crate<T>'. 'T' is "
+        + "'Crate<T>' in this call, taken from argument 1. To choose it yourself, write "
+        + "'first<Crate<T>>(...)' and change 'Crate<T>' to the type you want.");
+    try testing.assertEqual(mixed.bodyDiagnostics().length, 1L);
+}
+
+test "a named argument that matches no parameter offers the parameters still open" {
+    let analysis = try sema_support.analyzeOne("class Box \{\n"
+        + "    protected constructor(int width) \{ \}\n"
+        + "\}\n"
+        + "pair(int width, int height) -> int \{\n"
+        + "    return width + height;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let box = new Box(depth: 1);\n"
+        + "    int both = pair(width: 1, height: 2, depth: 3);\n"
+        + "    int one = pair(1, depth: 2);\n"
+        + "    let twice = new Box(1, width: 2);\n"
+        + "    return both + one;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "The constructor of 'Box' has no parameter named 'depth'. Its only parameter is 'width'. "
+        + "Change 'depth:' to 'width:'.");
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
+        "Function 'pair' has no parameter named 'depth'. Its parameters are 'width' and 'height'. "
+        + "Each of them already has an argument. Remove the argument 'depth: ...'.");
+    try sema_support.assertDiagnostic(reported, 2, "/proj/src/main.ens",
+        "Function 'pair' has no parameter named 'depth'. Its parameters are 'width' and 'height'. "
+        + "Change 'depth:' to 'height:'.");
+    try sema_support.assertDiagnostic(reported, 3, "/proj/src/main.ens",
+        "The constructor of 'Box' gets two arguments for parameter 'width'. Remove the named "
+        + "argument for 'width', or remove the positional one.");
+    try testing.assertEqual(reported.length, 4L);
+}
+
+// Every call shape shares one arity text, and the refusal of a static written without its type
+// name names what it is and how to write it. A generic call beside a refused argument reports only
+// that argument.
+test "a call with the wrong number of arguments names both counts in words and the one to add or remove" {
+    let analysis = try sema_support.analyzeOne("class Box \{\n"
+        + "    int width;\n"
+        + "    int height;\n"
+        + "    static const int limit = 4;\n"
+        + "    lazy const string label = \"box\";\n"
+        + "\n"
+        + "    constructor(this.width, this.height = 1);\n"
+        + "\n"
+        + "    resize(int by) \{\n"
+        + "    \}\n"
+        + "\n"
+        + "    static make(int size) -> Box \{\n"
+        + "        return new Box(size);\n"
+        + "    \}\n"
+        + "\n"
+        + "    reads() -> int \{\n"
+        + "        return limit + make(1).width;\n"
+        + "    \}\n"
+        + "\n"
+        + "    calls() -> string \{\n"
+        + "        return label() + limit();\n"
+        + "    \}\n"
+        + "\}\n"
+        + "\n"
+        + "class Plain \{\n"
+        + "\}\n"
+        + "\n"
+        + "class Tall extends Plain \{\n"
+        + "    constructor() \{\n"
+        + "        super(1);\n"
+        + "    \}\n"
+        + "\}\n"
+        + "\n"
+        + "span(int from, int to = 0, int step = 1) \{\n"
+        + "\}\n"
+        + "\n"
+        + "pair<A, B>(A first, B second) -> A \{\n"
+        + "    return first;\n"
+        + "\}\n"
+        + "\n"
+        + "identity<T>(T value) -> T \{\n"
+        + "    return value;\n"
+        + "\}\n"
+        + "\n"
+        + "main() -> int \{\n"
+        + "    span();\n"
+        + "    span(1, 2, 3, 4);\n"
+        + "    let b = new Box();\n"
+        + "    b.resize(1, 2);\n"
+        + "    (int, int) -> int f = (x, y) -> x;\n"
+        + "    f(1);\n"
+        + "    f();\n"
+        + "    int[] xs = [1, 2];\n"
+        + "    let part = xs.slice(1);\n"
+        + "    let one = pair<int>(1, 2);\n"
+        + "    let many = pair<int, int, int>(1, 2);\n"
+        + "    let p = new Plain(1);\n"
+        + "    int? m = null;\n"
+        + "    let same = identity(m.toString());\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string file = "/proj/src/main.ens";
+    try sema_support.assertDiagnostic(reported, 0, file, "'limit' is a static const of 'Box', and a static "
+        + "const is always read through its type name, even inside 'Box'. Write 'Box.limit'.");
+    try sema_support.assertDiagnostic(reported, 1, file, "'make' is a static method of 'Box', and a static "
+        + "method is always called through its type name, even inside 'Box'. Write 'Box.make(...)'.");
+    try sema_support.assertDiagnostic(reported, 2, file, "'label' is a lazy const of 'Box', and a lazy "
+        + "const is always read through its type name, even inside 'Box'. Write 'Box.label'. A lazy const "
+        + "is not called, so remove the arguments as well.");
+    try sema_support.assertDiagnostic(reported, 3, file, "'limit' is a static const of 'Box', and a static "
+        + "const is always read through its type name, even inside 'Box'. Write 'Box.limit'. A static "
+        + "const is not called, so remove the arguments as well.");
+    try sema_support.assertDiagnostic(reported, 4, file, "Base class 'Plain' declares no constructor, so "
+        + "'super(...)' takes no arguments. Write 'super()', or remove the call.");
+    try sema_support.assertDiagnostic(reported, 5, file, "Function 'span' takes one to three arguments, "
+        + "but this call passes none. Add an argument for 'from'.");
+    try sema_support.assertDiagnostic(reported, 6, file, "Function 'span' takes one to three arguments, "
+        + "but this call passes four. Remove the extra argument.");
+    try sema_support.assertDiagnostic(reported, 7, file, "The constructor of 'Box' takes one or two "
+        + "arguments, but this call passes none. Add an argument for 'width'.");
+    try sema_support.assertDiagnostic(reported, 8, file, "Method 'resize' takes one argument, but this "
+        + "call passes two. Remove the extra argument.");
+    try sema_support.assertDiagnostic(reported, 9, file, "'f' has type '(int, int) -> int', so it takes "
+        + "two arguments, but this call passes one. Add one more argument.");
+    try sema_support.assertDiagnostic(reported, 10, file, "'f' has type '(int, int) -> int', so it takes "
+        + "two arguments, but this call passes none. Add two more arguments.");
+    try sema_support.assertDiagnostic(reported, 11, file, "'slice' takes two arguments, but this call "
+        + "passes one. Add an argument for 'end'.");
+    try sema_support.assertDiagnostic(reported, 12, file, "Generic function 'pair' takes two type "
+        + "arguments, but this call passes one. Add a type argument for 'B'.");
+    try sema_support.assertDiagnostic(reported, 13, file, "Generic function 'pair' takes two type "
+        + "arguments, but this call passes three. Remove the extra type argument.");
+    try sema_support.assertDiagnostic(reported, 14, file, "Class 'Plain' declares no constructor, so 'new "
+        + "Plain(...)' takes no arguments. Write 'new Plain()'.");
+    try sema_support.assertDiagnostic(reported, 15, file, "Cannot read a member of 'int?' because it may "
+        + "be null here. Check 'm' for null first ('if (m != null)').");
+    try testing.assertEqual(reported.length, 16L);
+}
+
+// A method or function written as a value is called as the file writes it, and a refused call
+// names the argument or parameter to change.
+test "a refused call or name gives the call to write with the receiver and the arguments it has" {
+    let analysis = try sema_support.analyzeOne("class Box \{\n"
+        + "    int n = 0;\n"
+        + "\n"
+        + "    count() -> int \{\n"
+        + "        return this.n;\n"
+        + "    \}\n"
+        + "\n"
+        + "    grow(int by) -> int \{\n"
+        + "        return this.n + by;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "\n"
+        + "class Pair<K, V> \{\n"
+        + "    K key;\n"
+        + "    V value;\n"
+        + "\n"
+        + "    constructor(K key, V value) \{\n"
+        + "        this.key = key;\n"
+        + "        this.value = value;\n"
+        + "    \}\n"
+        + "\n"
+        + "    static of(K key, V value) -> Pair<K, V> \{\n"
+        + "        return new Pair<K, V>(key, value);\n"
+        + "    \}\n"
+        + "\}\n"
+        + "\n"
+        + "interface Speaker \{\n"
+        + "    speak();\n"
+        + "\}\n"
+        + "\n"
+        + "class Crate<T> \{\n"
+        + "    T item;\n"
+        + "\n"
+        + "    constructor(T item) \{\n"
+        + "        this.item = item;\n"
+        + "    \}\n"
+        + "\n"
+        + "    shout<T: Speaker>() \{\n"
+        + "    \}\n"
+        + "\}\n"
+        + "\n"
+        + "class Widget \{\n"
+        + "    grow() \{\n"
+        + "    \}\n"
+        + "\}\n"
+        + "\n"
+        + "external from libc \{\n"
+        + "    fill(out int result);\n"
+        + "    abs(int x) -> int;\n"
+        + "\}\n"
+        + "\n"
+        + "helper() -> int \{\n"
+        + "    return 1;\n"
+        + "\}\n"
+        + "\n"
+        + "pick<T>(T a, T b) -> T \{\n"
+        + "    return a;\n"
+        + "\}\n"
+        + "\n"
+        + "check(bool flag, int n) \{\n"
+        + "\}\n"
+        + "\n"
+        + "opener<T>(Crate<T> c) \{\n"
+        + "    c.shout();\n"
+        + "\}\n"
+        + "\n"
+        + "main() -> int \{\n"
+        + "    let b = new Box();\n"
+        + "    let f = b.count;\n"
+        + "    let g = b.grow;\n"
+        + "    let h = helper;\n"
+        + "    let p = Pair.of<int, string>(1, \"a\");\n"
+        + "    let q = Widget.grow;\n"
+        + "    check(flag: true, flag: false);\n"
+        + "    check(flag: true, 2);\n"
+        + "    int picked = pick(a: 1, b: 2);\n"
+        + "    int local = 0;\n"
+        + "    abs(out local);\n"
+        + "    fill(out total);\n"
+        + "    long wide = 0;\n"
+        + "    fill(out wide);\n"
+        + "    abs(x: 1);\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string file = "/proj/src/main.ens";
+    try sema_support.assertDiagnostic(reported, 0, file,
+        "'shout' exists on 'Crate<T>' only when 'T' satisfies 'Speaker', and nothing here requires that "
+        + "of 'T'. Add the bound to this function, as in '<T: Speaker>', or to 'T' where it is declared.");
+    try sema_support.assertDiagnostic(reported, 1, file,
+        "'count' is a method of 'Box', and a method's name is not a value. Call it as 'b.count()'.");
+    try sema_support.assertDiagnostic(reported, 2, file,
+        "'grow' is a method of 'Box', and a method's name is not a value. Call it as 'b.grow(...)'.");
+    try sema_support.assertDiagnostic(reported, 3, file,
+        "'helper' is a function, and a function's name is not a value. Call it as 'helper()', or wrap it "
+        + "in a lambda, as in '() -> int callback = () -> helper();'.");
+    try sema_support.assertDiagnostic(reported, 4, file,
+        "Type arguments are never written after a method name. Write them after the type name, as in "
+        + "'Pair<int, string>.of(1, \"a\")'.");
+    try sema_support.assertDiagnostic(reported, 5, file,
+        "'grow' belongs to each 'Widget' value, not to the type 'Widget', so it is used through a value. "
+        + "Call 'grow' on a value of type 'Widget'.");
+    try sema_support.assertDiagnostic(reported, 6, file,
+        "Argument 'flag' is named twice in this call. Remove one of the two.");
+    try sema_support.assertDiagnostic(reported, 7, file,
+        "Positional arguments must come before named ones. Move '2' before 'flag: true'.");
+    try sema_support.assertDiagnostic(reported, 8, file,
+        "'pick' is generic, and a call to a generic function cannot name its arguments. Pass them in "
+        + "order, as in 'pick(1, 2)'.");
+    try sema_support.assertDiagnostic(reported, 9, file,
+        "Parameter 'x' of 'abs' is not an 'out' parameter. Remove 'out' from 'out local'.");
+    try sema_support.assertDiagnostic(reported, 10, file,
+        "'total' in 'out total' is not a local variable or a parameter. Declare it first, as in 'int "
+        + "total = 0;'.");
+    try sema_support.assertDiagnostic(reported, 11, file,
+        "Parameter 'result' of 'fill' is 'out int', but 'wide' has type 'long'. Pass a variable of type "
+        + "'int'.");
+    try sema_support.assertDiagnostic(reported, 12, file,
+        "External function 'abs' takes its arguments by position, so a call cannot name them. Pass them "
+        + "in order, as in 'abs(1)'.");
+    try testing.assertEqual(reported.length, 13L);
+}
+
+// An argument names its callee and the parameter it is passed to, and a 'return' names what returns
+// it. A 'return' with a value in a callable that returns nothing offers the return type of that value.
+test "a type mismatch names the variable, the callee and the parameter, or the callable that returns it" {
+    let analysis = try sema_support.analyzeOne("class Box \{\n"
+        + "    int size;\n"
+        + "\n"
+        + "    constructor(int size) \{\n"
+        + "        this.size = size;\n"
+        + "        return 3;\n"
+        + "    \}\n"
+        + "\n"
+        + "    grow(int by) -> int \{\n"
+        + "        return \"a\";\n"
+        + "    \}\n"
+        + "\n"
+        + "    measure() \{\n"
+        + "        return 1;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "\n"
+        + "class Pair<K, V> \{\n"
+        + "    K key;\n"
+        + "    V value;\n"
+        + "\n"
+        + "    constructor(K key, V value) \{\n"
+        + "        this.key = key;\n"
+        + "        this.value = value;\n"
+        + "    \}\n"
+        + "\n"
+        + "    static of(K key, V value) -> Pair<K, V> \{\n"
+        + "        return new Pair<K, V>(key, value);\n"
+        + "    \}\n"
+        + "\}\n"
+        + "\n"
+        + "external from libc \{\n"
+        + "    abs(int x) -> int;\n"
+        + "\}\n"
+        + "\n"
+        + "area(int width, int height) -> int \{\n"
+        + "    return width * height;\n"
+        + "\}\n"
+        + "\n"
+        + "draw(int times) \{\n"
+        + "    return times;\n"
+        + "\}\n"
+        + "\n"
+        + "total() -> int \{\n"
+        + "    return;\n"
+        + "\}\n"
+        + "\n"
+        + "main() -> int \{\n"
+        + "    let b = new Box(\"big\");\n"
+        + "    b.grow(\"more\");\n"
+        + "    area(width: \"wide\", height: 2);\n"
+        + "    (int) -> int f = (x) -> x;\n"
+        + "    f(\"a\");\n"
+        + "    abs(\"a\");\n"
+        + "    let p = Pair<int, string>.of(\"k\", \"v\");\n"
+        + "    (int) -> int g = (x) -> \"a\";\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string file = "/proj/src/main.ens";
+    try sema_support.assertDiagnostic(reported, 0, file,
+        "The constructor of 'Box' returns nothing, so this 'return' cannot have a value. Write 'return;'.");
+    try sema_support.assertDiagnostic(reported, 1, file,
+        "Method 'grow' returns 'int', but this value has type 'string'.");
+    try sema_support.assertDiagnostic(reported, 2, file,
+        "Method 'measure' returns nothing, so this 'return' cannot have a value. Write 'return;', or "
+        + "declare a return type, as in 'measure() -> int'.");
+    try sema_support.assertDiagnostic(reported, 3, file,
+        "Function 'draw' returns nothing, so this 'return' cannot have a value. Write 'return;', or "
+        + "declare a return type, as in 'draw(int times) -> int'.");
+    try sema_support.assertDiagnostic(reported, 4, file,
+        "Function 'total' returns 'int', but this 'return' has no value. Write the value after 'return', "
+        + "as in 'return ...;'.");
+    try sema_support.assertDiagnostic(reported, 5, file,
+        "Argument 1 of the constructor of 'Box' has type 'string', but parameter 'size' has type 'int'.");
+    try sema_support.assertDiagnostic(reported, 6, file,
+        "Argument 1 of 'grow' has type 'string', but parameter 'by' has type 'int'.");
+    try sema_support.assertDiagnostic(reported, 7, file,
+        "Argument 'width' of 'area' has type 'string', but parameter 'width' has type 'int'.");
+    try sema_support.assertDiagnostic(reported, 8, file,
+        "Argument 1 of 'f' has type 'string', but 'f' takes an 'int' there.");
+    try sema_support.assertDiagnostic(reported, 9, file,
+        "Argument 1 of 'abs' has type 'string', but parameter 'x' has type 'int'.");
+    try sema_support.assertDiagnostic(reported, 10, file,
+        "Argument 1 of 'of' has type 'string', but parameter 'key' has type 'int'.");
+    try sema_support.assertDiagnostic(reported, 11, file,
+        "This lambda must return 'int', but its body has type 'string'.");
+    try testing.assertEqual(reported.length, 12L);
+}

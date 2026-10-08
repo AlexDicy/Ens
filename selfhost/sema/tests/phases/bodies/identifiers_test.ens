@@ -1,0 +1,872 @@
+import @std.testing;
+import sema_support;
+import FakeFileLoader from sema_support;
+import Stage from sema_support;
+
+test "undefined names and non-functions are reported" {
+    let analysis = try sema_support.analyzeOne("main() -> int \{\n"
+        + "    let value = missing;\n"
+        + "    let x = 1;\n"
+        + "    x(2);\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "Undefined name 'missing'. Check the spelling, or declare it before it is used.");
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
+        "'x' has type 'int', which is not a function type, so it cannot be called.");
+    try testing.assertEqual(reported.length, 2L);
+}
+
+test "a function has neither a receiver nor a base class to reach" {
+    let withThis = try sema_support.analyzeOne("main() -> int \{\n"
+        + "    return this.size;\n"
+        + "\}\n");
+    try sema_support.assertDiagnostic(withThis.bodyDiagnostics(), 0, "/proj/src/main.ens",
+        "'this' is the object a method was called on, so it is only available inside a method. Pass the "
+        + "object as a parameter, or move this code into a method.");
+    try testing.assertEqual(withThis.bodyDiagnostics().length, 1L);
+    let withSuper = try sema_support.analyzeOne("main() -> int \{\n"
+        + "    return super.size;\n"
+        + "\}\n");
+    try sema_support.assertDiagnostic(withSuper.bodyDiagnostics(), 0, "/proj/src/main.ens",
+        "'super' is the part of the object a method was called on that its base class declares, so it is "
+        + "only available inside a method. Move this code into a method of the subclass.");
+    try testing.assertEqual(withSuper.bodyDiagnostics().length, 1L);
+}
+
+// A function's name is not a value, so every position that writes a value refuses it. Where no
+// function type is expected, the fix declares one a lambda calling that function fits, and where one
+// is, the fix is that lambda.
+test "a function's name is not a value in any position" {
+    let analysis = try sema_support.analyzeOne("twice(int value) -> int \{\n"
+        + "    return value * 2;\n"
+        + "\}\n"
+        + "applies((int) -> int f, int value) -> int \{\n"
+        + "    return f(value);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let untyped = twice;\n"
+        + "    (int) -> int declared = twice;\n"
+        + "    let passed = applies(twice, 3);\n"
+        + "    twice = 4;\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string refused = "'twice' is a function, and a function's name is not a value. Call it as "
+        + "'twice(...)', or wrap it in a lambda, as in '(int) -> int callback = (value) -> twice(value);'.";
+    string lambda = "'twice' is a function, and a function's name is not a value. Write a lambda that "
+        + "calls it instead: '(value) -> twice(value)'.";
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens", refused);
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens", lambda);
+    try sema_support.assertDiagnostic(reported, 2, "/proj/src/main.ens", lambda);
+    try sema_support.assertDiagnostic(reported, 3, "/proj/src/main.ens", refused);
+    try testing.assertEqual(reported.length, 4L);
+}
+
+// One function type has to cover the name for the fix to spell one, and a name several
+// declarations share, a generic, and a 'throws' whose types the body decides leave none.
+test "a function name no one function type covers is refused without a declaration" {
+    let analysis = try sema_support.analyzeOne("class Failure extends Error \{\n"
+        + "    protected constructor(string message) \{ super(message); \}\n"
+        + "\}\n"
+        + "overloaded(int value) -> int \{\n"
+        + "    return value;\n"
+        + "\}\n"
+        + "overloaded(string value) -> string \{\n"
+        + "    return value;\n"
+        + "\}\n"
+        + "kept<T>(T value) -> T \{\n"
+        + "    return value;\n"
+        + "\}\n"
+        + "inferred(int value) -> int throws \{\n"
+        + "    if (value < 0) \{\n"
+        + "        throw new Failure(\"negative\");\n"
+        + "    \}\n"
+        + "    return value;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let a = overloaded;\n"
+        + "    let b = kept;\n"
+        + "    let c = inferred;\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string[] calls = ["overloaded(...)", "kept(...)", "try inferred(...)"];
+    string[] named = ["overloaded", "kept", "inferred"];
+    for (long i = 0; i < named.length; i++) {
+        try sema_support.assertDiagnostic(reported, i, "/proj/src/main.ens",
+            "'{named[i]}' is a function, and a function's name is not a value. Call it as "
+            + "'{calls[i]}', or wrap it in a lambda.");
+    }
+    try testing.assertEqual(reported.length, 3L);
+}
+
+// A module name only qualifies what the module declares. The message names the module the way
+// the file does, the last segment of its path or the alias an import bound it to.
+test "a module's name is not a value" {
+    let loader = new FakeFileLoader();
+    sema_support.aliasingLibrary(loader);
+    loader.add("/proj/src/main.ens",
+        "import lib.colors;\n"
+        + "import lib.sizes as sizing;\n"
+        + "import Ruler from lib.sizes;\n"
+        + "main() -> int \{\n"
+        + "    let named = colors;\n"
+        + "    let aliased = sizing;\n"
+        + "    return sizing.measure(new Ruler(2));\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Bodies]);
+    let reported = analysis.bodyDiagnostics();
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "'colors' names a module, not a value. Write one of its functions after the module name, as in "
+        + "'colors.pick()'.");
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
+        "'sizing' names a module, not a value. Write one of its functions after the module name, as in "
+        + "'sizing.measure(...)'.");
+    try testing.assertEqual(reported.length, 2L);
+}
+
+// A module the file can call nothing in has no example to offer, and one whose function throws
+// keeps the 'try' the call needs.
+test "a module's name is refused with a call only where it declares one" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/lib/quiet.ens",
+        "public class Only \{\n"
+        + "    public constructor();\n"
+        + "\}\n");
+    loader.add("/proj/src/lib/risky.ens",
+        "public class Failure extends Error \{\n"
+        + "    public constructor(string message) \{\n"
+        + "        super(message);\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public risked(int value) throws Failure \{\n"
+        + "    if (value < 0) \{\n"
+        + "        throw new Failure(\"negative\");\n"
+        + "    \}\n"
+        + "\}\n");
+    loader.add("/proj/src/main.ens",
+        "import lib.quiet;\n"
+        + "import lib.risky;\n"
+        + "main() -> int \{\n"
+        + "    let a = quiet;\n"
+        + "    let b = risky;\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Bodies]);
+    let reported = analysis.bodyDiagnostics();
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "'quiet' names a module, not a value.");
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
+        "'risky' names a module, not a value. Write one of its functions after the module name, as in "
+        + "'try risky.risked(...)'.");
+    try testing.assertEqual(reported.length, 2L);
+}
+
+// Every kind of type a class declaration makes, written where a value belongs. A class names the
+// construction this file can reach, an abstract one names where a value comes from instead, and a
+// class whose constructor this file cannot reach names nothing. A reachable static is named
+// alongside, and a generic class names only a static, since its construction would need type
+// arguments.
+test "a bare class name in a value position names the construction this file can reach" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/lib/parts.ens", sema_support.classKinds());
+    loader.add("/proj/src/main.ens",
+        "import Widget from lib.parts;\n"
+        + "import Sizer from lib.parts;\n"
+        + "import Derived from lib.parts;\n"
+        + "import Vault from lib.parts;\n"
+        + "import Locked from lib.parts;\n"
+        + "import Counter from lib.parts;\n"
+        + "import Shape from lib.parts;\n"
+        + "import Plain from lib.parts;\n"
+        + "import Holder from lib.parts;\n"
+        + "import Crate from lib.parts;\n"
+        + "main() -> int \{\n"
+        + "    let a = Widget;\n"
+        + "    let b = Sizer;\n"
+        + "    let c = Derived;\n"
+        + "    let d = Vault;\n"
+        + "    let e = Locked;\n"
+        + "    let f = Counter;\n"
+        + "    let g = Shape;\n"
+        + "    let h = Plain;\n"
+        + "    let i = Holder;\n"
+        + "    let j = Crate;\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Bodies]);
+    let reported = analysis.bodyDiagnostics();
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "'Widget' is a type, not a value. Write 'new Widget()' to construct one.");
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
+        "'Sizer' is a type, not a value. Write 'new Sizer(...)' to construct one.");
+    // A class with no constructor of its own is constructed through its base class's.
+    try sema_support.assertDiagnostic(reported, 2, "/proj/src/main.ens",
+        "'Derived' is a type, not a value. Write 'new Derived()' to construct one.");
+    try sema_support.assertDiagnostic(reported, 3, "/proj/src/main.ens",
+        "'Vault' is a type, not a value. Write 'Vault.open()' to call one of its static methods.");
+    try sema_support.assertDiagnostic(reported, 4, "/proj/src/main.ens",
+        "'Locked' is a type, not a value.");
+    try sema_support.assertDiagnostic(reported, 5, "/proj/src/main.ens",
+        "'Counter' is a type, not a value. Write 'new Counter()' to construct one, or write "
+        + "'Counter.limit' to read one of its static consts.");
+    try sema_support.assertDiagnostic(reported, 6, "/proj/src/main.ens",
+        "'Shape' is a type, not a value. Use a value of a subclass that is not abstract, or write "
+        + "'Shape.sides' to read one of its static consts.");
+    try sema_support.assertDiagnostic(reported, 7, "/proj/src/main.ens",
+        "'Plain' is a type, not a value. Use a value of a subclass that is not abstract.");
+    try sema_support.assertDiagnostic(reported, 8, "/proj/src/main.ens",
+        "'Holder' is a type, not a value. Write 'Holder.limit' to read one of its static consts.");
+    try sema_support.assertDiagnostic(reported, 9, "/proj/src/main.ens",
+        "'Crate' is a type, not a value.");
+    try testing.assertEqual(reported.length, 10L);
+}
+
+// An interface has no instances of its own, an enum's values are its constants, and a struct
+// value is a constructor call or an aggregate literal. A struct whose literal would have to set
+// a field this file cannot set names nothing.
+test "a bare interface, enum, or struct name says what a value of that kind is" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/lib/parts.ens", sema_support.valueKinds());
+    loader.add("/proj/src/main.ens",
+        "import Shown from lib.parts;\n"
+        + "import Kind from lib.parts;\n"
+        + "import Point from lib.parts;\n"
+        + "import Made from lib.parts;\n"
+        + "import Defaulted from lib.parts;\n"
+        + "import Hidden from lib.parts;\n"
+        + "main() -> int \{\n"
+        + "    let a = Shown;\n"
+        + "    let b = Kind;\n"
+        + "    let c = Point;\n"
+        + "    let d = Made;\n"
+        + "    let e = Defaulted;\n"
+        + "    let f = Hidden;\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Bodies]);
+    let reported = analysis.bodyDiagnostics();
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "'Shown' is a type, not a value. Use a value of a class that implements it.");
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
+        "'Kind' is a type, not a value. Write 'Kind.Large' to use one of its members.");
+    try sema_support.assertDiagnostic(reported, 2, "/proj/src/main.ens",
+        "'Point' is a type, not a value. Write 'Point value = \{x: ..., y: ...\};' to build "
+        + "one.");
+    try sema_support.assertDiagnostic(reported, 3, "/proj/src/main.ens",
+        "'Made' is a type, not a value. Write 'Made(...)' to construct one.");
+    // Every field of this one has a default, so a literal that sets nothing builds it.
+    try sema_support.assertDiagnostic(reported, 4, "/proj/src/main.ens",
+        "'Defaulted' is a type, not a value. Write 'Defaulted value = \{\};' to build one.");
+    try sema_support.assertDiagnostic(reported, 5, "/proj/src/main.ens",
+        "'Hidden' is a type, not a value.");
+    try testing.assertEqual(reported.length, 6L);
+}
+
+// A type is refused the same way whether an import brought its name in or the file declares it,
+// so one case of each kind is read here against the declarations of the file it is written in.
+test "a type this file declares is refused as a value by the kind of type it is" {
+    let analysis = try sema_support.analyzeOne(sema_support.classKinds() + sema_support.valueKinds()
+        + "main() -> int \{\n"
+        + "    let a = Widget;\n"
+        + "    let b = Shape;\n"
+        + "    let c = Shown;\n"
+        + "    let d = Kind;\n"
+        + "    let e = Point;\n"
+        + "    let f = Holder;\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "'Widget' is a type, not a value. Write 'new Widget()' to construct one.");
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
+        "'Shape' is a type, not a value. Use a value of a subclass that is not abstract, or write "
+        + "'Shape.sides' to read one of its static consts.");
+    try sema_support.assertDiagnostic(reported, 2, "/proj/src/main.ens",
+        "'Shown' is a type, not a value. Use a value of a class that implements it.");
+    try sema_support.assertDiagnostic(reported, 3, "/proj/src/main.ens",
+        "'Kind' is a type, not a value. Write 'Kind.Large' to use one of its members.");
+    try sema_support.assertDiagnostic(reported, 4, "/proj/src/main.ens",
+        "'Point' is a type, not a value. Write 'Point value = \{x: ..., y: ...\};' to build "
+        + "one.");
+    try sema_support.assertDiagnostic(reported, 5, "/proj/src/main.ens",
+        "'Holder' is a type, not a value. Write 'Holder.limit' to read one of its static consts.");
+    try testing.assertEqual(reported.length, 6L);
+}
+
+// A local, a parameter, and a module function each take the name from this file's type of the
+// same name, and the type still reads in a type position. Two lines of the program are refused:
+// a function's name is not a value either, and the type nothing shadows is refused as a type.
+test "a local, a parameter, or a module function of the same name keeps it from a type" {
+    let analysis = try sema_support.analyzeOne("public class Same \{\n"
+        + "    public constructor();\n"
+        + "\}\n"
+        + "public class Thing \{\n"
+        + "    public constructor();\n"
+        + "\}\n"
+        + "Thing() -> int \{\n"
+        + "    return 1;\n"
+        + "\}\n"
+        + "localTakesTheName() -> int \{\n"
+        + "    int Same = 3;\n"
+        + "    return Same + 1;\n"
+        + "\}\n"
+        + "parameterTakesTheName(int Same) -> int \{\n"
+        + "    return Same + 1;\n"
+        + "\}\n"
+        + "moduleFunctionTakesTheName() -> int \{\n"
+        + "    return Thing();\n"
+        + "\}\n"
+        + "aTypePositionReadsTheType() -> bool \{\n"
+        + "    Thing? held = null;\n"
+        + "    return held == null;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let a = Thing;\n"
+        + "    let b = Same;\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "'Thing' is a function, and a function's name is not a value. Call it as 'Thing()', or wrap it in "
+        + "a lambda, as in '() -> int callback = () -> Thing();'.");
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
+        "'Same' is a type, not a value. Write 'new Same()' to construct one.");
+    try testing.assertEqual(reported.length, 2L);
+}
+
+// A construction the receiver's type arguments exclude is not offered. This class declares no
+// constructor, so it would run the one its base class declares, and that one exists only for a
+// type argument its own does not satisfy.
+test "a class whose base constructor a constraint excludes is offered no construction" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/lib/parts.ens",
+        "public interface Ordered<T> \{\n"
+        + "    compareTo(T other) -> int;\n"
+        + "\}\n"
+        + "public class Plain \{\n"
+        + "    public constructor();\n"
+        + "\}\n"
+        + "public class Holder<T> \{\n"
+        + "    public constructor<T: Ordered<T>>();\n"
+        + "\}\n"
+        + "public class Derived extends Holder<Plain> \{\n"
+        + "\}\n");
+    loader.add("/proj/src/main.ens",
+        "import Derived from lib.parts;\n"
+        + "main() -> int \{\n"
+        + "    let held = Derived;\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Bodies]);
+    let reported = analysis.bodyDiagnostics();
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "'Derived' is a type, not a value.");
+    try testing.assertEqual(reported.length, 1L);
+}
+
+// Every kind of type written as the callee of a call, which reaches the routes a value of it
+// takes: a construction this file can reach, a static factory, an enum constant, or nothing. A
+// primitive's values are its literals, which the refusal leaves to the reader.
+test "a type name written as a callee offers the routes a value of it takes" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/lib/parts.ens", sema_support.classKinds() + sema_support.valueKinds());
+    loader.add("/proj/src/main.ens",
+        "import Widget from lib.parts;\n"
+        + "import Sizer from lib.parts;\n"
+        + "import Derived from lib.parts;\n"
+        + "import Vault from lib.parts;\n"
+        + "import Locked from lib.parts;\n"
+        + "import Counter from lib.parts;\n"
+        + "import Shape from lib.parts;\n"
+        + "import Plain from lib.parts;\n"
+        + "import Holder from lib.parts;\n"
+        + "import Crate from lib.parts;\n"
+        + "import Shown from lib.parts;\n"
+        + "import Kind from lib.parts;\n"
+        + "main() -> int \{\n"
+        + "    let a = Widget();\n"
+        + "    let b = Sizer(3);\n"
+        + "    let c = Derived();\n"
+        + "    let d = Vault();\n"
+        + "    let e = Locked();\n"
+        + "    let f = Counter();\n"
+        + "    let g = Shape();\n"
+        + "    let h = Plain();\n"
+        + "    let i = Holder();\n"
+        + "    let j = Crate();\n"
+        + "    let k = Shown();\n"
+        + "    let l = Kind(1);\n"
+        + "    let m = int(3);\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Bodies]);
+    let reported = analysis.bodyDiagnostics();
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "'Widget' is a type, not a function. Write 'new Widget()' to construct one.");
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
+        "'Sizer' is a type, not a function. Write 'new Sizer(...)' to construct one.");
+    try sema_support.assertDiagnostic(reported, 2, "/proj/src/main.ens",
+        "'Derived' is a type, not a function. Write 'new Derived()' to construct one.");
+    try sema_support.assertDiagnostic(reported, 3, "/proj/src/main.ens",
+        "'Vault' is a type, not a function. Write 'Vault.open()' to call one of its static methods.");
+    try sema_support.assertDiagnostic(reported, 4, "/proj/src/main.ens",
+        "'Locked' is a type, not a function.");
+    try sema_support.assertDiagnostic(reported, 5, "/proj/src/main.ens",
+        "'Counter' is a type, not a function. Write 'new Counter()' to construct one, or write "
+        + "'Counter.limit' to read one of its static consts.");
+    try sema_support.assertDiagnostic(reported, 6, "/proj/src/main.ens",
+        "'Shape' is a type, not a function. Use a value of a subclass that is not abstract, or write "
+        + "'Shape.sides' to read one of its static consts.");
+    try sema_support.assertDiagnostic(reported, 7, "/proj/src/main.ens",
+        "'Plain' is a type, not a function. Use a value of a subclass that is not abstract.");
+    try sema_support.assertDiagnostic(reported, 8, "/proj/src/main.ens",
+        "'Holder' is a type, not a function. Write 'Holder.limit' to read one of its static consts.");
+    try sema_support.assertDiagnostic(reported, 9, "/proj/src/main.ens",
+        "'Crate' is a type, not a function.");
+    try sema_support.assertDiagnostic(reported, 10, "/proj/src/main.ens",
+        "'Shown' is a type, not a function. Use a value of a class that implements it.");
+    try sema_support.assertDiagnostic(reported, 11, "/proj/src/main.ens",
+        "'Kind' is a type, not a function. Write 'Kind.Large' to use one of its members.");
+    try sema_support.assertDiagnostic(reported, 12, "/proj/src/main.ens",
+        "'int' is a type, not a function.");
+    try testing.assertEqual(reported.length, 13L);
+}
+
+// A module name and a module-qualified type name written as callees read the same examples their
+// value position offers, and a module this file can call nothing in offers none.
+test "a module name written as a callee is refused with a call the module declares" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/lib/quiet.ens",
+        "public class Only \{\n"
+        + "    public constructor();\n"
+        + "\}\n");
+    loader.add("/proj/src/lib/parts.ens",
+        "public class Widget \{\n"
+        + "    public constructor();\n"
+        + "\}\n"
+        + "public shown(int value) -> int \{\n"
+        + "    return value;\n"
+        + "\}\n");
+    loader.add("/proj/src/main.ens",
+        "import lib.quiet;\n"
+        + "import lib.parts;\n"
+        + "main() -> int \{\n"
+        + "    let a = quiet();\n"
+        + "    let b = parts(1);\n"
+        + "    let c = parts.Widget();\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Bodies]);
+    let reported = analysis.bodyDiagnostics();
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "'quiet' names a module, not a function.");
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
+        "'parts' names a module, not a function. Write one of its functions after the module name, as in "
+        + "'parts.shown(...)'.");
+    try sema_support.assertDiagnostic(reported, 2, "/proj/src/main.ens",
+        "'parts.Widget' writes a type after a module name, and only a function can be written "
+        + "after a module name. Write 'import Widget from lib.parts;' and then write 'Widget'.");
+    try testing.assertEqual(reported.length, 3L);
+}
+
+// A type parameter is a different type at each use, so a value of it is the only route offered,
+// and a bound adds none: a static is refused through a parameter whatever it is bounded by. A
+// name that is no parameter of the declaration reading it is still undefined.
+test "a type parameter is refused in a value position and as a callee" {
+    let analysis = try sema_support.analyzeOne("public interface Shown \{\n"
+        + "    size() -> int;\n"
+        + "\}\n"
+        + "public class Base \{\n"
+        + "    public static const int limit = 4;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\}\n"
+        + "public class Unbounded<Tag> \{\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    reads() \{\n"
+        + "        let held = Tag;\n"
+        + "    \}\n"
+        + "\n"
+        + "    calls() \{\n"
+        + "        let made = Tag(3);\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class ClassBound<Tag: Base> \{\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    reads() \{\n"
+        + "        let held = Tag;\n"
+        + "    \}\n"
+        + "\n"
+        + "    reachesAStatic() \{\n"
+        + "        let limit = Tag.limit;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class InterfaceBound<Tag: Shown> \{\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    reads() \{\n"
+        + "        let held = Tag;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "carries<Tag>() \{\n"
+        + "    let held = Tag;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let absent = Tag;\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "'Tag' is a type parameter, not a value. Use a value of type 'Tag', such as a parameter "
+        + "declared 'Tag value'.");
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
+        "'Tag' is a type parameter, not a function. Use a value of type 'Tag', such as a "
+        + "parameter declared 'Tag value'.");
+    try sema_support.assertDiagnostic(reported, 2, "/proj/src/main.ens",
+        "'Tag' is a type parameter, not a value. Use a value of type 'Tag', such as a parameter "
+        + "declared 'Tag value'.");
+    try sema_support.assertDiagnostic(reported, 3, "/proj/src/main.ens",
+        "'Tag.limit' names a static member through the type parameter 'Tag', and 'Tag' is a different "
+        + "type each time it is used, so 'Tag.limit' does not name one static member. Write the type's "
+        + "own name instead.");
+    try sema_support.assertDiagnostic(reported, 4, "/proj/src/main.ens",
+        "'Tag' is a type parameter, not a value. Use a value of type 'Tag', such as a parameter "
+        + "declared 'Tag value'.");
+    try sema_support.assertDiagnostic(reported, 5, "/proj/src/main.ens",
+        "'Tag' is a type parameter, not a value. Use a value of type 'Tag', such as a parameter "
+        + "declared 'Tag value'.");
+    try sema_support.assertDiagnostic(reported, 6, "/proj/src/main.ens",
+        "Undefined name 'Tag'. Check the spelling, or declare it before it is used.");
+    try testing.assertEqual(reported.length, 7L);
+}
+
+// A type parameter takes its name for the whole of the declaration that introduces it, so the
+// meaning the name has outside is unreachable inside. One refusal covers every position, a type
+// position and a 'new' among them, and it names what the parameter took the name from: a type or
+// a function this file declares, a type it imports, a module it imports, or a static of the type
+// that introduces the parameter, which the type name still reaches. A head the parameter took
+// from nothing reads what a type parameter qualifies instead.
+test "a type parameter that took its name from another meaning names both" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/lib/parts.ens",
+        "public class Widget \{\n"
+        + "    public static const int limit = 7;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\}\n"
+        + "public shown(int value) -> int \{\n"
+        + "    return value;\n"
+        + "\}\n");
+    loader.add("/proj/src/main.ens",
+        "import Widget from lib.parts;\n"
+        + "import lib.parts;\n"
+        + "public enum Kind \{\n"
+        + "    Large,\n"
+        + "\}\n"
+        + "public struct Made \{\n"
+        + "    public int a;\n"
+        + "\n"
+        + "    public constructor(this.a);\n"
+        + "\}\n"
+        + "public class Holder \{\n"
+        + "    public static const int size = 1;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\}\n"
+        + "helper(int value) -> int \{\n"
+        + "    return value;\n"
+        + "\}\n"
+        + "public class ValueOfEnum<Kind> \{\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    readsIt() \{\n"
+        + "        let held = Kind;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class ConstantOfEnum<Kind> \{\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    reachesIt() \{\n"
+        + "        let held = Kind.Large;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class CallOfStruct<Made> \{\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    callsIt() \{\n"
+        + "        let held = Made(3);\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class StaticOfClass<Holder> \{\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    reachesIt() \{\n"
+        + "        let held = Holder.size;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class CallOfFunction<helper> \{\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    callsIt() \{\n"
+        + "        let held = helper(1);\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class StaticOfImport<Widget> \{\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    reachesIt() \{\n"
+        + "        let held = Widget.limit;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class CallOfModule<parts> \{\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    callsIt() \{\n"
+        + "        let held = parts.shown(1);\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class StaticConstOwner<Limit> \{\n"
+        + "    public static const int Limit = 3;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    readsIt() \{\n"
+        + "        let held = Limit;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class StaticConstCaller<Limit> \{\n"
+        + "    public static const int Limit = 3;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    callsIt() \{\n"
+        + "        let held = Limit(1);\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class StaticMethodOwner<make> \{\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    public static make() -> int \{\n"
+        + "        return 1;\n"
+        + "    \}\n"
+        + "\n"
+        + "    callsIt() \{\n"
+        + "        let held = make();\n"
+        + "    \}\n"
+        + "\}\n"
+        + "carries<Kind>() \{\n"
+        + "    let held = Kind.Large;\n"
+        + "\}\n"
+        + "public class TypeOfModule<parts> \{\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    readsIt() \{\n"
+        + "        parts.Widget held;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class NewOfModule<parts> \{\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    makesIt() \{\n"
+        + "        let held = new parts.Widget();\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class BareHead<Slot> \{\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    readsIt() \{\n"
+        + "        Slot.Widget held;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Bodies]);
+    let reported = analysis.bodyDiagnostics();
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "'Kind' means the type parameter of 'ValueOfEnum' here, not the enum this file declares, "
+        + "because inside 'ValueOfEnum' the name 'Kind' always means the type parameter. Rename "
+        + "one of the two.");
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
+        "'Kind' means the type parameter of 'ConstantOfEnum' here, not the enum this file "
+        + "declares, because inside 'ConstantOfEnum' the name 'Kind' always means the type "
+        + "parameter. Rename one of the two.");
+    try sema_support.assertDiagnostic(reported, 2, "/proj/src/main.ens",
+        "'Made' means the type parameter of 'CallOfStruct' here, not the struct this file "
+        + "declares, because inside 'CallOfStruct' the name 'Made' always means the type "
+        + "parameter. Rename one of the two.");
+    try sema_support.assertDiagnostic(reported, 3, "/proj/src/main.ens",
+        "'Holder' means the type parameter of 'StaticOfClass' here, not the class this file "
+        + "declares, because inside 'StaticOfClass' the name 'Holder' always means the type "
+        + "parameter. Rename one of the two.");
+    try sema_support.assertDiagnostic(reported, 4, "/proj/src/main.ens",
+        "'helper' means the type parameter of 'CallOfFunction' here, not the function this file "
+        + "declares, because inside 'CallOfFunction' the name 'helper' always means the type "
+        + "parameter. Rename one of the two.");
+    try sema_support.assertDiagnostic(reported, 5, "/proj/src/main.ens",
+        "'Widget' means the type parameter of 'StaticOfImport' here, not the class declared in "
+        + "module 'lib.parts', because inside 'StaticOfImport' the name 'Widget' always means the "
+        + "type parameter. Rename one of the two.");
+    try sema_support.assertDiagnostic(reported, 6, "/proj/src/main.ens",
+        "'parts' means the type parameter of 'CallOfModule' here, not the module 'lib.parts' this "
+        + "file imports, because inside 'CallOfModule' the name 'parts' always means the type "
+        + "parameter. Rename one of the two.");
+    try sema_support.assertDiagnostic(reported, 7, "/proj/src/main.ens",
+        "'Limit' means the type parameter of 'StaticConstOwner' here, not the static const "
+        + "'StaticConstOwner' declares, because inside 'StaticConstOwner' the name 'Limit' always means "
+        + "the type parameter. Write 'StaticConstOwner.Limit' to read the static const, or rename one of "
+        + "the two.");
+    // Nothing named 'Limit' is callable, so a call position also drops the arguments.
+    try sema_support.assertDiagnostic(reported, 8, "/proj/src/main.ens",
+        "'Limit' means the type parameter of 'StaticConstCaller' here, not the static const "
+        + "'StaticConstCaller' declares, because inside 'StaticConstCaller' the name 'Limit' always "
+        + "means the type parameter. A static const is not called. Write 'StaticConstCaller.Limit' to "
+        + "read it, or rename one of the two and remove the arguments.");
+    try sema_support.assertDiagnostic(reported, 9, "/proj/src/main.ens",
+        "'make' means the type parameter of 'StaticMethodOwner' here, not the static method "
+        + "'StaticMethodOwner' declares, because inside 'StaticMethodOwner' the name 'make' always "
+        + "means the type parameter. Rename one of the two.");
+    try sema_support.assertDiagnostic(reported, 10, "/proj/src/main.ens",
+        "'Kind' means the type parameter of 'carries' here, not the enum this file declares, "
+        + "because inside 'carries' the name 'Kind' always means the type parameter. Rename one "
+        + "of the two.");
+    // A type position and a 'new' read the collision the value positions above read, because the
+    // head is the parameter there too.
+    try sema_support.assertDiagnostic(reported, 11, "/proj/src/main.ens",
+        "'parts' means the type parameter of 'TypeOfModule' here, not the module 'lib.parts' this "
+        + "file imports, because inside 'TypeOfModule' the name 'parts' always means the type "
+        + "parameter. Rename one of the two.");
+    try sema_support.assertDiagnostic(reported, 12, "/proj/src/main.ens",
+        "'parts' means the type parameter of 'NewOfModule' here, not the module 'lib.parts' this "
+        + "file imports, because inside 'NewOfModule' the name 'parts' always means the type "
+        + "parameter. Rename one of the two.");
+    // Nothing else in the file is called 'Slot', so there are not two meanings to name; what a
+    // type parameter qualifies is all the refusal has to say.
+    try sema_support.assertDiagnostic(reported, 13, "/proj/src/main.ens",
+        "'Slot.Widget' names a type through the type parameter 'Slot', and 'Slot' is a different type "
+        + "each time it is used, so 'Slot.Widget' does not name one type. Write the type's own name "
+        + "instead.");
+    try testing.assertEqual(reported.length, 14L);
+}
+
+// The refusal names a parameter of the type in reach, else the parameter a callable's body can
+// declare. A default has neither, unless a lambda inside it brings its own.
+test "a type parameter written as a value names the route its own position has" {
+    let analysis = try sema_support.analyzeOne("public enum Kind \{\n"
+        + "    Large,\n"
+        + "\}\n"
+        + "public class Alone<Slot> \{\n"
+        + "    public int bare = Slot;\n"
+        + "    public int made = Slot(3);\n"
+        + "    public int got = Slot.size;\n"
+        + "    public ((Slot) -> long) weigh = (each) -> Slot;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\}\n"
+        + "public class Collides<Kind> \{\n"
+        + "    public int held = Kind.Large;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\}\n"
+        + "public class Defaulted<Mark> \{\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    public takes(Mark given, int other = Mark) -> int \{\n"
+        + "        return other;\n"
+        + "    \}\n"
+        + "\n"
+        + "    reads() \{\n"
+        + "        let held = Mark;\n"
+        + "    \}\n"
+        + "\n"
+        + "    reachesIt(Mark given) \{\n"
+        + "        let held = Mark;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "'Slot' is a type parameter, not a value.");
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
+        "'Slot' is a type parameter, not a function.");
+    try sema_support.assertDiagnostic(reported, 2, "/proj/src/main.ens",
+        "'Slot.size' names a static member through the type parameter 'Slot', and 'Slot' is a different "
+        + "type each time it is used, so 'Slot.size' does not name one static member. Write the type's "
+        + "own name instead.");
+    // The lambda declares a parameter of the type the default around it cannot.
+    try sema_support.assertDiagnostic(reported, 3, "/proj/src/main.ens",
+        "'Slot' is a type parameter, not a value. Use a value of type 'Slot', such as 'each'.");
+    try sema_support.assertDiagnostic(reported, 4, "/proj/src/main.ens",
+        "'Kind' means the type parameter of 'Collides' here, not the enum this file declares, "
+        + "because inside 'Collides' the name 'Kind' always means the type parameter. Rename one "
+        + "of the two.");
+    // A parameter default sees neither its siblings nor 'this', so 'given' is out of reach.
+    try sema_support.assertDiagnostic(reported, 5, "/proj/src/main.ens",
+        "'Mark' is a type parameter, not a value.");
+    try sema_support.assertDiagnostic(reported, 6, "/proj/src/main.ens",
+        "'Mark' is a type parameter, not a value. Use a value of type 'Mark', such as a "
+        + "parameter declared 'Mark value'.");
+    try sema_support.assertDiagnostic(reported, 7, "/proj/src/main.ens",
+        "'Mark' is a type parameter, not a value. Use a value of type 'Mark', such as 'given'.");
+    try testing.assertEqual(reported.length, 8L);
+}
+
+// Everything else a method does with 'this' stays legal: it writes fields through it, passes it,
+// returns it, calls methods on it, and a class's method captures it in a lambda.
+test "reading and passing 'this' stays legal" {
+    let analysis = try sema_support.analyzeOne("public class Box \{\n"
+        + "    public int value = 0;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    public own() -> Box \{\n"
+        + "        this.value = 7;\n"
+        + "        this.value++;\n"
+        + "        takes(this);\n"
+        + "        return this.itself();\n"
+        + "    \}\n"
+        + "\n"
+        + "    public itself() -> Box \{\n"
+        + "        () -> int read = () -> this.value;\n"
+        + "        this.value = read();\n"
+        + "        return this;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public struct Point \{\n"
+        + "    public int x = 0;\n"
+        + "\n"
+        + "    public write() -> int \{\n"
+        + "        this.x = 4;\n"
+        + "        this.x++;\n"
+        + "        takesPoint(this);\n"
+        + "        return this.read();\n"
+        + "    \}\n"
+        + "\n"
+        + "    public read() -> int \{\n"
+        + "        return this.x;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "takes(Box box) \{\n"
+        + "\}\n"
+        + "takesPoint(Point point) \{\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+}
