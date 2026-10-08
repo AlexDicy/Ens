@@ -1,0 +1,310 @@
+import @std.testing;
+import sema_support;
+import FakeFileLoader from sema_support;
+import Stage from sema_support;
+
+test "a static const initializer follows the member visibility rules" {
+    let analysis = sema_support.analyzeProgram(
+        "public class Secret \{\n"
+        + "    static const int hidden = 5;\n"
+        + "\}\n"
+        + "public class Reader \{\n"
+        + "    public static const int copy = Secret.hidden + 1;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Checks]);
+    try sema_support.assertDiagnostic(analysis.checkDiagnostics(), 0, "/proj/src/main.ens",
+        "'hidden' is private to class 'Secret', so only code inside 'Secret' can read it. Mark it "
+        + "'protected' to read it here.");
+    try testing.assertEqual(analysis.checkDiagnostics().length, 1L);
+}
+
+// A 'protected' static const reaches the file that declares its type, and the subclasses of a class
+// that is not 'final'.
+test "a protected static const read from another file names the code that can read it" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/lib.ens",
+        "public class Open \{\n"
+        + "    protected static const int shared = 1;\n"
+        + "\}\n"
+        + "public final class Closed \{\n"
+        + "    protected static const int kept = 2;\n"
+        + "\}\n"
+        + "public struct Limits \{\n"
+        + "    protected static const int most = 3;\n"
+        + "\}\n");
+    loader.add("/proj/src/main.ens",
+        "import Open from lib;\n"
+        + "import Closed from lib;\n"
+        + "import Limits from lib;\n"
+        + "public class Reader \{\n"
+        + "    public static const int first = Open.shared;\n"
+        + "    public static const int second = Closed.kept;\n"
+        + "    public static const int third = Limits.most;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Checks]);
+    let reported = analysis.checkDiagnostics();
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens", "'shared' is 'protected' in class "
+        + "'Open', so only code in the file that declares 'Open' and in subclasses of 'Open' can read it. "
+        + "Mark it 'public' to read it here.");
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens", "'kept' is 'protected' in class "
+        + "'Closed', so only code in the file that declares 'Closed' can read it. Mark it 'public' to read "
+        + "it here.");
+    try sema_support.assertDiagnostic(reported, 2, "/proj/src/main.ens", "'most' is 'protected' in struct "
+        + "'Limits', so only code in the file that declares 'Limits' can read it. Mark it 'public' to read "
+        + "it here.");
+    try testing.assertEqual(reported.length, 3L);
+}
+
+// A static belongs to the class that declares it, so a static const initializer that reads one
+// through a subclass is refused as a body is, once, naming the declaring class.
+test "a static const initializer names the class that declares a static read through a subclass" {
+    let analysis = sema_support.analyzeProgram(
+        "class Root \{\n"
+        + "    static const int limit = 3;\n"
+        + "    lazy const string label = \"root\";\n"
+        + "\n"
+        + "    static make() -> int \{\n"
+        + "        return 1;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "class Branch extends Root \{\n"
+        + "\}\n"
+        + "class Leaf extends Branch \{\n"
+        + "\}\n"
+        + "class Reader \{\n"
+        + "    static const int copied = Branch.limit;\n"
+        + "    static const int deep = Leaf.limit + 1;\n"
+        + "    static const string named = Branch.label;\n"
+        + "    static const int called = Branch.make();\n"
+        + "    lazy const int later = Branch.limit;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Checks, Stage.Bodies]);
+    let constants = analysis.checkDiagnostics();
+    string file = "/proj/src/main.ens";
+    try sema_support.assertDiagnostic(constants, 0, file, "'limit' is declared by 'Root', and a static is "
+        + "not inherited, so it is always written with 'Root' in front. Write 'Root.limit'.");
+    try sema_support.assertDiagnostic(constants, 1, file, "'limit' is declared by 'Root', and a static is "
+        + "not inherited, so it is always written with 'Root' in front. Write 'Root.limit'.");
+    try sema_support.assertDiagnostic(constants, 2, file, "The initializer of static const 'Reader.named' "
+        + "must be a compile-time constant, but 'Root.label' is a lazy const, whose value is built on its "
+        + "first read at run time. A constant is built from literals, '+', '-', '*', '/', '%', string "
+        + "concatenation and other static consts read through their type name.");
+    try sema_support.assertDiagnostic(constants, 3, file, "The initializer of static const 'Reader.called' "
+        + "must be a compile-time constant, but it calls a function, which only runs at run time. A "
+        + "constant is built from literals, '+', '-', '*', '/', '%', string concatenation and other "
+        + "static consts read through their type name.");
+    try testing.assertEqual(constants.length, 4L);
+    let bodies = analysis.bodyDiagnostics();
+    try sema_support.assertDiagnostic(bodies, 0, file, "'limit' is declared by 'Root', and a static is not "
+        + "inherited, so it is always written with 'Root' in front. Write 'Root.limit'.");
+    try testing.assertEqual(bodies.length, 1L);
+}
+
+// A base class's static read through a subclass is written through the name the reading file has
+// for the base, or after an import that gives it one, so the fix compiles where it is reported.
+test "a static read through a subclass names the base the way the reading file can write it" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/base.ens",
+        "public class Root \{\n"
+        + "    public static const int limit = 3;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\}\n"
+        + "\n"
+        + "public class Branch extends Root \{\n"
+        + "    public constructor();\n"
+        + "\}\n");
+    loader.add("/proj/src/alias.ens",
+        "import Root as Base from base;\n"
+        + "import Branch from base;\n"
+        + "\n"
+        + "public class AliasReader \{\n"
+        + "    public static const int copied = Branch.limit;\n"
+        + "\}\n"
+        + "\n"
+        + "public aliasRead() -> int \{\n"
+        + "    return Branch.limit;\n"
+        + "\}\n");
+    loader.add("/proj/src/plain.ens",
+        "import Branch from base;\n"
+        + "\n"
+        + "public class PlainReader \{\n"
+        + "    public static const int copied = Branch.limit;\n"
+        + "\}\n"
+        + "\n"
+        + "public plainRead() -> int \{\n"
+        + "    return Branch.limit;\n"
+        + "\}\n");
+    loader.add("/proj/src/clash.ens",
+        "import Branch from base;\n"
+        + "\n"
+        + "class Root \{\n"
+        + "\}\n"
+        + "\n"
+        + "public class ClashReader \{\n"
+        + "    public static const int copied = Branch.limit;\n"
+        + "\}\n"
+        + "\n"
+        + "public clashRead() -> int \{\n"
+        + "    return Branch.limit;\n"
+        + "\}\n");
+    loader.add("/proj/src/main.ens",
+        "import alias;\n"
+        + "import plain;\n"
+        + "import clash;\n"
+        + "\n"
+        + "main() -> int \{\n"
+        + "    return alias.aliasRead() + plain.plainRead() + clash.clashRead();\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Checks, Stage.Bodies]);
+    let constants = analysis.checkDiagnostics();
+    try sema_support.assertDiagnostic(constants, 0, "/proj/src/alias.ens", "'limit' is declared by 'Base', "
+        + "and a static is not inherited, so it is always written with 'Base' in front. Write 'Base.limit'.");
+    try sema_support.assertDiagnostic(constants, 1, "/proj/src/clash.ens", "'limit' is declared by 'Root "
+        + "(from base)', and a static is not inherited, so it is always written with 'BaseRoot' in front. "
+        + "Write 'import Root as BaseRoot from base;' and then 'BaseRoot.limit'.");
+    try sema_support.assertDiagnostic(constants, 2, "/proj/src/plain.ens", "'limit' is declared by 'Root "
+        + "(from base)', and a static is not inherited, so it is always written with 'Root' in front. Write "
+        + "'import Root from base;' and then 'Root.limit'.");
+    try testing.assertEqual(constants.length, 3L);
+    let bodies = analysis.bodyDiagnostics();
+    try sema_support.assertDiagnostic(bodies, 0, "/proj/src/alias.ens", "'limit' is declared by 'Base', and "
+        + "a static is not inherited, so it is always written with 'Base' in front. Write 'Base.limit'.");
+    try sema_support.assertDiagnostic(bodies, 1, "/proj/src/clash.ens", "'limit' is declared by 'Root (from "
+        + "base)', and a static is not inherited, so it is always written with 'BaseRoot' in front. Write "
+        + "'import Root as BaseRoot from base;' and then 'BaseRoot.limit'.");
+    try sema_support.assertDiagnostic(bodies, 2, "/proj/src/plain.ens", "'limit' is declared by 'Root (from "
+        + "base)', and a static is not inherited, so it is always written with 'Root' in front. Write "
+        + "'import Root from base;' and then 'Root.limit'.");
+    try testing.assertEqual(bodies.length, 3L);
+}
+
+// Type arguments on the head are refused only once the member is a static const of that type; a
+// member the head's class does not declare is refused for what it is first.
+test "a static const initializer refuses type arguments only on a static const of the head" {
+    let analysis = sema_support.analyzeProgram(
+        "class Root \{\n"
+        + "    static const int limit = 1;\n"
+        + "\}\n"
+        + "class Sub<T> extends Root \{\n"
+        + "\}\n"
+        + "class Holder<T> \{\n"
+        + "    static const int size = 2;\n"
+        + "\}\n"
+        + "class Reader \{\n"
+        + "    static const int inherited = Sub<int>.limit;\n"
+        + "    static const int missing = Holder<int>.nothing;\n"
+        + "    static const int argued = Holder<int>.size;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Checks]);
+    let reported = analysis.checkDiagnostics();
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens", "'limit' is declared by 'Root', and "
+        + "a static is not inherited, so it is always written with 'Root' in front. Write 'Root.limit'.");
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens", "The initializer of static const "
+        + "'Reader.missing' must be a compile-time constant, but 'Holder.nothing' is not a static const. A "
+        + "constant is built from literals, '+', '-', '*', '/', '%', string concatenation and other static "
+        + "consts read through their type name.");
+    try sema_support.assertDiagnostic(reported, 2, "/proj/src/main.ens", "A static const never depends on "
+        + "type arguments. Read it through the plain type name, as 'Holder.size'.");
+    try testing.assertEqual(reported.length, 3L);
+}
+
+// A head that declares no statics is refused for what it is: an interface or an external type as a
+// body refuses it, an enum by its members, and any other name as one this file cannot name.
+test "a static const initializer names what a head without statics is" {
+    let analysis = sema_support.analyzeProgram(
+        "interface Speaker \{\n"
+        + "    speak() -> int;\n"
+        + "\}\n"
+        + "enum Color \{\n"
+        + "    Red,\n"
+        + "\}\n"
+        + "external type Handle;\n"
+        + "class Reader \{\n"
+        + "    static const int spoken = Speaker.limit;\n"
+        + "    static const int held = Handle.limit;\n"
+        + "    static const int missing = Color.limit;\n"
+        + "    static const int red = Color.Red;\n"
+        + "    static const int nowhere = Nowhere.limit;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Checks]);
+    let reported = analysis.checkDiagnostics();
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens", "'Speaker' is an interface, and an "
+        + "interface has no static members. Call 'limit' on a value of a class that implements 'Speaker'.");
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens", "'Handle' is an external type, and "
+        + "an external type has no members, because its contents belong to the C library.");
+    try sema_support.assertDiagnostic(reported, 2, "/proj/src/main.ens", "The initializer of static const "
+        + "'Reader.missing' must be a compile-time constant, but 'limit' is not a member of enum 'Color'. A "
+        + "constant is built from literals, '+', '-', '*', '/', '%', string concatenation and other static "
+        + "consts read through their type name.");
+    try sema_support.assertDiagnostic(reported, 3, "/proj/src/main.ens", "The initializer of static const "
+        + "'Reader.red' must be a compile-time constant, but 'Color.Red' is a member of enum 'Color', and a "
+        + "static const can only have a number type, 'char', 'bool' or 'string'. A constant is built from "
+        + "literals, '+', '-', '*', '/', '%', string concatenation and other static consts read through "
+        + "their type name.");
+    try sema_support.assertDiagnostic(reported, 4, "/proj/src/main.ens", "The initializer of static const "
+        + "'Reader.nowhere' must be a compile-time constant, but 'Nowhere' is not a class or struct this "
+        + "file can name. A constant is built from literals, '+', '-', '*', '/', '%', string concatenation "
+        + "and other static consts read through their type name.");
+    try testing.assertEqual(reported.length, 5L);
+}
+
+test "two lazy const initializers that read each other close a cycle" {
+    let analysis = sema_support.analyzeProgram(
+        "public class Cycle \{\n"
+        + "    public lazy const long first = Cycle.second + 1;\n"
+        + "    public lazy const long second = Cycle.first + 1;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return Cycle.first as int;\n"
+        + "\}\n");
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Checks]);
+    try sema_support.assertDiagnostic(analysis.checkDiagnostics(), 0, "/proj/src/main.ens",
+        "'Cycle.second' cannot take its value from 'Cycle.first': the lazy consts between them "
+        + "form a cycle. Build one of the two without reading the other.");
+    try testing.assertEqual(analysis.checkDiagnostics().length, 1L);
+}
+
+// A static const is one value for every type argument as well, so its initializer refuses a
+// type parameter for the same reason, whether the name stands alone or heads a member read.
+test "a static const initializer refuses a type parameter as a name and as a head" {
+    let analysis = sema_support.analyzeProgram(
+        "public class Box<T> \{\n"
+        + "    public static const int limit = 8;\n"
+        + "    public static const int shared = T;\n"
+        + "    public static const int reached = T.limit;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Checks]);
+    let reported = analysis.checkDiagnostics();
+    string constantRule = " A constant is built from literals, '+', '-', '*', '/', '%', "
+        + "string concatenation and other static consts read through their type name.";
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "The initializer of static const 'Box.shared' must be a compile-time constant, but "
+        + "'T' is a type parameter, and a static const of 'Box' has one value for every choice "
+        + "of 'T'." + constantRule);
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
+        "The initializer of static const 'Box.reached' must be a compile-time constant, but "
+        + "'T' is a type parameter, and a static const of 'Box' has one value for every choice "
+        + "of 'T'." + constantRule);
+    try testing.assertEqual(reported.length, 2L);
+}

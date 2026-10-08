@@ -1148,3 +1148,274 @@ test "a compound write through 'super' writes the result back" {
         + "super.f;'), check the local, and write the result back to 'super.f'.");
     try testing.assertEqual(reported.length, 1L);
 }
+
+// The advice a null-use refusal gives for a checked 'weak' field 'target' read from 'owner'.
+weakAdvice(string owner) -> string {
+    return "'{owner}.target' is a 'weak' field, so it can become null at any time. A later read "
+        + "of it can be null even after a null check. Copy it into a local first ('let target = "
+        + "{owner}.target;') and check the local.";
+}
+
+test "uses of a checked weak field are rejected with the weak explanation" {
+    let analysis = try sema_support.analyzeOne(
+        "class Node \{ protected int size; protected constructor(this.size = 0); "
+        + "protected report() -> int \{ return this.size; \} \}\n"
+        + "class Holder \{ protected weak Node? target; protected constructor(); \}\n"
+        + "class Chain \{ protected const Holder? holder; protected constructor(this.holder = null); \}\n"
+        + "consume(Node node) \{ \}\n"
+        + "readAfterCheck(Holder h) -> int \{\n"
+        + "    if (h.target != null) \{ return h.target.size; \}\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "callAfterCheck(Holder k) -> int \{\n"
+        + "    if (k.target != null) \{ return k.target.report(); \}\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "interpolateAfterCheck(Holder h) -> string \{\n"
+        + "    if (h.target != null) \{ return \"\{h.target\}\"; \}\n"
+        + "    return \"gone\";\n"
+        + "\}\n"
+        + "passAfterCheck(Holder h) \{\n"
+        + "    if (h.target != null) \{ consume(h.target); \}\n"
+        + "\}\n"
+        + "throughLongerPath(Chain c) -> int \{\n"
+        + "    if (c.holder != null && c.holder.target != null) \{\n"
+        + "        return c.holder.target.size;\n"
+        + "    \}\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    passAfterCheck(new Holder());\n"
+        + "    int total = readAfterCheck(new Holder()) + callAfterCheck(new Holder())\n"
+        + "        + throughLongerPath(new Chain());\n"
+        + "    if (interpolateAfterCheck(new Holder()) == \"gone\") \{ return total; \}\n"
+        + "    return total + 1;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string memberRead = "Cannot read a member of 'Node?' because it may be null here. ";
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens", memberRead + weakAdvice("h"));
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens", memberRead + weakAdvice("k"));
+    try sema_support.assertDiagnostic(reported, 2, "/proj/src/main.ens",
+        "Argument 1 of 'consume' has type 'Node?', but parameter 'node' has type 'Node'. The value may be "
+        + "null here. " + weakAdvice("h"));
+    try sema_support.assertDiagnostic(reported, 3, "/proj/src/main.ens", memberRead + weakAdvice("c.holder"));
+    try testing.assertEqual(reported.length, 4L);
+}
+
+// A copy of a mutable field whose 'const' field is the value names that value, for a member read
+// after a null check and for a type test.
+test "a copy of a field before a 'const' field names the value it checks or tests" {
+    let analysis = try sema_support.analyzeOne("class Shape \{\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "class Circle extends Shape \{\n"
+        + "    protected int radius = 1;\n"
+        + "\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "class Inner \{\n"
+        + "    protected const Circle? circle = null;\n"
+        + "    protected const Shape shape = new Circle();\n"
+        + "\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "class Holder \{\n"
+        + "    protected Inner inner = new Inner();\n"
+        + "\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "read(Holder h) -> int \{\n"
+        + "    if (h.inner.circle != null) \{\n"
+        + "        return h.inner.circle.radius;\n"
+        + "    \}\n"
+        + "    if (h.inner.shape is Circle) \{\n"
+        + "        return h.inner.shape.radius;\n"
+        + "    \}\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string file = "/proj/src/main.ens";
+    try sema_support.assertDiagnostic(reported, 0, file, "Cannot read a member of 'Circle?' because it "
+        + "may be null here. 'h.inner' is a field, so it can change at any time. A later read of "
+        + "'h.inner.circle' can be null even after a null check. Copy it into a local first ('let inner = "
+        + "h.inner;') and check 'inner.circle' for null.");
+    try sema_support.assertDiagnostic(reported, 1, file, "Type 'Shape' has no field or method named "
+        + "'radius'. 'h.inner' is a field, so it can change at any time. A later read of 'h.inner.shape' "
+        + "can be another type even after a type test. Copy it into a local first ('let inner = h.inner;') "
+        + "and test 'inner.shape'.");
+    try testing.assertEqual(reported.length, 2L);
+}
+
+// A store, an argument, a return, a member read, an index, a call through a function value and a
+// loop name the value they refuse, and a use that takes one '?' of several checks only the rest.
+test "a value that may be null gets the fix for the place it is read from, in every refusal of one" {
+    let analysis = try sema_support.analyzeOne("class Tally \{\n"
+        + "    int? count = 1;\n"
+        + "\n"
+        + "    constructor();\n"
+        + "\n"
+        + "    read() -> int \{\n"
+        + "        return 1;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "\n"
+        + "takes(int value) \{\n"
+        + "\}\n"
+        + "\n"
+        + "pick() -> int? \{\n"
+        + "    return null;\n"
+        + "\}\n"
+        + "\n"
+        + "returned(int? x) -> int \{\n"
+        + "    return x;\n"
+        + "\}\n"
+        + "\n"
+        + "uses(int? x, int?? xx, int[]??? deep, Tally? mt, int[]? xs, ((int) -> int)? f,\n"
+        + "        Shape?? ss, int k) \{\n"
+        + "    int first = x;\n"
+        + "    int second = xx;\n"
+        + "    takes(x);\n"
+        + "    int third = pick();\n"
+        + "    int fourth = mt?.count;\n"
+        + "    string text = x.toString();\n"
+        + "    int called = f(k);\n"
+        + "    int element = xs[k];\n"
+        + "    int? safe = deep?[0];\n"
+        + "    () -> int later = () -> x;\n"
+        + "    bool tested = ss is Circle;\n"
+        + "    string hole = \"\{xx\}\";\n"
+        + "    for (int item in xs) \{\n"
+        + "    \}\n"
+        + "\}\n"
+        + "\n"
+        + "class Shape \{\n"
+        + "    constructor();\n"
+        + "\}\n"
+        + "\n"
+        + "class Circle extends Shape \{\n"
+        + "    constructor();\n"
+        + "\}\n"
+        + "\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string file = "/proj/src/main.ens";
+    try sema_support.assertDiagnostic(reported, 0, file, "Function 'returned' returns 'int', but this "
+        + "value has type 'int?'. The value may be null here. Check 'x' for null first ('if (x != null)').");
+    try sema_support.assertDiagnostic(reported, 1, file, "Variable 'first' has type 'int', but its value "
+        + "has type 'int?'. The value may be null here. Check 'x' for null first ('if (x != null)').");
+    try sema_support.assertDiagnostic(reported, 2, file, "Variable 'second' has type 'int', but its value "
+        + "has type 'int??'. The value may be null here. Check 'xx' for null twice, once for each '?' ('if "
+        + "(xx != null) \{ if (xx != null) \{ ... \} \}').");
+    try sema_support.assertDiagnostic(reported, 3, file, "Argument 1 of 'takes' has type 'int?', but "
+        + "parameter 'value' has type 'int'. The value may be null here. Check 'x' for null first ('if (x "
+        + "!= null)').");
+    try sema_support.assertDiagnostic(reported, 4, file, "Variable 'third' has type 'int', but its value "
+        + "has type 'int?'. The value may be null here. Each call to 'pick' returns its own result. A "
+        + "later call can return null even after a null check on an earlier one. Store the result in a "
+        + "local first ('let pickResult = pick();') and check the local.");
+    try sema_support.assertDiagnostic(reported, 5, file, "Variable 'fourth' has type 'int', but its value "
+        + "has type 'int?'. The value may be null here. 'mt?.count' is null whenever 'mt' is null. Supply "
+        + "a fallback with '??'.");
+    try sema_support.assertDiagnostic(reported, 6, file, "Cannot read a member of 'int?' because it may be "
+        + "null here. Check 'x' for null first ('if (x != null)').");
+    try sema_support.assertDiagnostic(reported, 7, file, "'f' has type '((int) -> int)?', which may be "
+        + "null here. Check 'f' for null first ('if (f != null)').");
+    try sema_support.assertDiagnostic(reported, 8, file, "Cannot index 'int[]?' because it may be null "
+        + "here. Check 'xs' for null first ('if (xs != null)').");
+    try sema_support.assertDiagnostic(reported, 9, file, "'?[' checks for one level of null, but the value "
+        + "on its left has type 'int[]???', which can be null at more than one level. Check 'deep' for "
+        + "null twice ('if (deep != null) \{ if (deep != null) \{ ... \} \}').");
+    try sema_support.assertDiagnostic(reported, 10, file, "This lambda must return 'int', but its body has "
+        + "type 'int?'. The value may be null here. Supply a fallback for 'x' with '??'.");
+    try sema_support.assertDiagnostic(reported, 11, file, "Cannot use 'is' on a value of type 'Shape??', "
+        + "because 'is' checks for only one level of null. Check 'ss' for null first ('if (ss != null)').");
+    try sema_support.assertDiagnostic(reported, 12, file, "Cannot interpolate a value of type 'int??', "
+        + "because it may be null at more than one level. Check 'xx' for null first ('if (xx != null)').");
+    try sema_support.assertDiagnostic(reported, 13, file, "'for (... in ...)' cannot iterate 'int[]?' "
+        + "because it may be null here. Check 'xs' for null first ('if (xs != null)').");
+    try testing.assertEqual(reported.length, 14L);
+}
+
+// A '?:' or switch value that may be null gets the fix its nullable branch gets alone, with the
+// fallback as the other choice. A fallback names the value it goes on.
+test "a join value that may be null gets the fix for the branch it is read from" {
+    let analysis = try sema_support.analyzeOne("class Inner \{\n"
+        + "    int f = 0;\n"
+        + "\n"
+        + "    constructor();\n"
+        + "\}\n"
+        + "\n"
+        + "class Holder \{\n"
+        + "    int? count = 0;\n"
+        + "    Inner?? twice = null;\n"
+        + "\n"
+        + "    constructor();\n"
+        + "\}\n"
+        + "\n"
+        + "takes(int value) \{\n"
+        + "\}\n"
+        + "\n"
+        + "forms(Holder h, int k, bool flag, int? n, int[] xs) \{\n"
+        + "    int r = switch (k) \{\n"
+        + "        0 -> h.count,\n"
+        + "        default -> 1,\n"
+        + "    \};\n"
+        + "    int r2 = flag ? h.count : 1;\n"
+        + "    takes(flag ? h.count : 1);\n"
+        + "    int r4 = flag ? n : 1;\n"
+        + "    int r5 = switch (k) \{\n"
+        + "        0 -> n,\n"
+        + "        default -> 1,\n"
+        + "    \};\n"
+        + "    for (int i = 0; i < 3; i += h.twice?.f ?? 0) \{\n"
+        + "    \}\n"
+        + "    string text = xs.toString(1);\n"
+        + "\}\n"
+        + "\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string file = "/proj/src/main.ens";
+    try sema_support.assertDiagnostic(reported, 0, file, "Variable 'r' has type 'int', but its value has "
+        + "type 'int?'. The value may be null here. 'h.count' is a field, so it can change at any time. A "
+        + "later read of it can be null even after a null check. Copy it into a local first ('let count = "
+        + "h.count;') and check the local, or supply a fallback for 'h.count' with '??'.");
+    try sema_support.assertDiagnostic(reported, 1, file, "Variable 'r2' has type 'int', but its value has "
+        + "type 'int?'. The value may be null here. 'h.count' is a field, so it can change at any time. A "
+        + "later read of it can be null even after a null check. Copy it into a local first ('let count = "
+        + "h.count;') and check the local, or supply a fallback for 'h.count' with '??'.");
+    try sema_support.assertDiagnostic(reported, 2, file, "Argument 1 of 'takes' has type 'int?', but "
+        + "parameter 'value' has type 'int'. The value may be null here. 'h.count' is a field, so it can "
+        + "change at any time. A later read of it can be null even after a null check. Copy it into a "
+        + "local first ('let count = h.count;') and check the local, or supply a fallback for 'h.count' "
+        + "with '??'.");
+    try sema_support.assertDiagnostic(reported, 3, file, "Variable 'r4' has type 'int', but its value has "
+        + "type 'int?'. The value may be null here. Check 'n' for null first ('if (n != null)'), or supply "
+        + "a fallback for 'n' with '??'.");
+    try sema_support.assertDiagnostic(reported, 4, file, "Variable 'r5' has type 'int', but its value has "
+        + "type 'int?'. The value may be null here. Check 'n' for null first ('if (n != null)'), or supply "
+        + "a fallback for 'n' with '??'.");
+    try sema_support.assertDiagnostic(reported, 5, file, "'?.' checks for one level of null, but the value "
+        + "on its left has type 'Inner??', which can be null at more than one level. Supply a fallback for "
+        + "'h.twice' with '??'.");
+    try sema_support.assertDiagnostic(reported, 6, file, "'toString' takes no arguments, but this call "
+        + "passes one. Remove the extra argument.");
+    try testing.assertEqual(reported.length, 7L);
+}
+
+// A '?' after a function type binds to its return type, so the type that allows null is the
+// parenthesized one and the hint has to say so.
+test "the hint for a function type that should allow null names the parenthesized form" {
+    try sema_support.assertOnlyProblem("main() -> int \{\n"
+        + "    (int) -> bool? notNullable = null;\n"
+        + "    return 0;\n"
+        + "\}\n",
+        "Variable 'notNullable' has type '(int) -> bool?', but its value has type 'null'. '(int) -> "
+        + "bool?' can never be null. Write the type as '((int) -> bool?)?' if it should allow null.");
+}

@@ -1,0 +1,198 @@
+import @std.testing;
+import @ens.frontend.support.source;
+import LocalBinding from model.scopes;
+import BindingKind from model.scopes;
+import model.narrow;
+import NarrowingPath from model.narrow;
+import NarrowingState from model.narrow;
+import PathSegment from model.narrow;
+import Field from model.typemembers;
+import Type from model.types;
+import TypeStore from model.types;
+import PrimitiveKind from model.types;
+import Visibility from model.types;
+import List from @std.collections.list;
+
+binding(string name, Type type) -> LocalBinding {
+    return new LocalBinding(name, type, BindingKind.Variable, false, source.makeSpan(0, 0));
+}
+
+pathOf(LocalBinding root, List<PathSegment> segments) -> NarrowingPath {
+    return new NarrowingPath(root, segments);
+}
+
+fieldPath(LocalBinding root, string field) -> NarrowingPath {
+    let segments = new List<PathSegment>();
+    segments.push(narrow.fieldSegment(field));
+    return new NarrowingPath(root, segments);
+}
+
+test "paths compare and hash by content" {
+    let store = new TypeStore();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let root = binding("root", intType);
+    let other = binding("other", intType);
+
+    try testing.assertTrue(narrow.bindingPath(root) == narrow.bindingPath(root),
+        "two spellings of the same root should be equal");
+    try testing.assertTrue(narrow.bindingPath(root).hash() == narrow.bindingPath(root).hash(),
+        "equal paths should hash equally");
+    try testing.assertTrue(narrow.bindingPath(root) != narrow.bindingPath(other),
+        "distinct roots should differ");
+
+    try testing.assertTrue(fieldPath(root, "door") == fieldPath(root, "door"),
+        "field segments should compare by name");
+    try testing.assertTrue(fieldPath(root, "door").hash() == fieldPath(root, "door").hash(),
+        "equal field paths should hash equally");
+    try testing.assertTrue(fieldPath(root, "door") != fieldPath(root, "window"),
+        "different field names should differ");
+    try testing.assertTrue(fieldPath(root, "door") != narrow.bindingPath(root),
+        "a longer path should differ from its root");
+}
+
+test "state layers narrow, look up innermost-first, and pop cleanly" {
+    let store = new TypeStore();
+    let optionalInt = store.optionalOf(store.primitive(PrimitiveKind.Int));
+    let intType = store.primitive(PrimitiveKind.Int);
+    let longType = store.primitive(PrimitiveKind.Long);
+    let root = binding("value", optionalInt);
+    let state = new NarrowingState();
+
+    try testing.assertTrue(state.provenType(narrow.bindingPath(root)) == null,
+        "an unproven path reads as null");
+    state.narrow(narrow.bindingPath(root), intType);
+    try testing.assertTrue(state.provenType(narrow.bindingPath(root)) == intType,
+        "a narrowed path reads its proven type");
+
+    state.push();
+    try testing.assertTrue(state.provenType(narrow.bindingPath(root)) == intType,
+        "an inner layer sees the outer proof");
+    state.narrow(narrow.bindingPath(root), longType);
+    try testing.assertTrue(state.provenType(narrow.bindingPath(root)) == longType,
+        "the innermost proof wins");
+    state.pop();
+    try testing.assertTrue(state.provenType(narrow.bindingPath(root)) == intType,
+        "popping a layer restores the outer proof");
+}
+
+test "invalidation erases across every layer" {
+    let store = new TypeStore();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let root = binding("room", intType);
+    let unrelated = binding("other", intType);
+    let state = new NarrowingState();
+
+    state.narrow(fieldPath(root, "door"), intType);
+    state.push();
+    state.narrow(narrow.bindingPath(root), intType);
+    state.narrow(fieldPath(unrelated, "door"), intType);
+
+    state.clearForRoot(root);
+    try testing.assertTrue(state.provenType(narrow.bindingPath(root)) == null,
+        "a root clear drops the binding's own narrowing");
+    try testing.assertTrue(state.provenType(fieldPath(root, "door")) == null,
+        "a root clear drops a member path, even in an outer layer");
+    try testing.assertTrue(state.provenType(fieldPath(unrelated, "door")) == intType,
+        "paths under other roots are untouched");
+}
+
+test "a deeper write drops the paths it prefixes and nothing shorter" {
+    let store = new TypeStore();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let house = binding("house", intType);
+    let state = new NarrowingState();
+
+    let roomDoor = new List<PathSegment>();
+    roomDoor.push(narrow.fieldSegment("room"));
+    roomDoor.push(narrow.fieldSegment("door"));
+    state.narrow(fieldPath(house, "room"), intType);
+    state.narrow(pathOf(house, roomDoor), intType);
+
+    let written = new List<PathSegment>();
+    written.push(narrow.fieldSegment("room"));
+    written.push(narrow.fieldSegment("door"));
+    state.clearPrefixedBy(pathOf(house, written));
+    try testing.assertTrue(state.provenType(fieldPath(house, "room")) == intType,
+        "writing house.room.door keeps the shorter house.room narrowing");
+    let reread = new List<PathSegment>();
+    reread.push(narrow.fieldSegment("room"));
+    reread.push(narrow.fieldSegment("door"));
+    try testing.assertTrue(state.provenType(pathOf(house, reread)) == null,
+        "writing house.room.door drops house.room.door itself");
+
+    state.narrow(pathOf(house, roomDoor), intType);
+    state.clearPrefixedBy(fieldPath(house, "room"));
+    try testing.assertTrue(state.provenType(pathOf(house, roomDoor)) == null,
+        "writing house.room drops the deeper house.room.door narrowing");
+
+    let other = binding("other", intType);
+    state.narrow(fieldPath(house, "room"), intType);
+    state.clearPrefixedBy(fieldPath(other, "room"));
+    try testing.assertTrue(state.provenType(fieldPath(house, "room")) == intType,
+        "a write under another root keeps the path");
+}
+
+typeLevelField(string name, Type type) -> Field {
+    return new Field(name, type, Visibility.Public, false, true, false, true, true,
+        source.makeSpan(0, 0), type);
+}
+
+test "a type-level root compares by field identity and clears only its own paths" {
+    let store = new TypeStore();
+    let optionalInt = store.optionalOf(store.primitive(PrimitiveKind.Int));
+    let intType = store.primitive(PrimitiveKind.Int);
+    let label = typeLevelField("label", optionalInt);
+    let other = typeLevelField("label", optionalInt);
+    let local = binding("label", optionalInt);
+
+    try testing.assertTrue(narrow.typeLevelPath(label) == narrow.typeLevelPath(label),
+        "two reads of one field should be one path");
+    try testing.assertTrue(narrow.typeLevelPath(label).hash() == narrow.typeLevelPath(label).hash(),
+        "equal type-level paths should hash equally");
+    try testing.assertTrue(narrow.typeLevelPath(label) != narrow.typeLevelPath(other),
+        "two fields of one name should be two paths");
+    try testing.assertTrue(narrow.typeLevelPath(label) != narrow.bindingPath(local),
+        "a field root should differ from a binding of the same name");
+
+    let name = narrow.fieldSegment("name");
+    try testing.assertTrue(narrow.typeLevelPath(label).extended(name)
+        == narrow.typeLevelPath(label).extended(narrow.fieldSegment("name")),
+        "an extended path should compare by its segments");
+    try testing.assertTrue(narrow.typeLevelPath(label).extended(name) != narrow.typeLevelPath(label),
+        "an extended path should differ from its root");
+
+    let state = new NarrowingState();
+    state.narrow(narrow.typeLevelPath(label).extended(name), intType);
+    state.narrow(narrow.typeLevelPath(other).extended(name), intType);
+    state.clearPrefixedBy(narrow.typeLevelPath(other));
+    state.clearForRoot(local);
+    try testing.assertTrue(state.provenType(narrow.typeLevelPath(label).extended(name)) == intType,
+        "clearing another field or a binding should keep this field's path");
+    try testing.assertTrue(state.provenType(narrow.typeLevelPath(other).extended(name)) == null,
+        "clearing a field should drop the paths it prefixes");
+}
+
+test "a type-level path and a binding path never prefix each other" {
+    let store = new TypeStore();
+    let optionalInt = store.optionalOf(store.primitive(PrimitiveKind.Int));
+    let intType = store.primitive(PrimitiveKind.Int);
+    let label = typeLevelField("label", optionalInt);
+    let local = binding("label", optionalInt);
+    let name = narrow.fieldSegment("name");
+    let state = new NarrowingState();
+
+    state.narrow(narrow.typeLevelPath(label).extended(name), intType);
+    state.narrow(narrow.bindingPath(local).extended(name), intType);
+    state.clearPrefixedBy(narrow.bindingPath(local));
+    try testing.assertTrue(state.provenType(narrow.typeLevelPath(label).extended(name)) == intType,
+        "a write to a binding should keep a type-level path under a field of the same name");
+    try testing.assertTrue(state.provenType(narrow.bindingPath(local).extended(name)) == null,
+        "a write to a binding should drop the paths it prefixes");
+
+    state.narrow(narrow.bindingPath(local).extended(name), intType);
+    state.clearPrefixedBy(narrow.typeLevelPath(label));
+    try testing.assertTrue(state.provenType(narrow.bindingPath(local).extended(name)) == intType,
+        "clearing a type-level path should keep a binding path of the same name");
+    try testing.assertTrue(state.provenType(narrow.typeLevelPath(label).extended(name)) == null,
+        "clearing a type-level path should drop the paths it prefixes");
+}

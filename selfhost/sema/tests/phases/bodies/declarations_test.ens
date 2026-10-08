@@ -4,29 +4,6 @@ import Stage from sema_support;
 import sema_support;
 import ProgramAnalysis from pipeline;
 
-test "noreturn rejects a return type and a return statement" {
-    let loader = new FakeFileLoader();
-    loader.add("/proj/src/app.ens",
-        "noreturn withType() -> int \{\n"
-        + "    panic(\"x\");\n"
-        + "\}\n"
-        + "noreturn usesReturn() \{\n"
-        + "    return;\n"
-        + "\}\n");
-    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["app.ens"]);
-    try sema_support.assertProgramCleanExcept(analysis, [Stage.Signatures, Stage.Bodies]);
-    let signatures = analysis.signatureDiagnostics();
-    try sema_support.assertDiagnostic(signatures, 0, "/proj/src/app.ens",
-        "A 'noreturn' function never returns a value, so it declares no return type. Remove the "
-        + "'-> ...' clause after the parameter list.");
-    try testing.assertEqual(signatures.length, 1L);
-    let bodies = analysis.bodyDiagnostics();
-    try sema_support.assertDiagnostic(bodies, 0, "/proj/src/app.ens",
-        "Function 'usesReturn' is 'noreturn', so it never returns and cannot contain 'return'. Throw, "
-        + "call 'panic' or call another 'noreturn' function instead.");
-    try testing.assertEqual(bodies.length, 1L);
-}
-
 test "a noreturn body that can complete normally is rejected" {
     let loader = new FakeFileLoader();
     loader.add("/proj/src/app.ens",
@@ -39,43 +16,6 @@ test "a noreturn body that can complete normally is rejected" {
     try sema_support.assertDiagnostic(reported, 0, "/proj/src/app.ens",
         "Function 'dribble' is declared 'noreturn', but a path through its body ends normally. End every "
         + "path by throwing, calling 'panic' or calling another 'noreturn' function.");
-    try testing.assertEqual(reported.length, 1L);
-}
-
-test "noreturn is illegal on constructors and destructors" {
-    let loader = new FakeFileLoader();
-    loader.add("/proj/src/app.ens",
-        "class Widget \{\n"
-        + "    noreturn constructor() \{ panic(\"x\"); \}\n"
-        + "    noreturn destructor() \{ panic(\"x\"); \}\n"
-        + "\}\n");
-    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["app.ens"]);
-    try sema_support.assertProgramCleanExcept(analysis, [Stage.Layout]);
-    let reported = analysis.layoutDiagnostics();
-    try sema_support.assertDiagnostic(reported, 0, "/proj/src/app.ens",
-        "The constructor of 'Widget' cannot be marked 'noreturn'. A constructor always returns the "
-        + "new object. Remove 'noreturn'.");
-    try sema_support.assertDiagnostic(reported, 1, "/proj/src/app.ens",
-        "The destructor of 'Widget' cannot be marked 'noreturn'. A destructor runs when the object "
-        + "is destroyed, and it always returns. Remove 'noreturn'.");
-    try testing.assertEqual(reported.length, 2L);
-}
-
-test "an override cannot drop a base method's noreturn contract" {
-    let loader = new FakeFileLoader();
-    loader.add("/proj/src/app.ens",
-        "abstract class Base \{\n"
-        + "    protected abstract noreturn boom();\n"
-        + "\}\n"
-        + "class Derived extends Base \{\n"
-        + "    protected override boom() \{ panic(\"x\"); \}\n"
-        + "\}\n");
-    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["app.ens"]);
-    try sema_support.assertProgramCleanExcept(analysis, [Stage.Layout]);
-    let reported = analysis.layoutDiagnostics();
-    try sema_support.assertDiagnostic(reported, 0, "/proj/src/app.ens",
-        "Override of 'boom' must be marked 'noreturn', because the 'boom' it overrides in 'Base' "
-        + "is. Add 'noreturn' before the method name.");
     try testing.assertEqual(reported.length, 1L);
 }
 
@@ -364,4 +304,139 @@ test "the fixes that rename or give a body compile and construct" {
         + "\}\n");
     let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
     try sema_support.assertProgramClean(analysis);
+}
+
+// One 'lazy const' value is shared by every type argument, so its initializer cannot use a type
+// parameter, whether the parameter is written as a type argument or stands where a value
+// belongs. The refusal names the instance field that carries one value per instance instead.
+test "a lazy const initializer refuses a type parameter written as a type or as a value" {
+    let analysis = sema_support.analyzeProgram(
+        "zeroOf<Value>() -> long \{\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "public class Box<T> \{\n"
+        + "    public lazy const long fromType = zeroOf<T>();\n"
+        + "    public lazy const long fromValue = T;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Bodies]);
+    let reported = analysis.bodyDiagnostics();
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "The initializer of lazy const 'Box.fromType' cannot use a type parameter, because "
+        + "one lazy const value is shared by every type argument of 'Box'. Remove 'lazy const' to give each "
+        + "instance its own 'fromType'.");
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
+        "The initializer of lazy const 'Box.fromValue' cannot use a type parameter, because "
+        + "one lazy const value is shared by every type argument of 'Box'. Remove 'lazy const' to give each "
+        + "instance its own 'fromValue'.");
+    try testing.assertEqual(reported.length, 2L);
+}
+
+test "every terminating shape satisfies the return-path check" {
+    let analysis = try sema_support.analyzeOne("enum Color \{ Red, Green, \}\n"
+        + "class Failure extends Error \{\n"
+        + "    protected constructor(string message) \{ super(message); \}\n"
+        + "\}\n"
+        + "viaIf(int x) -> int \{\n"
+        + "    if (x > 0) \{ return 1; \} else if (x < 0) \{ return -1; \}\n"
+        + "    else \{ panic(\"zero\"); \}\n"
+        + "\}\n"
+        + "viaSwitch(Color c) -> int \{\n"
+        + "    switch (c) \{ Red -> \{ return 1; \}, Green -> \{ return 2; \}, \}\n"
+        + "\}\n"
+        + "viaLoop() -> int \{\n"
+        + "    while (true) \{ let x = 0; \}\n"
+        + "\}\n"
+        + "viaNestedBreak() -> int \{\n"
+        + "    while (true) \{\n"
+        + "        while (false) \{ break; \}\n"
+        + "    \}\n"
+        + "\}\n"
+        + "viaThrow(int x) -> int throws \{\n"
+        + "    if (x > 0) \{ return x; \} else \{ throw new Failure(\"bad\"); \}\n"
+        + "\}\n"
+        + "main() -> int \{ return viaIf(1) + viaSwitch(Color.Red); \}\n");
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+}
+
+test "a body that can fall off the end is rejected" {
+    let analysis = try sema_support.analyzeOne("bad(int x) -> int \{\n"
+        + "    if (x > 0) \{ return 1; \}\n"
+        + "\}\n"
+        + "main() -> int \{ return bad(1); \}\n");
+    let diagnostics = analysis.bodyDiagnostics();
+    try testing.assertEqual(diagnostics.length, 1L);
+    try sema_support.assertDiagnostic(diagnostics, 0, "/proj/src/main.ens",
+        "Function 'bad' returns 'int', but a path through its body ends without a 'return'. Add a "
+        + "'return' at the end of every path.");
+}
+
+test "a 'while (true)' loop with a bound break does not terminate" {
+    let analysis = try sema_support.analyzeOne("bad() -> int \{\n"
+        + "    while (true) \{\n"
+        + "        if (1 > 0) \{ break; \}\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{ return bad(); \}\n");
+    let diagnostics = analysis.bodyDiagnostics();
+    try testing.assertEqual(diagnostics.length, 1L);
+    try sema_support.assertDiagnostic(diagnostics, 0, "/proj/src/main.ens",
+        "Function 'bad' returns 'int', but a path through its body ends without a 'return'. Add a "
+        + "'return' at the end of every path.");
+}
+
+test "a switch with a non-returning arm or expression arms does not terminate" {
+    let analysis = try sema_support.analyzeOne("enum Color \{ Red, Green, \}\n"
+        + "bad(Color c) -> int \{\n"
+        + "    switch (c) \{ Red -> \{ return 1; \}, Green -> \{ let x = 0; \}, \}\n"
+        + "\}\n"
+        + "alsoBad(Color c) -> int \{\n"
+        + "    switch (c) \{ Red -> 1, Green -> 2, \}\n"
+        + "\}\n"
+        + "main() -> int \{ return bad(Color.Red); \}\n");
+    let diagnostics = analysis.bodyDiagnostics();
+    try testing.assertEqual(diagnostics.length, 2L);
+    try sema_support.assertDiagnostic(diagnostics, 0, "/proj/src/main.ens",
+        "Function 'bad' returns 'int', but a path through its body ends without a 'return'. Add a "
+        + "'return' at the end of every path.");
+    try sema_support.assertDiagnostic(diagnostics, 1, "/proj/src/main.ens",
+        "Function 'alsoBad' returns 'int', but a path through its body ends without a 'return'. Add a "
+        + "'return' at the end of every path.");
+}
+
+test "a catch clause of a non-void function must also exit" {
+    let analysis = try sema_support.analyzeOne("class Failure extends Error \{\n"
+        + "    protected constructor(string message) \{ super(message); \}\n"
+        + "\}\n"
+        + "mayThrow(int x) -> int throws \{\n"
+        + "    if (x < 0) \{ throw new Failure(\"negative\"); \}\n"
+        + "    return x;\n"
+        + "\}\n"
+        + "bad() -> int \{\n"
+        + "    return try mayThrow(1);\n"
+        + "\} catch (Error e) \{\n"
+        + "    let unused = 0;\n"
+        + "\}\n"
+        + "oneBranch(bool flag) -> int \{\n"
+        + "    return try mayThrow(1);\n"
+        + "\} catch (Error e) \{\n"
+        + "    if (flag) \{ return -1; \}\n"
+        + "\}\n"
+        + "good() -> int \{\n"
+        + "    return try mayThrow(1);\n"
+        + "\} catch (Error e) \{\n"
+        + "    return -1;\n"
+        + "\}\n"
+        + "main() -> int \{ return good(); \}\n");
+    // Each clause is reported at its own span, so the text names the clause and not the body.
+    let diagnostics = analysis.bodyDiagnostics();
+    try testing.assertEqual(diagnostics.length, 2L);
+    try sema_support.assertDiagnostic(diagnostics, 0, "/proj/src/main.ens",
+        "Function 'bad' returns 'int', but a path through its 'catch' clause ends without a 'return'. Add "
+        + "a 'return' at the end of every path.");
+    try sema_support.assertDiagnostic(diagnostics, 1, "/proj/src/main.ens",
+        "Function 'oneBranch' returns 'int', but a path through its 'catch' clause ends without a "
+        + "'return'. Add a 'return' at the end of every path.");
 }

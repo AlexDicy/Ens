@@ -1,5 +1,7 @@
 import FakeFileLoader from sema_support;
 import sema_support;
+import @std.testing;
+import ConstantKind from model.literalvalues;
 
 test "a callable keeps the markers its own shape governs" {
     let loader = new FakeFileLoader();
@@ -51,4 +53,170 @@ test "a 'const' field is legal on a class and a struct, with or without a defaul
         + "\}\n");
     let analysis = sema_support.analyzeAll(loader, "/proj/src", ["app.ens"]);
     try sema_support.assertProgramClean(analysis);
+}
+
+test "statics land beside the instance members, outside layout and dispatch" {
+    let analysis = try sema_support.analyzeOne(
+        "public class Path \{\n"
+        + "    public static const string separator = \"/\";\n"
+        + "    public static const int limit = 10;\n"
+        + "    public static const int doubled = Path.limit * 2 + 1;\n"
+        + "\n"
+        + "    public static join(string left, string right) -> string \{\n"
+        + "        return left + Path.separator + right;\n"
+        + "    \}\n"
+        + "\n"
+        + "    public describe() -> string \{\n"
+        + "        return Path.separator;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    print(Path.join(\"a\", \"b\"));\n"
+        + "    return Path.limit - 10;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+    let path = try sema_support.classNamed(analysis, "main", "Path");
+    try testing.assertEqual(path.fields().length(), 0L);
+    try testing.assertEqual(path.methods().length(), 1L);
+    try testing.assertEqual(path.staticFields().length(), 3L);
+    try testing.assertEqual(path.staticMethods().length(), 1L);
+    try testing.assertTrue(path.staticMethods().get(0).isStatic(),
+        "the static list must carry the marker");
+    try testing.assertTrue(!path.methods().get(0).isStatic(),
+        "an instance method must not carry the marker");
+    let separator = path.staticFields().get(0).constantValue();
+    try testing.assertTrue(separator != null, "'separator' should have evaluated");
+    if (separator != null) {
+        try testing.assertTrue(separator.kind() == ConstantKind.String, "a string constant");
+        try testing.assertEqual(separator.text(), "/");
+    }
+    let doubled = path.staticFields().get(2).constantValue();
+    try testing.assertTrue(doubled != null, "'doubled' should have evaluated");
+    if (doubled != null) {
+        try testing.assertEqual(doubled.integerBits(), 21L);
+    }
+}
+
+// Statics are not inherited, so a base class's static leaves its name free for a subclass's own
+// instance field.
+test "a subclass instance field may share a name with a base class static" {
+    let analysis = sema_support.analyzeProgram(
+        "public class Quota \{\n"
+        + "    public static const int limit = 5;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\}\n"
+        + "public class Allowance extends Quota \{\n"
+        + "    public int limit = 7;\n"
+        + "\n"
+        + "    public constructor();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let allowance = new Allowance();\n"
+        + "    return allowance.limit - Quota.limit;\n"
+        + "\}\n");
+    try sema_support.assertProgramClean(analysis);
+    let quota = try sema_support.classNamed(analysis, "main", "Quota");
+    let allowance = try sema_support.classNamed(analysis, "main", "Allowance");
+    try testing.assertEqual(quota.fields().length(), 0L);
+    try testing.assertEqual(quota.staticFields().length(), 1L);
+    try testing.assertEqual(quota.staticFields().get(0).name(), "limit");
+    try testing.assertEqual(allowance.staticFields().length(), 0L);
+    try testing.assertEqual(allowance.fields().length(), 1L);
+    try testing.assertEqual(allowance.fields().get(0).name(), "limit");
+    try testing.assertTrue(!allowance.fields().get(0).isStatic(),
+        "'allowance.limit' must reach the instance field");
+}
+
+// Statics are not inherited, so a base class's static method leaves its name free for a
+// subclass's own instance method.
+test "a subclass instance method may share a name with a base class static method" {
+    let analysis = sema_support.analyzeProgram(
+        "public class Quota \{\n"
+        + "    public static limit() -> int \{\n"
+        + "        return 5;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class Allowance extends Quota \{\n"
+        + "    public limit() -> int \{\n"
+        + "        return 7;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return new Allowance().limit() - Quota.limit();\n"
+        + "\}\n");
+    try sema_support.assertProgramClean(analysis);
+    let quota = try sema_support.classNamed(analysis, "main", "Quota");
+    let allowance = try sema_support.classNamed(analysis, "main", "Allowance");
+    try testing.assertEqual(quota.methods().length(), 0L);
+    try testing.assertEqual(quota.staticMethods().length(), 1L);
+    try testing.assertEqual(quota.staticMethods().get(0).name(), "limit");
+    try testing.assertEqual(allowance.staticMethods().length(), 0L);
+    try testing.assertEqual(allowance.methods().length(), 1L);
+    try testing.assertEqual(allowance.methods().get(0).name(), "limit");
+}
+
+// A private member belongs to its own class alone, so a subclass inherits nothing under that
+// name. A static of the subclass may take it, for a private base method as for a private base
+// field.
+test "a private base class method and field leave their names free for a subclass static" {
+    let analysis = sema_support.analyzeProgram(
+        "public class Quota \{\n"
+        + "    int room;\n"
+        + "\n"
+        + "    public constructor() \{\n"
+        + "        this.room = 1;\n"
+        + "    \}\n"
+        + "\n"
+        + "    limit() -> int \{\n"
+        + "        return this.room;\n"
+        + "    \}\n"
+        + "\n"
+        + "    public reach() -> int \{\n"
+        + "        return this.limit();\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class Allowance extends Quota \{\n"
+        + "    public static limit() -> int \{\n"
+        + "        return 7;\n"
+        + "    \}\n"
+        + "\n"
+        + "    public static const int room = 2;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return Allowance.limit() + Allowance.room - new Quota().reach();\n"
+        + "\}\n");
+    try sema_support.assertProgramClean(analysis);
+    let allowance = try sema_support.classNamed(analysis, "main", "Allowance");
+    try testing.assertEqual(allowance.staticMethods().length(), 1L);
+    try testing.assertEqual(allowance.staticMethods().get(0).name(), "limit");
+    try testing.assertEqual(allowance.staticFields().length(), 1L);
+    try testing.assertEqual(allowance.staticFields().get(0).name(), "room");
+}
+
+test "a lazy const lands beside the statics and takes no compile-time value" {
+    let analysis = try sema_support.analyzeOne(
+        "public class Reader \{\n"
+        + "    public const string text;\n"
+        + "\n"
+        + "    public constructor(this.text);\n"
+        + "\}\n"
+        + "makeReader() -> Reader \{\n"
+        + "    return new Reader(\"in\");\n"
+        + "\}\n"
+        + "public class Streams \{\n"
+        + "    public lazy const Reader input = makeReader();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return Streams.input.text.length as int;\n"
+        + "\}\n");
+    try sema_support.assertProgramClean(analysis);
+    let streams = try sema_support.classNamed(analysis, "main", "Streams");
+    try testing.assertEqual(streams.fields().length(), 0L);
+    try testing.assertEqual(streams.staticFields().length(), 1L);
+    let input = streams.staticFields().get(0);
+    try testing.assertTrue(input.isLazy(), "the lazy marker must reach the model");
+    try testing.assertTrue(!input.isStatic(), "'lazy' is not 'static'");
+    try testing.assertTrue(input.constantValue() == null,
+        "a lazy const holds no compile-time value");
 }
