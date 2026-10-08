@@ -1,0 +1,687 @@
+// Names used as values: locals, functions, types, type parameters and modules, and 'this' and 'super'.
+// A name that is not a value where it is written is refused with the fix for the value meant.
+import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ThisExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SuperExpressionNode from @ens.frontend.syntax.generated.nodes;
+import Span from @ens.frontend.support.source;
+import FunctionEntry from context;
+import RefusedImport from phases.link;
+import LocalBinding from model.scopes;
+import phases.calls;
+import phases.members;
+import phases.bodies.lambdas;
+import phases.bodies.staticmembers;
+import phases.bodies.memberaccess;
+import phases.bodies.functionvalues;
+import NamePosition from phases.bodies.memberaccess;
+import LambdaFit from phases.bodies.functionvalues;
+import model.narrow;
+import model.hierarchy;
+import model.typemembers;
+import Signature from model.typemembers;
+import model.typenames;
+import model.types;
+import Type from model.types;
+import FunctionType from model.types;
+import ClassType from model.types;
+import StructType from model.types;
+import InterfaceType from model.types;
+import EnumType from model.types;
+import TypeParamType from model.types;
+import List from @std.collections.list;
+import StringBuilder from @std.text.stringbuilder;
+import BodyChecker from phases.bodies;
+import LocalName from phases.bodies;
+import TypeParameterName from phases.bodies;
+import FunctionName from phases.bodies;
+import TypeName from phases.bodies;
+import NamespaceName from phases.bodies;
+
+// A call an example can write to the signature, carrying the 'try' the call needs. Null where the
+// signature is generic, and where it throws what only its body decides.
+callExample(string spelling, Signature signature) -> string? {
+    Type[] thrown = signature.throwsTypes();
+    if (signature.isGeneric() || (signature.declaresThrows() && thrown.length == 0)) {
+        return null;
+    }
+    string arguments = "(...)";
+    if (signature.parameters().length == 0) {
+        arguments = "()";
+    }
+    if (thrown.length > 0) {
+        return "try {spelling}{arguments}";
+    }
+    return "{spelling}{arguments}";
+}
+
+// True when the name belongs to an import that the link phase refused and reported.
+public isRefusedImport(BodyChecker checker, string name) -> bool {
+    return checker.context().linkTable().binding(name) is RefusedImport;
+}
+
+public analyzeIdentifier(BodyChecker checker, IdentifierExpressionNode node) -> Type {
+    string name = node.name().text();
+    if (name.length == 0) {
+        return checker.store().errorType();
+    }
+    let wanted = checker.targets().functionTargetOf(node.green());
+    let primitive = types.primitiveNamed(checker.store(), name);
+    if (primitive != null) {
+        reportTypeAsValue(checker, name, primitive, node.name().span());
+        return checker.store().errorType();
+    }
+    let resolution = checker.resolveName(name);
+    if (resolution == null) {
+        if (isRefusedImport(checker, name)) {
+            return checker.store().errorType();
+        }
+        let ownerName = staticSuggestionOwner(checker, name);
+        if (ownerName != null) {
+            checker.reporter().report(staticWithoutType(checker, name, ownerName, false, wanted),
+                node.name().span());
+            return checker.store().errorType();
+        }
+        checker.reporter().report("Undefined name '{name}'. Check the spelling, or declare it "
+            + "before it is used.", node.name().span());
+        return checker.store().errorType();
+    }
+    switch (resolution) {
+        is LocalName local -> {
+            checker.result().setBinding(node.green(), local.binding());
+            checker.assignment().checkDefiniteAssignment(local.binding(), node.name().span());
+            let proven = checker.narrowing().provenType(narrow.bindingPath(local.binding()));
+            if (proven != null) {
+                return proven;
+            }
+            return local.binding().type();
+        },
+        is FunctionName functions -> {
+            reportFunctionAsValue(checker, name, functions.entries(), node.name().span(), name, wanted);
+            return checker.store().errorType();
+        },
+        is TypeName named -> {
+            reportTypeAsValue(checker, name, named.target(), node.name().span());
+            return checker.store().errorType();
+        },
+        is TypeParameterName held -> {
+            reportTypeParameterRefusal(checker, "'{name}' is a type parameter, not a value.",
+                held.parameter(), node.name().span(), NamePosition.Value);
+            return checker.store().errorType();
+        },
+        is NamespaceName module -> {
+            reportModuleAsValue(checker, name, module.targetModulePath(), node.name().span());
+            return checker.store().errorType();
+        },
+    }
+}
+
+// 'named' is the type the refused name stands for, and 'spelling' is how this file writes
+// that name.
+reportTypeAsValue(BodyChecker checker, string spelling, Type named, Span at) {
+    checker.reporter().report(typeAsValueMessage(checker, spelling, named), at);
+}
+
+// The message a type name written where a value belongs is refused with.
+typeAsValueMessage(BodyChecker checker, string spelling, Type named) -> string {
+    return typeRefusalMessage(checker, "'{spelling}' is a type, not a value.", spelling, named);
+}
+
+// A type name written as the callee of a call. The routes are the ones a value position
+// offers, since a type name reaches no call of its own.
+public reportTypeAsCall(BodyChecker checker, string spelling, Type named, Span at) {
+    checker.reporter().report(typeRefusalMessage(checker, "'{spelling}' is a type, not a function.",
+        spelling, named), at);
+}
+
+// The refusal sentence the position writes, then the routes to a value of the type this
+// file can spell.
+typeRefusalMessage(BodyChecker checker, string refusal, string spelling, Type named) -> string {
+    string fix = typeAsValueFix(checker, spelling, named);
+    if (fix.length == 0) {
+        return refusal;
+    }
+    return "{refusal} {fix}.";
+}
+
+// 'refusal' is the sentence the position writes, followed by how this position reaches a
+// value of the parameter's type. Only a parameter holds one, so the route names one in
+// reach, else the one a callable's body can declare, and a default reaches neither.
+public reportTypeParameterRefusal(BodyChecker checker, string refusal, TypeParamType parameter, Span at,
+                                  NamePosition position) {
+    string name = parameter.name();
+    string written = refusal;
+    let inReach = parameterOfType(checker, parameter);
+    if (inReach != null) {
+        written = "{refusal} Use a value of type '{name}', such as '{inReach.name()}'.";
+    } else if (checker.frame().inCallableBody()) {
+        written = "{refusal} Use a value of type '{name}', such as a parameter declared '{name} value'.";
+    }
+    checker.reporter().report(typeParameterMessage(checker, parameter, written, position), at);
+}
+
+// The parameter in reach whose type is this one, innermost first, or null where none is. A
+// local is left out, because naming one would need it to be assigned where it is named.
+parameterOfType(BodyChecker checker, Type type) -> LocalBinding? {
+    for (long i = checker.frame().parametersInReach().length() - 1; i >= 0; i--) {
+        let binding = checker.frame().parametersInReach().get(i);
+        if (binding.type() == type) {
+            return binding;
+        }
+    }
+    return null;
+}
+
+// What a refused type parameter reads: the collision where it took the name from another
+// meaning of the file, the refusal of a position that can use no type parameter at all, and
+// 'plain' where the name means nothing else there.
+public typeParameterMessage(BodyChecker checker, TypeParamType parameter, string plain,
+                            NamePosition position) -> string {
+    let asStatic = shadowedStaticMessage(checker, parameter, position);
+    if (asStatic != null) {
+        return asStatic;
+    }
+    string name = parameter.name();
+    // 'obligationOwnerName' is the generic declaration whose body is being checked, which
+    // is the one whose header introduced the parameter.
+    string genericOwner = checker.obligationOwnerName();
+    let taken = shadowedMeaning(checker, name);
+    if (taken == null || genericOwner.length == 0) {
+        return checker.resolver().typeParameterRefusal() ?? plain;
+    }
+    return typenames.typeParameterTookNameMessage(name, genericOwner, taken);
+}
+
+// A static of the enclosing type under the refused name, or null where it declares none. A
+// static const is read through the plain type name, while a static method of a generic type
+// needs the type arguments that only such a call itself could otherwise determine. Where the
+// name was written as a call, reading the static const also means dropping the arguments.
+shadowedStaticMessage(BodyChecker checker, TypeParamType parameter, NamePosition position) -> string? {
+    let owner = checker.frame().enclosingOwner();
+    if (owner == null) {
+        return null;
+    }
+    let authority = types.authorityOf(owner);
+    if (authority == null) {
+        return null;
+    }
+    string name = parameter.name();
+    string ownerName = authority.name();
+    string kind = "";
+    if (members.findField(typemembers.staticFieldsOf(owner), name) != null) {
+        kind = "static const";
+    } else if (members.findMethodNamed(typemembers.staticMethodsOf(owner), name) != null) {
+        kind = "static method";
+    } else {
+        return null;
+    }
+    string refusal = "'{name}' means the type parameter of '{ownerName}' here, not the {kind} "
+        + "'{ownerName}' declares, because inside '{ownerName}' the name '{name}' always means the "
+        + "type parameter.";
+    if (kind == "static method") {
+        return "{refusal} Rename one of the two.";
+    }
+    if (position == NamePosition.Call) {
+        return "{refusal} A static const is not called. Write '{ownerName}.{name}' to read it, or rename "
+            + "one of the two and remove the arguments.";
+    }
+    return "{refusal} Write '{ownerName}.{name}' to read the static const, or rename one of the two.";
+}
+
+// The meaning a type parameter took its name from, as the refusal names it, or null where
+// the name means nothing else in the file.
+shadowedMeaning(BodyChecker checker, string name) -> string? {
+    let outside = checker.resolveNameOutsideTypeParameters(name);
+    if (outside == null) {
+        return null;
+    }
+    switch (outside) {
+        is TypeName named -> {
+            return declaringPhrase(checker, typenames.kindWordOf(named.target()),
+                named.target().modulePath());
+        },
+        is FunctionName functions -> {
+            let offered = functions.fromPrelude();
+            if (offered == null) {
+                return declaringPhrase(checker, "function", checker.modulePath());
+            }
+            string[] paths = offered.modulePaths();
+            if (paths.length != 1) {
+                return null;
+            }
+            return declaringPhrase(checker, "function", paths[0]);
+        },
+        is NamespaceName module -> {
+            return typenames.importedModulePhrase(module.targetModulePath());
+        },
+        default -> {
+            return null;
+        },
+    }
+}
+
+// Where a shadowed meaning is declared, as the refusal names it.
+declaringPhrase(BodyChecker checker, string kindWord, string modulePath) -> string {
+    return typenames.declaringPhrase(kindWord, modulePath, checker.modulePath());
+}
+
+// How this file writes a value of the type, then how it reaches a static member of it. A
+// route this file cannot spell is left out, and the fix is empty where it can spell neither.
+typeAsValueFix(BodyChecker checker, string spelling, Type named) -> string {
+    string value = valueRoute(checker, spelling, named);
+    let staticMember = staticMemberExample(checker, spelling, named);
+    if (staticMember == null) {
+        return value;
+    }
+    string purpose = "to read one of its static consts";
+    if (staticMember.endsWith(")")) {
+        purpose = "to call one of its static methods";
+    }
+    if (value.length == 0) {
+        return "Write '{staticMember}' {purpose}";
+    }
+    return "{value}, or write '{staticMember}' {purpose}";
+}
+
+// The way a value of the type is written where the refused name stands, or empty where this
+// file can spell none. A primitive's values are its literals, which the refusal leaves to
+// the reader.
+valueRoute(BodyChecker checker, string spelling, Type named) -> string {
+    let authority = types.authorityOf(named);
+    if (authority == null) {
+        return "";
+    }
+    switch (authority) {
+        is InterfaceType ignored -> {
+            return "Use a value of a class that implements it";
+        },
+        is EnumType enumType -> {
+            string[] constants = enumType.memberNames();
+            if (constants.length == 0) {
+                return "";
+            }
+            return "Write '{spelling}.{constants[0]}' to use one of its members";
+        },
+        is ClassType classType -> {
+            if (classType.isAbstract()) {
+                return "Use a value of a subclass that is not abstract";
+            }
+            // Constructing a generic class needs type arguments, and an example cannot put
+            // one there that the use site has a name for.
+            if (classType.isGeneric()) {
+                return "";
+            }
+            let arguments = classConstructionArguments(checker, classType);
+            if (arguments == null) {
+                return "";
+            }
+            return "Write 'new {spelling}{arguments}' to construct one";
+        },
+        is StructType structType -> {
+            // A generic struct needs type arguments in its constructor call and in the
+            // literal alike, and an example cannot name one.
+            if (structType.isGeneric()) {
+                return "";
+            }
+            return structValueRoute(checker, spelling, structType);
+        },
+        default -> {
+            return "";
+        },
+    }
+}
+
+// How a struct value is written: a constructor call, or an aggregate literal where this file
+// can reach no constructor.
+public structValueRoute(BodyChecker checker, string spelling, Type structType) -> string {
+    let arguments = reachableConstructorArguments(checker, structType);
+    if (arguments != null) {
+        return "Write '{spelling}{arguments}' to construct one";
+    }
+    let literal = structLiteralExample(checker, spelling, structType);
+    if (literal == null) {
+        return "";
+    }
+    return "Write '{literal}' to build one";
+}
+
+// A declaration that builds the struct from an aggregate literal, naming every field the
+// literal has to set. Null where a field it has to set cannot be set from this file.
+public structLiteralExample(BodyChecker checker, string spelling, Type structType) -> string? {
+    let fields = typemembers.fieldsOf(structType);
+    if (fields == null) {
+        return null;
+    }
+    let listed = new StringBuilder();
+    for (long i = 0; i < fields.length(); i++) {
+        let field = fields.get(i);
+        if (field.hasDefault()) {
+            continue;
+        }
+        if (!memberaccess.isAccessAllowed(checker, field.visibility(), field.definingType())) {
+            return null;
+        }
+        if (!listed.isEmpty()) {
+            listed.append(", ");
+        }
+        listed.append("{field.name()}: ...");
+    }
+    return "{spelling} value = \{{listed.toString()}\};";
+}
+
+// The argument list a 'new' of the class writes, or null where this file can reach no
+// constructor of it.
+public classConstructionArguments(BodyChecker checker, Type classType) -> string? {
+    if (typemembers.constructorsOf(classType).length() > 0) {
+        return reachableConstructorArguments(checker, classType);
+    }
+    if (reachesImplicitConstruction(checker, classType)) {
+        return "()";
+    }
+    return null;
+}
+
+// '()' where a constructor this file can reach takes no argument, '(...)' where the ones it
+// can reach take arguments, and null where it can reach none.
+reachableConstructorArguments(BodyChecker checker, Type record) -> string? {
+    let constructors = typemembers.constructorsOf(record);
+    bool anyReachable = false;
+    for (long i = 0; i < constructors.length(); i++) {
+        let candidate = constructors.get(i);
+        if (!checker.resolver().memberExists(candidate)
+                || !memberaccess.isAccessAllowed(checker, candidate.visibility(), candidate.definingType())) {
+            continue;
+        }
+        if (calls.requiredArgumentCount(candidate.signature()) == 0) {
+            return "()";
+        }
+        anyReachable = true;
+    }
+    if (anyReachable) {
+        return "(...)";
+    }
+    return null;
+}
+
+// Whether a class that declares no constructor of its own is constructed with no arguments.
+// Its implicit chain must run a base constructor that exists here, or none at all.
+reachesImplicitConstruction(BodyChecker checker, Type classType) -> bool {
+    let chain = typemembers.implicitBaseConstructor(classType);
+    if (chain.owner() == null) {
+        return true;
+    }
+    let chosen = chain.chosen();
+    return chosen != null && checker.resolver().memberExists(chosen);
+}
+
+// One static member of the type this file can reach, written after 'spelling'. A type-level
+// const reads as a value on its own and a static method reads as a call.
+staticMemberExample(BodyChecker checker, string spelling, Type named) -> string? {
+    let fields = typemembers.staticFieldsOf(named);
+    if (fields != null) {
+        for (long i = 0; i < fields.length(); i++) {
+            let field = fields.get(i);
+            if (memberaccess.isAccessAllowed(checker, field.visibility(), field.definingType())) {
+                return "{spelling}.{field.name()}";
+            }
+        }
+    }
+    let authority = types.authorityOf(named);
+    // A static method of a generic type may need type arguments that only the arguments of
+    // the call itself determine.
+    if (authority != null && authority.isGeneric()) {
+        return null;
+    }
+    let methods = typemembers.staticMethodsOf(named);
+    if (methods == null) {
+        return null;
+    }
+    for (long i = 0; i < methods.length(); i++) {
+        let method = methods.get(i);
+        if (!memberaccess.isAccessAllowed(checker, method.visibility(), method.definingType())) {
+            continue;
+        }
+        let call = callExample("{spelling}.{method.name()}", method.signature());
+        if (call != null) {
+            return call;
+        }
+    }
+    return null;
+}
+
+// 'spelling' is how this file writes the function's name, which is 'module.name' where a
+// module qualifies it, and 'head' is the name it starts with. 'wanted' is the function type
+// expected where it is written.
+public reportFunctionAsValue(BodyChecker checker, string spelling, List<FunctionEntry> entries, Span at,
+                             string head, FunctionType? wanted) {
+    if (wanted != null) {
+        let signatures = new List<Signature>();
+        for (let entry in entries) {
+            signatures.push(entry.signature());
+        }
+        let fix = functionvalues.lambdaFix(checker, "function", spelling, signatures.toArray(), wanted, head);
+        checker.reporter().report(functionvalues.functionValueRefusal("'{spelling}' is a function", fix,
+            spelling), at);
+        return;
+    }
+    bool bare = true;
+    bool throwing = entries.length() > 0;
+    for (let entry in entries) {
+        if (entry.signature().parameters().length > 0) {
+            bare = false;
+        }
+        if (!entry.signature().declaresThrows()) {
+            throwing = false;
+        }
+    }
+    string call = "{spelling}(...)";
+    if (bare) {
+        call = "{spelling}()";
+    }
+    if (throwing) {
+        call = "try " + call;
+    }
+    string message = "'{spelling}' is a function, and a function's name is not a value. "
+        + "Call it as '{call}', or wrap it in a lambda";
+    let example = lambdaDeclarationFor(checker, spelling, entries);
+    if (example == null) {
+        checker.reporter().report(message + ".", at);
+        return;
+    }
+    checker.reporter().report(message + ", as in '{example}'.", at);
+}
+
+reportModuleAsValue(BodyChecker checker, string name, string targetPath, Span at) {
+    reportModuleRefusal(checker, "'{name}' names a module, not a value.", name, targetPath, at);
+}
+
+public reportModuleAsCall(BodyChecker checker, string name, string targetPath, Span at) {
+    reportModuleRefusal(checker, "'{name}' names a module, not a function.", name, targetPath, at);
+}
+
+// 'refusal' is the sentence the position writes, and 'name' is how this file writes the
+// module. The example calls a function the module declares, because a type it declares is
+// refused in a value position too.
+reportModuleRefusal(BodyChecker checker, string refusal, string name, string targetPath, Span at) {
+    let called = moduleFunctionExample(checker, name, targetPath);
+    if (called == null) {
+        checker.reporter().report(refusal, at);
+        return;
+    }
+    checker.reporter().report(refusal + " Write one of its functions after the module name, as in "
+        + "'{called}'.", at);
+}
+
+// A call this file can write to a function the module declares, or null where it can write
+// none. The module's declaration order decides which function that is, and the functions the
+// language provides in every module are not among them.
+moduleFunctionExample(BodyChecker checker, string name, string targetPath) -> string? {
+    let target = checker.contextsByPath().get(targetPath);
+    if (target == null) {
+        return null;
+    }
+    string targetPackagePrefix = target.module().packagePrefix();
+    let entries = target.functions().all();
+    for (long i = 0; i < entries.length(); i++) {
+        let entry = entries.get(i);
+        if (entry.isBuiltin()) {
+            continue;
+        }
+        if (!types.isVisibleFrom(entry.visibility(), targetPath, targetPackagePrefix,
+                checker.modulePath(), checker.packagePrefix())) {
+            continue;
+        }
+        let signature = entry.signature();
+        let call = callExample("{name}.{signature.name()}", signature);
+        if (call != null) {
+            return call;
+        }
+    }
+    return null;
+}
+
+// A declaration holding a lambda that calls the named function, or null when the name has no
+// one function type this file can write. Several overloads, a generic, an 'out' parameter, a
+// 'throws' whose types the body decides, and a type this file cannot name each leave none.
+lambdaDeclarationFor(BodyChecker checker, string spelling, List<FunctionEntry> entries) -> string? {
+    if (entries.length() != 1) {
+        return null;
+    }
+    let signature = entries.get(0).signature();
+    Type[] thrown = signature.throwsTypes();
+    if (signature.isGeneric() || (signature.declaresThrows() && thrown.length == 0)) {
+        return null;
+    }
+    let parameterTypes = new List<Type>();
+    let passed = new StringBuilder();
+    for (let parameter in signature.parameters()) {
+        if (parameter.isOut()) {
+            return null;
+        }
+        if (parameterTypes.length() > 0) {
+            passed.append(", ");
+        }
+        parameterTypes.push(parameter.type());
+        passed.append(parameter.name());
+    }
+    Type held = checker.store().functionOf(parameterTypes.toArray(), signature.returnType(), thrown);
+    if (!checker.names().canSpell(held)) {
+        return null;
+    }
+    string typeText = checker.names().of(held);
+    string arguments = passed.toString();
+    if (thrown.length > 0) {
+        return "({typeText}) callback = ({arguments}) -> try {spelling}({arguments});";
+    }
+    return "{typeText} callback = ({arguments}) -> {spelling}({arguments});";
+}
+
+// The enclosing type's name when it declares a static under the given name, for the
+// uniform-access suggestion; null otherwise.
+public staticSuggestionOwner(BodyChecker checker, string name) -> string? {
+    let owner = checker.frame().enclosingOwner();
+    if (owner == null) {
+        return null;
+    }
+    if (members.findField(typemembers.staticFieldsOf(owner), name) == null
+            && members.findMethodNamed(typemembers.staticMethodsOf(owner), name) == null) {
+        return null;
+    }
+    let authority = types.authorityOf(owner);
+    if (authority == null) {
+        return null;
+    }
+    return authority.name();
+}
+
+// How a refusal names a function value called by 'calleeName', which is empty for one with no name.
+public functionValueName(BodyChecker checker, string calleeName) -> string {
+    if (calleeName.length == 0) {
+        return "this function value";
+    }
+    return "'{calleeName}'";
+}
+
+// The refusal of the static 'name' of the enclosing type 'ownerName', written without the type
+// name in front. 'called' is true when the code calls it, and 'wanted' is the function type
+// expected where it is written.
+public staticWithoutType(BodyChecker checker, string name, string ownerName, bool called,
+                         FunctionType? wanted = null) -> string {
+    let owner = checker.frame().enclosingOwner();
+    string kind = "static method";
+    if (owner != null) {
+        let field = members.findField(typemembers.staticFieldsOf(owner), name);
+        if (field != null && field.isLazy()) {
+            kind = "lazy const";
+        } else if (field != null) {
+            kind = "static const";
+        }
+    }
+    if (kind == "static method") {
+        string refusal = "'{name}' is a static method of '{ownerName}', and a static method is always "
+            + "called through its type name, even inside '{ownerName}'.";
+        if (wanted != null && owner != null) {
+            let statics = memberaccess.staticsNamed(owner, name);
+            let fix = functionvalues.lambdaFix(checker, "method", name,
+                staticmembers.reachedSignatures(checker, statics, wanted), wanted, ownerName);
+            if (fix.fit() != LambdaFit.Called) {
+                string spelling = "'{fix.before()}{ownerName}.{name}{fix.after()}'";
+                return "{refusal} {functionvalues.nameNotValueText(fix, spelling)}";
+            }
+        }
+        return "{refusal} Write '{ownerName}.{name}(...)'.";
+    }
+    string refusal = "'{name}' is a {kind} of '{ownerName}', and a {kind} is always read through its "
+        + "type name, even inside '{ownerName}'. Write '{ownerName}.{name}'.";
+    if (called) {
+        return "{refusal} A {kind} is not called, so remove the arguments as well.";
+    }
+    return refusal;
+}
+
+public analyzeThis(BodyChecker checker, ThisExpressionNode node) -> Type {
+    let receiver = checker.frame().thisType();
+    if (receiver == null) {
+        if (checker.frame().inStaticMethod()) {
+            checker.reporter().report("'this' is the object a method was called on, and a static method "
+                + "is not called on an object. Take the object as a parameter, or remove 'static'.",
+                node.thisKeyword().span());
+        } else {
+            checker.reporter().report("'this' is the object a method was called on, so it is only "
+                + "available inside a method. Pass the object as a parameter, or move this code into a "
+                + "method.", node.thisKeyword().span());
+        }
+        return checker.store().errorType();
+    }
+    lambdas.captureReceiver(checker, receiver, node.thisKeyword().span());
+    return receiver;
+}
+
+public analyzeSuper(BodyChecker checker, SuperExpressionNode node) -> Type {
+    let receiver = checker.frame().thisType();
+    if (receiver == null) {
+        if (checker.frame().inStaticMethod()) {
+            checker.reporter().report("'super' is the part of the object a method was called on that its "
+                + "base class declares, and a static method is not called on an object. Remove 'static' "
+                + "to make it an instance method.", node.superKeyword().span());
+        } else {
+            checker.reporter().report("'super' is the part of the object a method was called on that its "
+                + "base class declares, so it is only available inside a method. Move this code into a "
+                + "method of the subclass.", node.superKeyword().span());
+        }
+        return checker.store().errorType();
+    }
+    let base = hierarchy.baseOf(receiver);
+    if (base == null) {
+        let authority = types.authorityOf(receiver);
+        string shown = checker.names().of(receiver);
+        if (authority != null) {
+            shown = authority.name();
+        }
+        checker.reporter().report("'super' cannot be used in '{shown}', because '{shown}' has no base "
+            + "class. Remove 'super', or give '{shown}' a base class with 'extends'.",
+            node.superKeyword().span());
+        return checker.store().errorType();
+    }
+    lambdas.captureReceiver(checker, receiver, node.superKeyword().span());
+    return base;
+}

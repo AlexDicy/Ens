@@ -74,14 +74,11 @@ import ModuleContext from context;
 import FunctionEntry from context;
 import ImportedType from phases.link;
 import ImportedNamespace from phases.link;
-import RefusedImport from phases.link;
 import TypeResolver from phases.resolve;
 import SemaResult from result;
 import Scope from model.scopes;
 import LocalBinding from model.scopes;
 import BindingKind from model.scopes;
-import LambdaCapture from model.lambdas;
-import LambdaInfo from model.lambdas;
 import phases.calls;
 import CallShape from phases.calls;
 import CallCandidate from phases.calls;
@@ -101,14 +98,14 @@ import LiteralOrigin from phases.bodies.literaltargets;
 import JoinText from phases.bodies.literaltargets;
 import DeferredLiteralFix from phases.bodies.literaltargets;
 import LiteralTargets from phases.bodies.literaltargets;
+import phases.bodies.identifiers;
+import phases.bodies.lambdas;
+import LambdaFrame from phases.bodies.lambdas;
 import phases.bodies.functioncalls;
 import ChosenParameter from phases.bodies.functioncalls;
 import BuiltShape from phases.bodies.functioncalls;
 import phases.bodies.staticmembers;
 import phases.bodies.memberaccess;
-import phases.bodies.functionvalues;
-import NamePosition from phases.bodies.memberaccess;
-import LambdaFit from phases.bodies.functionvalues;
 import phases.bodies.operators;
 import phases.bodies.assignments;
 import phases.bodies.literalfixes;
@@ -120,7 +117,6 @@ import AssignmentState from phases.bodies.definiteassignment;
 import phases.bodies.wording;
 import phases.bodies.narrowing;
 import NarrowingFact from phases.bodies.narrowing;
-import model.narrow;
 import NarrowingPath from model.narrow;
 import NarrowingState from model.narrow;
 import model.hierarchy;
@@ -130,7 +126,6 @@ import Method from model.typemembers;
 import MemberConstraint from model.typemembers;
 import Parameter from model.typemembers;
 import Signature from model.typemembers;
-import model.typenames;
 import TypeNames from model.typenames;
 import model.types;
 import Type from model.types;
@@ -139,7 +134,6 @@ import NullType from model.types;
 import StringType from model.types;
 import OptionalType from model.types;
 import ArrayType from model.types;
-import FunctionType from model.types;
 import PrimitiveKind from model.types;
 import DeclaredType from model.types;
 import ClassType from model.types;
@@ -158,7 +152,6 @@ import phases.obligations;
 import List from @std.collections.list;
 import Map from @std.collections.map;
 import Set from @std.collections.set;
-import StringBuilder from @std.text.stringbuilder;
 
 // Checks every body of every module. Modules reach each other only through the type store, the
 // link tables, and the other modules' function tables (for namespace-qualified calls and for the
@@ -243,68 +236,6 @@ public final class NamespaceName extends NameResolution {
     }
 }
 
-// One lambda whose body is being checked: the scope outside it, the receiver outside it, and
-// what its body has read from either so far. The captures accumulate in first-read order, which
-// is the order the closure copies them in.
-class LambdaFrame {
-    protected Scope? enclosingScope;
-    protected Type? enclosingReceiver;
-    protected List<LambdaCapture> captures;
-    protected List<LocalBinding> capturedBindings;
-    protected bool readsReceiver;
-
-    protected constructor(Scope? enclosingScope, Type? enclosingReceiver) {
-        this.enclosingScope = enclosingScope;
-        this.enclosingReceiver = enclosingReceiver;
-        this.captures = new List<LambdaCapture>();
-        this.capturedBindings = new List<LocalBinding>();
-        this.readsReceiver = false;
-    }
-
-    // The binding this name has outside the lambda, or null when the enclosing scope has none.
-    protected lookupOuter(string name) -> LocalBinding? {
-        let outer = this.enclosingScope;
-        if (outer == null) {
-            return null;
-        }
-        return outer.lookup(name);
-    }
-
-    protected captureBinding(LocalBinding binding) {
-        for (long i = 0; i < this.capturedBindings.length(); i++) {
-            if (this.capturedBindings.get(i) == binding) {
-                return;
-            }
-        }
-        this.capturedBindings.push(binding);
-        this.captures.push(new LambdaCapture(binding, binding.type()));
-    }
-
-    // Records that the lambda copies the enclosing receiver; true the first time, so a rejection
-    // reports once however many times the body reads 'this'.
-    protected captureReceiver(Type receiver) -> bool {
-        if (this.readsReceiver) {
-            return false;
-        }
-        this.readsReceiver = true;
-        this.captures.push(new LambdaCapture(null, receiver));
-        return true;
-    }
-
-    protected holds(LocalBinding binding) -> bool {
-        for (long i = 0; i < this.capturedBindings.length(); i++) {
-            if (this.capturedBindings.get(i) == binding) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    protected result() -> LambdaCapture[] {
-        return this.captures.toArray();
-    }
-}
-
 // What a type argument must be to satisfy the bound 'bound', spelled 'shown' where it is used.
 boundKindText(Type bound, Type shown, TypeNames names) -> string {
     if (types.isInterfaceLike(bound)) {
@@ -344,23 +275,6 @@ everyValueFix(Type scrutineeType, Expression scrutinee, ArmBody body, bool first
 matchesEveryValue(Type inner, Type armType) -> bool {
     return !(armType is OptionalType) && !(armType is TypeParamType) && types.isClassLike(armType)
         && (armType == inner || hierarchy.isSubclassOrConforms(inner, armType));
-}
-
-// A call an example can write to the signature, carrying the 'try' the call needs. Null where the
-// signature is generic, and where it throws what only its body decides.
-callExample(string spelling, Signature signature) -> string? {
-    Type[] thrown = signature.throwsTypes();
-    if (signature.isGeneric() || (signature.declaresThrows() && thrown.length == 0)) {
-        return null;
-    }
-    string arguments = "(...)";
-    if (signature.parameters().length == 0) {
-        arguments = "()";
-    }
-    if (thrown.length > 0) {
-        return "try {spelling}{arguments}";
-    }
-    return "{spelling}{arguments}";
 }
 
 // The callable whose body is being checked: its parameters and receiver, what a 'return' in it
@@ -599,6 +513,16 @@ public final class CallableFrame {
     }
 }
 
+// The scope, narrowing, frame and definite-assignment state outside a lambda, kept while its body is checked.
+public final class OuterLambdaState {
+    protected Scope? outerScope;
+    protected NarrowingState outerNarrowing;
+    protected CallableFrame outerFrame;
+    protected AssignmentState outerAssignment;
+
+    protected constructor(this.outerScope, this.outerNarrowing, this.outerFrame, this.outerAssignment);
+}
+
 public final class BodyChecker implements NoreturnCalls {
     ModuleContext moduleContext;
     Map<string, ModuleContext> contextsByModulePath;
@@ -615,7 +539,7 @@ public final class BodyChecker implements NoreturnCalls {
     CallableFrame callableFrame;
     // The lambdas whose bodies are being checked, outermost first. Empty in ordinary code; a
     // name the innermost one does not declare itself is a capture.
-    List<LambdaFrame> lambdaFrames;
+    List<LambdaFrame> lambdaFrameStack;
     NarrowingState narrowingState;
     // The 'const' locals declared without a type, and the values 'is' arms matched. A refused write to
     // a constant local gives each its own fix.
@@ -630,7 +554,7 @@ public final class BodyChecker implements NoreturnCalls {
 
     ObligationRegistry deferredObligations;
     GreenNode? obligationOwner;
-    string obligationOwnerName;
+    string genericOwnerName;
     string obligationOwnerDisplay;
 
     protected constructor(ModuleContext context, Map<string, ModuleContext> contextsByPath,
@@ -645,7 +569,7 @@ public final class BodyChecker implements NoreturnCalls {
         this.typeNames = context.names();
         this.canonicalModulePath = context.module().canonicalPath();
         this.modulePackagePrefix = context.module().packagePrefix();
-        this.lambdaFrames = new List<LambdaFrame>();
+        this.lambdaFrameStack = new List<LambdaFrame>();
         this.narrowingState = new NarrowingState();
         this.callableFrame = new CallableFrame(null);
         this.untypedConstantLocals = new List<LocalBinding>();
@@ -656,7 +580,7 @@ public final class BodyChecker implements NoreturnCalls {
         this.arrayNewNames = new Map<GreenNode, string>();
         this.deferredObligations = context.obligations();
         this.obligationOwner = null;
-        this.obligationOwnerName = "";
+        this.genericOwnerName = "";
         this.obligationOwnerDisplay = "";
     }
 
@@ -727,6 +651,36 @@ public final class BodyChecker implements NoreturnCalls {
 
     public armBindings() -> List<LocalBinding> {
         return this.matchedArmBindings;
+    }
+
+    public lambdaFrames() -> List<LambdaFrame> {
+        return this.lambdaFrameStack;
+    }
+
+    // Saves the state outside a lambda and starts the lambda's own: 'lambdaFrame' on the frame stack, an
+    // empty scope and narrowing, the frame 'inner', and the assignment state the lambda derives.
+    public enterLambda(LambdaFrame lambdaFrame, CallableFrame inner) -> OuterLambdaState {
+        let outer = new OuterLambdaState(this.scope, this.narrowingState, this.callableFrame,
+            this.assignmentState);
+        this.lambdaFrameStack.push(lambdaFrame);
+        this.scope = new Scope(null);
+        this.narrowingState = new NarrowingState();
+        this.callableFrame = inner;
+        this.assignmentState = outer.outerAssignment.forLambda();
+        return outer;
+    }
+
+    // Ends a lambda's body: drops its frame and restores the state 'enterLambda' saved.
+    public leaveLambda(OuterLambdaState outer) {
+        this.lambdaFrameStack.pop();
+        this.scope = outer.outerScope;
+        this.narrowingState = outer.outerNarrowing;
+        this.callableFrame = outer.outerFrame;
+        this.assignmentState = outer.outerAssignment;
+    }
+
+    public obligationOwnerName() -> string {
+        return this.genericOwnerName;
     }
 
     protected run() {
@@ -816,14 +770,14 @@ public final class BodyChecker implements NoreturnCalls {
     enterObligationOwner(DeclaredType found) {
         if (found.isGeneric()) {
             this.obligationOwner = found.declaration();
-            this.obligationOwnerName = found.name();
+            this.genericOwnerName = found.name();
             this.obligationOwnerDisplay = this.names().of(found);
         }
     }
 
     leaveObligationOwner() {
         this.obligationOwner = null;
-        this.obligationOwnerName = "";
+        this.genericOwnerName = "";
         this.obligationOwnerDisplay = "";
     }
 
@@ -914,7 +868,7 @@ public final class BodyChecker implements NoreturnCalls {
             if (declaration != null) {
                 ownsObligations = true;
                 this.obligationOwner = declaration;
-                this.obligationOwnerName = signature.name();
+                this.genericOwnerName = signature.name();
                 this.obligationOwnerDisplay = "{signature.name()}<{typeParameterNamesText(signature)}>";
             }
         }
@@ -1451,7 +1405,7 @@ public final class BodyChecker implements NoreturnCalls {
         if (own != null) {
             return own;
         }
-        return this.lookupCapture(name);
+        return lambdas.lookupCapture(this, name);
     }
 
     // Unqualified name resolution, innermost declaration first: local scopes, then a type
@@ -2111,13 +2065,13 @@ public final class BodyChecker implements NoreturnCalls {
                 return literaltyping.analyzeLiteral(this, literal);
             },
             is IdentifierExpressionNode identifier -> {
-                return this.analyzeIdentifier(identifier);
+                return identifiers.analyzeIdentifier(this, identifier);
             },
             is ThisExpressionNode keyword -> {
-                return this.analyzeThis(keyword);
+                return identifiers.analyzeThis(this, keyword);
             },
             is SuperExpressionNode keyword -> {
-                return this.analyzeSuper(keyword);
+                return identifiers.analyzeSuper(this, keyword);
             },
             is BinaryExpressionNode binary -> {
                 return operators.analyzeBinary(this, binary);
@@ -2209,7 +2163,7 @@ public final class BodyChecker implements NoreturnCalls {
         if (node is LambdaExpressionNode) {
             let outerHolder = this.targets().lambdaHolder();
             this.targets().setLambdaHolder(origin);
-            Type adapted = this.analyzeLambda(node, target);
+            Type adapted = lambdas.analyzeLambda(this, node, target);
             this.targets().setLambdaHolder(outerHolder);
             this.result().setType(node.green(), adapted);
             return adapted;
@@ -2267,945 +2221,7 @@ public final class BodyChecker implements NoreturnCalls {
             ?? literaltyping.adaptFloatLiteral(this, node, target, origin) ?? analyzed;
     }
 
-    // ---- Lambdas ----
-
-    // The fix for the lambda 'node' written where a type that is not a function type is declared, with
-    // a function type example taking the lambda's parameters.
-    lambdaTypeAdvice(LambdaExpressionNode node) -> string {
-        let parts = new StringBuilder();
-        for (long i = 0; i < node.parametersCount(); i++) {
-            if (i > 0) {
-                parts.append(", ");
-            }
-            let written = node.parameters(i).declaredType();
-            if (written != null) {
-                parts.append(wording.greenSpelling(written.green()));
-            } else {
-                parts.append("int");
-            }
-        }
-        string example = "({parts.toString()}) -> int";
-        let holder = this.targets().lambdaHolder();
-        if (holder != null && holder.kind() == OriginKind.Declared && holder.name().length > 0) {
-            return "Declare '{holder.name()}' with a function type instead, such as '{example}'.";
-        }
-        return "Write it where a function type such as '{example}' is declared.";
-    }
-
-    // Checks a lambda against the function type its surroundings expect. The target supplies the
-    // parameter types the lambda leaves out and the return type its body is checked against. The body is
-    // checked as a callable of its own: its own scope, its own narrowing, its own loops, and a
-    // return type of its own, so nothing about the enclosing control flow reaches into it. What
-    // it reads from outside is a capture, recorded for the phases that lower it.
-    analyzeLambda(LambdaExpressionNode node, Type target) -> Type {
-        Type core = convert.coreOf(target);
-        if (core is ErrorType) {
-            return this.store().errorType();
-        }
-        if (!(core is FunctionType)) {
-            this.reporter().report("A lambda is a function value, so it cannot be "
-                + "{typenames.typeArticle(this.names().of(target))} '{this.names().of(target)}'. "
-                + this.lambdaTypeAdvice(node), node.span());
-            return this.store().errorType();
-        }
-        Type[] expected = core.parameterTypes();
-        if (!this.checkLambdaShape(node, core, expected)) {
-            return this.store().errorType();
-        }
-        let parameters = new List<Parameter>();
-        for (long i = 0; i < node.parametersCount(); i++) {
-            let declared = node.parameters(i);
-            parameters.push(new Parameter(declared.name().text(), expected[i], false, false,
-                false, declared.name().span()));
-        }
-        let signature = new Signature("lambda", parameters.toArray(),
-            core.returnType(), false, false, [], [], [], node.green(), node.span());
-        let captures = this.checkLambdaBody(node, signature);
-        this.result().setLambda(node.green(),
-            new LambdaInfo(signature, core, captures));
-        return core;
-    }
-
-    // The lambda's parameter list against the target's: the same count, all types written or
-    // none, and every written type exactly the one the target passes. Invariant, so a written
-    // type that merely accepts the target's is still a mismatch.
-    checkLambdaShape(LambdaExpressionNode node, FunctionType target, Type[] expected) -> bool {
-        long given = node.parametersCount();
-        if (given != expected.length) {
-            string mine = parameterCountText(given);
-            string theirs = parameterCountText(expected.length);
-            this.reporter().report("This lambda takes {mine}, but '{this.names().of(target)}' "
-                + "takes {theirs}. Write it as '{lambdaShapeExample(expected.length)}'.",
-                node.span());
-            return false;
-        }
-        long typed = 0;
-        for (long i = 0; i < given; i++) {
-            if (node.parameters(i).declaredType() != null) {
-                typed++;
-            }
-        }
-        if (typed > 0 && typed < given) {
-            this.reporter().report("This lambda gives a type to some parameters and not to others. Write a "
-                + "type for every parameter or for none, as in '(int a, int b) -> a + b' or "
-                + "'(a, b) -> a + b'.", node.span());
-            return false;
-        }
-        bool matched = true;
-        for (long i = 0; i < given; i++) {
-            let reference = node.parameters(i).declaredType();
-            if (reference == null) {
-                continue;
-            }
-            Type written = this.resolver().resolveType(reference);
-            if (written is ErrorType) {
-                matched = false;
-                continue;
-            }
-            if (written != expected[i]) {
-                this.reporter().report("Parameter '{node.parameters(i).name().text()}' is declared "
-                    + "'{this.names().of(written)}', but the function type '{this.names().of(target)}' gives "
-                    + "it {typenames.typeArticle(this.names().of(expected[i]))} "
-                    + "'{this.names().of(expected[i])}'. Write '{this.names().of(expected[i])} "
-                    + "{node.parameters(i).name().text()}', or leave the type out.", reference.span());
-                matched = false;
-            }
-        }
-        return matched;
-    }
-
-    // Walks the lambda's body under its own checker state and returns what it captured.
-    checkLambdaBody(LambdaExpressionNode node, Signature signature) -> LambdaCapture[] {
-        let lambdaFrame = new LambdaFrame(this.scope, this.frame().thisType());
-        let outerScope = this.scope;
-        let outerNarrowing = this.narrowingState;
-        let outerFrame = this.callableFrame;
-        let outerDeferred = this.targets().deferredFixes();
-        bool outerAwaiting = this.targets().awaitingParameter();
-        let outerAssignment = this.assignmentState;
-
-        this.lambdaFrames.push(lambdaFrame);
-        this.scope = new Scope(null);
-        this.narrowingState = new NarrowingState();
-        let innerFrame = outerFrame.forLambda(node, signature.returnType(),
-            literalfixes.returnOriginThrough(this, this.targets().lambdaHolder(), signature.returnType()));
-        this.callableFrame = innerFrame;
-        this.targets().setLambdaHolder(null);
-        this.targets().setDeferredFixes(null);
-        this.targets().setAwaitingParameter(false);
-        this.assignmentState = outerAssignment.forLambda();
-
-        Parameter[] parameters = signature.parameters();
-        let lambdaScope = this.scope;
-        for (long i = 0; i < parameters.length; i++) {
-            let parameter = parameters[i];
-            let binding = new LocalBinding(parameter.name(), parameter.type(),
-                BindingKind.Parameter, false, parameter.span());
-            this.frame().parametersInReach().push(binding);
-            if (lambdaScope != null && !lambdaScope.define(binding)) {
-                this.reporter().report("Parameter '{parameter.name()}' is declared twice in this lambda. "
-                    + "Rename one of the two.", parameter.span());
-            }
-            this.result().setBinding(node.parameters(i).green(), binding);
-        }
-
-        this.enterScope();
-        this.walkLambdaBody(node, signature.returnType());
-        this.leaveScope();
-
-        this.lambdaFrames.pop();
-        this.scope = outerScope;
-        this.narrowingState = outerNarrowing;
-        this.callableFrame = outerFrame;
-        // A 'super(...)' in the lambda counts as the enclosing constructor's own.
-        if (innerFrame.sawSuperCall()) {
-            outerFrame.noteSuperCall();
-        }
-        this.targets().setDeferredFixes(outerDeferred);
-        this.targets().setAwaitingParameter(outerAwaiting);
-        this.assignmentState = outerAssignment;
-        return lambdaFrame.result();
-    }
-
-    // A block body is a function body: every path must return a value when the target returns
-    // one. An expression body is the value itself, unless the target returns nothing, in which
-    // case it is evaluated and discarded like an expression statement.
-    walkLambdaBody(LambdaExpressionNode node, Type returned) {
-        let body = node.body();
-        if (body is BlockNode) {
-            this.walkBlock(body);
-            if (!types.isVoidType(returned) && !(returned is ErrorType)
-                    && !flow.blockTerminates(body, ExitScope.Function, this)) {
-                this.reporter().report("This lambda returns '{this.names().of(returned)}', but a path "
-                    + "through its body ends without a 'return'. Add a 'return' at the end of every path.",
-                    node.arrow().span());
-            }
-            return;
-        }
-        if (body is Expression) {
-            if (types.isVoidType(returned)) {
-                this.analyzeExpression(body);
-                return;
-            }
-            Type actual = this.analyzeExpressionAdapt(body, returned, this.frame().currentReturnOrigin());
-            if (!(returned is ErrorType) && !(actual is ErrorType)
-                    && !convert.isAssignableStrict(returned, actual)) {
-                this.reporter().report("This lambda must return '{this.names().of(returned)}', but its body "
-                    + "has type '{this.names().of(actual)}'."
-                    + "{nullguidance.valueAssignabilityHint(this, returned, actual, body)}", body.span());
-            }
-        }
-    }
-
-    // A name the lambda being checked does not declare itself: the enclosing lambdas' scopes,
-    // outermost last, then the enclosing callable's. Finding one there is a capture, and every
-    // lambda between the declaration and the use copies it.
-    lookupCapture(string name) -> LocalBinding? {
-        for (long i = this.lambdaFrames.length() - 1; i >= 0; i--) {
-            let found = this.lambdaFrames.get(i).lookupOuter(name);
-            if (found == null) {
-                continue;
-            }
-            for (long j = i; j < this.lambdaFrames.length(); j++) {
-                this.lambdaFrames.get(j).captureBinding(found);
-            }
-            return found;
-        }
-        return null;
-    }
-
-    // Records that every lambda being checked copies the enclosing receiver, which is what makes
-    // 'this' readable, its fields writable, and its methods callable inside a lambda. A struct
-    // receiver is refused: copying it would give the lambda its own struct, so a write through
-    // the copy would not be a write to the one the method runs over. A primitive receiver is a
-    // value nothing can write through, so copying it changes nothing and it is allowed.
-    captureReceiver(Type receiver, Span at) {
-        long depth = this.lambdaFrames.length();
-        if (depth == 0) {
-            return;
-        }
-        if (functionvalues.refusesThisCapture(receiver)) {
-            if (this.lambdaFrames.get(depth - 1).captureReceiver(receiver)) {
-                this.reporter().report("A lambda cannot capture 'this' here: "
-                    + functionvalues.structThisAdvice(this.names().of(receiver)), at);
-            }
-            return;
-        }
-        for (long i = 0; i < depth; i++) {
-            let ignored = this.lambdaFrames.get(i).captureReceiver(receiver);
-        }
-    }
-
-    // Whether the binding is declared outside the lambda being checked, so a write to it would land on
-    // the lambda's own copy.
-    isCapturedBinding(LocalBinding binding) -> bool {
-        if (this.lambdaFrames.length() == 0) {
-            return false;
-        }
-        return this.lambdaFrames.get(this.lambdaFrames.length() - 1).holds(binding);
-    }
-
-    // Whether the lambda being checked read 'this' of a struct, which reported that it cannot capture it.
-    public lambdaRefusedThis() -> bool {
-        long depth = this.lambdaFrames.length();
-        let receiver = this.frame().thisType();
-        return depth > 0 && receiver != null && functionvalues.refusesThisCapture(receiver)
-            && this.lambdaFrames.get(depth - 1).readsReceiver;
-    }
-
-    // Reports a write to a captured local; true when it reported. 'action' names what the write
-    // would do, so '=' and '++' read naturally.
-    reportCapturedWrite(LocalBinding binding, string action, Span at) -> bool {
-        if (!this.isCapturedBinding(binding)) {
-            return false;
-        }
-        this.reporter().report("Cannot {action} '{binding.name()}' inside a lambda: a lambda works "
-            + "on copies of what it captures, so the '{binding.name()}' outside it would not "
-            + "change. Return the value the lambda computes and store it where the lambda is called, or "
-            + "keep the value in a field of an object the lambda uses.", at);
-        return true;
-    }
-
-    // Reports a write refused for where it stands rather than for what it names; true when it
-    // reported. 'action' names what the write would do, so '=' and '++' read naturally.
-    public reportRefusedWrite(LocalBinding binding, string action, Span at) -> bool {
-        if (this.reportCapturedWrite(binding, action, at)) {
-            return true;
-        }
-        return this.reportSiblingFieldWrite(binding, at);
-    }
-
-    // The binding a write to a member chain changes, or null where the chain changes another
-    // object instead. A struct field lives in the value that holds it, so a chain of them
-    // changes what stands at its root, while a class reference or an array element anywhere
-    // along it leads to storage of its own.
-    public writtenChainRoot(Expression target) -> LocalBinding? {
-        Expression root = wording.unwrapParentheses(target);
-        while (root is MemberExpressionNode) {
-            let objectType = this.result().typeOf(root.object().green());
-            if (objectType == null || !types.isStructLike(objectType)) {
-                return null;
-            }
-            root = wording.unwrapParentheses(root.object());
-        }
-        if (root is IdentifierExpressionNode) {
-            return this.result().bindingOf(root.green());
-        }
-        return null;
-    }
-
-    // Reports a write to a sibling field inside a field default; true when it reported. A
-    // default is the value of the field it belongs to, so it reads its siblings and writes none
-    // of them. A default naming its own field is refused by the checks phase instead.
-    reportSiblingFieldWrite(LocalBinding binding, Span at) -> bool {
-        if (binding.kind() != BindingKind.SiblingField) {
-            return false;
-        }
-        let defaulted = this.frame().fieldDefaultName();
-        if (defaulted == null || defaulted == binding.name()) {
-            return false;
-        }
-        this.reporter().report("Field '{binding.name()}' cannot be assigned inside the default of "
-            + "'{defaulted}'. A default gives its own field a value and reads earlier ones, so "
-            + "give '{binding.name()}' its value in its own default, or assign both fields in a "
-            + "constructor.", at);
-        return true;
-    }
-
-    // True when the name belongs to an import that the link phase refused and reported.
-    public isRefusedImport(string name) -> bool {
-        return this.context().linkTable().binding(name) is RefusedImport;
-    }
-
-    analyzeIdentifier(IdentifierExpressionNode node) -> Type {
-        string name = node.name().text();
-        if (name.length == 0) {
-            return this.store().errorType();
-        }
-        let wanted = this.targets().functionTargetOf(node.green());
-        let primitive = types.primitiveNamed(this.store(), name);
-        if (primitive != null) {
-            this.reportTypeAsValue(name, primitive, node.name().span());
-            return this.store().errorType();
-        }
-        let resolution = this.resolveName(name);
-        if (resolution == null) {
-            if (this.isRefusedImport(name)) {
-                return this.store().errorType();
-            }
-            let ownerName = this.staticSuggestionOwner(name);
-            if (ownerName != null) {
-                this.reporter().report(this.staticWithoutType(name, ownerName, false, wanted),
-                    node.name().span());
-                return this.store().errorType();
-            }
-            this.reporter().report("Undefined name '{name}'. Check the spelling, or declare it "
-                + "before it is used.", node.name().span());
-            return this.store().errorType();
-        }
-        switch (resolution) {
-            is LocalName local -> {
-                this.result().setBinding(node.green(), local.binding());
-                this.assignment().checkDefiniteAssignment(local.binding(), node.name().span());
-                let proven = this.narrowingState.provenType(narrow.bindingPath(local.binding()));
-                if (proven != null) {
-                    return proven;
-                }
-                return local.binding().type();
-            },
-            is FunctionName functions -> {
-                this.reportFunctionAsValue(name, functions.entries(), node.name().span(), name, wanted);
-                return this.store().errorType();
-            },
-            is TypeName named -> {
-                this.reportTypeAsValue(name, named.target(), node.name().span());
-                return this.store().errorType();
-            },
-            is TypeParameterName held -> {
-                this.reportTypeParameterRefusal("'{name}' is a type parameter, not a value.",
-                    held.parameter(), node.name().span(), NamePosition.Value);
-                return this.store().errorType();
-            },
-            is NamespaceName module -> {
-                this.reportModuleAsValue(name, module.targetModulePath(), node.name().span());
-                return this.store().errorType();
-            },
-        }
-    }
-
-    // 'named' is the type the refused name stands for, and 'spelling' is how this file writes
-    // that name.
-    reportTypeAsValue(string spelling, Type named, Span at) {
-        this.reporter().report(this.typeAsValueMessage(spelling, named), at);
-    }
-
-    // The message a type name written where a value belongs is refused with.
-    typeAsValueMessage(string spelling, Type named) -> string {
-        return this.typeRefusalMessage("'{spelling}' is a type, not a value.", spelling, named);
-    }
-
-    // A type name written as the callee of a call. The routes are the ones a value position
-    // offers, since a type name reaches no call of its own.
-    public reportTypeAsCall(string spelling, Type named, Span at) {
-        this.reporter().report(this.typeRefusalMessage("'{spelling}' is a type, not a function.",
-            spelling, named), at);
-    }
-
-    // The refusal sentence the position writes, then the routes to a value of the type this
-    // file can spell.
-    typeRefusalMessage(string refusal, string spelling, Type named) -> string {
-        string fix = this.typeAsValueFix(spelling, named);
-        if (fix.length == 0) {
-            return refusal;
-        }
-        return "{refusal} {fix}.";
-    }
-
-    // 'refusal' is the sentence the position writes, followed by how this position reaches a
-    // value of the parameter's type. Only a parameter holds one, so the route names one in
-    // reach, else the one a callable's body can declare, and a default reaches neither.
-    public reportTypeParameterRefusal(string refusal, TypeParamType parameter, Span at,
-                                      NamePosition position) {
-        string name = parameter.name();
-        string written = refusal;
-        let inReach = this.parameterOfType(parameter);
-        if (inReach != null) {
-            written = "{refusal} Use a value of type '{name}', such as '{inReach.name()}'.";
-        } else if (this.frame().inCallableBody()) {
-            written = "{refusal} Use a value of type '{name}', such as a parameter declared '{name} value'.";
-        }
-        this.reporter().report(this.typeParameterMessage(parameter, written, position), at);
-    }
-
-    // The parameter in reach whose type is this one, innermost first, or null where none is. A
-    // local is left out, because naming one would need it to be assigned where it is named.
-    parameterOfType(Type type) -> LocalBinding? {
-        for (long i = this.frame().parametersInReach().length() - 1; i >= 0; i--) {
-            let binding = this.frame().parametersInReach().get(i);
-            if (binding.type() == type) {
-                return binding;
-            }
-        }
-        return null;
-    }
-
-    // What a refused type parameter reads: the collision where it took the name from another
-    // meaning of the file, the refusal of a position that can use no type parameter at all, and
-    // 'plain' where the name means nothing else there.
-    public typeParameterMessage(TypeParamType parameter, string plain, NamePosition position) -> string {
-        let asStatic = this.shadowedStaticMessage(parameter, position);
-        if (asStatic != null) {
-            return asStatic;
-        }
-        string name = parameter.name();
-        // 'obligationOwnerName' is the generic declaration whose body is being checked, which
-        // is the one whose header introduced the parameter.
-        string genericOwner = this.obligationOwnerName;
-        let taken = this.shadowedMeaning(name);
-        if (taken == null || genericOwner.length == 0) {
-            return this.resolver().typeParameterRefusal() ?? plain;
-        }
-        return typenames.typeParameterTookNameMessage(name, genericOwner, taken);
-    }
-
-    // A static of the enclosing type under the refused name, or null where it declares none. A
-    // static const is read through the plain type name, while a static method of a generic type
-    // needs the type arguments that only such a call itself could otherwise determine. Where the
-    // name was written as a call, reading the static const also means dropping the arguments.
-    shadowedStaticMessage(TypeParamType parameter, NamePosition position) -> string? {
-        let owner = this.frame().enclosingOwner();
-        if (owner == null) {
-            return null;
-        }
-        let authority = types.authorityOf(owner);
-        if (authority == null) {
-            return null;
-        }
-        string name = parameter.name();
-        string ownerName = authority.name();
-        string kind = "";
-        if (members.findField(typemembers.staticFieldsOf(owner), name) != null) {
-            kind = "static const";
-        } else if (members.findMethodNamed(typemembers.staticMethodsOf(owner), name) != null) {
-            kind = "static method";
-        } else {
-            return null;
-        }
-        string refusal = "'{name}' means the type parameter of '{ownerName}' here, not the {kind} "
-            + "'{ownerName}' declares, because inside '{ownerName}' the name '{name}' always means the "
-            + "type parameter.";
-        if (kind == "static method") {
-            return "{refusal} Rename one of the two.";
-        }
-        if (position == NamePosition.Call) {
-            return "{refusal} A static const is not called. Write '{ownerName}.{name}' to read it, or rename "
-                + "one of the two and remove the arguments.";
-        }
-        return "{refusal} Write '{ownerName}.{name}' to read the static const, or rename one of the two.";
-    }
-
-    // The meaning a type parameter took its name from, as the refusal names it, or null where
-    // the name means nothing else in the file.
-    shadowedMeaning(string name) -> string? {
-        let outside = this.resolveNameOutsideTypeParameters(name);
-        if (outside == null) {
-            return null;
-        }
-        switch (outside) {
-            is TypeName named -> {
-                return this.declaringPhrase(typenames.kindWordOf(named.target()),
-                    named.target().modulePath());
-            },
-            is FunctionName functions -> {
-                let offered = functions.fromPrelude();
-                if (offered == null) {
-                    return this.declaringPhrase("function", this.modulePath());
-                }
-                string[] paths = offered.modulePaths();
-                if (paths.length != 1) {
-                    return null;
-                }
-                return this.declaringPhrase("function", paths[0]);
-            },
-            is NamespaceName module -> {
-                return typenames.importedModulePhrase(module.targetModulePath());
-            },
-            default -> {
-                return null;
-            },
-        }
-    }
-
-    // Where a shadowed meaning is declared, as the refusal names it.
-    declaringPhrase(string kindWord, string modulePath) -> string {
-        return typenames.declaringPhrase(kindWord, modulePath, this.modulePath());
-    }
-
-    // How this file writes a value of the type, then how it reaches a static member of it. A
-    // route this file cannot spell is left out, and the fix is empty where it can spell neither.
-    typeAsValueFix(string spelling, Type named) -> string {
-        string value = this.valueRoute(spelling, named);
-        let staticMember = this.staticMemberExample(spelling, named);
-        if (staticMember == null) {
-            return value;
-        }
-        string purpose = "to read one of its static consts";
-        if (staticMember.endsWith(")")) {
-            purpose = "to call one of its static methods";
-        }
-        if (value.length == 0) {
-            return "Write '{staticMember}' {purpose}";
-        }
-        return "{value}, or write '{staticMember}' {purpose}";
-    }
-
-    // The way a value of the type is written where the refused name stands, or empty where this
-    // file can spell none. A primitive's values are its literals, which the refusal leaves to
-    // the reader.
-    valueRoute(string spelling, Type named) -> string {
-        let authority = types.authorityOf(named);
-        if (authority == null) {
-            return "";
-        }
-        switch (authority) {
-            is InterfaceType ignored -> {
-                return "Use a value of a class that implements it";
-            },
-            is EnumType enumType -> {
-                string[] constants = enumType.memberNames();
-                if (constants.length == 0) {
-                    return "";
-                }
-                return "Write '{spelling}.{constants[0]}' to use one of its members";
-            },
-            is ClassType classType -> {
-                if (classType.isAbstract()) {
-                    return "Use a value of a subclass that is not abstract";
-                }
-                // Constructing a generic class needs type arguments, and an example cannot put
-                // one there that the use site has a name for.
-                if (classType.isGeneric()) {
-                    return "";
-                }
-                let arguments = this.classConstructionArguments(classType);
-                if (arguments == null) {
-                    return "";
-                }
-                return "Write 'new {spelling}{arguments}' to construct one";
-            },
-            is StructType structType -> {
-                // A generic struct needs type arguments in its constructor call and in the
-                // literal alike, and an example cannot name one.
-                if (structType.isGeneric()) {
-                    return "";
-                }
-                return this.structValueRoute(spelling, structType);
-            },
-            default -> {
-                return "";
-            },
-        }
-    }
-
-    // How a struct value is written: a constructor call, or an aggregate literal where this file
-    // can reach no constructor.
-    structValueRoute(string spelling, Type structType) -> string {
-        let arguments = this.reachableConstructorArguments(structType);
-        if (arguments != null) {
-            return "Write '{spelling}{arguments}' to construct one";
-        }
-        let literal = this.structLiteralExample(spelling, structType);
-        if (literal == null) {
-            return "";
-        }
-        return "Write '{literal}' to build one";
-    }
-
-    // A declaration that builds the struct from an aggregate literal, naming every field the
-    // literal has to set. Null where a field it has to set cannot be set from this file.
-    structLiteralExample(string spelling, Type structType) -> string? {
-        let fields = typemembers.fieldsOf(structType);
-        if (fields == null) {
-            return null;
-        }
-        let listed = new StringBuilder();
-        for (long i = 0; i < fields.length(); i++) {
-            let field = fields.get(i);
-            if (field.hasDefault()) {
-                continue;
-            }
-            if (!memberaccess.isAccessAllowed(this, field.visibility(), field.definingType())) {
-                return null;
-            }
-            if (!listed.isEmpty()) {
-                listed.append(", ");
-            }
-            listed.append("{field.name()}: ...");
-        }
-        return "{spelling} value = \{{listed.toString()}\};";
-    }
-
-    // The argument list a 'new' of the class writes, or null where this file can reach no
-    // constructor of it.
-    public classConstructionArguments(Type classType) -> string? {
-        if (typemembers.constructorsOf(classType).length() > 0) {
-            return this.reachableConstructorArguments(classType);
-        }
-        if (this.reachesImplicitConstruction(classType)) {
-            return "()";
-        }
-        return null;
-    }
-
-    // '()' where a constructor this file can reach takes no argument, '(...)' where the ones it
-    // can reach take arguments, and null where it can reach none.
-    reachableConstructorArguments(Type record) -> string? {
-        let constructors = typemembers.constructorsOf(record);
-        bool anyReachable = false;
-        for (long i = 0; i < constructors.length(); i++) {
-            let candidate = constructors.get(i);
-            if (!this.resolver().memberExists(candidate)
-                    || !memberaccess.isAccessAllowed(this, candidate.visibility(),
-                        candidate.definingType())) {
-                continue;
-            }
-            if (calls.requiredArgumentCount(candidate.signature()) == 0) {
-                return "()";
-            }
-            anyReachable = true;
-        }
-        if (anyReachable) {
-            return "(...)";
-        }
-        return null;
-    }
-
-    // Whether a class that declares no constructor of its own is constructed with no arguments.
-    // Its implicit chain must run a base constructor that exists here, or none at all.
-    reachesImplicitConstruction(Type classType) -> bool {
-        let chain = typemembers.implicitBaseConstructor(classType);
-        if (chain.owner() == null) {
-            return true;
-        }
-        let chosen = chain.chosen();
-        return chosen != null && this.resolver().memberExists(chosen);
-    }
-
-    // One static member of the type this file can reach, written after 'spelling'. A type-level
-    // const reads as a value on its own and a static method reads as a call.
-    staticMemberExample(string spelling, Type named) -> string? {
-        let fields = typemembers.staticFieldsOf(named);
-        if (fields != null) {
-            for (long i = 0; i < fields.length(); i++) {
-                let field = fields.get(i);
-                if (memberaccess.isAccessAllowed(this, field.visibility(), field.definingType())) {
-                    return "{spelling}.{field.name()}";
-                }
-            }
-        }
-        let authority = types.authorityOf(named);
-        // A static method of a generic type may need type arguments that only the arguments of
-        // the call itself determine.
-        if (authority != null && authority.isGeneric()) {
-            return null;
-        }
-        let methods = typemembers.staticMethodsOf(named);
-        if (methods == null) {
-            return null;
-        }
-        for (long i = 0; i < methods.length(); i++) {
-            let method = methods.get(i);
-            if (!memberaccess.isAccessAllowed(this, method.visibility(), method.definingType())) {
-                continue;
-            }
-            let call = callExample("{spelling}.{method.name()}", method.signature());
-            if (call != null) {
-                return call;
-            }
-        }
-        return null;
-    }
-
-    // 'spelling' is how this file writes the function's name, which is 'module.name' where a
-    // module qualifies it, and 'head' is the name it starts with. 'wanted' is the function type
-    // expected where it is written.
-    public reportFunctionAsValue(string spelling, List<FunctionEntry> entries, Span at, string head,
-                          FunctionType? wanted) {
-        if (wanted != null) {
-            let signatures = new List<Signature>();
-            for (let entry in entries) {
-                signatures.push(entry.signature());
-            }
-            let fix = functionvalues.lambdaFix(this, "function", spelling, signatures.toArray(), wanted,
-                head);
-            this.reporter().report(functionvalues.functionValueRefusal("'{spelling}' is a function", fix,
-                spelling), at);
-            return;
-        }
-        bool bare = true;
-        bool throwing = entries.length() > 0;
-        for (let entry in entries) {
-            if (entry.signature().parameters().length > 0) {
-                bare = false;
-            }
-            if (!entry.signature().declaresThrows()) {
-                throwing = false;
-            }
-        }
-        string call = "{spelling}(...)";
-        if (bare) {
-            call = "{spelling}()";
-        }
-        if (throwing) {
-            call = "try " + call;
-        }
-        string message = "'{spelling}' is a function, and a function's name is not a value. "
-            + "Call it as '{call}', or wrap it in a lambda";
-        let example = this.lambdaDeclarationFor(spelling, entries);
-        if (example == null) {
-            this.reporter().report(message + ".", at);
-            return;
-        }
-        this.reporter().report(message + ", as in '{example}'.", at);
-    }
-
-    reportModuleAsValue(string name, string targetPath, Span at) {
-        this.reportModuleRefusal("'{name}' names a module, not a value.", name, targetPath, at);
-    }
-
-    public reportModuleAsCall(string name, string targetPath, Span at) {
-        this.reportModuleRefusal("'{name}' names a module, not a function.", name, targetPath,
-            at);
-    }
-
-    // 'refusal' is the sentence the position writes, and 'name' is how this file writes the
-    // module. The example calls a function the module declares, because a type it declares is
-    // refused in a value position too.
-    reportModuleRefusal(string refusal, string name, string targetPath, Span at) {
-        let called = this.moduleFunctionExample(name, targetPath);
-        if (called == null) {
-            this.reporter().report(refusal, at);
-            return;
-        }
-        this.reporter().report(refusal + " Write one of its functions after the module name, as in "
-            + "'{called}'.", at);
-    }
-
-    // A call this file can write to a function the module declares, or null where it can write
-    // none. The module's declaration order decides which function that is, and the functions the
-    // language provides in every module are not among them.
-    moduleFunctionExample(string name, string targetPath) -> string? {
-        let target = this.contextsByPath().get(targetPath);
-        if (target == null) {
-            return null;
-        }
-        string targetPackagePrefix = target.module().packagePrefix();
-        let entries = target.functions().all();
-        for (long i = 0; i < entries.length(); i++) {
-            let entry = entries.get(i);
-            if (entry.isBuiltin()) {
-                continue;
-            }
-            if (!types.isVisibleFrom(entry.visibility(), targetPath, targetPackagePrefix,
-                    this.modulePath(), this.packagePrefix())) {
-                continue;
-            }
-            let signature = entry.signature();
-            let call = callExample("{name}.{signature.name()}", signature);
-            if (call != null) {
-                return call;
-            }
-        }
-        return null;
-    }
-
-    // A declaration holding a lambda that calls the named function, or null when the name has no
-    // one function type this file can write. Several overloads, a generic, an 'out' parameter, a
-    // 'throws' whose types the body decides, and a type this file cannot name each leave none.
-    lambdaDeclarationFor(string spelling, List<FunctionEntry> entries) -> string? {
-        if (entries.length() != 1) {
-            return null;
-        }
-        let signature = entries.get(0).signature();
-        Type[] thrown = signature.throwsTypes();
-        if (signature.isGeneric() || (signature.declaresThrows() && thrown.length == 0)) {
-            return null;
-        }
-        let parameterTypes = new List<Type>();
-        let passed = new StringBuilder();
-        for (let parameter in signature.parameters()) {
-            if (parameter.isOut()) {
-                return null;
-            }
-            if (parameterTypes.length() > 0) {
-                passed.append(", ");
-            }
-            parameterTypes.push(parameter.type());
-            passed.append(parameter.name());
-        }
-        Type held = this.store().functionOf(parameterTypes.toArray(), signature.returnType(),
-            thrown);
-        if (!this.names().canSpell(held)) {
-            return null;
-        }
-        string typeText = this.names().of(held);
-        string arguments = passed.toString();
-        if (thrown.length > 0) {
-            return "({typeText}) callback = ({arguments}) -> try {spelling}({arguments});";
-        }
-        return "{typeText} callback = ({arguments}) -> {spelling}({arguments});";
-    }
-
-    // The enclosing type's name when it declares a static under the given name, for the
-    // uniform-access suggestion; null otherwise.
-    public staticSuggestionOwner(string name) -> string? {
-        let owner = this.frame().enclosingOwner();
-        if (owner == null) {
-            return null;
-        }
-        if (members.findField(typemembers.staticFieldsOf(owner), name) == null
-                && members.findMethodNamed(typemembers.staticMethodsOf(owner), name) == null) {
-            return null;
-        }
-        let authority = types.authorityOf(owner);
-        if (authority == null) {
-            return null;
-        }
-        return authority.name();
-    }
-
-    // How a refusal names a function value called by 'calleeName', which is empty for one with no name.
-    public functionValueName(string calleeName) -> string {
-        if (calleeName.length == 0) {
-            return "this function value";
-        }
-        return "'{calleeName}'";
-    }
-
-    // The refusal of the static 'name' of the enclosing type 'ownerName', written without the type
-    // name in front. 'called' is true when the code calls it, and 'wanted' is the function type
-    // expected where it is written.
-    public staticWithoutType(string name, string ownerName, bool called,
-                             FunctionType? wanted = null) -> string {
-        let owner = this.frame().enclosingOwner();
-        string kind = "static method";
-        if (owner != null) {
-            let field = members.findField(typemembers.staticFieldsOf(owner), name);
-            if (field != null && field.isLazy()) {
-                kind = "lazy const";
-            } else if (field != null) {
-                kind = "static const";
-            }
-        }
-        if (kind == "static method") {
-            string refusal = "'{name}' is a static method of '{ownerName}', and a static method is always "
-                + "called through its type name, even inside '{ownerName}'.";
-            if (wanted != null && owner != null) {
-                let statics = memberaccess.staticsNamed(owner, name);
-                let fix = functionvalues.lambdaFix(this, "method", name,
-                    staticmembers.reachedSignatures(this, statics, wanted), wanted, ownerName);
-                if (fix.fit() != LambdaFit.Called) {
-                    string spelling = "'{fix.before()}{ownerName}.{name}{fix.after()}'";
-                    return "{refusal} {functionvalues.nameNotValueText(fix, spelling)}";
-                }
-            }
-            return "{refusal} Write '{ownerName}.{name}(...)'.";
-        }
-        string refusal = "'{name}' is a {kind} of '{ownerName}', and a {kind} is always read through its "
-            + "type name, even inside '{ownerName}'. Write '{ownerName}.{name}'.";
-        if (called) {
-            return "{refusal} A {kind} is not called, so remove the arguments as well.";
-        }
-        return refusal;
-    }
-
-    analyzeThis(ThisExpressionNode node) -> Type {
-        let receiver = this.frame().thisType();
-        if (receiver == null) {
-            if (this.frame().inStaticMethod()) {
-                this.reporter().report("'this' is the object a method was called on, and a static method "
-                    + "is not called on an object. Take the object as a parameter, or remove 'static'.",
-                    node.thisKeyword().span());
-            } else {
-                this.reporter().report("'this' is the object a method was called on, so it is only "
-                    + "available inside a method. Pass the object as a parameter, or move this code into a "
-                    + "method.", node.thisKeyword().span());
-            }
-            return this.store().errorType();
-        }
-        this.captureReceiver(receiver, node.thisKeyword().span());
-        return receiver;
-    }
-
-    analyzeSuper(SuperExpressionNode node) -> Type {
-        let receiver = this.frame().thisType();
-        if (receiver == null) {
-            if (this.frame().inStaticMethod()) {
-                this.reporter().report("'super' is the part of the object a method was called on that its "
-                    + "base class declares, and a static method is not called on an object. Remove 'static' "
-                    + "to make it an instance method.", node.superKeyword().span());
-            } else {
-                this.reporter().report("'super' is the part of the object a method was called on that its "
-                    + "base class declares, so it is only available inside a method. Move this code into a "
-                    + "method of the subclass.", node.superKeyword().span());
-            }
-            return this.store().errorType();
-        }
-        let base = hierarchy.baseOf(receiver);
-        if (base == null) {
-            let authority = types.authorityOf(receiver);
-            string shown = this.names().of(receiver);
-            if (authority != null) {
-                shown = authority.name();
-            }
-            this.reporter().report("'super' cannot be used in '{shown}', because '{shown}' has no base "
-                + "class. Remove 'super', or give '{shown}' a base class with 'extends'.",
-                node.superKeyword().span());
-            return this.store().errorType();
-        }
-        this.captureReceiver(receiver, node.superKeyword().span());
-        return base;
-    }
+    // ---- 'new' expressions ----
 
     // The head this file writes for a struct a diagnostic offers to build, or null where it has
     // no spelling for it. An instantiation keeps its type arguments, which its literal and its
@@ -3227,7 +2243,7 @@ public final class BodyChecker implements NoreturnCalls {
         let head = this.structHead(structType, name);
         string? literal = null;
         if (head != null) {
-            literal = this.structLiteralExample(head, structType);
+            literal = identifiers.structLiteralExample(this, head, structType);
         }
         if (literal == null) {
             this.reporter().report(refusal + " Add a 'constructor(...)' to it.", node.span());
@@ -3244,7 +2260,7 @@ public final class BodyChecker implements NoreturnCalls {
         let head = this.structHead(structType, written);
         string route = "";
         if (head != null) {
-            route = this.structValueRoute(head, structType);
+            route = identifiers.structValueRoute(this, head, structType);
         }
         if (route.length == 0) {
             this.reporter().report(refusal + " Remove 'new', and add a 'constructor(...)' to '{written}' to "
@@ -3320,8 +2336,6 @@ public final class BodyChecker implements NoreturnCalls {
             arguments, node.span(), this.names().of(target));
         return target;
     }
-
-    // ---- 'new' expressions ----
 
     // analyzeCall for a 'new' expression. The arguments of a generic type's constructor reach the
     // object it builds.
@@ -3573,7 +2587,7 @@ public final class BodyChecker implements NoreturnCalls {
     }
 
     inRawStorageAllocator() -> bool {
-        return this.modulePath() == "std.collections.rawarray" && this.obligationOwnerName == "RawArray";
+        return this.modulePath() == "std.collections.rawarray" && this.genericOwnerName == "RawArray";
     }
 
     // Records single-dimension array-new declaration initializers (for diagnostic wording)
@@ -4350,36 +3364,6 @@ isFinalClass(Type type) -> bool {
 // implemented, so it has none even though it counts as floating-point elsewhere.
 public isTextualFloat(Type core) -> bool {
     return convert.isFloatType(core) && !types.isDecimalType(core);
-}
-
-parameterCountText(long count) -> string {
-    if (count == 1) {
-        return "1 parameter";
-    }
-    return "{count} parameters";
-}
-
-// A lambda of the right arity, as a diagnostic shows the shape to write: '(a, b) -> ...'.
-lambdaShapeExample(long count) -> string {
-    let builder = new StringBuilder();
-    builder.append("(");
-    for (long i = 0; i < count; i++) {
-        if (i > 0) {
-            builder.append(", ");
-        }
-        builder.append(parameterExampleName(i));
-    }
-    builder.append(") -> ...");
-    return builder.toString();
-}
-
-parameterExampleName(long index) -> string {
-    return switch (index) {
-        0 -> "a",
-        1 -> "b",
-        2 -> "c",
-        default -> "p{index + 1}",
-    };
 }
 
 public enumOrdinal(EnumType enumType, string memberName) -> long {
