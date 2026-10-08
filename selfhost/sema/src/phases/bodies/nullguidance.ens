@@ -1,0 +1,1126 @@
+// What a refusal about a value that may be null or that can change says to do instead: the null
+// checks, the locals to copy into, and the operand and assignment texts that name them.
+import CatchClauseNode from @ens.frontend.syntax.generated.nodes;
+import SyntaxNode from @ens.frontend.syntax.node;
+import Expression from @ens.frontend.syntax.generated.nodes;
+import VariableDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import ForEachStatementNode from @ens.frontend.syntax.generated.nodes;
+import SwitchExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SwitchArm from @ens.frontend.syntax.generated.nodes;
+import ValueArmNode from @ens.frontend.syntax.generated.nodes;
+import TypeArmNode from @ens.frontend.syntax.generated.nodes;
+import DefaultArmNode from @ens.frontend.syntax.generated.nodes;
+import ErrorSwitchArmNode from @ens.frontend.syntax.generated.nodes;
+import ArmBody from @ens.frontend.syntax.generated.nodes;
+import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ThisExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SuperExpressionNode from @ens.frontend.syntax.generated.nodes;
+import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ParameterNode from @ens.frontend.syntax.generated.nodes;
+import LambdaParameterNode from @ens.frontend.syntax.generated.nodes;
+import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SafeMemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SubscriptExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SafeSubscriptExpressionNode from @ens.frontend.syntax.generated.nodes;
+import TernaryExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SyntaxKind from @ens.frontend.syntax.generated.kind;
+import GreenElement from @ens.frontend.syntax.green;
+import GreenNode from @ens.frontend.syntax.green;
+import support.diagnostics;
+import model.convert;
+import phases.bodies.wording;
+import phases.bodies.narrowing;
+import model.hierarchy;
+import model.typemembers;
+import Field from model.typemembers;
+import model.typenames;
+import TypeNames from model.typenames;
+import model.types;
+import Type from model.types;
+import ErrorType from model.types;
+import NullType from model.types;
+import OptionalType from model.types;
+import ArrayType from model.types;
+import ClassType from model.types;
+import List from @std.collections.list;
+import phases.bodies;
+import BodyChecker from phases.bodies;
+import WriteTarget from phases.bodies;
+import MissingMember from phases.bodies;
+
+// How a refusal describes a field or element that can change, as in "'t.count' is a field".
+class UnstableStepWords {
+    protected string kind;
+    protected string noun;
+    protected string change;
+    protected string place;
+
+    protected constructor(this.kind, this.noun, this.change, this.place);
+}
+
+// The kind of fix a nullable operand takes.
+public enum OperandForm {
+    Present,
+    Stable,
+    Copied,
+    Stored,
+    Guarded,
+    NoFix,
+}
+
+// One operand of a refused operator and the fix it takes. 'held' spells the value once the fix is
+// written, or is empty.
+public final class NullableOperand {
+    protected OperandForm operandForm;
+    protected long levels;
+    protected string spelling;
+    protected string heldSpelling;
+    protected string localName;
+    protected string declarationText;
+    protected UnstableStepWords? words;
+    protected string callee;
+    protected string writeBack;
+    protected string stores;
+    protected string guard;
+    protected bool wholeCall;
+    protected bool calls;
+    protected bool everyLevel = true;
+    protected bool writes = false;
+
+    protected constructor(this.operandForm, this.levels, this.spelling, this.heldSpelling, this.localName,
+                          this.declarationText, this.words, this.callee, this.writeBack, this.stores,
+                          this.guard, this.wholeCall, this.calls);
+
+    public form() -> OperandForm {
+        return this.operandForm;
+    }
+
+    public held() -> string {
+        return this.heldSpelling;
+    }
+
+    public local() -> string {
+        return this.localName;
+    }
+
+    public declaration() -> string {
+        return this.declarationText;
+    }
+}
+
+// A field or element access through '.', '?.', '[' or '?['. 'safe' marks '?.' and '?['.
+public final class AccessStep {
+    protected Expression stepReceiver;
+    protected string? stepMember;
+    protected Expression? stepIndex;
+    protected bool isSafe;
+
+    protected constructor(this.stepReceiver, this.stepMember, this.stepIndex, this.isSafe);
+
+    // The access on one line, with '?.' spelled '.' and '?[' spelled '['.
+    protected plainSpelling() -> string {
+        string object = wording.oneLineSpelling(this.stepReceiver);
+        let index = this.stepIndex;
+        if (index != null) {
+            return "{object}[{wording.oneLineSpelling(index)}]";
+        }
+        return "{object}.{this.stepMember ?? ""}";
+    }
+
+    public receiver() -> Expression {
+        return this.stepReceiver;
+    }
+
+    public member() -> string? {
+        return this.stepMember;
+    }
+
+    public index() -> Expression? {
+        return this.stepIndex;
+    }
+
+    public safe() -> bool {
+        return this.isSafe;
+    }
+}
+
+// The outermost step that keeps a value from being a stable place, which is an array element
+// or an instance field that is not 'const'. Null when the value reads neither. A field read
+// through its type name is never the step. Its declaration is refused without 'const'.
+unstableStep(BodyChecker checker, Expression expression) -> Expression? {
+    Expression core = wording.unwrapParentheses(expression);
+    switch (core) {
+        is MemberExpressionNode member -> {
+            if (checker.result().staticConstFieldOf(member.green()) != null) {
+                return null;
+            }
+            if (!readsConstField(checker, member)) {
+                return member;
+            }
+            return unstableStep(checker, member.object());
+        },
+        is SubscriptExpressionNode subscript -> {
+            return subscript;
+        },
+        default -> {
+            return null;
+        },
+    }
+}
+
+// Whether the member access reads a 'const' field, either an instance field or a static or
+// lazy one reached through its type. False when the object has no analyzed type.
+public readsConstField(BodyChecker checker, MemberExpressionNode member) -> bool {
+    let typeLevel = checker.result().staticConstFieldOf(member.green());
+    if (typeLevel != null) {
+        return typeLevel.isConst();
+    }
+    let field = accessedField(checker, member);
+    return field != null && field.isConst();
+}
+
+// The field a member access reads through '.' or '?.'. Null when it reads none, or when the
+// object has no analyzed type.
+public accessedField(BodyChecker checker, Expression expression) -> Field? {
+    let access = accessStep(expression);
+    if (access == null) {
+        return null;
+    }
+    let name = access.member();
+    let objectType = checker.result().typeOf(access.receiver().green());
+    if (name == null || objectType == null) {
+        return null;
+    }
+    return typemembers.inheritedOrOwnField(convert.coreOf(objectType), name);
+}
+
+// Why a type test on the value proves nothing for a later read, and the local copy that does.
+// Null when the value reads no array element and no field that is not 'const'.
+public unstableTestGuidance(BodyChecker checker, Expression value) -> string? {
+    return copiedGuidance(checker, value, "type test", "test");
+}
+
+// The copy advice for a value read from a field or an element, for a check named 'check'.
+copiedGuidance(BodyChecker checker, Expression value, string check, string verb) -> string? {
+    let operand = classifyOperand(checker, value, 1, "", false);
+    if (operand.form() != OperandForm.Copied) {
+        return null;
+    }
+    return copiedAdvice([operand], check, verb);
+}
+
+// The null guidance for a binary operator, or null unless it takes both sides without their '?'.
+// A write target's fix writes the result back to it.
+public binaryGuidance(BodyChecker checker, Expression leftNode, Expression rightNode, Type left, Type right,
+                      bool accepted, WriteTarget? written, string operatorText) -> string? {
+    if (!accepted) {
+        return null;
+    }
+    return operandsAdvice(classifyOperands(checker, leftNode, rightNode, left, right, written), operatorText);
+}
+
+// The null guidance for a unary operator, or null unless it takes the operand without its '?'.
+// A write target's fix writes the result back to it.
+public unaryGuidance(BodyChecker checker, Expression operand, Type type, bool accepted,
+                     WriteTarget? written) -> string? {
+    long levels = wording.optionalLevels(type);
+    if (written != null) {
+        levels = written.nullLevels();
+    }
+    if (!accepted || levels == 0) {
+        return null;
+    }
+    return operandsAdvice([classifyOperand(checker, operand, levels, "", written != null)]);
+}
+
+// The null guidance for 'value' of type 'type' in a use that takes one '?', or an empty string
+// unless the type has more.
+public oneLevelGuidance(BodyChecker checker, Expression value, Type type) -> string {
+    if (!(type is OptionalType) || !(type.inner() is OptionalType)) {
+        return "";
+    }
+    return nullGuidance(checker, value, type, wording.optionalLevels(type) - 1) ?? "";
+}
+
+// The null guidance for 'value' of type 'type' where a use takes it with 'levels' fewer '?'.
+public nullGuidance(BodyChecker checker, Expression value, Type type, long levels) -> string? {
+    let branches = new List<Expression>();
+    collectNullableBranches(checker, wording.unwrapParentheses(value), branches);
+    if (branches.length() == 0 || !isJoin(wording.unwrapParentheses(value))) {
+        let operand = classifyOperand(checker, value, levels, "", false);
+        operand.everyLevel = levels == wording.optionalLevels(type);
+        return operandsAdvice([operand]);
+    }
+    let operands = new List<NullableOperand>();
+    for (let branch in branches) {
+        long own = wording.optionalLevels(checker.recordedType(branch));
+        long used = own;
+        if (levels < own) {
+            used = levels;
+        }
+        let operand = classifyOperand(checker, branch, used, "", false);
+        operand.everyLevel = used == own;
+        operands.push(operand);
+    }
+    NullableOperand[] classified = operands.toArray();
+    let advice = operandsAdvice(classified);
+    if (advice == null || advice.endsWith("'??'.") || advice.endsWith("once for each '?'.")) {
+        return advice;
+    }
+    string clause = fallbackAdvice(classified, true) ?? "";
+    if (clause.length == 0) {
+        return advice;
+    }
+    return "{advice.substring(0, advice.length - 1)}, or s{clause.substring(1)}";
+}
+
+// Adds to 'found' each value of the '?:' or switch 'value', through nested ones, whose type may
+// be null.
+collectNullableBranches(BodyChecker checker, Expression value, List<Expression> found) {
+    switch (value) {
+        is TernaryExpressionNode ternary -> {
+            collectNullableBranches(checker, wording.unwrapParentheses(ternary.thenValue()), found);
+            collectNullableBranches(checker, wording.unwrapParentheses(ternary.elseValue()), found);
+        },
+        is SwitchExpressionNode join -> {
+            for (let arm in bodies.armsOfExpression(join)) {
+                let body = armValue(arm);
+                if (body != null) {
+                    collectNullableBranches(checker, wording.unwrapParentheses(body), found);
+                }
+            }
+        },
+        default -> {
+            if (checker.recordedType(value) is OptionalType) {
+                found.push(value);
+            }
+        },
+    }
+}
+
+// 'opening', which the words 'may be null' continue, with the null guidance for 'value' of type
+// 'type' in a use that takes none of its '?'.
+public maybeNullRefusal(BodyChecker checker, string opening, Expression value, Type type) -> string {
+    long levels = wording.optionalLevels(type);
+    string why = "{opening} may be null here.";
+    if (levels > 1) {
+        why = "{opening} may be null at more than one level.";
+    }
+    return withGuidance(checker, why, nullGuidance(checker, value, type, levels));
+}
+
+// Both operands of a binary operator and their fixes. Two locals that would share a name get
+// 'left' and 'right' in front of it.
+classifyOperands(BodyChecker checker, Expression leftNode, Expression rightNode, Type left, Type right,
+                 WriteTarget? written) -> NullableOperand[] {
+    long leftLevels = wording.optionalLevels(left);
+    if (written != null) {
+        leftLevels = written.nullLevels();
+    }
+    bool writesBack = written != null;
+    let first = classifyOperand(checker, leftNode, leftLevels, "", writesBack);
+    let second = classifyOperand(checker, rightNode, wording.optionalLevels(right), "", false);
+    if (first.local().length > 0 && first.local() == second.local() && !samePlace(first, second)) {
+        first = classifyOperand(checker, leftNode, leftLevels, "left", writesBack);
+        second = classifyOperand(checker, rightNode, second.levels, "right", false);
+    }
+    return [first, second];
+}
+
+// The operand and its fix for the 'levels' of null that a refusal names. An operand gets no fix
+// where no statement can go.
+public classifyOperand(BodyChecker checker, Expression operand, long levels, string prefix,
+                       bool writesBack) -> NullableOperand {
+    string spelling = wording.oneLineSpelling(wording.unwrapParentheses(operand));
+    OperandForm form = OperandForm.NoFix;
+    string held = "";
+    string local = "";
+    string declaration = "";
+    UnstableStepWords? words = null;
+    string callee = "";
+    string writeBack = "";
+    string stores = "";
+    string guard = "";
+    let step = unstableStep(checker, operand);
+    if (step == null && writesBack) {
+        step = safeStep(checker, operand);
+    }
+    let call = storedCall(checker, operand);
+    let read = accessStep(wording.unwrapParentheses(operand));
+    if (levels == 0) {
+        form = OperandForm.Present;
+        held = wording.oneLineSpelling(operand);
+    } else if (!checker.frame().statementsAllowed()) {
+        form = OperandForm.NoFix;
+    } else if (narrowing.buildNarrowingPath(checker, operand) != null) {
+        form = OperandForm.Stable;
+        held = wording.simpleSpelling(operand) ?? spelling;
+    } else if (read != null && read.safe() && !writesBack) {
+        if (levels == 1) {
+            form = OperandForm.Guarded;
+            guard = wording.oneLineSpelling(wording.unwrapParentheses(read.receiver()));
+            let slot = checker.safeSlotType(wording.unwrapParentheses(operand));
+            if (narrowing.buildNarrowingPath(checker, read.receiver()) != null && slot != null
+                    && !(slot is OptionalType)) {
+                held = read.plainSpelling();
+            }
+        }
+    } else if (checker.frame().inLoopCondition() && (step != null || call != null)) {
+        form = OperandForm.NoFix;
+    } else if (step != null || call != null) {
+        Expression source = wording.unwrapParentheses(operand);
+        string base = "value";
+        if (step != null) {
+            form = OperandForm.Copied;
+            source = step;
+        } else if (call != null) {
+            form = OperandForm.Stored;
+            callee = calleeName(call) ?? "";
+            base = storedResultName(call, callee);
+        }
+        let access = accessStep(source);
+        string copied = wording.oneLineSpelling(source);
+        string copyRead = copied;
+        if (access != null) {
+            base = access.member() ?? base;
+            if (access.safe()) {
+                copied = access.plainSpelling();
+            }
+        }
+        local = freeLocalName(checker, prefix, base);
+        declaration = "let {local} = {copyRead};";
+        if (step != null) {
+            words = unstableWords(checker, step, copied);
+        }
+        if (access != null && step != null && writesBack) {
+            Expression receiver = wording.unwrapParentheses(access.receiver());
+            let index = access.index();
+            bool receiverCalls = containsCall(receiver.green());
+            bool indexCalls = index != null && containsCall(index.green());
+            if (receiverCalls && !holdsReference(checker, receiver)) {
+                form = OperandForm.NoFix;
+            } else if (receiverCalls || indexCalls) {
+                string stored = "";
+                string place = wording.oneLineSpelling(receiver);
+                string holder = "";
+                string what = "the field";
+                if (index != null) {
+                    what = "the element";
+                }
+                if (indexCalls) {
+                    what = "the index and {what}";
+                }
+                if (receiverCalls) {
+                    holder = freeLocalName(checker, prefix, receiverName(checker, receiver));
+                    stored = "let {holder} = {place}; ";
+                    string named = "'{place}'";
+                    if (receiver is CallExpressionNode) {
+                        named = "the result of {named}";
+                    }
+                    what = indexCalls ? "{named}, {what}" : "{named} and {what}";
+                    place = holder;
+                    local = freeLocalName(checker, prefix, base, holder);
+                }
+                string accessor = ".{base}";
+                if (index != null && indexCalls) {
+                    string at = freeLocalName(checker, "", "at", holder);
+                    stored = "{stored}let {at} = {wording.oneLineSpelling(index)}; ";
+                    accessor = "[{at}]";
+                } else if (index != null) {
+                    accessor = "[{wording.oneLineSpelling(index)}]";
+                }
+                string safe = "";
+                if (access.safe()) {
+                    safe = "?";
+                }
+                declaration = "{stored}let {local} = {place}{safe}{accessor};";
+                writeBack = "'{place}{accessor}'";
+                stores = what;
+            } else if (namesStorage(checker, receiver)) {
+                writeBack = "'{copied}'";
+            }
+        }
+        string rest = memberSteps(operand, source);
+        held = local + rest;
+        spelling = copied + rest;
+    }
+    let classified = new NullableOperand(form, levels, spelling, held, local, declaration, words,
+        callee, writeBack, stores, guard, wording.unwrapParentheses(operand) is CallExpressionNode,
+        containsCall(operand.green()));
+    classified.writes = writesBack;
+    return classified;
+}
+
+// A write through '?.' or '?[' as the step that the same write without its '?' lands in.
+// Null when a null check cannot narrow the value in front of the '?'.
+safeStep(BodyChecker checker, Expression operand) -> Expression? {
+    Expression core = wording.unwrapParentheses(operand);
+    let access = accessStep(core);
+    if (access != null && access.safe() && narrowing.buildNarrowingPath(checker, access.receiver()) != null) {
+        return core;
+    }
+    return null;
+}
+
+// The base name of the local a receiver that makes a call is stored in. That is the member's
+// name for a field, the callee's for a call, and 'element' for an array element.
+receiverName(BodyChecker checker, Expression receiver) -> string {
+    let access = accessStep(receiver);
+    if (access != null) {
+        return access.member() ?? "element";
+    }
+    if (receiver is CallExpressionNode) {
+        let callee = calleeName(receiver);
+        if (callee != null) {
+            return storedResultName(receiver, callee);
+        }
+    }
+    return "value";
+}
+
+// The call a value is read from, directly or through 'const' fields of its result.
+// Null when the value reads no call that way, or the called function has no name.
+storedCall(BodyChecker checker, Expression operand) -> CallExpressionNode? {
+    Expression core = wording.unwrapParentheses(operand);
+    while (core is MemberExpressionNode && readsConstField(checker, core)) {
+        core = wording.unwrapParentheses(core.object());
+    }
+    if (core is CallExpressionNode && calleeName(core) != null) {
+        return core;
+    }
+    return null;
+}
+
+// The base name, joined to the prefix when there is one, and numbered from 2 when the name is
+// taken where the fix would declare it or is the name of another local the same fix declares.
+public freeLocalName(BodyChecker checker, string prefix, string base, string declared = "") -> string {
+    string name = base;
+    if (prefix.length > 0) {
+        name = joinedName(prefix, base);
+    }
+    string candidate = name;
+    for (long number = 2; nameTaken(checker, candidate) || candidate == declared; number++) {
+        candidate = "{name}{number}";
+    }
+    return candidate;
+}
+
+// Whether the expression's value is a reference, so a local copy of it points at the same object.
+holdsReference(BodyChecker checker, Expression expression) -> bool {
+    let type = checker.result().typeOf(expression.green());
+    return type != null && (types.isClassLike(type) || type is ArrayType);
+}
+
+// Whether the name already means something where a fix would declare a local of that name.
+nameTaken(BodyChecker checker, string name) -> bool {
+    let current = checker.currentScope();
+    if (current != null && current.lookup(name) != null) {
+        return true;
+    }
+    if (checker.resolver().typeParameterNamed(name) != null
+            || checker.resolveNameOutsideTypeParameters(name) != null) {
+        return true;
+    }
+    let callable = checker.frame().callableSyntax();
+    return callable != null && declaresName(callable, name);
+}
+
+// The sentence that points two strings at 'compareTo', spelled with the operands' own names.
+// An operand with no spelling gets a description of the result instead.
+public orderingAdvice(BodyChecker checker, string operatorText, Expression leftNode, Expression rightNode,
+                      Type left, Type right) -> string {
+    let operands = classifyOperands(checker, leftNode, rightNode, left, right, null);
+    let first = operands[0];
+    let second = operands[1];
+    if (first.held().length == 0 || second.held().length == 0) {
+        return "Order strings with 'compareTo'. Its result is below zero when the string it is "
+            + "called on sorts before the argument.";
+    }
+    string receiver = first.held();
+    if (first.form() == OperandForm.Present && !wording.isSingleTerm(leftNode)) {
+        receiver = "({first.held()})";
+    }
+    return "Order strings with 'compareTo', as in '{receiver}.compareTo({second.held()}) {operatorText} 0'.";
+}
+
+// How a refusal describes the step that keeps a value from being stable, a field or an element,
+// spelled as 'spelled'.
+unstableWords(BodyChecker checker, Expression step, string spelled) -> UnstableStepWords {
+    string place = "'{spelled}'";
+    let access = accessStep(step);
+    if (access == null || access.member() == null) {
+        return new UnstableStepWords("an array element", "element", "change", place);
+    }
+    let field = accessedField(checker, step);
+    if (field != null && field.isWeak()) {
+        return new UnstableStepWords("a 'weak' field", "field", "become null", place);
+    }
+    return new UnstableStepWords("a field", "field", "change", place);
+}
+
+// Whether the expression reads storage a write can reach, which a call's result is not.
+namesStorage(BodyChecker checker, Expression expression) -> bool {
+    Expression core = wording.unwrapParentheses(expression);
+    switch (core) {
+        is IdentifierExpressionNode ignored -> {
+            return true;
+        },
+        is ThisExpressionNode ignored -> {
+            return true;
+        },
+        is SuperExpressionNode ignored -> {
+            return true;
+        },
+        is MemberExpressionNode member -> {
+            return namesStorage(checker, member.object());
+        },
+        is SubscriptExpressionNode element -> {
+            return namesStorage(checker, element.object());
+        },
+        default -> {
+            return false;
+        },
+    }
+}
+
+// The refusal followed by the guidance, or the refusal alone when there is no guidance.
+public withGuidance(BodyChecker checker, string refusal, string? guidance) -> string {
+    if (guidance == null) {
+        return refusal;
+    }
+    return refusal + " " + guidance;
+}
+
+// Whether a class extending the type, however far down, has a member of this name, which a
+// type test on the value would have let a use reach.
+public subclassHasMember(BodyChecker checker, Type type, string name) -> bool {
+    if (!(type is ClassType)) {
+        return false;
+    }
+    let subclasses = type.directSubclasses();
+    for (long i = 0; i < subclasses.length(); i++) {
+        let subclass = subclasses.get(i);
+        if (!(checker.lookupMember(subclass, name) is MissingMember)) {
+            return true;
+        }
+        if (subclassHasMember(checker, subclass, name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// assignabilityHint with the mismatched value in hand, which a value that fits once its null is
+// gone extends with the null guidance for the place it is read from.
+public valueAssignabilityHint(BodyChecker checker, Type target, Type source, Expression? value) -> string {
+    string hint = assignabilityHint(target, source, checker.names());
+    long levels = nullLevelsAbove(target, source);
+    if (value == null || target is ErrorType || hint.length > 0 || levels == 0) {
+        return hint;
+    }
+    return withGuidance(checker, " The value may be null here.",
+        nullGuidance(checker, value, source, levels));
+}
+
+// The advice for the operands, said once when both take the same fix. Null when none has advice.
+operandsAdvice(NullableOperand[] operands, string operatorText = "") -> string? {
+    if (operands.length == 2 && operands[0].form() == operands[1].form()
+            && operands[0].levels == operands[1].levels && !samePlace(operands[0], operands[1])) {
+        let paired = formAdvice(operands, operatorText);
+        if (paired != null) {
+            return paired;
+        }
+    }
+    string advice = "";
+    string first = "";
+    for (long i = 0; i < operands.length; i++) {
+        let one = formAdvice([operands[i]], operatorText);
+        if (one != null && (i == 0 || (!samePlace(operands[0], operands[i]) && one != first))) {
+            advice = "{advice} {one}";
+        }
+        if (i == 0 && one != null) {
+            first = one;
+        }
+    }
+    if (advice.length == 0) {
+        return null;
+    }
+    return advice.substring(1);
+}
+
+// The advice for one operand, or for two of the same form, which then share each sentence. Two
+// operands are joined by 'operatorText'.
+formAdvice(NullableOperand[] operands, string operatorText) -> string? {
+    let first = operands[0];
+    switch (first.form()) {
+        Stable -> {
+            string names = joinedValues(operands, false, "'", "'", " and ");
+            string condition = joinedValues(operands, false, "", " != null", " && ");
+            if (first.levels == 1) {
+                return "Check {names} for null first ('if ({condition})').";
+            }
+            return "Check {names} for null{repeatedCheck(condition, first.levels, first.everyLevel)}.";
+        },
+        Copied -> {
+            return copiedAdvice(operands, "null check", "check");
+        },
+        Stored -> {
+            return storedAdvice(operands);
+        },
+        Guarded -> {
+            return guardedAdvice(operands, operatorText);
+        },
+        NoFix -> {
+            return fallbackAdvice(operands, false);
+        },
+        default -> {
+            return null;
+        },
+    }
+}
+
+// The advice for the values read where no statement can go, which only a '??' fallback can give a
+// value, or with 'any' for values of any form. A write gets none, because '??' makes no place.
+fallbackAdvice(NullableOperand[] operands, bool any) -> string? {
+    let first = operands[0];
+    let named = new List<string>();
+    for (let operand in operands) {
+        if (operand.writes || operand.levels == 0 || (!any && operand.form() != OperandForm.NoFix)) {
+            return null;
+        }
+        named.push("'{operand.spelling}'");
+    }
+    string fallbacks = "a fallback for {named.get(0)}";
+    if (operands.length > 1) {
+        fallbacks = "fallbacks for {diagnostics.andJoined(named.toArray())}";
+    }
+    if (first.levels < 2) {
+        return "Supply {fallbacks} with '??'.";
+    }
+    string times = timesWord(first.levels);
+    if (!first.everyLevel) {
+        return "Supply {fallbacks} with '??' {times}.";
+    }
+    return "Supply {fallbacks} with '??' {times}, once for each '?'.";
+}
+
+// Whether the value is a '?:' or a switch expression.
+public isJoin(Expression value) -> bool {
+    return value is TernaryExpressionNode || value is SwitchExpressionNode;
+}
+
+// The value an expression arm produces, or null for a block arm.
+public armValue(SwitchArm arm) -> Expression? {
+    ArmBody? body = null;
+    switch (arm) {
+        is ValueArmNode value -> {
+            body = value.body();
+        },
+        is TypeArmNode typed -> {
+            body = typed.body();
+        },
+        is DefaultArmNode fallback -> {
+            body = fallback.body();
+        },
+        is ErrorSwitchArmNode ignored -> { },
+    }
+    if (body is Expression) {
+        return body;
+    }
+    return null;
+}
+
+// "twice", "three times" or "N times".
+timesWord(long levels) -> string {
+    if (levels == 2) {
+        return "twice";
+    }
+    if (levels == 3) {
+        return "three times";
+    }
+    return "{levels} times";
+}
+
+// The advice for one or two call results, or fields read from them, stored in locals to check.
+storedAdvice(NullableOperand[] operands) -> string? {
+    let first = operands[0];
+    let second = operands[operands.length - 1];
+    if (first.wholeCall != second.wholeCall) {
+        return null;
+    }
+    string callees = "'{first.callee}'";
+    if (second.callee != first.callee) {
+        callees = "{callees} and to '{second.callee}'";
+    }
+    string fix = localsFix(operands, "check", true, "");
+    if (first.wholeCall) {
+        string results = "the result";
+        if (operands.length == 2) {
+            results = "both results";
+        }
+        return "Each call to {callees} returns its own result. A later call can return null even after "
+            + "a null check on an earlier one. Store {results} in {fix}";
+    }
+    string fields = "'{first.spelling}' is a field of the result of a call";
+    string read = "'{first.spelling}'";
+    string stored = read;
+    if (operands.length == 2 && second.spelling == first.spelling) {
+        fields = "Both sides read '{first.spelling}', a field of the result of a call";
+        stored = "'{first.spelling}' from both calls";
+    } else if (operands.length == 2) {
+        fields = "'{first.spelling}' and '{second.spelling}' are fields of the results of calls";
+        read = "them";
+        stored = "'{first.spelling}' and '{second.spelling}'";
+    }
+    return "{fields}. Each call to {callees} returns its own result, so a later read of {read} can be "
+        + "null even after a null check. Store {stored} in {fix}";
+}
+
+// The advice for one or two values read through '?.' or '?[', which is null whenever the value in
+// front of the '?' is null. Two operands are joined by 'operatorText'.
+guardedAdvice(NullableOperand[] operands, string operatorText) -> string? {
+    let first = operands[0];
+    let second = operands[operands.length - 1];
+    if (second.guard != first.guard && first.held().length > 0 && second.held().length > 0) {
+        return "'{first.spelling}' is null whenever '{first.guard}' is null, and '{second.spelling}' "
+            + "whenever '{second.guard}' is null. Check both for null first ('if ({first.guard} != null "
+            + "&& {second.guard} != null)') and write '{first.held()} {operatorText} {second.held()}', or "
+            + "supply fallbacks with '??'.";
+    }
+    if (second.guard != first.guard || (first.held().length == 0) != (second.held().length == 0)) {
+        return null;
+    }
+    string reads = "'{first.spelling}' is";
+    string plain = "'{first.held()}'";
+    if (operands.length == 2) {
+        reads = "'{first.spelling}' and '{second.spelling}' are";
+        plain = "'{first.held()}' and '{second.held()}'";
+    }
+    string refusal = "{reads} null whenever '{first.guard}' is null.";
+    if (first.held().length == 0) {
+        return "{refusal} Supply a fallback with '??'.";
+    }
+    return "{refusal} Check '{first.guard}' for null first ('if ({first.guard} != null)') and write "
+        + "{plain}, or supply a fallback with '??'.";
+}
+
+// The advice for one or two operands that read a field or an element, for a check named 'check'.
+// A compound assignment writes its result back to the first.
+copiedAdvice(NullableOperand[] operands, string check, string verb) -> string? {
+    let first = operands[0].words;
+    let second = operands[operands.length - 1].words;
+    if (first == null || second == null) {
+        return null;
+    }
+    string stores = operands[0].stores;
+    if (operands.length == 2 && (stores.length > 0 || operands[1].stores.length > 0)) {
+        return null;
+    }
+    string described = "{first.place} is {first.kind}, so it can {first.change}";
+    string copied = "it";
+    string checked = copied;
+    bool eachRead = operands.length == 2 && operands[0].spelling == operands[1].spelling;
+    if (eachRead) {
+        described = "Both sides read {first.place}, {first.kind}, so it can {first.change}";
+        copied = "them";
+        if (holdsMore(operands)) {
+            checked = "'{operands[0].spelling}'";
+        }
+    } else if (operands.length == 2) {
+        string change = "change";
+        if (first.change == second.change) {
+            change = first.change;
+        }
+        described = "{first.place} is {first.kind} and {second.place} is {second.kind}, so they can "
+            + change;
+        if (first.kind == second.kind) {
+            string kind = first.kind.substring(first.kind.startsWith("an ") ? 3 : 2);
+            described = "{first.place} and {second.place} are {kind}s, so they can {change}";
+        }
+        copied = "them";
+        checked = copied;
+        if (holdsMore(operands)) {
+            checked = joinedValues(operands, true, "'", "'", " and ");
+        }
+    } else if (holdsMore(operands)) {
+        checked = joinedValues(operands, true, "'", "'", " and ");
+    }
+    string outcome = "null";
+    if (check != "null check") {
+        outcome = "another type";
+    }
+    string action = "Copy {copied} into";
+    string fix = localsFix(operands, verb, check == "null check", operands[0].writeBack);
+    if (eachRead && fix.startsWith("locals ")) {
+        action = "Copy each read into";
+        fix = "a local " + fix.substring(7);
+    }
+    if (stores.length > 0) {
+        action = "Store {stores} in";
+    }
+    return "{described} at any time. A later read of {checked} can be {outcome} even after a {check}. "
+        + "{action} {fix}";
+}
+
+// The part of a fix that declares the locals and checks them, ending with the write-back to 'place'
+// when there is one.
+localsFix(NullableOperand[] operands, string verb, bool forNull, string place) -> string {
+    string where = "a local";
+    string checked = "{verb} the local";
+    string declarations = operands[0].declaration();
+    let words = operands[0].words;
+    if (operands[0].stores.length > 0 && words != null) {
+        where = "locals";
+        checked = "{verb} '{operands[0].local()}'";
+    }
+    if (operands.length == 2) {
+        where = "locals";
+        checked = "{verb} the locals";
+        declarations = "{declarations} {operands[1].declaration()}";
+    }
+    if (holdsMore(operands)) {
+        checked = "{verb} {joinedValues(operands, false, "'", "'", " and ")}";
+        if (forNull) {
+            checked = "{checked} for null";
+        }
+    }
+    string condition = joinedValues(operands, false, "", " != null", " && ");
+    checked = checked + repeatedCheck(condition, operands[0].levels, operands[0].everyLevel);
+    if (place.length == 0) {
+        return "{where} first ('{declarations}') and {checked}.";
+    }
+    return "{where} first ('{declarations}'), {checked}, and write the result back to {place}.";
+}
+
+// The operands' values, each as the fix leaves it or, when 'written', as the code spells it.
+// Each goes between 'before' and 'after', joined by 'between', as in "'a' and 'b'".
+joinedValues(NullableOperand[] operands, bool written, string before, string after,
+             string between) -> string {
+    string text = "";
+    for (let operand in operands) {
+        string value = operand.held();
+        if (written) {
+            value = operand.spelling;
+        }
+        if (text.length > 0) {
+            text = text + between;
+        }
+        text = text + before + value + after;
+    }
+    return text;
+}
+
+// Whether the local of one of the operands contains more than its value.
+holdsMore(NullableOperand[] operands) -> bool {
+    for (let operand in operands) {
+        if (operand.held() != operand.local()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Whether both operands read the same place, which one fix covers.
+samePlace(NullableOperand first, NullableOperand second) -> bool {
+    return (first.form() == OperandForm.Stable || first.form() == OperandForm.Copied
+            || first.form() == OperandForm.Guarded)
+        && first.form() == second.form() && first.spelling == second.spelling && !first.calls;
+}
+
+// Whether a local or a parameter of that name is declared anywhere under the node.
+declaresName(SyntaxNode node, string name) -> bool {
+    string declared = "";
+    switch (node) {
+        is VariableDeclarationNode variable -> {
+            declared = variable.name().text();
+        },
+        is ParameterNode parameter -> {
+            declared = parameter.name().text();
+        },
+        is LambdaParameterNode parameter -> {
+            declared = parameter.name().text();
+        },
+        is ForEachStatementNode loop -> {
+            declared = loop.name().text();
+        },
+        is CatchClauseNode clause -> {
+            declared = clause.name().text();
+        },
+        is TypeArmNode arm -> {
+            let binding = arm.binding();
+            if (binding != null) {
+                declared = binding.text();
+            }
+        },
+        default -> {},
+    }
+    if (declared == name) {
+        return true;
+    }
+    let children = node.childNodes();
+    for (long i = 0; i < children.length(); i++) {
+        if (declaresName(children.get(i), name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The member names from 'step' out to the value, as in '.count' for 'h.inner.count' after 'h.inner'.
+// Parentheses on the way are left out.
+memberSteps(Expression value, Expression step) -> string {
+    string steps = "";
+    Expression core = wording.unwrapParentheses(value);
+    while (core is MemberExpressionNode
+            && (core.span().start != step.span().start || core.span().end() != step.span().end())) {
+        steps = ".{core.member().text()}{steps}";
+        core = wording.unwrapParentheses(core.object());
+    }
+    return steps;
+}
+
+// The field or element access the expression is, or null for any other expression.
+public accessStep(Expression expression) -> AccessStep? {
+    switch (expression) {
+        is MemberExpressionNode member -> {
+            return new AccessStep(member.object(), member.member().text(), null, false);
+        },
+        is SafeMemberExpressionNode member -> {
+            return new AccessStep(member.object(), member.member().text(), null, true);
+        },
+        is SubscriptExpressionNode element -> {
+            return new AccessStep(element.object(), null, element.index(), false);
+        },
+        is SafeSubscriptExpressionNode element -> {
+            return new AccessStep(element.object(), null, element.index(), true);
+        },
+        default -> {
+            return null;
+        },
+    }
+}
+
+// Whether a call is made anywhere in the element.
+containsCall(GreenElement element) -> bool {
+    if (element.kind() == SyntaxKind.CallExpression) {
+        return true;
+    }
+    if (element is GreenNode) {
+        for (long i = 0; i < element.slotCount(); i++) {
+            let slot = element.slot(i);
+            if (slot != null && containsCall(slot)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// The name of the function or method a call invokes, or null when the callee has none.
+calleeName(CallExpressionNode call) -> string? {
+    Expression callee = wording.unwrapParentheses(call.callee());
+    switch (callee) {
+        is IdentifierExpressionNode identifier -> {
+            return identifier.name().text();
+        },
+        is MemberExpressionNode member -> {
+            return member.member().text();
+        },
+        default -> {
+            return null;
+        },
+    }
+}
+
+// The base name of the local a call's result is stored in, as in 'boxLookup' for 'box.lookup()' or
+// 'findResult' for 'find()'.
+storedResultName(CallExpressionNode call, string callee) -> string {
+    Expression reached = wording.unwrapParentheses(call.callee());
+    if (reached is MemberExpressionNode) {
+        let receiver = wording.unwrapParentheses(reached.object());
+        if (receiver is IdentifierExpressionNode) {
+            string owner = receiver.name().text();
+            return joinedName(owner.substring(0, 1).toLowerAscii() + owner.substring(1), callee);
+        }
+    }
+    return "{callee}Result";
+}
+
+// Two names joined into one, the second starting with a capital letter.
+joinedName(string first, string second) -> string {
+    return first + second.substring(0, 1).toUpperAscii() + second.substring(1);
+}
+
+// The words that spell out 'levels' nested null checks of 'condition', or nothing for one level.
+// 'everyLevel' is true when the checks remove every '?' of the type.
+repeatedCheck(string condition, long levels, bool everyLevel) -> string {
+    if (levels < 2) {
+        return "";
+    }
+    string times = timesWord(levels);
+    string opened = "";
+    string closed = "";
+    for (long i = 0; i < levels; i++) {
+        opened = opened + "if ({condition}) \{ ";
+        closed = closed + " \}";
+    }
+    if (!everyLevel) {
+        return " {times} ('{opened}...{closed}')";
+    }
+    return " {times}, once for each '?' ('{opened}...{closed}')";
+}
+
+// A value type flowing into an interface-typed slot it conforms to. The conformance is a
+// compile-time judgment: it lets a generic bound take the value, and nothing more, because a
+// struct and a primitive are both held as their own bits and so have no interface value.
+public valueConformanceHint(Type target, Type source, TypeNames names) -> string {
+    string kind = types.valueKindWord(source);
+    if (kind.length == 0) {
+        return "";
+    }
+    Type slot = target;
+    while (slot is OptionalType) {
+        slot = slot.inner();
+    }
+    if (!types.isInterfaceLike(slot) || !hierarchy.conformsTo(source, slot)) {
+        return "";
+    }
+    string shown = names.of(source);
+    string named = names.of(slot);
+    return " '{shown}' implements '{named}', but {typenames.typeArticle(kind)} {kind} can only be passed "
+        + "where a type parameter such as '<T: {named}>' is declared. A value of type '{named}' must be an "
+        + "object of a class, and {typenames.typeArticle(kind)} {kind} value is not one. Declare the type as "
+        + "'{shown}', or declare '<T: {named}>' and use 'T'.";
+}
+
+// Guidance appended to an assignability failure: a value type flowing into an interface it
+// conforms to, or 'null' flowing into a type without '?'. It opens with a space, because the
+// sentence before it ends with a full stop.
+assignabilityHint(Type target, Type source, TypeNames names) -> string {
+    if (target is ErrorType) {
+        return "";
+    }
+    string conformance = valueConformanceHint(target, source, names);
+    if (conformance.length > 0) {
+        return conformance;
+    }
+    if (source is NullType && !(target is OptionalType)) {
+        return " '{names.of(target)}' can never be null. Write the type as '{names.nullableOf(target)}' if "
+            + "it should allow null.";
+    }
+    return "";
+}
+
+// How many '?' levels 'source' loses before a value of it fits 'target', or 0 when none does.
+nullLevelsAbove(Type target, Type source) -> long {
+    long levels = 0;
+    Type remaining = source;
+    while (remaining is OptionalType) {
+        remaining = remaining.inner();
+        levels++;
+        if (convert.isAssignableStrict(target, remaining)) {
+            return levels;
+        }
+    }
+    return 0;
+}
