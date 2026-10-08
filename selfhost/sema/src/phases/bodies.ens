@@ -107,13 +107,12 @@ import LiteralOrigin from phases.bodies.literaltargets;
 import JoinText from phases.bodies.literaltargets;
 import DeferredLiteralFix from phases.bodies.literaltargets;
 import LiteralTargets from phases.bodies.literaltargets;
+import phases.bodies.operators;
+import phases.bodies.assignments;
 import phases.bodies.literalfixes;
 import phases.bodies.valuejoins;
 import phases.bodies.literaltyping;
 import phases.bodies.nullguidance;
-import OperandForm from phases.bodies.nullguidance;
-import AccessStep from phases.bodies.nullguidance;
-import phases.bodies.definiteassignment;
 import AssignmentFlow from phases.bodies.definiteassignment;
 import AssignmentState from phases.bodies.definiteassignment;
 import phases.bodies.wording;
@@ -157,7 +156,6 @@ import Obligation from phases.obligations;
 import InterpolationObligation from phases.obligations;
 import TypeTestObligation from phases.obligations;
 import ArrayElementObligation from phases.obligations;
-import EqualityObligation from phases.obligations;
 import HashObligation from phases.obligations;
 import Origin from phases.obligations;
 import phases.obligations;
@@ -190,10 +188,14 @@ public checkBodies(List<ModuleContext> contexts) -> FileDiagnostic[] {
 public sealed abstract class NameResolution {
 }
 
-class LocalName extends NameResolution {
-    protected LocalBinding binding;
+public final class LocalName extends NameResolution {
+    protected LocalBinding localBinding;
 
-    protected constructor(this.binding);
+    protected constructor(this.localBinding);
+
+    public binding() -> LocalBinding {
+        return this.localBinding;
+    }
 }
 
 // The type parameter in scope under the name, which takes that name for the whole of the
@@ -223,26 +225,6 @@ class NamespaceName extends NameResolution {
     protected string targetModulePath;
 
     protected constructor(this.targetModulePath);
-}
-
-// The target of a compound assignment, or of '++' or '--'. 'nullLevels' counts the '?' levels of
-// its own null that a refusal names.
-public class WriteTarget {
-    protected long levelCount;
-
-    protected constructor(this.levelCount);
-
-    public nullLevels() -> long {
-        return this.levelCount;
-    }
-}
-
-// Why '++' or '--' refuses to change its operand. A misplaced change is refused only where it is
-// written, such as inside a lambda.
-enum WriteRefusal {
-    None,
-    Misplaced,
-    Unwritable,
 }
 
 // The parameter a call's resolution chose for the argument at 'span'.
@@ -337,7 +319,7 @@ public class MissingMember extends MemberLookup {
 
 // Where a member access appears, which decides what a method under its name is reported as. The
 // expression around a covered access reports that method itself.
-enum MemberPosition {
+public enum MemberPosition {
     Read,
     Write,
     Covered,
@@ -1033,8 +1015,8 @@ public final class BodyChecker implements NoreturnCalls {
     NarrowingState narrowingState;
     // The 'const' locals declared without a type, and the values 'is' arms matched. A refused write to
     // a constant local gives each its own fix.
-    List<LocalBinding> untypedConstants;
-    List<LocalBinding> armBindings;
+    List<LocalBinding> untypedConstantLocals;
+    List<LocalBinding> matchedArmBindings;
     LiteralTargets literalTargets;
 
     AssignmentState assignmentState;
@@ -1062,9 +1044,9 @@ public final class BodyChecker implements NoreturnCalls {
         this.lambdaFrames = new List<LambdaFrame>();
         this.narrowingState = new NarrowingState();
         this.callableFrame = new CallableFrame(null);
-        this.untypedConstants = new List<LocalBinding>();
+        this.untypedConstantLocals = new List<LocalBinding>();
         this.literalTargets = new LiteralTargets();
-        this.armBindings = new List<LocalBinding>();
+        this.matchedArmBindings = new List<LocalBinding>();
         this.assignmentState = new AssignmentState(this.bodyReporter, this.typeNames);
         this.fillProvenNews = new Set<GreenNode>();
         this.arrayNewNames = new Map<GreenNode, string>();
@@ -1133,6 +1115,14 @@ public final class BodyChecker implements NoreturnCalls {
 
     public targets() -> LiteralTargets {
         return this.literalTargets;
+    }
+
+    public untypedConstants() -> List<LocalBinding> {
+        return this.untypedConstantLocals;
+    }
+
+    public armBindings() -> List<LocalBinding> {
+        return this.matchedArmBindings;
     }
 
     protected run() {
@@ -1862,7 +1852,7 @@ public final class BodyChecker implements NoreturnCalls {
     // Unqualified name resolution, innermost declaration first: local scopes, then a type
     // parameter in scope, then the module's functions, then a type this file declares, then the
     // file's imports, then the prelude's functions, then the implicit exception base class.
-    resolveName(string name) -> NameResolution? {
+    public resolveName(string name) -> NameResolution? {
         let binding = this.lookupBinding(name);
         if (binding != null) {
             return new LocalName(binding);
@@ -1946,7 +1936,7 @@ public final class BodyChecker implements NoreturnCalls {
     }
 
     // The name a diagnostic about a field's declaring type should use.
-    constFieldOwnerName(Field field) -> string {
+    public constFieldOwnerName(Field field) -> string {
         let authority = types.authorityOf(field.definingType());
         if (authority != null) {
             return authority.name();
@@ -2061,7 +2051,7 @@ public final class BodyChecker implements NoreturnCalls {
         let binding = new LocalBinding(name, bindingType, BindingKind.Variable, isConst,
             node.name().span());
         if (isConst && declaredType == null) {
-            this.untypedConstants.push(binding);
+            this.untypedConstantLocals.push(binding);
         }
         this.defineLocal(binding, node.name().span());
         this.result().setBinding(node.green(), binding);
@@ -2345,7 +2335,7 @@ public final class BodyChecker implements NoreturnCalls {
         let binding = new LocalBinding(node.name().text(), bindingType, BindingKind.Variable,
             isConst, node.name().span());
         if (isConst && declaredType == null) {
-            this.untypedConstants.push(binding);
+            this.untypedConstantLocals.push(binding);
         }
         let current = this.scope;
         if (current != null) {
@@ -2527,13 +2517,13 @@ public final class BodyChecker implements NoreturnCalls {
                 return this.analyzeSuper(keyword);
             },
             is BinaryExpressionNode binary -> {
-                return this.analyzeBinary(binary);
+                return operators.analyzeBinary(this, binary);
             },
             is PrefixExpressionNode prefix -> {
-                return this.analyzePrefix(prefix);
+                return operators.analyzePrefix(this, prefix);
             },
             is PostfixExpressionNode postfix -> {
-                return this.analyzePostfix(postfix);
+                return operators.analyzePostfix(this, postfix);
             },
             is CallExpressionNode call -> {
                 return this.analyzeCall(call, null);
@@ -2563,7 +2553,7 @@ public final class BodyChecker implements NoreturnCalls {
                 return narrowing.analyzeTypeTest(this, test);
             },
             is AssignmentExpressionNode assignment -> {
-                return this.analyzeAssignment(assignment);
+                return assignments.analyzeAssignment(this, assignment);
             },
             is TernaryExpressionNode ternary -> {
                 return valuejoins.analyzeTernary(this, ternary, null);
@@ -2927,7 +2917,7 @@ public final class BodyChecker implements NoreturnCalls {
 
     // Reports a write refused for where it stands rather than for what it names; true when it
     // reported. 'action' names what the write would do, so '=' and '++' read naturally.
-    reportRefusedWrite(LocalBinding binding, string action, Span at) -> bool {
+    public reportRefusedWrite(LocalBinding binding, string action, Span at) -> bool {
         if (this.reportCapturedWrite(binding, action, at)) {
             return true;
         }
@@ -2938,7 +2928,7 @@ public final class BodyChecker implements NoreturnCalls {
     // object instead. A struct field lives in the value that holds it, so a chain of them
     // changes what stands at its root, while a class reference or an array element anywhere
     // along it leads to storage of its own.
-    writtenChainRoot(Expression target) -> LocalBinding? {
+    public writtenChainRoot(Expression target) -> LocalBinding? {
         Expression root = wording.unwrapParentheses(target);
         while (root is MemberExpressionNode) {
             let objectType = this.result().typeOf(root.object().green());
@@ -3004,13 +2994,13 @@ public final class BodyChecker implements NoreturnCalls {
         }
         switch (resolution) {
             is LocalName local -> {
-                this.result().setBinding(node.green(), local.binding);
-                this.assignment().checkDefiniteAssignment(local.binding, node.name().span());
-                let proven = this.narrowingState.provenType(narrow.bindingPath(local.binding));
+                this.result().setBinding(node.green(), local.binding());
+                this.assignment().checkDefiniteAssignment(local.binding(), node.name().span());
+                let proven = this.narrowingState.provenType(narrow.bindingPath(local.binding()));
                 if (proven != null) {
                     return proven;
                 }
-                return local.binding.type();
+                return local.binding().type();
             },
             is FunctionName functions -> {
                 this.reportFunctionAsValue(name, functions.entries, node.name().span(), name, wanted);
@@ -3601,1103 +3591,6 @@ public final class BodyChecker implements NoreturnCalls {
         return base;
     }
 
-    analyzeBinary(BinaryExpressionNode node) -> Type {
-        SyntaxKind operator = node.operator().kind();
-        // '&&' and '||' evaluate the right side only when the left did not already decide
-        // the result, so a check on the left narrows the right: 'x != null && x.ready()'.
-        if (operator == SyntaxKind.AmpersandAmpersand || operator == SyntaxKind.PipePipe) {
-            Type shortLeft = this.analyzeExpression(node.left());
-            Type shortRight = narrowing.analyzeGuardedBranch(this, node.left(), node.right(),
-                operator == SyntaxKind.AmpersandAmpersand, null);
-            if (shortLeft is ErrorType || shortRight is ErrorType) {
-                return this.store().errorType();
-            }
-            if (!convert.isBoolType(shortLeft) || !convert.isBoolType(shortRight)) {
-                bool accepted = convert.isBoolType(convert.coreOf(shortLeft))
-                    && convert.isBoolType(convert.coreOf(shortRight));
-                let guidance = nullguidance.binaryGuidance(this, node.left(), node.right(), shortLeft,
-                    shortRight, accepted, null, node.operator().text());
-                string sides = sidesClause(node.left(), node.right(), shortLeft, shortRight,
-                    !convert.isBoolType(shortLeft), !convert.isBoolType(shortRight), this.names());
-                this.reporter().report(nullguidance.withGuidance(this, "'{node.operator().text()}' needs a "
-                    + "'bool' on both sides, {sides}.", guidance), node.span());
-            }
-            return this.store().primitive(PrimitiveKind.Bool);
-        }
-        Type? target = null;
-        LiteralOrigin? origin = null;
-        if (this.targets().binaryNode() == node.green()) {
-            if (literalfixes.isArithmeticOperator(operator) || operator == SyntaxKind.Ampersand
-                    || operator == SyntaxKind.Pipe || operator == SyntaxKind.Caret) {
-                target = this.targets().binaryTarget();
-                origin = this.targets().binaryOrigin();
-            }
-            this.targets().clearBinaryStash();
-        }
-        this.targets().stash(node.left(), target, origin);
-        Type left = this.analyzeExpression(node.left());
-        this.targets().clearStash();
-        this.targets().stash(node.right(), target, origin);
-        Type right = this.analyzeExpression(node.right());
-        this.targets().clearStash();
-        if (left is ErrorType || right is ErrorType) {
-            return this.store().errorType();
-        }
-        this.targets().enterOperands(node, target, origin);
-        Type result = this.analyzeBinaryOperands(node.span(), operator, node.operator().text(),
-            node.left(), node.right(), left, right, null);
-        this.targets().leaveOperands();
-        return result;
-    }
-
-    // The result of 'left OP right' under the operator's own rules. A compound assignment passes its
-    // target as 'written', which is checked without its '?'.
-    analyzeBinaryOperands(Span span, SyntaxKind operator, string operatorText,
-                                  Expression leftNode, Expression rightNode, Type left,
-                                  Type right, WriteTarget? written) -> Type {
-        switch (operator) {
-            Plus, Minus, Star, Slash, Percent -> {
-                return this.analyzeArithmetic(span, operator, operatorText, leftNode, rightNode,
-                    left, right, written);
-            },
-            EqualsEquals, NotEquals -> {
-                return this.analyzeEquality(span, operatorText, leftNode, rightNode, left, right);
-            },
-            Less, Greater, LessEquals, GreaterEquals -> {
-                return this.analyzeComparison(span, operator, operatorText, leftNode, rightNode, left, right);
-            },
-            Ampersand, Pipe, Caret -> {
-                return this.analyzeBitwise(span, operator, operatorText, leftNode, rightNode, left,
-                    right, written);
-            },
-            LessLess, GreaterGreater, GreaterGreaterGreater -> {
-                return this.analyzeShift(span, operator, operatorText, leftNode, rightNode, left,
-                    right, written);
-            },
-            default -> {
-                this.reporter().report("Internal: unsupported binary operator "
-                    + "'{operatorText}'.", span);
-                return this.store().errorType();
-            },
-        }
-    }
-
-    // Both sides after an untyped literal on either side adapts to the other side's type.
-    adaptOperands(Expression leftNode, Expression rightNode, Type left, Type right,
-                  string operatorText) -> Type[] {
-        return [this.adaptedOperand(leftNode, left, right, rightNode, operatorText, false),
-            this.adaptedOperand(rightNode, right, left, leftNode, operatorText, true)];
-    }
-
-    // The operand's type once an untyped literal in it adapts toward 'toward', the type of 'other'.
-    // Any other operand keeps its type.
-    adaptedOperand(Expression node, Type type, Type toward, Expression other, string operatorText,
-                   bool onRight) -> Type {
-        let fix = literalfixes.operandLiteralFix(this, node, other, toward, operatorText, onRight);
-        literalfixes.noteSuffixedOperand(this, node, other, toward, operatorText, onRight);
-        return literaltyping.adaptIntegerLiteral(this, node, toward, null, fix)
-            ?? literaltyping.adaptFloatLiteral(this, node, toward, null, fix) ?? type;
-    }
-
-    analyzeArithmetic(Span span, SyntaxKind operator, string operatorText, Expression leftNode,
-                              Expression rightNode, Type left, Type right, WriteTarget? written) -> Type {
-        Type[] adapted = this.adaptOperands(leftNode, rightNode, checkedSide(left, written), right,
-            operatorText);
-        if (adapted[0] is ErrorType || adapted[1] is ErrorType) {
-            return this.store().errorType();
-        }
-        Type checkedLeft = adapted[0];
-        Type shownLeft = shownSide(checkedLeft, left, written);
-        Type checkedRight = adapted[1];
-        bool joins = operator == SyntaxKind.Plus
-            && (convert.coreOf(checkedLeft) is StringType || convert.coreOf(checkedRight) is StringType);
-        bool accepted = acceptsCores(operator, checkedLeft, checkedRight);
-        let guidance = nullguidance.binaryGuidance(this, leftNode, rightNode, shownLeft, checkedRight,
-            accepted, written, operatorText);
-        if (joins) {
-            if (isStringable(checkedLeft) && isStringable(checkedRight)) {
-                return this.store().stringType();
-            }
-            string refusal = sidesRefusal(operator, operatorText, leftNode, rightNode, shownLeft,
-                checkedRight, this.names());
-            if (!accepted) {
-                refusal = "Cannot add a value of type '{this.names().of(checkedRight)}' to a string.";
-                if (isStringable(convert.coreOf(checkedRight))) {
-                    refusal = "Cannot add a string to a value of type '{this.names().of(shownLeft)}'.";
-                }
-                refusal = refusal + " Only a string, a number or a 'bool' can be added to one.";
-            }
-            this.reporter().report(nullguidance.withGuidance(this, refusal, guidance), span);
-            return this.store().errorType();
-        }
-        if (!convert.isNumericType(checkedLeft) || !convert.isNumericType(checkedRight)) {
-            this.reporter().report(nullguidance.withGuidance(this, sidesRefusal(operator, operatorText,
-                leftNode, rightNode, shownLeft, checkedRight, this.names()), guidance), span);
-            return this.store().errorType();
-        }
-        let common = convert.numericCommonType(checkedLeft, checkedRight);
-        if (common == null) {
-            this.reporter().report("'{operatorText}' needs the same number type on both sides, "
-                + "{sidesClause(leftNode, rightNode, shownLeft, checkedRight, true, true, this.names())}."
-                + bothSidesConversion(operatorText, leftNode, rightNode, checkedLeft, checkedRight), span);
-            return this.store().errorType();
-        }
-        return common;
-    }
-
-    // A comparison against 'null' is a presence test on the declared storage type, so it stays
-    // legal on a binding declared optional even where narrowing already proved the value non-null.
-    analyzeEquality(Span span, string operatorText, Expression leftNode, Expression rightNode, Type left,
-                    Type right) -> Type {
-        Type[] adapted = this.adaptOperands(leftNode, rightNode, left, right, operatorText);
-        Type leftSide = adapted[0];
-        Type rightSide = adapted[1];
-        if (rightSide is NullType) {
-            leftSide = narrowing.presenceOperandType(this, leftNode, leftSide);
-        } else if (leftSide is NullType) {
-            rightSide = narrowing.presenceOperandType(this, rightNode, rightSide);
-        }
-        if (this.reportFunctionComparison(span, leftSide, rightSide)) {
-            return this.store().primitive(PrimitiveKind.Bool);
-        }
-        if (!convert.isAssignableStrict(leftSide, rightSide)
-                && !convert.isAssignableStrict(rightSide, leftSide)) {
-            this.reporter().report(this.comparisonRefusal(operatorText, leftNode, rightNode, leftSide,
-                rightSide), span);
-        } else {
-            this.checkStructEquatable(leftSide, rightSide, span);
-        }
-        return this.store().primitive(PrimitiveKind.Bool);
-    }
-
-    // The refusal of 'operatorText' between two sides whose types are never equal. Against 'null',
-    // the side that can never be null is named with the result the comparison always has.
-    comparisonRefusal(string operatorText, Expression leftNode, Expression rightNode, Type left, Type right)
-            -> string {
-        if (!(left is NullType) && !(right is NullType)) {
-            return "Cannot compare '{this.names().of(left)}' with '{this.names().of(right)}', because a "
-                + "value of one of these types is never equal to a value of the other.";
-        }
-        Type other = left;
-        Expression valueNode = leftNode;
-        if (left is NullType) {
-            other = right;
-            valueNode = rightNode;
-        }
-        string result = "false";
-        if (operatorText == "!=") {
-            result = "true";
-        }
-        string nullable = this.names().nullableOf(other);
-        let spelled = wording.shortSpelling(valueNode);
-        if (spelled == null) {
-            return "This value has type '{this.names().of(other)}', which can never be null, so this "
-                + "comparison is always {result}. Remove the comparison, or give the value a nullable type "
-                + "such as '{nullable}' if it should allow null.";
-        }
-        string comparison = "{spelled} {operatorText} null";
-        if (left is NullType) {
-            comparison = "null {operatorText} {spelled}";
-        }
-        string change = "give '{spelled}' a nullable type such as '{nullable}'";
-        if (wording.unwrapParentheses(valueNode) is IdentifierExpressionNode) {
-            change = "declare '{spelled}' as '{nullable}'";
-        }
-        return "'{spelled}' has type '{this.names().of(other)}', which can never be null, so '{comparison}' "
-            + "is always {result}. Remove the comparison, or {change} if it should allow null.";
-    }
-
-    // A function value has nothing to reach into: no fields, no methods, no identity and no text
-    // form. The one home for reporting it, whether the name was read or called.
-    reportFunctionMember(string name, Type functionType, Span at) -> Type {
-        this.reporter().report(capabilities.functionMemberIssue(name, functionType, this.names()), at);
-        return this.store().errorType();
-    }
-
-    // Refuses comparing two function values, which have no identity, and returns whether it did.
-    // Comparing a nullable one with 'null' tests presence and stays allowed.
-    reportFunctionComparison(Span span, Type left, Type right) -> bool {
-        if (left is NullType || right is NullType) {
-            return false;
-        }
-        if (!(convert.coreOf(left) is FunctionType) && !(convert.coreOf(right) is FunctionType)) {
-            return false;
-        }
-        this.reporter().report("A function value has no identity, so '{this.names().of(left)}' and "
-            + "'{this.names().of(right)}' cannot be compared. Compare what the functions produce, "
-            + "or keep a name or tag beside each one and compare that.", span);
-        return true;
-    }
-
-    // Struct and array '==' compare memberwise, so every field or element needs its own '=='.
-    // A type mentioning a type parameter is judged per instantiation.
-    checkStructEquatable(Type leftSide, Type rightSide, Span span) {
-        Type judged = leftSide;
-        if (convert.coreOf(leftSide) is ArrayType && convert.coreOf(rightSide) is ArrayType) {
-            judged = convert.coreOf(leftSide);
-        } else if (!types.isStructLike(leftSide) || leftSide != rightSide) {
-            return;
-        }
-        if (convert.containsTypeParam(judged)) {
-            this.recordObligation(new EqualityObligation(judged, span));
-            return;
-        }
-        let issue = capabilities.equalityComparabilityIssue(judged, this.names());
-        if (issue != null) {
-            this.reporter().report(issue, span);
-        }
-    }
-
-    analyzeComparison(Span span, SyntaxKind operator, string operatorText, Expression leftNode,
-                              Expression rightNode, Type left, Type right) -> Type {
-        Type[] adapted = this.adaptOperands(leftNode, rightNode, left, right, operatorText);
-        if (adapted[0] is ErrorType || adapted[1] is ErrorType) {
-            return this.store().primitive(PrimitiveKind.Bool);
-        }
-        Type first = adapted[0];
-        Type second = adapted[1];
-        if (!convert.isNumericType(first) || !convert.isNumericType(second)) {
-            bool ordersStrings = convert.coreOf(first) is StringType && convert.coreOf(second) is StringType;
-            bool accepted = acceptsCores(operator, first, second);
-            let guidance = nullguidance.binaryGuidance(this, leftNode, rightNode, first, second, accepted,
-                null, operatorText);
-            string sides = sidesClause(leftNode, rightNode, first, second, !convert.isNumericType(first),
-                !convert.isNumericType(second), this.names());
-            string refusal = nullguidance.withGuidance(this, "'{operatorText}' compares numbers, {sides}.",
-                guidance);
-            if (ordersStrings) {
-                refusal = refusal + " "
-                    + nullguidance.orderingAdvice(this, operatorText, leftNode, rightNode, first, second);
-            }
-            this.reporter().report(refusal, span);
-            return this.store().primitive(PrimitiveKind.Bool);
-        }
-        if (convert.numericCommonType(first, second) == null) {
-            this.reporter().report("'{operatorText}' needs the same number type on both sides, "
-                + "{sidesClause(leftNode, rightNode, first, second, true, true, this.names())}."
-                + bothSidesConversion(operatorText, leftNode, rightNode, first, second), span);
-        }
-        return this.store().primitive(PrimitiveKind.Bool);
-    }
-
-    analyzeBitwise(Span span, SyntaxKind operator, string operatorText, Expression leftNode,
-                           Expression rightNode, Type left, Type right, WriteTarget? written) -> Type {
-        // A bitwise operator takes integers, so only an integer literal adapts to the other side.
-        Type checkedLeft = literaltyping.adaptIntegerLiteral(this, leftNode, right, null,
-            literalfixes.operandLiteralFix(this, leftNode, rightNode, right, operatorText, false))
-            ?? checkedSide(left, written);
-        Type checkedRight = literaltyping.adaptIntegerLiteral(this, rightNode, left, null,
-            literalfixes.operandLiteralFix(this, rightNode, leftNode, left, operatorText, true)) ?? right;
-        if (checkedLeft is ErrorType || checkedRight is ErrorType) {
-            return this.store().errorType();
-        }
-        Type shownLeft = shownSide(checkedLeft, left, written);
-        if (!convert.isIntegerType(checkedLeft) || !convert.isIntegerType(checkedRight)) {
-            bool accepted = acceptsCores(operator, checkedLeft, checkedRight);
-            let guidance = nullguidance.binaryGuidance(this, leftNode, rightNode, shownLeft, checkedRight,
-                accepted, written, operatorText);
-            this.reporter().report(nullguidance.withGuidance(this, sidesRefusal(operator, operatorText,
-                leftNode, rightNode, shownLeft, checkedRight, this.names()), guidance), span);
-            return this.store().errorType();
-        }
-        if (checkedLeft != checkedRight) {
-            this.reporter().report("'{operatorText}' needs the same integer type on both sides, "
-                + "{sidesClause(leftNode, rightNode, shownLeft, checkedRight, true, true, this.names())}."
-                + bothSidesConversion(operatorText, leftNode, rightNode, checkedLeft, checkedRight), span);
-            return this.store().errorType();
-        }
-        return checkedLeft;
-    }
-
-    // The shifted value alone decides the result type, so only the distance adapts.
-    analyzeShift(Span span, SyntaxKind operator, string operatorText, Expression leftNode,
-                 Expression rightNode, Type left, Type right, WriteTarget? written) -> Type {
-        Type checkedLeft = checkedSide(left, written);
-        JoinText? why = null;
-        if (literalfixes.overflowWidening(this, rightNode, checkedLeft) != null) {
-            string text = wording.takesTypeFrom("'{wording.oneLineSpelling(leftNode)}'",
-                this.names().of(convert.coreOf(checkedLeft)));
-            why = new JoinText(text, text);
-        }
-        Type distance = literaltyping.adaptIntegerLiteral(this, rightNode, checkedLeft, null, why) ?? right;
-        if (distance is ErrorType) {
-            return this.store().errorType();
-        }
-        bool accepted = acceptsCores(operator, left, distance);
-        let guidance = nullguidance.binaryGuidance(this, leftNode, rightNode, left, distance, accepted,
-            written, operatorText);
-        bool shiftedNull = left is OptionalType;
-        if (written != null) {
-            shiftedNull = written.nullLevels() > 0;
-        }
-        if (accepted && shiftedNull && distance is OptionalType) {
-            this.reporter().report(nullguidance.withGuidance(this,
-                "'{operatorText}' needs an integer to shift and an "
-                + "integer shift distance, {sidesClause(leftNode, rightNode, left, distance, true, true,
-                this.names())}.", guidance), span);
-            return this.store().errorType();
-        }
-        if (!convert.isIntegerType(checkedLeft)) {
-            this.reporter().report(nullguidance.withGuidance(this, sidesRefusal(operator, operatorText,
-                leftNode, rightNode, left, distance, this.names()), guidance), span);
-            return this.store().errorType();
-        }
-        if (!convert.isIntegerType(distance)) {
-            this.reporter().report(nullguidance.withGuidance(this,
-                "'{operatorText}' needs an integer shift distance, but "
-                + "{wording.sideNamed(rightNode, "the distance")} has type '{this.names().of(distance)}'.",
-                guidance), span);
-            return this.store().errorType();
-        }
-        if (checkedLeft != distance) {
-            string shifted = this.names().of(shownSide(checkedLeft, left, written));
-            string wanted = this.names().of(checkedLeft);
-            string fix = "Convert the distance with 'as'.";
-            if (wording.shortSpelling(rightNode) != null) {
-                fix = "Write '{wording.converted(wording.unwrapParentheses(rightNode), wanted)}'.";
-            }
-            this.reporter().report("'{operatorText}' shifts {typenames.typeArticle(shifted)} '{shifted}' "
-                + "here, so the shift distance must be {typenames.typeArticle(wanted)} '{wanted}' too, but "
-                + "{wording.sideNamed(rightNode, "the distance")} has type '{this.names().of(distance)}'. "
-                + "{fix}",
-                span);
-            return this.store().errorType();
-        }
-        return checkedLeft;
-    }
-
-    analyzePrefix(PrefixExpressionNode node) -> Type {
-        SyntaxKind prefixOperator = node.operator().kind();
-        Type operand = this.analyzePrefixOperand(prefixOperator, node.operand());
-        if (prefixOperator == SyntaxKind.Minus || prefixOperator == SyntaxKind.Plus) {
-            valuejoins.retargetLiteralRange(this, node, node.operand(), prefixOperator == SyntaxKind.Minus);
-        }
-        if (operand is ErrorType) {
-            return this.store().errorType();
-        }
-        Type core = operand;
-        switch (node.operator().kind()) {
-            Minus, Plus -> {
-                if (!convert.isNumericType(core)) {
-                    let guidance = nullguidance.unaryGuidance(this, node.operand(), operand,
-                        convert.isNumericType(convert.coreOf(operand)), null);
-                    this.reporter().report(nullguidance.withGuidance(this, "Unary '{node.operator().text()}' "
-                        + "needs a number, but {wording.sideNamed(node.operand(), "the operand")} has type "
-                        + "'{this.names().of(operand)}'.", guidance), node.span());
-                    return this.store().errorType();
-                }
-                return core;
-            },
-            Exclamation -> {
-                if (!convert.isBoolType(core)) {
-                    let guidance = nullguidance.unaryGuidance(this, node.operand(), operand,
-                        convert.isBoolType(convert.coreOf(operand)), null);
-                    this.reporter().report(nullguidance.withGuidance(this, "'!' negates a 'bool', but "
-                        + "{wording.sideNamed(node.operand(), "the operand")} has type "
-                        + "'{this.names().of(operand)}'.",
-                        guidance), node.span());
-                    return this.store().errorType();
-                }
-                return core;
-            },
-            Tilde -> {
-                if (!convert.isIntegerType(core)) {
-                    let guidance = nullguidance.unaryGuidance(this, node.operand(), operand,
-                        convert.isIntegerType(convert.coreOf(operand)), null);
-                    this.reporter().report(nullguidance.withGuidance(this, "'~' flips the bits of an "
-                        + "integer, but {wording.sideNamed(node.operand(), "the operand")} has type "
-                        + "'{this.names().of(operand)}'.",
-                        guidance), node.span());
-                    return this.store().errorType();
-                }
-                return core;
-            },
-            PlusPlus, MinusMinus -> {
-                return this.analyzeIncrement(node.span(), node.operand(), core,
-                    node.operator().kind() == SyntaxKind.PlusPlus, true);
-            },
-            default -> {
-                this.reporter().report("Internal: unsupported unary operator "
-                    + "'{node.operator().text()}'.", node.operator().span());
-                return this.store().errorType();
-            },
-        }
-    }
-
-    // The operand of a prefix operator. '++' and '--' store back what they read, so their
-    // operand takes the write position; the other prefix operators only read theirs.
-    analyzePrefixOperand(SyntaxKind operator, Expression operand) -> Type {
-        if (operator == SyntaxKind.PlusPlus || operator == SyntaxKind.MinusMinus) {
-            return this.analyzeWriteTarget(operand);
-        }
-        return this.analyzeExpression(operand);
-    }
-
-    analyzePostfix(PostfixExpressionNode node) -> Type {
-        Type operand = this.analyzeWriteTarget(node.operand());
-        if (operand is ErrorType) {
-            return this.store().errorType();
-        }
-        return this.analyzeIncrement(node.span(), node.operand(), operand,
-            node.operator().kind() == SyntaxKind.PlusPlus, false);
-    }
-
-    analyzeIncrement(Span span, Expression operand, Type operandType, bool isIncrement,
-                             bool isPrefix) -> Type {
-        string operator = "--";
-        if (isIncrement) {
-            operator = "++";
-        }
-        string before = "";
-        string after = operator;
-        if (isPrefix) {
-            before = operator;
-            after = "";
-        }
-        // Parentheses around the operand name the same storage, so every rule below reads through them.
-        Expression changed = wording.unwrapParentheses(operand);
-        // A write through '?.' or '?[' is judged by the slot it lands in, as the same write without
-        // the '?' is.
-        Type changedType = operandType;
-        bool safe = this.reportSafeTarget(operand, operandType, operator, before, after, span);
-        if (safe) {
-            changedType = this.safeSlotType(changed) ?? operandType;
-        }
-        long nullLevels = wording.optionalLevels(changedType);
-        let refusal = this.reportUnchangeable(changed, changedType, safe, operator, before, after, span);
-        if (refusal == WriteRefusal.Unwritable) {
-            nullLevels = 0;
-        }
-        if (changed is ThisExpressionNode || changed is SuperExpressionNode) {
-            return operandType;
-        }
-        if (!convert.isNumericType(changedType)) {
-            string refusalText = "'{operator}' works only on numbers, and "
-                + "'{wording.oneLineSpelling(changed)}' has type '{this.names().of(changedType)}'.";
-            if (acceptsCores(SyntaxKind.PlusPlus, changedType, changedType)) {
-                // A slot reached through '?.' or '?[' is refused for its null only once the '?' is gone.
-                if (nullLevels > 0 && !safe) {
-                    let guidance = nullguidance.unaryGuidance(this, operand, changedType, true,
-                        new WriteTarget(nullLevels));
-                    this.reporter().report(nullguidance.withGuidance(this, refusalText, guidance), span);
-                }
-                return changedType;
-            }
-            this.reporter().report(refusalText + " Use it on an integer or a floating-point variable, for "
-                + "example '{before}count{after}'.", span);
-            return changedType;
-        }
-        if (safe || refusal != WriteRefusal.None) {
-            return changedType;
-        }
-        narrowing.invalidateForWrite(this, changed);
-        narrowing.establishWriteNarrowing(this, changed, operandType);
-        return changedType;
-    }
-
-    // Reports why '++' or '--' cannot change the operand at this place in the code, when it cannot.
-    // 'before' and 'after' place the operator as the code writes it.
-    reportUnchangeable(Expression changed, Type changedType, bool safe, string operator,
-                       string before, string after, Span span) -> WriteRefusal {
-        if (changed is ThisExpressionNode || changed is SuperExpressionNode) {
-            string keyword = "this";
-            if (changed is SuperExpressionNode) {
-                keyword = "super";
-            }
-            string refusal = "'{keyword}' is not a variable, so '{operator}' cannot change it.";
-            let field = this.receiverExampleField(changedType, true);
-            if (field != null) {
-                refusal = refusal + " Change a field instead, as in '{before}{keyword}.{field}{after}'.";
-            }
-            this.reporter().report(refusal, span);
-            return WriteRefusal.Unwritable;
-        }
-        if (!safe && !this.isLValue(changed)) {
-            this.reporter().report("{wording.sideNamed(changed, "This value")} is not a variable, a field or "
-                + "an array element, so '{operator}' cannot change it.", span);
-            return WriteRefusal.Unwritable;
-        }
-        if (changed is IdentifierExpressionNode) {
-            let binding = this.result().bindingOf(changed.green());
-            if (binding != null && this.reportRefusedWrite(binding, "change", span)) {
-                return WriteRefusal.Misplaced;
-            }
-            if (binding != null && binding.isConst()) {
-                this.reporter().report(this.constantRefusal("'{operator}' cannot change '{binding.name()}'",
-                    binding), span);
-                return WriteRefusal.Unwritable;
-            }
-        }
-        if (changed is MemberExpressionNode) {
-            let staticField = this.result().staticConstFieldOf(changed.green());
-            if (staticField != null) {
-                this.reporter().report("The '{operator}' operator cannot change "
-                    + "'{staticConstDisplay(staticField, this.names())}': a "
-                    + "{members.typeLevelFieldWord(staticField)} keeps the value its "
-                    + "initializer gives it. Change the initializer, or use an instance field.", span);
-                return WriteRefusal.Unwritable;
-            }
-            let root = this.writtenChainRoot(changed);
-            if (root != null && this.reportRefusedWrite(root, "change", span)) {
-                return WriteRefusal.Misplaced;
-            }
-        }
-        let field = nullguidance.accessedField(this, changed);
-        if (field != null && field.isConst()) {
-            this.reporter().report("The '{operator}' operator cannot change field "
-                + "'{field.name()}': a 'const' field is assigned once when the object "
-                + "is constructed and never again. Remove 'const' from the field if it "
-                + "needs to change.", span);
-            return WriteRefusal.Unwritable;
-        }
-        return WriteRefusal.None;
-    }
-
-    // Refuses assigning to 'this' or to 'super', neither of which is a variable, and names a
-    // field of the type the keyword reaches. Reports nothing where it reaches none, since
-    // reading the keyword there reports that instead.
-    reportReceiverAssignment(string keyword, Type reached, string operator, Span at) {
-        if (reached is ErrorType) {
-            return;
-        }
-        string refusal = "'{keyword}' is not a variable, so it cannot be assigned.";
-        let field = this.receiverExampleField(reached, operator != "=");
-        if (field == null) {
-            this.reporter().report(refusal, at);
-            return;
-        }
-        this.reporter().report(refusal + " Assign the fields that should change, as in "
-            + "'{keyword}.{field} {operator} ...'.", at);
-    }
-
-    // Refuses a write through '?.' or '?[', which has nowhere to store when the value in front of
-    // the '?' is null. The example spells the same write without its '?' inside a null check, and
-    // there is none where no statement can go.
-    reportSafeWrite(Expression target, AccessStep access, Type reached, string operator,
-                    string before, string after, Span at) {
-        string reader = "?.";
-        let index = access.index();
-        if (index != null) {
-            reader = "?[";
-        }
-        string subject = "'{wording.oneLineSpelling(wording.unwrapParentheses(access.receiver()))}'";
-        string refusal = "'{reader}' cannot appear on the left side of '{operator}', because "
-            + "there is nothing to write to when {subject} is null.";
-        if (operator == "++" || operator == "--") {
-            refusal = "'{operator}' cannot change '{wording.oneLineSpelling(target)}' through '{reader}', "
-                + "because there is nothing to write to when {subject} is null.";
-        }
-        if (reached is ErrorType) {
-            this.reporter().report(refusal, at);
-            return;
-        }
-        let front = nullguidance.classifyOperand(this, access.receiver(), 1, "", false);
-        if (front.form() == OperandForm.NoFix) {
-            this.reporter().report(refusal, at);
-            return;
-        }
-        string accessor = ".{access.member() ?? ""}";
-        if (index != null) {
-            accessor = "[{wording.simpleSpelling(index) ?? ""}]";
-        }
-        bool spelled = index == null || wording.simpleSpelling(index) != null;
-        string write = "{before}{front.held()}{accessor}{after}";
-        if (spelled && front.form() == OperandForm.Stable) {
-            this.reporter().report(refusal + " Check for null first, as in 'if ({front.held()} != null) "
-                + "\{ {write}; \}'.", at);
-            return;
-        }
-        string spelledFront = wording.oneLineSpelling(wording.unwrapParentheses(access.receiver()));
-        string local = front.local();
-        string declaration = front.declaration();
-        bool whole = front.held() == front.local();
-        string copy = "";
-        if (front.form() == OperandForm.Copied) {
-            copy = "Copy '{spelledFront}' into a local first";
-        } else if (front.form() == OperandForm.Stored) {
-            copy = "Store the result of '{spelledFront}' in a local first";
-        } else if (front.form() == OperandForm.Guarded) {
-            string base = nullguidance.accessStep(wording.unwrapParentheses(access.receiver()))?.member()
-                ?? "value";
-            local = nullguidance.freeLocalName(this, "", base);
-            declaration = "let {local} = {spelledFront};";
-            whole = true;
-            copy = "Copy '{spelledFront}' into a local first";
-        }
-        if (!spelled || !whole || copy.length == 0) {
-            this.reporter().report(refusal + " Check for null first, then write the same line "
-                + "without the '?'.", at);
-            return;
-        }
-        this.reporter().report(refusal + " {copy} ('{declaration}') and check the local, as in "
-            + "'if ({local} != null) \{ {before}{local}{accessor}{after}; \}'.", at);
-    }
-
-    // reportSafeWrite for a target read through '?.' or '?[', and true when the target is one.
-    reportSafeTarget(Expression target, Type reached, string operator, string before, string after,
-                     Span at) -> bool {
-        Expression written = wording.unwrapParentheses(target);
-        let access = nullguidance.accessStep(written);
-        if (access == null || !access.safe()) {
-            return false;
-        }
-        this.reportSafeWrite(written, access, reached, operator, before, after, at);
-        return true;
-    }
-
-    // The name of a field that a write through 'this' or 'super' can land in, or null when there is
-    // none. With 'numeric', the field is a number.
-    receiverExampleField(Type reached, bool numeric = false) -> string? {
-        let fields = typemembers.fieldsOf(reached);
-        if (fields == null) {
-            return null;
-        }
-        for (long i = 0; i < fields.length(); i++) {
-            let field = fields.get(i);
-            if (field.isConst() || field.isStatic() || (numeric && !convert.isNumericType(field.type()))) {
-                continue;
-            }
-            if (!this.isAccessAllowed(field.visibility(), field.definingType())) {
-                continue;
-            }
-            if (typemembers.inheritedOrOwnField(reached, field.name()) == field) {
-                return field.name();
-            }
-        }
-        return null;
-    }
-
-    // The declared type of the slot a write through '?.' or '?[' lands in, the field's or the
-    // element's own type. Null when the write lands in no field or element.
-    public safeSlotType(Expression target) -> Type? {
-        let field = nullguidance.accessedField(this, target);
-        if (field != null) {
-            return field.type();
-        }
-        let access = nullguidance.accessStep(target);
-        if (access != null && access.safe() && access.index() != null) {
-            let objectType = this.result().typeOf(access.receiver().green());
-            if (objectType != null) {
-                Type array = convert.coreOf(objectType);
-                if (array is ArrayType) {
-                    return array.element();
-                }
-            }
-        }
-        return null;
-    }
-
-    // A member write through a class reference mutates the heap object, so any object works; a
-    // struct member write needs an addressable struct, so the object must itself be an lvalue.
-    // Parentheses name the place they hold, so the test reads through them wherever they stand.
-    isLValue(Expression node) -> bool {
-        switch (wording.unwrapParentheses(node)) {
-            is IdentifierExpressionNode ignored -> {
-                return true;
-            },
-            is SubscriptExpressionNode ignored -> {
-                return true;
-            },
-            is ThisExpressionNode ignored -> {
-                return true;
-            },
-            is MemberExpressionNode member -> {
-                let objectType = this.result().typeOf(member.object().green());
-                if (objectType != null && types.isStructLike(objectType)) {
-                    return this.isLValue(member.object());
-                }
-                return true;
-            },
-            default -> {
-                return false;
-            },
-        }
-    }
-
-    // Analyzes the left side of a write. A member access takes the write position wherever it
-    // stands, as the left side itself, under a '?.', or inside parentheses, which name the place
-    // they hold.
-    analyzeWriteTarget(Expression target, MemberPosition position = MemberPosition.Write)
-            -> Type {
-        switch (target) {
-            is MemberExpressionNode member -> {
-                Type analyzed = this.analyzeMemberValue(member, position);
-                this.result().setType(member.green(), analyzed);
-                return analyzed;
-            },
-            is SafeMemberExpressionNode member -> {
-                Type analyzed = this.analyzeSafeMemberValue(member, position);
-                this.result().setType(member.green(), analyzed);
-                return analyzed;
-            },
-            is ParenthesizedExpressionNode parenthesized -> {
-                Type analyzed = this.analyzeWriteTarget(parenthesized.inner(), position);
-                this.result().setType(parenthesized.green(), analyzed);
-                return analyzed;
-            },
-            default -> {
-                return this.analyzeExpression(target);
-            },
-        }
-    }
-
-    analyzeAssignment(AssignmentExpressionNode node) -> Type {
-        // A plain `x = ...` is a definite assignment of x, so its own identifier on the left is
-        // a write, not a read to check. A compound `x += ...` reads x first, and a member or
-        // subscript target reads its base, which must already be assigned.
-        bool simpleAssign = node.operator().kind() == SyntaxKind.Equals;
-        let target = node.target();
-        // Parentheses around a target name the same storage, so every rule below reads through
-        // them.
-        let writtenTarget = wording.unwrapParentheses(target);
-        let previousTarget = this.assignment().assignmentTarget();
-        if (simpleAssign && writtenTarget is IdentifierExpressionNode) {
-            let resolved = this.resolveName(writtenTarget.name().text());
-            if (resolved is LocalName) {
-                this.assignment().setAssignmentTarget(resolved.binding);
-            }
-        }
-        Type targetType = this.analyzeWriteTarget(target);
-        this.assignment().setAssignmentTarget(previousTarget);
-        string operator = node.operator().text();
-        // The levels of the target's own null that a refusal of a compound operator names. None are
-        // named where no write can change the target.
-        long nullLevels = wording.optionalLevels(targetType);
-        // A refused write proves nothing about the target, so it narrows nothing.
-        bool refused = false;
-        switch (writtenTarget) {
-            is ThisExpressionNode ignored -> {
-                this.reportReceiverAssignment("this", targetType, operator, node.span());
-                nullLevels = 0;
-                refused = true;
-            },
-            is SuperExpressionNode ignored -> {
-                this.reportReceiverAssignment("super", targetType, operator, node.span());
-                nullLevels = 0;
-                refused = true;
-            },
-            is SafeMemberExpressionNode ignored -> {},
-            is SafeSubscriptExpressionNode ignored -> {},
-            default -> {
-                if (!this.isLValue(target)) {
-                    string outcome = "so '{operator}' cannot store its result there";
-                    if (operator == "=") {
-                        outcome = "so it cannot be assigned";
-                    }
-                    this.reporter().report("{wording.sideNamed(target, "This value")} is not a variable, a "
-                        + "field or an array element, {outcome}.", node.span());
-                    nullLevels = 0;
-                    refused = true;
-                }
-            },
-        }
-        let staticTarget = this.result().staticConstFieldOf(writtenTarget.green());
-        if (staticTarget != null) {
-            this.reporter().report("Cannot assign to '{staticConstDisplay(staticTarget, this.names())}': "
-                + "a {members.typeLevelFieldWord(staticTarget)} keeps the value its initializer "
-                + "gives it. Change the initializer, or use an instance field.", node.span());
-            nullLevels = 0;
-            refused = true;
-        }
-        if (writtenTarget is IdentifierExpressionNode) {
-            let refusal = this.reportBindingWrite(writtenTarget);
-            if (refusal == WriteRefusal.Unwritable) {
-                nullLevels = 0;
-            }
-            refused = refused || refusal != WriteRefusal.None;
-        } else if (writtenTarget is MemberExpressionNode) {
-            let root = this.writtenChainRoot(writtenTarget);
-            if (root != null && this.reportRefusedWrite(root, "change", writtenTarget.span())) {
-                refused = true;
-            }
-        }
-        Type assignTarget = this.declaredTargetType(writtenTarget, targetType);
-        Type valueType = this.analyzeExpressionAdapt(node.value(), assignTarget,
-            literalfixes.assignmentOrigin(this, node, writtenTarget, assignTarget));
-        // A write through '?.' or '?[' is judged by the slot it lands in, as the same write without
-        // the '?' is.
-        Type writtenType = targetType;
-        bool safe = this.reportSafeTarget(target, targetType, operator, "", " {operator} ...", node.span());
-        if (safe) {
-            writtenType = assignTarget;
-            nullLevels = wording.optionalLevels(assignTarget);
-            refused = true;
-        }
-        let field = nullguidance.accessedField(this, writtenTarget);
-        bool throughThis = writtenTarget is MemberExpressionNode
-            && wording.unwrapParentheses(writtenTarget.object()) is ThisExpressionNode;
-        if (field != null && field.isConst()) {
-            if (this.checkConstFieldWrite(node, field, throughThis, simpleAssign)) {
-                refused = true;
-            }
-            nullLevels = 0;
-        }
-        // What the store actually lands: the right side for '=', the operator's result for 'OP='.
-        Type storedType = valueType;
-        // A slot reached through '?.' or '?[' is refused for its null only once the '?' is gone, so its
-        // compound write is checked as a write to its core type.
-        Type compoundTarget = writtenType;
-        long compoundLevels = nullLevels;
-        if (safe && writtenType is OptionalType) {
-            compoundTarget = convert.coreOf(writtenType);
-            compoundLevels = 0;
-        }
-        if (!(assignTarget is ErrorType) && !(valueType is ErrorType)) {
-            if (simpleAssign) {
-                if (!convert.isAssignableStrict(assignTarget, valueType)) {
-                    string hint = nullguidance.valueAssignabilityHint(this, assignTarget, valueType,
-                        node.value());
-                    this.reporter().report(
-                        "'{wording.oneLineSpelling(wording.unwrapParentheses(node.target()))}' has type "
-                        + "'{this.names().of(assignTarget)}', but the value assigned to it has type "
-                        + "'{this.names().of(valueType)}'.{hint}", node.span());
-                    refused = true;
-                }
-            } else if (!(targetType is ErrorType) && !(writtenTarget is ThisExpressionNode)
-                    && !(writtenTarget is SuperExpressionNode)) {
-                let result = this.checkCompoundAssignment(node, assignTarget, compoundTarget, valueType,
-                    new WriteTarget(compoundLevels), this.namesDeclaredPlace(writtenTarget));
-                if (result == null) {
-                    refused = true;
-                } else {
-                    storedType = result;
-                }
-            }
-        }
-        if (assignTarget != targetType && !safe) {
-            this.result().setType(node.target().green(), assignTarget);
-        }
-        // A refused write to a static or lazy const changes no narrowing.
-        if (staticTarget == null) {
-            narrowing.invalidateForWrite(this, writtenTarget);
-            if (!refused) {
-                narrowing.establishWriteNarrowing(this, writtenTarget, storedType);
-            }
-        }
-        if (writtenTarget is IdentifierExpressionNode) {
-            let binding = this.result().bindingOf(writtenTarget.green());
-            if (binding != null && this.assignment().unconditionalPosition()) {
-                this.assignment().markAssigned(binding);
-            }
-        } else if (field != null && simpleAssign && throughThis) {
-            this.assignment().markThisFieldMaybeAssigned(field, node.span());
-            if (this.assignment().unconditionalPosition()) {
-                this.assignment().markThisFieldAssigned(field);
-            }
-        }
-        return assignTarget;
-    }
-
-    // Enforces the write-once contract of a 'const' field at an assignment naming it, and returns
-    // true when it refuses the write. The one legal write is a plain '=' through 'this' inside a
-    // constructor of the field's own type, outside any loop, on a path that cannot have assigned it.
-    checkConstFieldWrite(AssignmentExpressionNode node, Field field, bool throughThis, bool simpleAssign)
-            -> bool {
-        string name = field.name();
-        string ownerName = this.constFieldOwnerName(field);
-        if (!simpleAssign) {
-            string operatorText = node.operator().text();
-            this.reporter().report("Cannot use '{operatorText}' on field '{name}': a 'const' "
-                + "field is assigned once when the object is constructed and never again. "
-                + "Remove 'const' from the field if it needs to change.", node.span());
-            return true;
-        }
-        if (!this.frame().inConstructor() || !throughThis) {
-            string sites = "inside a constructor of '{ownerName}' as 'this.{name} = ...'";
-            if (types.authorityOf(field.definingType()) is StructType) {
-                sites = sites + " or by a struct literal like '\{{name}: ...\}'";
-            }
-            this.reporter().report("Cannot assign a new value to field '{name}': it is 'const', "
-                + "so it is assigned exactly once, " + sites + ". Remove 'const' from the "
-                + "field if it needs to change.", node.span());
-            return true;
-        }
-        if (field.definingType() != this.assignment().constructorFieldOwner()) {
-            this.reporter().report("Field '{name}' is 'const' and declared in base class "
-                + "'{ownerName}', so only a constructor of '{ownerName}' can assign it. Pass "
-                + "the value to 'super(...)' instead.", node.span());
-            return true;
-        }
-        if (this.frame().loopDepth() > 0) {
-            this.reporter().report("Field '{name}' is 'const' and cannot be assigned inside a "
-                + "loop, which can run more than once. Assign it once, outside the loop.",
-                node.span());
-            return true;
-        }
-        let earlier = this.assignment().possibleWriteOf(field);
-        if (earlier != null) {
-            this.reporter().report("Field '{name}' is 'const' and may already be assigned when "
-                + "this line runs. Remove one of the assignments.", node.span(), earlier.span(),
-                "'{name}' is assigned here");
-            return true;
-        }
-        return false;
-    }
-
-    // 'a OP= b' means 'a = a OP b', so the operator's result has to fit the target. Returns that
-    // result, or null when the write is refused.
-    checkCompoundAssignment(AssignmentExpressionNode node, Type assignTarget, Type targetType,
-                                    Type valueType, WriteTarget written, bool declared) -> Type? {
-        SyntaxKind operator = compoundOperator(node.operator().kind());
-        string operatorText = node.operator().text();
-        if (operator == SyntaxKind.Invalid) {
-            this.reporter().report("Internal: unsupported compound assignment operator "
-                + "'{operatorText}'.", node.operator().span());
-            return valueType;
-        }
-        Type result = this.analyzeBinaryOperands(node.span(), operator, operatorText,
-            node.target(), node.value(), targetType, valueType, written);
-        bool storable = result is ErrorType || convert.isAssignableStrict(assignTarget, result);
-        if (!storable) {
-            Type core = convert.coreOf(targetType);
-            string declaredType = this.names().of(result);
-            if (assignTarget is OptionalType) {
-                declaredType = this.names().nullableOf(result);
-            }
-            string target = wording.oneLineSpelling(wording.unwrapParentheses(node.target()));
-            string cast = wording.converted(wording.unwrapParentheses(node.value()), this.names().of(core));
-            string place = this.declaredPlaceAs(node.target(), declaredType);
-            string fix = "";
-            if (convert.isNumericType(valueType) && convert.isNumericType(core)) {
-                fix = " Write '{cast}'.";
-                if (declared && place.length > 0) {
-                    fix = " Write '{cast}', or declare {place}.";
-                }
-            } else if (declared && place.length > 0) {
-                fix = " Declare {place}.";
-            }
-            this.reporter().report("Cannot store the result of '{operatorText}' back into '{target}', "
-                + "whose type is '{this.names().of(assignTarget)}': "
-                + "{combinedWords(operator, core, valueType, this.names())} produces "
-                + "'{this.names().of(result)}'.{fix}", node.span());
-        }
-        bool nullRefused = written.nullLevels() > 0 && !(valueType is OptionalType)
-            && acceptsCores(operator, targetType, valueType);
-        if (nullRefused) {
-            let guidance = nullguidance.binaryGuidance(this, node.target(), node.value(), targetType,
-                valueType, true, written, operatorText);
-            this.reporter().report(nullguidance.withGuidance(this, sidesRefusal(operator, operatorText,
-                node.target(), node.value(), targetType, valueType, this.names()), guidance), node.span());
-        }
-        if (result is ErrorType || !storable || nullRefused) {
-            return null;
-        }
-        return result;
-    }
-
-    // The variable, field or array a compound write lands in, declared so that it takes 'slotType',
-    // as in "'count' as 'long'". Empty when no declaration names it.
-    declaredPlaceAs(Expression target, string slotType) -> string {
-        Expression core = wording.unwrapParentheses(target);
-        if (core is IdentifierExpressionNode) {
-            return "'{core.name().text()}' as '{slotType}'";
-        }
-        let access = nullguidance.accessStep(core);
-        if (access == null) {
-            return "";
-        }
-        let member = access.member();
-        if (member != null) {
-            return "field '{member}' as '{slotType}'";
-        }
-        Expression receiver = wording.unwrapParentheses(access.receiver());
-        string? array = nullguidance.accessStep(receiver)?.member();
-        if (receiver is IdentifierExpressionNode) {
-            array = receiver.name().text();
-        }
-        let arrayType = narrowing.declaredSlotType(this, receiver);
-        if (array == null || arrayType == null) {
-            return "";
-        }
-        string levels = "";
-        Type layer = arrayType;
-        while (layer is OptionalType) {
-            levels = "{levels}?";
-            layer = layer.inner();
-        }
-        return "'{array}' as '{slotType}[]{levels}'";
-    }
-
-    // Reports a write the binding refuses, and returns why it refuses it.
-    reportBindingWrite(IdentifierExpressionNode identifier) -> WriteRefusal {
-        let binding = this.result().bindingOf(identifier.green());
-        if (binding == null) {
-            return WriteRefusal.None;
-        }
-        if (this.reportRefusedWrite(binding, "assign a new value to", identifier.span())) {
-            return WriteRefusal.Misplaced;
-        }
-        if (!binding.isConst()) {
-            return WriteRefusal.None;
-        }
-        this.reporter().report(
-            this.constantRefusal("Cannot assign a new value to '{binding.name()}'", binding),
-            identifier.span());
-        return WriteRefusal.Unwritable;
-    }
-
-    // The refusal 'opening' of a write to the constant local 'binding', with the change to its
-    // declaration that lets it change. The value an 'is' arm matched has no declaration to change.
-    constantRefusal(string opening, LocalBinding binding) -> string {
-        string name = binding.name();
-        if (definiteassignment.bindingsContain(this.armBindings, binding)) {
-            return "{opening}, because '{name}' is the value this 'is' arm matched, and it cannot change. "
-                + "Copy it into a variable if it needs to change, as in 'let changed = {name};'.";
-        }
-        string fix = "Remove 'const' from its declaration";
-        if (definiteassignment.bindingsContain(this.untypedConstants, binding)) {
-            fix = "Replace 'const' with 'let' in its declaration";
-        }
-        return "{opening}, because '{name}' is declared 'const'. {fix} if it needs to change.";
-    }
-
-    // Whether the target names a variable, a field or an element, whose declaration could take another type.
-    namesDeclaredPlace(Expression target) -> bool {
-        switch (target) {
-            is IdentifierExpressionNode identifier -> {
-                return this.result().bindingOf(identifier.green()) != null;
-            },
-            is MemberExpressionNode ignored -> {
-                return narrowing.declaredSlotType(this, target) != null;
-            },
-            is SubscriptExpressionNode ignored -> {
-                return narrowing.declaredSlotType(this, target) != null;
-            },
-            default -> {
-                return this.safeSlotType(target) != null;
-            },
-        }
-    }
-
-    // The declared type of the written slot: the binding's, field's, or element's own type.
-    declaredTargetType(Expression target, Type analyzed) -> Type {
-        switch (target) {
-            is IdentifierExpressionNode identifier -> {
-                let binding = this.result().bindingOf(identifier.green());
-                if (binding == null) {
-                    return analyzed;
-                }
-                return binding.type();
-            },
-            is MemberExpressionNode member -> {
-                return narrowing.declaredSlotType(this, member) ?? analyzed;
-            },
-            is SubscriptExpressionNode subscript -> {
-                let objectType = this.result().typeOf(subscript.object().green());
-                if (objectType is ArrayType) {
-                    return objectType.element();
-                }
-                return analyzed;
-            },
-            default -> {
-                if (nullguidance.accessStep(target)?.safe() ?? false) {
-                    return this.safeSlotType(target) ?? analyzed;
-                }
-                return analyzed;
-            },
-        }
-    }
-
     analyzeSubscript(SubscriptExpressionNode node) -> Type {
         Type objectType = this.analyzeExpression(node.object());
         let outerDeferred = this.targets().deferredFixes();
@@ -5099,7 +3992,7 @@ public final class BodyChecker implements NoreturnCalls {
     // Export members are visible everywhere and public ones package-wide; private members are
     // visible inside the declaring type, and protected ones in a subclass method or anywhere
     // in the module that declares the type.
-    isAccessAllowed(Visibility visibility, Type definingType) -> bool {
+    public isAccessAllowed(Visibility visibility, Type definingType) -> bool {
         let defining = types.authorityOf(definingType);
         if (defining == null) {
             return true;
@@ -5210,7 +4103,7 @@ public final class BodyChecker implements NoreturnCalls {
 
     // A covered access reports no method here. A call is covered because it takes the method
     // this resolves to from the side table this sets.
-    analyzeMemberValue(MemberExpressionNode node, MemberPosition position = MemberPosition.Read)
+    public analyzeMemberValue(MemberExpressionNode node, MemberPosition position = MemberPosition.Read)
             -> Type {
         let object = node.object();
         string name = node.member().text();
@@ -5283,7 +4176,7 @@ public final class BodyChecker implements NoreturnCalls {
             }
         }
         if (core is FunctionType) {
-            return this.reportFunctionMember(name, core, node.member().span());
+            return operators.reportFunctionMember(this, name, core, node.member().span());
         }
         if (core is ExternalType) {
             string held = wording.sideNamed(node.object(), "the value");
@@ -5479,7 +4372,7 @@ public final class BodyChecker implements NoreturnCalls {
         return false;
     }
 
-    analyzeSafeMemberValue(SafeMemberExpressionNode node,
+    public analyzeSafeMemberValue(SafeMemberExpressionNode node,
                                    MemberPosition position = MemberPosition.Read) -> Type {
         Type objectType = this.analyzeExpression(node.object());
         if (objectType is ErrorType) {
@@ -7439,7 +6332,7 @@ public final class BodyChecker implements NoreturnCalls {
         let arguments = node.arguments();
         if (convert.coreOf(core) is FunctionType) {
             this.analyzeArgumentsOnly(arguments);
-            return this.reportFunctionMember(name, core, node.span());
+            return operators.reportFunctionMember(this, name, core, node.span());
         }
         // The standard library's binding handles a call it declares a member for, so the
         // compiler's own member of that name steps aside there.
@@ -7871,8 +6764,8 @@ public final class BodyChecker implements NoreturnCalls {
             return;
         }
         if (binding.isConst()) {
-            this.reporter().report(this.constantRefusal("Cannot pass '{outName}' as 'out'", binding),
-                argument.span());
+            this.reporter().report(assignments.constantRefusal(this, "Cannot pass '{outName}' as 'out'",
+                binding), argument.span());
         }
         this.result().setBinding(argument.green(), binding);
         if (binding.type() != parameter.type()) {
@@ -8314,7 +7207,7 @@ public final class BodyChecker implements NoreturnCalls {
                         }
                         let binding = new LocalBinding(bindingToken.text(), bindingType,
                             BindingKind.Variable, true, bindingToken.span());
-                        this.armBindings.push(binding);
+                        this.matchedArmBindings.push(binding);
                         let current = this.scope;
                         if (current != null) {
                             current.define(binding);
@@ -9004,15 +7897,6 @@ typeParameterExample(DeclaredType owner) -> string {
     return example;
 }
 
-// "Path.separator", the way a static const reads in a diagnostic.
-staticConstDisplay(Field field, TypeNames names) -> string {
-    let owner = types.authorityOf(field.definingType());
-    if (owner == null) {
-        return field.name();
-    }
-    return "{names.nameOf(owner)}.{field.name()}";
-}
-
 // The statics a type declares under the name. No chain walk: statics are not inherited, so only
 // the named type's own list is used.
 staticsNamed(Type owner, string name) -> List<Method> {
@@ -9047,11 +7931,6 @@ isFinalClass(Type type) -> bool {
 // implemented, so it has none even though it counts as floating-point elsewhere.
 public isTextualFloat(Type core) -> bool {
     return convert.isFloatType(core) && !types.isDecimalType(core);
-}
-
-isStringable(Type core) -> bool {
-    return core is StringType || convert.isIntegerType(core) || convert.isBoolType(core)
-        || isTextualFloat(core);
 }
 
 parameterCountText(long count) -> string {
@@ -9394,244 +8273,6 @@ misplacedTryRefusal(Expression operand) -> string {
     return "{opening} Move 'try' to the call that can throw.";
 }
 
-// Whether the operator takes both sides once every '?' is removed from them.
-acceptsCores(SyntaxKind operator, Type left, Type right) -> bool {
-    Type first = convert.coreOf(left);
-    Type second = convert.coreOf(right);
-    switch (operator) {
-        Plus -> {
-            if (first is StringType || second is StringType) {
-                return isStringable(first) && isStringable(second);
-            }
-            return convert.isNumericType(first) && convert.isNumericType(second);
-        },
-        Minus, Star, Slash, Percent, PlusPlus, MinusMinus -> {
-            return convert.isNumericType(first) && convert.isNumericType(second);
-        },
-        Ampersand, Pipe, Caret, LessLess, GreaterGreater, GreaterGreaterGreater -> {
-            return convert.isIntegerType(first) && convert.isIntegerType(second);
-        },
-        // Two strings are ordered with 'compareTo' instead of an ordering operator.
-        Less, Greater, LessEquals, GreaterEquals -> {
-            return (first is StringType && second is StringType)
-                || (convert.isNumericType(first) && convert.isNumericType(second));
-        },
-        default -> {
-            return false;
-        },
-    }
-}
-
-// The type an operator checks its left side as. A write target is checked without its '?'.
-checkedSide(Type left, WriteTarget? written) -> Type {
-    if (written != null) {
-        return convert.coreOf(left);
-    }
-    return left;
-}
-
-// The type a text names for the left side of an operator, as 'adapted' toward the other side.
-// A write target is named with its own type instead.
-shownSide(Type adapted, Type left, WriteTarget? written) -> Type {
-    if (written != null) {
-        return left;
-    }
-    return adapted;
-}
-
-// The refusal of an operator's sides 'leftNode' and 'rightNode', naming the ones the operator does
-// not take. A shift names only the shifted value.
-sidesRefusal(SyntaxKind operator, string operatorText, Expression leftNode, Expression rightNode, Type left,
-             Type right, TypeNames names) -> string {
-    bool joins = convert.coreOf(left) is StringType || convert.coreOf(right) is StringType;
-    if (operator == SyntaxKind.Plus && joins) {
-        string sides = sidesClause(leftNode, rightNode, left, right, left is OptionalType,
-            right is OptionalType, names);
-        return "'{operatorText}' joins a string only when neither side can be null, {sides}.";
-    }
-    switch (operator) {
-        Ampersand, Pipe, Caret -> {
-            string sides = sidesClause(leftNode, rightNode, left, right, !convert.isIntegerType(left),
-                !convert.isIntegerType(right), names);
-            return "'{operatorText}' needs integers on both sides, {sides}.";
-        },
-        LessLess, GreaterGreater, GreaterGreaterGreater -> {
-            return "'{operatorText}' shifts an integer, but "
-                + "{wording.sideNamed(leftNode, "the value it shifts")} has type '{names.of(left)}'.";
-        },
-        default -> {
-            string sides = sidesClause(leftNode, rightNode, left, right, !convert.isNumericType(left),
-                !convert.isNumericType(right), names);
-            return "'{operatorText}' needs numbers on both sides, {sides}.";
-        },
-    }
-}
-
-// The clause "but ... has type 'T'" naming the sides of an operator it does not take, the ones
-// 'leftFails' and 'rightFails' mark. A side with no short spelling is named by its place.
-sidesClause(Expression leftNode, Expression rightNode, Type left, Type right, bool leftFails, bool rightFails,
-            TypeNames names) -> string {
-    if (leftFails && !rightFails) {
-        return "but {wording.sideNamed(leftNode, "the left side")} has type '{names.of(left)}'";
-    }
-    if (rightFails && !leftFails) {
-        return "but {wording.sideNamed(rightNode, "the right side")} has type '{names.of(right)}'";
-    }
-    let first = wording.shortSpelling(leftNode);
-    let second = wording.shortSpelling(rightNode);
-    bool same = names.of(left) == names.of(right);
-    if (first != null && second != null && first != second) {
-        if (same) {
-            return "but '{first}' and '{second}' both have type '{names.of(left)}'";
-        }
-        return "but '{first}' has type '{names.of(left)}' and '{second}' has type '{names.of(right)}'";
-    }
-    if (same) {
-        return "but both sides have type '{names.of(left)}'";
-    }
-    return "but the sides are '{names.of(left)}' and '{names.of(right)}'";
-}
-
-// The sentence, opening with a space, that converts two sides of different number types to the
-// narrowest type with every value of each, so no value changes. Empty when no type has them all, and
-// for a compound assignment, whose result goes back into its left side.
-bothSidesConversion(string operatorText, Expression leftNode, Expression rightNode, Type left, Type right)
-        -> string {
-    Type leftCore = convert.coreOf(left);
-    Type rightCore = convert.coreOf(right);
-    if (isCompoundOperator(operatorText) || !(leftCore is PrimitiveType) || !(rightCore is PrimitiveType)) {
-        return "";
-    }
-    string target = holdingNumberType(leftCore.kind(), rightCore.kind());
-    if (target.length == 0) {
-        return "";
-    }
-    let leftSpelled = wording.shortSpelling(leftNode);
-    let rightSpelled = wording.shortSpelling(rightNode);
-    Expression leftValue = wording.unwrapParentheses(leftNode);
-    Expression rightValue = wording.unwrapParentheses(rightNode);
-    bool convertsLeft = primitiveName(leftCore.kind()) != target;
-    bool convertsRight = primitiveName(rightCore.kind()) != target;
-    if (leftSpelled == null || rightSpelled == null) {
-        return " Convert both sides to '{target}' with 'as'.";
-    }
-    string leftText = wording.oneLineSpelling(leftValue);
-    string rightText = wording.oneLineSpelling(rightValue);
-    if (convertsLeft) {
-        leftText = wording.converted(leftValue, target);
-    }
-    if (convertsRight) {
-        rightText = wording.converted(rightValue, target);
-    }
-    string example = "{leftText} {operatorText} {rightText}";
-    if (convertsLeft && convertsRight) {
-        return " Convert both sides to '{target}', as in '{example}'.";
-    }
-    string side = leftSpelled;
-    if (convertsRight) {
-        side = rightSpelled;
-    }
-    return " Convert '{side}' to '{target}', as in '{example}'.";
-}
-
-// Whether 'operatorText' writes its result back into its left side, as '+=' does.
-isCompoundOperator(string operatorText) -> bool {
-    return operatorText.endsWith("=") && operatorText != "<=" && operatorText != ">="
-        && operatorText != "==" && operatorText != "!=";
-}
-
-// The narrowest number type with every value of 'first' and of 'second', or empty when none has them
-// all. An integer type comes first at each width, and a 'float' or a 'double' side needs a
-// floating-point type.
-holdingNumberType(PrimitiveKind first, PrimitiveKind second) -> string {
-    if (isFloatingKind(first) || isFloatingKind(second)) {
-        for (let kind in [PrimitiveKind.Float, PrimitiveKind.Double]) {
-            if (floatHoldsEveryValue(kind, first) && floatHoldsEveryValue(kind, second)) {
-                return primitiveName(kind);
-            }
-        }
-        return "";
-    }
-    PrimitiveKind[] ordered = [PrimitiveKind.Short, PrimitiveKind.UShort, PrimitiveKind.Int,
-        PrimitiveKind.UInt, PrimitiveKind.Long, PrimitiveKind.ULong];
-    for (let kind in ordered) {
-        if (valuejoins.holdsEveryValue(kind, first) && valuejoins.holdsEveryValue(kind, second)) {
-            return primitiveName(kind);
-        }
-    }
-    return "";
-}
-
-// Whether the kind is 'float' or 'double'.
-isFloatingKind(PrimitiveKind kind) -> bool {
-    return kind == PrimitiveKind.Float || kind == PrimitiveKind.Double;
-}
-
-// Whether the floating-point kind 'outer' has every value of 'inner' exactly: a 'float' has integers of
-// up to 24 bits and a 'double' of up to 53.
-floatHoldsEveryValue(PrimitiveKind outer, PrimitiveKind inner) -> bool {
-    if (inner == PrimitiveKind.Double) {
-        return outer == PrimitiveKind.Double;
-    }
-    if (inner == PrimitiveKind.Float) {
-        return true;
-    }
-    if (inner == PrimitiveKind.Bool) {
-        return false;
-    }
-    long width = literaltyping.integerWidth(inner);
-    if (inner == PrimitiveKind.Char) {
-        width = 21;
-    }
-    if (outer == PrimitiveKind.Float) {
-        return width <= 24;
-    }
-    return width < 64;
-}
-
-// The name a number kind is written with.
-primitiveName(PrimitiveKind kind) -> string {
-    if (kind == PrimitiveKind.Float) {
-        return "float";
-    }
-    if (kind == PrimitiveKind.Double) {
-        return "double";
-    }
-    if (kind == PrimitiveKind.Byte) {
-        return "byte";
-    }
-    if (kind == PrimitiveKind.Char) {
-        return "char";
-    }
-    return literaltyping.primitiveKindName(kind);
-}
-
-// How an arithmetic operator combines a value with a target, as in "adding 'long' to 'int'".
-combinedWords(SyntaxKind operator, Type target, Type value, TypeNames names) -> string {
-    string first = "'{names.of(target)}'";
-    string second = "'{names.of(value)}'";
-    switch (operator) {
-        Plus -> {
-            return "adding {second} to {first}";
-        },
-        Minus -> {
-            return "subtracting {second} from {first}";
-        },
-        Star -> {
-            return "multiplying {first} by {second}";
-        },
-        Slash -> {
-            return "dividing {first} by {second}";
-        },
-        Percent -> {
-            return "the remainder of dividing {first} by {second}";
-        },
-        default -> {
-            return "combining {first} with {second}";
-        },
-    }
-}
-
 typeParameterNamesText(Signature signature) -> string {
     string text = "";
     let parameters = signature.typeParameters();
@@ -9688,49 +8329,6 @@ hasTypedArm(List<SwitchArm> arms) -> bool {
         }
     }
     return false;
-}
-
-// The binary operator a compound-assignment token stands for ('+=' gives '+'), or Invalid when
-// the token is not a compound assignment.
-compoundOperator(SyntaxKind token) -> SyntaxKind {
-    switch (token) {
-        PlusEquals -> {
-            return SyntaxKind.Plus;
-        },
-        MinusEquals -> {
-            return SyntaxKind.Minus;
-        },
-        StarEquals -> {
-            return SyntaxKind.Star;
-        },
-        SlashEquals -> {
-            return SyntaxKind.Slash;
-        },
-        PercentEquals -> {
-            return SyntaxKind.Percent;
-        },
-        AmpersandEquals -> {
-            return SyntaxKind.Ampersand;
-        },
-        PipeEquals -> {
-            return SyntaxKind.Pipe;
-        },
-        CaretEquals -> {
-            return SyntaxKind.Caret;
-        },
-        LessLessEquals -> {
-            return SyntaxKind.LessLess;
-        },
-        GreaterGreaterEquals -> {
-            return SyntaxKind.GreaterGreater;
-        },
-        GreaterGreaterGreaterEquals -> {
-            return SyntaxKind.GreaterGreaterGreater;
-        },
-        default -> {
-            return SyntaxKind.Invalid;
-        },
-    }
 }
 
 // The constant an integer switch label names: a char literal's codepoint, or an int or long

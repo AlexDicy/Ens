@@ -1,0 +1,753 @@
+// The binary and prefix operators, and '++' and '--' written after a value: the operand types each
+// operator accepts, the conversion of one side to the type of the other, and the refusals for
+// operands that do not fit.
+import Expression from @ens.frontend.syntax.generated.nodes;
+import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ThisExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SuperExpressionNode from @ens.frontend.syntax.generated.nodes;
+import BinaryExpressionNode from @ens.frontend.syntax.generated.nodes;
+import PrefixExpressionNode from @ens.frontend.syntax.generated.nodes;
+import PostfixExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SyntaxKind from @ens.frontend.syntax.generated.kind;
+import Span from @ens.frontend.support.source;
+import model.capabilities;
+import model.convert;
+import LiteralOrigin from phases.bodies.literaltargets;
+import JoinText from phases.bodies.literaltargets;
+import phases.bodies.assignments;
+import WriteTarget from phases.bodies.assignments;
+import WriteRefusal from phases.bodies.assignments;
+import phases.bodies.literalfixes;
+import phases.bodies.valuejoins;
+import phases.bodies.literaltyping;
+import phases.bodies.nullguidance;
+import phases.bodies.wording;
+import phases.bodies.narrowing;
+import model.typenames;
+import TypeNames from model.typenames;
+import model.types;
+import Type from model.types;
+import ErrorType from model.types;
+import NullType from model.types;
+import StringType from model.types;
+import OptionalType from model.types;
+import ArrayType from model.types;
+import FunctionType from model.types;
+import PrimitiveType from model.types;
+import PrimitiveKind from model.types;
+import EqualityObligation from phases.obligations;
+import phases.bodies;
+import BodyChecker from phases.bodies;
+
+public analyzeBinary(BodyChecker checker, BinaryExpressionNode node) -> Type {
+    SyntaxKind operator = node.operator().kind();
+    // '&&' and '||' evaluate the right side only when the left did not already decide
+    // the result, so a check on the left narrows the right: 'x != null && x.ready()'.
+    if (operator == SyntaxKind.AmpersandAmpersand || operator == SyntaxKind.PipePipe) {
+        Type shortLeft = checker.analyzeExpression(node.left());
+        Type shortRight = narrowing.analyzeGuardedBranch(checker, node.left(), node.right(),
+            operator == SyntaxKind.AmpersandAmpersand, null);
+        if (shortLeft is ErrorType || shortRight is ErrorType) {
+            return checker.store().errorType();
+        }
+        if (!convert.isBoolType(shortLeft) || !convert.isBoolType(shortRight)) {
+            bool accepted = convert.isBoolType(convert.coreOf(shortLeft))
+                && convert.isBoolType(convert.coreOf(shortRight));
+            let guidance = nullguidance.binaryGuidance(checker, node.left(), node.right(), shortLeft,
+                shortRight, accepted, null, node.operator().text());
+            string sides = sidesClause(node.left(), node.right(), shortLeft, shortRight,
+                !convert.isBoolType(shortLeft), !convert.isBoolType(shortRight), checker.names());
+            checker.reporter().report(nullguidance.withGuidance(checker, "'{node.operator().text()}' needs a "
+                + "'bool' on both sides, {sides}.", guidance), node.span());
+        }
+        return checker.store().primitive(PrimitiveKind.Bool);
+    }
+    Type? target = null;
+    LiteralOrigin? origin = null;
+    if (checker.targets().binaryNode() == node.green()) {
+        if (literalfixes.isArithmeticOperator(operator) || operator == SyntaxKind.Ampersand
+                || operator == SyntaxKind.Pipe || operator == SyntaxKind.Caret) {
+            target = checker.targets().binaryTarget();
+            origin = checker.targets().binaryOrigin();
+        }
+        checker.targets().clearBinaryStash();
+    }
+    checker.targets().stash(node.left(), target, origin);
+    Type left = checker.analyzeExpression(node.left());
+    checker.targets().clearStash();
+    checker.targets().stash(node.right(), target, origin);
+    Type right = checker.analyzeExpression(node.right());
+    checker.targets().clearStash();
+    if (left is ErrorType || right is ErrorType) {
+        return checker.store().errorType();
+    }
+    checker.targets().enterOperands(node, target, origin);
+    Type result = analyzeBinaryOperands(checker, node.span(), operator, node.operator().text(),
+        node.left(), node.right(), left, right, null);
+    checker.targets().leaveOperands();
+    return result;
+}
+
+// The result of 'left OP right' under the operator's own rules. A compound assignment passes its
+// target as 'written', which is checked without its '?'.
+public analyzeBinaryOperands(BodyChecker checker, Span span, SyntaxKind operator, string operatorText,
+                             Expression leftNode, Expression rightNode, Type left,
+                             Type right, WriteTarget? written) -> Type {
+    switch (operator) {
+        Plus, Minus, Star, Slash, Percent -> {
+            return analyzeArithmetic(checker, span, operator, operatorText, leftNode, rightNode,
+                left, right, written);
+        },
+        EqualsEquals, NotEquals -> {
+            return analyzeEquality(checker, span, operatorText, leftNode, rightNode, left, right);
+        },
+        Less, Greater, LessEquals, GreaterEquals -> {
+            return analyzeComparison(checker, span, operator, operatorText, leftNode, rightNode, left, right);
+        },
+        Ampersand, Pipe, Caret -> {
+            return analyzeBitwise(checker, span, operator, operatorText, leftNode, rightNode, left,
+                right, written);
+        },
+        LessLess, GreaterGreater, GreaterGreaterGreater -> {
+            return analyzeShift(checker, span, operator, operatorText, leftNode, rightNode, left,
+                right, written);
+        },
+        default -> {
+            checker.reporter().report("Internal: unsupported binary operator '{operatorText}'.", span);
+            return checker.store().errorType();
+        },
+    }
+}
+
+// Both sides after an untyped literal on either side adapts to the other side's type.
+adaptOperands(BodyChecker checker, Expression leftNode, Expression rightNode, Type left, Type right,
+              string operatorText) -> Type[] {
+    return [adaptedOperand(checker, leftNode, left, right, rightNode, operatorText, false),
+        adaptedOperand(checker, rightNode, right, left, leftNode, operatorText, true)];
+}
+
+// The operand's type once an untyped literal in it adapts toward 'toward', the type of 'other'.
+// Any other operand keeps its type.
+adaptedOperand(BodyChecker checker, Expression node, Type type, Type toward, Expression other,
+               string operatorText, bool onRight) -> Type {
+    let fix = literalfixes.operandLiteralFix(checker, node, other, toward, operatorText, onRight);
+    literalfixes.noteSuffixedOperand(checker, node, other, toward, operatorText, onRight);
+    return literaltyping.adaptIntegerLiteral(checker, node, toward, null, fix)
+        ?? literaltyping.adaptFloatLiteral(checker, node, toward, null, fix) ?? type;
+}
+
+analyzeArithmetic(BodyChecker checker, Span span, SyntaxKind operator, string operatorText,
+                  Expression leftNode, Expression rightNode, Type left, Type right, WriteTarget? written)
+                  -> Type {
+    Type[] adapted = adaptOperands(checker, leftNode, rightNode, checkedSide(left, written), right,
+        operatorText);
+    if (adapted[0] is ErrorType || adapted[1] is ErrorType) {
+        return checker.store().errorType();
+    }
+    Type checkedLeft = adapted[0];
+    Type shownLeft = shownSide(checkedLeft, left, written);
+    Type checkedRight = adapted[1];
+    bool joins = operator == SyntaxKind.Plus
+        && (convert.coreOf(checkedLeft) is StringType || convert.coreOf(checkedRight) is StringType);
+    bool accepted = acceptsCores(operator, checkedLeft, checkedRight);
+    let guidance = nullguidance.binaryGuidance(checker, leftNode, rightNode, shownLeft, checkedRight,
+        accepted, written, operatorText);
+    if (joins) {
+        if (isStringable(checkedLeft) && isStringable(checkedRight)) {
+            return checker.store().stringType();
+        }
+        string refusal = sidesRefusal(operator, operatorText, leftNode, rightNode, shownLeft,
+            checkedRight, checker.names());
+        if (!accepted) {
+            refusal = "Cannot add a value of type '{checker.names().of(checkedRight)}' to a string.";
+            if (isStringable(convert.coreOf(checkedRight))) {
+                refusal = "Cannot add a string to a value of type '{checker.names().of(shownLeft)}'.";
+            }
+            refusal = refusal + " Only a string, a number or a 'bool' can be added to one.";
+        }
+        checker.reporter().report(nullguidance.withGuidance(checker, refusal, guidance), span);
+        return checker.store().errorType();
+    }
+    if (!convert.isNumericType(checkedLeft) || !convert.isNumericType(checkedRight)) {
+        checker.reporter().report(nullguidance.withGuidance(checker, sidesRefusal(operator, operatorText,
+            leftNode, rightNode, shownLeft, checkedRight, checker.names()), guidance), span);
+        return checker.store().errorType();
+    }
+    let common = convert.numericCommonType(checkedLeft, checkedRight);
+    if (common == null) {
+        checker.reporter().report("'{operatorText}' needs the same number type on both sides, "
+            + "{sidesClause(leftNode, rightNode, shownLeft, checkedRight, true, true, checker.names())}."
+            + bothSidesConversion(operatorText, leftNode, rightNode, checkedLeft, checkedRight), span);
+        return checker.store().errorType();
+    }
+    return common;
+}
+
+// A comparison against 'null' is a presence test on the declared storage type, so it stays
+// legal on a binding declared optional even where narrowing already proved the value non-null.
+analyzeEquality(BodyChecker checker, Span span, string operatorText, Expression leftNode,
+                Expression rightNode, Type left, Type right) -> Type {
+    Type[] adapted = adaptOperands(checker, leftNode, rightNode, left, right, operatorText);
+    Type leftSide = adapted[0];
+    Type rightSide = adapted[1];
+    if (rightSide is NullType) {
+        leftSide = narrowing.presenceOperandType(checker, leftNode, leftSide);
+    } else if (leftSide is NullType) {
+        rightSide = narrowing.presenceOperandType(checker, rightNode, rightSide);
+    }
+    if (reportFunctionComparison(checker, span, leftSide, rightSide)) {
+        return checker.store().primitive(PrimitiveKind.Bool);
+    }
+    if (!convert.isAssignableStrict(leftSide, rightSide)
+            && !convert.isAssignableStrict(rightSide, leftSide)) {
+        checker.reporter().report(comparisonRefusal(checker, operatorText, leftNode, rightNode, leftSide,
+            rightSide), span);
+    } else {
+        checkStructEquatable(checker, leftSide, rightSide, span);
+    }
+    return checker.store().primitive(PrimitiveKind.Bool);
+}
+
+// The refusal of 'operatorText' between two sides whose types are never equal. Against 'null',
+// the side that can never be null is named with the result the comparison always has.
+comparisonRefusal(BodyChecker checker, string operatorText, Expression leftNode, Expression rightNode,
+                  Type left, Type right) -> string {
+    if (!(left is NullType) && !(right is NullType)) {
+        return "Cannot compare '{checker.names().of(left)}' with '{checker.names().of(right)}', because a "
+            + "value of one of these types is never equal to a value of the other.";
+    }
+    Type other = left;
+    Expression valueNode = leftNode;
+    if (left is NullType) {
+        other = right;
+        valueNode = rightNode;
+    }
+    string result = "false";
+    if (operatorText == "!=") {
+        result = "true";
+    }
+    string nullable = checker.names().nullableOf(other);
+    let spelled = wording.shortSpelling(valueNode);
+    if (spelled == null) {
+        return "This value has type '{checker.names().of(other)}', which can never be null, so this "
+            + "comparison is always {result}. Remove the comparison, or give the value a nullable type "
+            + "such as '{nullable}' if it should allow null.";
+    }
+    string comparison = "{spelled} {operatorText} null";
+    if (left is NullType) {
+        comparison = "null {operatorText} {spelled}";
+    }
+    string change = "give '{spelled}' a nullable type such as '{nullable}'";
+    if (wording.unwrapParentheses(valueNode) is IdentifierExpressionNode) {
+        change = "declare '{spelled}' as '{nullable}'";
+    }
+    return "'{spelled}' has type '{checker.names().of(other)}', which can never be null, so '{comparison}' "
+        + "is always {result}. Remove the comparison, or {change} if it should allow null.";
+}
+
+// A function value has nothing to reach into: no fields, no methods, no identity and no text
+// form. The one home for reporting it, whether the name was read or called.
+public reportFunctionMember(BodyChecker checker, string name, Type functionType, Span at) -> Type {
+    checker.reporter().report(capabilities.functionMemberIssue(name, functionType, checker.names()), at);
+    return checker.store().errorType();
+}
+
+// Refuses comparing two function values, which have no identity, and returns whether it did.
+// Comparing a nullable one with 'null' tests presence and stays allowed.
+reportFunctionComparison(BodyChecker checker, Span span, Type left, Type right) -> bool {
+    if (left is NullType || right is NullType) {
+        return false;
+    }
+    if (!(convert.coreOf(left) is FunctionType) && !(convert.coreOf(right) is FunctionType)) {
+        return false;
+    }
+    checker.reporter().report("A function value has no identity, so '{checker.names().of(left)}' and "
+        + "'{checker.names().of(right)}' cannot be compared. Compare what the functions produce, "
+        + "or keep a name or tag beside each one and compare that.", span);
+    return true;
+}
+
+// Struct and array '==' compare memberwise, so every field or element needs its own '=='.
+// A type mentioning a type parameter is judged per instantiation.
+checkStructEquatable(BodyChecker checker, Type leftSide, Type rightSide, Span span) {
+    Type judged = leftSide;
+    if (convert.coreOf(leftSide) is ArrayType && convert.coreOf(rightSide) is ArrayType) {
+        judged = convert.coreOf(leftSide);
+    } else if (!types.isStructLike(leftSide) || leftSide != rightSide) {
+        return;
+    }
+    if (convert.containsTypeParam(judged)) {
+        checker.recordObligation(new EqualityObligation(judged, span));
+        return;
+    }
+    let issue = capabilities.equalityComparabilityIssue(judged, checker.names());
+    if (issue != null) {
+        checker.reporter().report(issue, span);
+    }
+}
+
+analyzeComparison(BodyChecker checker, Span span, SyntaxKind operator, string operatorText,
+                  Expression leftNode, Expression rightNode, Type left, Type right) -> Type {
+    Type[] adapted = adaptOperands(checker, leftNode, rightNode, left, right, operatorText);
+    if (adapted[0] is ErrorType || adapted[1] is ErrorType) {
+        return checker.store().primitive(PrimitiveKind.Bool);
+    }
+    Type first = adapted[0];
+    Type second = adapted[1];
+    if (!convert.isNumericType(first) || !convert.isNumericType(second)) {
+        bool ordersStrings = convert.coreOf(first) is StringType && convert.coreOf(second) is StringType;
+        bool accepted = acceptsCores(operator, first, second);
+        let guidance = nullguidance.binaryGuidance(checker, leftNode, rightNode, first, second, accepted,
+            null, operatorText);
+        string sides = sidesClause(leftNode, rightNode, first, second, !convert.isNumericType(first),
+            !convert.isNumericType(second), checker.names());
+        string refusal = nullguidance.withGuidance(checker, "'{operatorText}' compares numbers, {sides}.",
+            guidance);
+        if (ordersStrings) {
+            refusal = refusal + " "
+                + nullguidance.orderingAdvice(checker, operatorText, leftNode, rightNode, first, second);
+        }
+        checker.reporter().report(refusal, span);
+        return checker.store().primitive(PrimitiveKind.Bool);
+    }
+    if (convert.numericCommonType(first, second) == null) {
+        checker.reporter().report("'{operatorText}' needs the same number type on both sides, "
+            + "{sidesClause(leftNode, rightNode, first, second, true, true, checker.names())}."
+            + bothSidesConversion(operatorText, leftNode, rightNode, first, second), span);
+    }
+    return checker.store().primitive(PrimitiveKind.Bool);
+}
+
+analyzeBitwise(BodyChecker checker, Span span, SyntaxKind operator, string operatorText, Expression leftNode,
+               Expression rightNode, Type left, Type right, WriteTarget? written) -> Type {
+    // A bitwise operator takes integers, so only an integer literal adapts to the other side.
+    Type checkedLeft = literaltyping.adaptIntegerLiteral(checker, leftNode, right, null,
+        literalfixes.operandLiteralFix(checker, leftNode, rightNode, right, operatorText, false))
+        ?? checkedSide(left, written);
+    Type checkedRight = literaltyping.adaptIntegerLiteral(checker, rightNode, left, null,
+        literalfixes.operandLiteralFix(checker, rightNode, leftNode, left, operatorText, true)) ?? right;
+    if (checkedLeft is ErrorType || checkedRight is ErrorType) {
+        return checker.store().errorType();
+    }
+    Type shownLeft = shownSide(checkedLeft, left, written);
+    if (!convert.isIntegerType(checkedLeft) || !convert.isIntegerType(checkedRight)) {
+        bool accepted = acceptsCores(operator, checkedLeft, checkedRight);
+        let guidance = nullguidance.binaryGuidance(checker, leftNode, rightNode, shownLeft, checkedRight,
+            accepted, written, operatorText);
+        checker.reporter().report(nullguidance.withGuidance(checker, sidesRefusal(operator, operatorText,
+            leftNode, rightNode, shownLeft, checkedRight, checker.names()), guidance), span);
+        return checker.store().errorType();
+    }
+    if (checkedLeft != checkedRight) {
+        checker.reporter().report("'{operatorText}' needs the same integer type on both sides, "
+            + "{sidesClause(leftNode, rightNode, shownLeft, checkedRight, true, true, checker.names())}."
+            + bothSidesConversion(operatorText, leftNode, rightNode, checkedLeft, checkedRight), span);
+        return checker.store().errorType();
+    }
+    return checkedLeft;
+}
+
+// The shifted value alone decides the result type, so only the distance adapts.
+analyzeShift(BodyChecker checker, Span span, SyntaxKind operator, string operatorText, Expression leftNode,
+             Expression rightNode, Type left, Type right, WriteTarget? written) -> Type {
+    Type checkedLeft = checkedSide(left, written);
+    JoinText? why = null;
+    if (literalfixes.overflowWidening(checker, rightNode, checkedLeft) != null) {
+        string text = wording.takesTypeFrom("'{wording.oneLineSpelling(leftNode)}'",
+            checker.names().of(convert.coreOf(checkedLeft)));
+        why = new JoinText(text, text);
+    }
+    Type distance = literaltyping.adaptIntegerLiteral(checker, rightNode, checkedLeft, null, why) ?? right;
+    if (distance is ErrorType) {
+        return checker.store().errorType();
+    }
+    bool accepted = acceptsCores(operator, left, distance);
+    let guidance = nullguidance.binaryGuidance(checker, leftNode, rightNode, left, distance, accepted,
+        written, operatorText);
+    bool shiftedNull = left is OptionalType;
+    if (written != null) {
+        shiftedNull = written.nullLevels() > 0;
+    }
+    if (accepted && shiftedNull && distance is OptionalType) {
+        checker.reporter().report(nullguidance.withGuidance(checker,
+            "'{operatorText}' needs an integer to shift and an "
+            + "integer shift distance, {sidesClause(leftNode, rightNode, left, distance, true, true,
+            checker.names())}.", guidance), span);
+        return checker.store().errorType();
+    }
+    if (!convert.isIntegerType(checkedLeft)) {
+        checker.reporter().report(nullguidance.withGuidance(checker, sidesRefusal(operator, operatorText,
+            leftNode, rightNode, left, distance, checker.names()), guidance), span);
+        return checker.store().errorType();
+    }
+    if (!convert.isIntegerType(distance)) {
+        checker.reporter().report(nullguidance.withGuidance(checker,
+            "'{operatorText}' needs an integer shift distance, but "
+            + "{wording.sideNamed(rightNode, "the distance")} has type '{checker.names().of(distance)}'.",
+            guidance), span);
+        return checker.store().errorType();
+    }
+    if (checkedLeft != distance) {
+        string shifted = checker.names().of(shownSide(checkedLeft, left, written));
+        string wanted = checker.names().of(checkedLeft);
+        string fix = "Convert the distance with 'as'.";
+        if (wording.shortSpelling(rightNode) != null) {
+            fix = "Write '{wording.converted(wording.unwrapParentheses(rightNode), wanted)}'.";
+        }
+        checker.reporter().report("'{operatorText}' shifts {typenames.typeArticle(shifted)} '{shifted}' "
+            + "here, so the shift distance must be {typenames.typeArticle(wanted)} '{wanted}' too, but "
+            + "{wording.sideNamed(rightNode, "the distance")} has type '{checker.names().of(distance)}'. "
+            + "{fix}",
+            span);
+        return checker.store().errorType();
+    }
+    return checkedLeft;
+}
+
+public analyzePrefix(BodyChecker checker, PrefixExpressionNode node) -> Type {
+    SyntaxKind prefixOperator = node.operator().kind();
+    Type operand = analyzePrefixOperand(checker, prefixOperator, node.operand());
+    if (prefixOperator == SyntaxKind.Minus || prefixOperator == SyntaxKind.Plus) {
+        valuejoins.retargetLiteralRange(checker, node, node.operand(), prefixOperator == SyntaxKind.Minus);
+    }
+    if (operand is ErrorType) {
+        return checker.store().errorType();
+    }
+    Type core = operand;
+    switch (node.operator().kind()) {
+        Minus, Plus -> {
+            if (!convert.isNumericType(core)) {
+                let guidance = nullguidance.unaryGuidance(checker, node.operand(), operand,
+                    convert.isNumericType(convert.coreOf(operand)), null);
+                checker.reporter().report(nullguidance.withGuidance(checker,
+                    "Unary '{node.operator().text()}' needs a number, but "
+                    + "{wording.sideNamed(node.operand(), "the operand")} has type "
+                    + "'{checker.names().of(operand)}'.", guidance), node.span());
+                return checker.store().errorType();
+            }
+            return core;
+        },
+        Exclamation -> {
+            if (!convert.isBoolType(core)) {
+                let guidance = nullguidance.unaryGuidance(checker, node.operand(), operand,
+                    convert.isBoolType(convert.coreOf(operand)), null);
+                checker.reporter().report(nullguidance.withGuidance(checker, "'!' negates a 'bool', but "
+                    + "{wording.sideNamed(node.operand(), "the operand")} has type "
+                    + "'{checker.names().of(operand)}'.",
+                    guidance), node.span());
+                return checker.store().errorType();
+            }
+            return core;
+        },
+        Tilde -> {
+            if (!convert.isIntegerType(core)) {
+                let guidance = nullguidance.unaryGuidance(checker, node.operand(), operand,
+                    convert.isIntegerType(convert.coreOf(operand)), null);
+                checker.reporter().report(nullguidance.withGuidance(checker, "'~' flips the bits of an "
+                    + "integer, but {wording.sideNamed(node.operand(), "the operand")} has type "
+                    + "'{checker.names().of(operand)}'.",
+                    guidance), node.span());
+                return checker.store().errorType();
+            }
+            return core;
+        },
+        PlusPlus, MinusMinus -> {
+            return analyzeIncrement(checker, node.span(), node.operand(), core,
+                node.operator().kind() == SyntaxKind.PlusPlus, true);
+        },
+        default -> {
+            checker.reporter().report("Internal: unsupported unary operator "
+                + "'{node.operator().text()}'.", node.operator().span());
+            return checker.store().errorType();
+        },
+    }
+}
+
+// The operand of a prefix operator. '++' and '--' store back what they read, so their
+// operand takes the write position; the other prefix operators only read theirs.
+analyzePrefixOperand(BodyChecker checker, SyntaxKind operator, Expression operand) -> Type {
+    if (operator == SyntaxKind.PlusPlus || operator == SyntaxKind.MinusMinus) {
+        return assignments.analyzeWriteTarget(checker, operand);
+    }
+    return checker.analyzeExpression(operand);
+}
+
+public analyzePostfix(BodyChecker checker, PostfixExpressionNode node) -> Type {
+    Type operand = assignments.analyzeWriteTarget(checker, node.operand());
+    if (operand is ErrorType) {
+        return checker.store().errorType();
+    }
+    return analyzeIncrement(checker, node.span(), node.operand(), operand,
+        node.operator().kind() == SyntaxKind.PlusPlus, false);
+}
+
+analyzeIncrement(BodyChecker checker, Span span, Expression operand, Type operandType, bool isIncrement,
+                 bool isPrefix) -> Type {
+    string operator = "--";
+    if (isIncrement) {
+        operator = "++";
+    }
+    string before = "";
+    string after = operator;
+    if (isPrefix) {
+        before = operator;
+        after = "";
+    }
+    // Parentheses around the operand name the same storage, so every rule below reads through them.
+    Expression changed = wording.unwrapParentheses(operand);
+    // A write through '?.' or '?[' is judged by the slot it lands in, as the same write without
+    // the '?' is.
+    Type changedType = operandType;
+    bool safe = assignments.reportSafeTarget(checker, operand, operandType, operator, before, after, span);
+    if (safe) {
+        changedType = assignments.safeSlotType(checker, changed) ?? operandType;
+    }
+    long nullLevels = wording.optionalLevels(changedType);
+    let refusal = assignments.reportUnchangeable(checker, changed, changedType, safe, operator, before, after,
+        span);
+    if (refusal == WriteRefusal.Unwritable) {
+        nullLevels = 0;
+    }
+    if (changed is ThisExpressionNode || changed is SuperExpressionNode) {
+        return operandType;
+    }
+    if (!convert.isNumericType(changedType)) {
+        string refusalText = "'{operator}' works only on numbers, and "
+            + "'{wording.oneLineSpelling(changed)}' has type '{checker.names().of(changedType)}'.";
+        if (acceptsCores(SyntaxKind.PlusPlus, changedType, changedType)) {
+            // A slot reached through '?.' or '?[' is refused for its null only once the '?' is gone.
+            if (nullLevels > 0 && !safe) {
+                let guidance = nullguidance.unaryGuidance(checker, operand, changedType, true,
+                    new WriteTarget(nullLevels));
+                checker.reporter().report(nullguidance.withGuidance(checker, refusalText, guidance), span);
+            }
+            return changedType;
+        }
+        checker.reporter().report(refusalText + " Use it on an integer or a floating-point variable, for "
+            + "example '{before}count{after}'.", span);
+        return changedType;
+    }
+    if (safe || refusal != WriteRefusal.None) {
+        return changedType;
+    }
+    narrowing.invalidateForWrite(checker, changed);
+    narrowing.establishWriteNarrowing(checker, changed, operandType);
+    return changedType;
+}
+
+isStringable(Type core) -> bool {
+    return core is StringType || convert.isIntegerType(core) || convert.isBoolType(core)
+        || bodies.isTextualFloat(core);
+}
+
+// Whether the operator takes both sides once every '?' is removed from them.
+public acceptsCores(SyntaxKind operator, Type left, Type right) -> bool {
+    Type first = convert.coreOf(left);
+    Type second = convert.coreOf(right);
+    switch (operator) {
+        Plus -> {
+            if (first is StringType || second is StringType) {
+                return isStringable(first) && isStringable(second);
+            }
+            return convert.isNumericType(first) && convert.isNumericType(second);
+        },
+        Minus, Star, Slash, Percent, PlusPlus, MinusMinus -> {
+            return convert.isNumericType(first) && convert.isNumericType(second);
+        },
+        Ampersand, Pipe, Caret, LessLess, GreaterGreater, GreaterGreaterGreater -> {
+            return convert.isIntegerType(first) && convert.isIntegerType(second);
+        },
+        // Two strings are ordered with 'compareTo' instead of an ordering operator.
+        Less, Greater, LessEquals, GreaterEquals -> {
+            return (first is StringType && second is StringType)
+                || (convert.isNumericType(first) && convert.isNumericType(second));
+        },
+        default -> {
+            return false;
+        },
+    }
+}
+
+// The type an operator checks its left side as. A write target is checked without its '?'.
+checkedSide(Type left, WriteTarget? written) -> Type {
+    if (written != null) {
+        return convert.coreOf(left);
+    }
+    return left;
+}
+
+// The type a text names for the left side of an operator, as 'adapted' toward the other side.
+// A write target is named with its own type instead.
+shownSide(Type adapted, Type left, WriteTarget? written) -> Type {
+    if (written != null) {
+        return left;
+    }
+    return adapted;
+}
+
+// The refusal of an operator's sides 'leftNode' and 'rightNode', naming the ones the operator does
+// not take. A shift names only the shifted value.
+public sidesRefusal(SyntaxKind operator, string operatorText, Expression leftNode, Expression rightNode,
+                    Type left, Type right, TypeNames names) -> string {
+    bool joins = convert.coreOf(left) is StringType || convert.coreOf(right) is StringType;
+    if (operator == SyntaxKind.Plus && joins) {
+        string sides = sidesClause(leftNode, rightNode, left, right, left is OptionalType,
+            right is OptionalType, names);
+        return "'{operatorText}' joins a string only when neither side can be null, {sides}.";
+    }
+    switch (operator) {
+        Ampersand, Pipe, Caret -> {
+            string sides = sidesClause(leftNode, rightNode, left, right, !convert.isIntegerType(left),
+                !convert.isIntegerType(right), names);
+            return "'{operatorText}' needs integers on both sides, {sides}.";
+        },
+        LessLess, GreaterGreater, GreaterGreaterGreater -> {
+            return "'{operatorText}' shifts an integer, but "
+                + "{wording.sideNamed(leftNode, "the value it shifts")} has type '{names.of(left)}'.";
+        },
+        default -> {
+            string sides = sidesClause(leftNode, rightNode, left, right, !convert.isNumericType(left),
+                !convert.isNumericType(right), names);
+            return "'{operatorText}' needs numbers on both sides, {sides}.";
+        },
+    }
+}
+
+// The clause "but ... has type 'T'" naming the sides of an operator it does not take, the ones
+// 'leftFails' and 'rightFails' mark. A side with no short spelling is named by its place.
+sidesClause(Expression leftNode, Expression rightNode, Type left, Type right, bool leftFails, bool rightFails,
+            TypeNames names) -> string {
+    if (leftFails && !rightFails) {
+        return "but {wording.sideNamed(leftNode, "the left side")} has type '{names.of(left)}'";
+    }
+    if (rightFails && !leftFails) {
+        return "but {wording.sideNamed(rightNode, "the right side")} has type '{names.of(right)}'";
+    }
+    let first = wording.shortSpelling(leftNode);
+    let second = wording.shortSpelling(rightNode);
+    bool same = names.of(left) == names.of(right);
+    if (first != null && second != null && first != second) {
+        if (same) {
+            return "but '{first}' and '{second}' both have type '{names.of(left)}'";
+        }
+        return "but '{first}' has type '{names.of(left)}' and '{second}' has type '{names.of(right)}'";
+    }
+    if (same) {
+        return "but both sides have type '{names.of(left)}'";
+    }
+    return "but the sides are '{names.of(left)}' and '{names.of(right)}'";
+}
+
+// The sentence, opening with a space, that converts two sides of different number types to the
+// narrowest type with every value of each, so no value changes. Empty when no type has them all, and
+// for a compound assignment, whose result goes back into its left side.
+bothSidesConversion(string operatorText, Expression leftNode, Expression rightNode, Type left, Type right)
+        -> string {
+    Type leftCore = convert.coreOf(left);
+    Type rightCore = convert.coreOf(right);
+    if (isCompoundOperator(operatorText) || !(leftCore is PrimitiveType) || !(rightCore is PrimitiveType)) {
+        return "";
+    }
+    string target = holdingNumberType(leftCore.kind(), rightCore.kind());
+    if (target.length == 0) {
+        return "";
+    }
+    let leftSpelled = wording.shortSpelling(leftNode);
+    let rightSpelled = wording.shortSpelling(rightNode);
+    Expression leftValue = wording.unwrapParentheses(leftNode);
+    Expression rightValue = wording.unwrapParentheses(rightNode);
+    bool convertsLeft = primitiveName(leftCore.kind()) != target;
+    bool convertsRight = primitiveName(rightCore.kind()) != target;
+    if (leftSpelled == null || rightSpelled == null) {
+        return " Convert both sides to '{target}' with 'as'.";
+    }
+    string leftText = wording.oneLineSpelling(leftValue);
+    string rightText = wording.oneLineSpelling(rightValue);
+    if (convertsLeft) {
+        leftText = wording.converted(leftValue, target);
+    }
+    if (convertsRight) {
+        rightText = wording.converted(rightValue, target);
+    }
+    string example = "{leftText} {operatorText} {rightText}";
+    if (convertsLeft && convertsRight) {
+        return " Convert both sides to '{target}', as in '{example}'.";
+    }
+    string side = leftSpelled;
+    if (convertsRight) {
+        side = rightSpelled;
+    }
+    return " Convert '{side}' to '{target}', as in '{example}'.";
+}
+
+// Whether 'operatorText' writes its result back into its left side, as '+=' does.
+isCompoundOperator(string operatorText) -> bool {
+    return operatorText.endsWith("=") && operatorText != "<=" && operatorText != ">="
+        && operatorText != "==" && operatorText != "!=";
+}
+
+// The narrowest number type with every value of 'first' and of 'second', or empty when none has them
+// all. An integer type comes first at each width, and a 'float' or a 'double' side needs a
+// floating-point type.
+holdingNumberType(PrimitiveKind first, PrimitiveKind second) -> string {
+    if (isFloatingKind(first) || isFloatingKind(second)) {
+        for (let kind in [PrimitiveKind.Float, PrimitiveKind.Double]) {
+            if (floatHoldsEveryValue(kind, first) && floatHoldsEveryValue(kind, second)) {
+                return primitiveName(kind);
+            }
+        }
+        return "";
+    }
+    PrimitiveKind[] ordered = [PrimitiveKind.Short, PrimitiveKind.UShort, PrimitiveKind.Int,
+        PrimitiveKind.UInt, PrimitiveKind.Long, PrimitiveKind.ULong];
+    for (let kind in ordered) {
+        if (valuejoins.holdsEveryValue(kind, first) && valuejoins.holdsEveryValue(kind, second)) {
+            return primitiveName(kind);
+        }
+    }
+    return "";
+}
+
+// Whether the kind is 'float' or 'double'.
+isFloatingKind(PrimitiveKind kind) -> bool {
+    return kind == PrimitiveKind.Float || kind == PrimitiveKind.Double;
+}
+
+// Whether the floating-point kind 'outer' has every value of 'inner' exactly: a 'float' has integers of
+// up to 24 bits and a 'double' of up to 53.
+floatHoldsEveryValue(PrimitiveKind outer, PrimitiveKind inner) -> bool {
+    if (inner == PrimitiveKind.Double) {
+        return outer == PrimitiveKind.Double;
+    }
+    if (inner == PrimitiveKind.Float) {
+        return true;
+    }
+    if (inner == PrimitiveKind.Bool) {
+        return false;
+    }
+    long width = literaltyping.integerWidth(inner);
+    if (inner == PrimitiveKind.Char) {
+        width = 21;
+    }
+    if (outer == PrimitiveKind.Float) {
+        return width <= 24;
+    }
+    return width < 64;
+}
+
+// The name a number kind is written with.
+primitiveName(PrimitiveKind kind) -> string {
+    if (kind == PrimitiveKind.Float) {
+        return "float";
+    }
+    if (kind == PrimitiveKind.Double) {
+        return "double";
+    }
+    if (kind == PrimitiveKind.Byte) {
+        return "byte";
+    }
+    if (kind == PrimitiveKind.Char) {
+        return "char";
+    }
+    return literaltyping.primitiveKindName(kind);
+}

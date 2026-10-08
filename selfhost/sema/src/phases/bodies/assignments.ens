@@ -1,0 +1,740 @@
+// Assignments with '=' and with a compound operator such as '+=': the place a write changes, and the
+// refusals for a place that cannot be written, such as a constant, 'this' or a member reached through
+// '?.'. '++' and '--' use the same refusals.
+import Expression from @ens.frontend.syntax.generated.nodes;
+import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ThisExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SuperExpressionNode from @ens.frontend.syntax.generated.nodes;
+import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SafeMemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SubscriptExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SafeSubscriptExpressionNode from @ens.frontend.syntax.generated.nodes;
+import AssignmentExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ParenthesizedExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SyntaxKind from @ens.frontend.syntax.generated.kind;
+import Span from @ens.frontend.support.source;
+import LocalBinding from model.scopes;
+import model.convert;
+import phases.members;
+import phases.bodies.literalfixes;
+import phases.bodies.nullguidance;
+import OperandForm from phases.bodies.nullguidance;
+import AccessStep from phases.bodies.nullguidance;
+import phases.bodies.definiteassignment;
+import phases.bodies.wording;
+import phases.bodies.narrowing;
+import model.typemembers;
+import Field from model.typemembers;
+import TypeNames from model.typenames;
+import model.types;
+import Type from model.types;
+import ErrorType from model.types;
+import OptionalType from model.types;
+import ArrayType from model.types;
+import StructType from model.types;
+import phases.bodies.operators;
+import BodyChecker from phases.bodies;
+import LocalName from phases.bodies;
+import MemberPosition from phases.bodies;
+
+// The target of a compound assignment, or of '++' or '--'. 'nullLevels' counts the '?' levels of
+// its own null that a refusal names.
+public final class WriteTarget {
+    protected long levelCount;
+
+    public constructor(this.levelCount);
+
+    public nullLevels() -> long {
+        return this.levelCount;
+    }
+}
+
+// Why '++' or '--' refuses to change its operand. A misplaced change is refused only where it is
+// written, such as inside a lambda.
+public enum WriteRefusal {
+    None,
+    Misplaced,
+    Unwritable,
+}
+
+// Reports why '++' or '--' cannot change the operand at this place in the code, when it cannot.
+// 'before' and 'after' place the operator as the code writes it.
+public reportUnchangeable(BodyChecker checker, Expression changed, Type changedType, bool safe,
+                          string operator, string before, string after, Span span) -> WriteRefusal {
+    if (changed is ThisExpressionNode || changed is SuperExpressionNode) {
+        string keyword = "this";
+        if (changed is SuperExpressionNode) {
+            keyword = "super";
+        }
+        string refusal = "'{keyword}' is not a variable, so '{operator}' cannot change it.";
+        let field = receiverExampleField(checker, changedType, true);
+        if (field != null) {
+            refusal = refusal + " Change a field instead, as in '{before}{keyword}.{field}{after}'.";
+        }
+        checker.reporter().report(refusal, span);
+        return WriteRefusal.Unwritable;
+    }
+    if (!safe && !isLValue(checker, changed)) {
+        checker.reporter().report("{wording.sideNamed(changed, "This value")} is not a variable, a field or "
+            + "an array element, so '{operator}' cannot change it.", span);
+        return WriteRefusal.Unwritable;
+    }
+    if (changed is IdentifierExpressionNode) {
+        let binding = checker.result().bindingOf(changed.green());
+        if (binding != null && checker.reportRefusedWrite(binding, "change", span)) {
+            return WriteRefusal.Misplaced;
+        }
+        if (binding != null && binding.isConst()) {
+            checker.reporter().report(constantRefusal(checker,
+                "'{operator}' cannot change '{binding.name()}'", binding), span);
+            return WriteRefusal.Unwritable;
+        }
+    }
+    if (changed is MemberExpressionNode) {
+        let staticField = checker.result().staticConstFieldOf(changed.green());
+        if (staticField != null) {
+            checker.reporter().report("The '{operator}' operator cannot change "
+                + "'{staticConstDisplay(staticField, checker.names())}': a "
+                + "{members.typeLevelFieldWord(staticField)} keeps the value its "
+                + "initializer gives it. Change the initializer, or use an instance field.", span);
+            return WriteRefusal.Unwritable;
+        }
+        let root = checker.writtenChainRoot(changed);
+        if (root != null && checker.reportRefusedWrite(root, "change", span)) {
+            return WriteRefusal.Misplaced;
+        }
+    }
+    let field = nullguidance.accessedField(checker, changed);
+    if (field != null && field.isConst()) {
+        checker.reporter().report("The '{operator}' operator cannot change field "
+            + "'{field.name()}': a 'const' field is assigned once when the object "
+            + "is constructed and never again. Remove 'const' from the field if it "
+            + "needs to change.", span);
+        return WriteRefusal.Unwritable;
+    }
+    return WriteRefusal.None;
+}
+
+// Refuses assigning to 'this' or to 'super', neither of which is a variable, and names a
+// field of the type the keyword reaches. Reports nothing where it reaches none, since
+// reading the keyword there reports that instead.
+reportReceiverAssignment(BodyChecker checker, string keyword, Type reached, string operator, Span at) {
+    if (reached is ErrorType) {
+        return;
+    }
+    string refusal = "'{keyword}' is not a variable, so it cannot be assigned.";
+    let field = receiverExampleField(checker, reached, operator != "=");
+    if (field == null) {
+        checker.reporter().report(refusal, at);
+        return;
+    }
+    checker.reporter().report(refusal + " Assign the fields that should change, as in "
+        + "'{keyword}.{field} {operator} ...'.", at);
+}
+
+// Refuses a write through '?.' or '?[', which has nowhere to store when the value in front of
+// the '?' is null. The example spells the same write without its '?' inside a null check, and
+// there is none where no statement can go.
+reportSafeWrite(BodyChecker checker, Expression target, AccessStep access, Type reached, string operator,
+                string before, string after, Span at) {
+    string reader = "?.";
+    let index = access.index();
+    if (index != null) {
+        reader = "?[";
+    }
+    string subject = "'{wording.oneLineSpelling(wording.unwrapParentheses(access.receiver()))}'";
+    string refusal = "'{reader}' cannot appear on the left side of '{operator}', because "
+        + "there is nothing to write to when {subject} is null.";
+    if (operator == "++" || operator == "--") {
+        refusal = "'{operator}' cannot change '{wording.oneLineSpelling(target)}' through '{reader}', "
+            + "because there is nothing to write to when {subject} is null.";
+    }
+    if (reached is ErrorType) {
+        checker.reporter().report(refusal, at);
+        return;
+    }
+    let front = nullguidance.classifyOperand(checker, access.receiver(), 1, "", false);
+    if (front.form() == OperandForm.NoFix) {
+        checker.reporter().report(refusal, at);
+        return;
+    }
+    string accessor = ".{access.member() ?? ""}";
+    if (index != null) {
+        accessor = "[{wording.simpleSpelling(index) ?? ""}]";
+    }
+    bool spelled = index == null || wording.simpleSpelling(index) != null;
+    string write = "{before}{front.held()}{accessor}{after}";
+    if (spelled && front.form() == OperandForm.Stable) {
+        checker.reporter().report(refusal + " Check for null first, as in 'if ({front.held()} != null) "
+            + "\{ {write}; \}'.", at);
+        return;
+    }
+    string spelledFront = wording.oneLineSpelling(wording.unwrapParentheses(access.receiver()));
+    string local = front.local();
+    string declaration = front.declaration();
+    bool whole = front.held() == front.local();
+    string copy = "";
+    if (front.form() == OperandForm.Copied) {
+        copy = "Copy '{spelledFront}' into a local first";
+    } else if (front.form() == OperandForm.Stored) {
+        copy = "Store the result of '{spelledFront}' in a local first";
+    } else if (front.form() == OperandForm.Guarded) {
+        string base = nullguidance.accessStep(wording.unwrapParentheses(access.receiver()))?.member()
+            ?? "value";
+        local = nullguidance.freeLocalName(checker, "", base);
+        declaration = "let {local} = {spelledFront};";
+        whole = true;
+        copy = "Copy '{spelledFront}' into a local first";
+    }
+    if (!spelled || !whole || copy.length == 0) {
+        checker.reporter().report(refusal + " Check for null first, then write the same line "
+            + "without the '?'.", at);
+        return;
+    }
+    checker.reporter().report(refusal + " {copy} ('{declaration}') and check the local, as in "
+        + "'if ({local} != null) \{ {before}{local}{accessor}{after}; \}'.", at);
+}
+
+// reportSafeWrite for a target read through '?.' or '?[', and true when the target is one.
+public reportSafeTarget(BodyChecker checker, Expression target, Type reached, string operator, string before,
+                        string after, Span at) -> bool {
+    Expression written = wording.unwrapParentheses(target);
+    let access = nullguidance.accessStep(written);
+    if (access == null || !access.safe()) {
+        return false;
+    }
+    reportSafeWrite(checker, written, access, reached, operator, before, after, at);
+    return true;
+}
+
+// The name of a field that a write through 'this' or 'super' can land in, or null when there is
+// none. With 'numeric', the field is a number.
+receiverExampleField(BodyChecker checker, Type reached, bool numeric = false) -> string? {
+    let fields = typemembers.fieldsOf(reached);
+    if (fields == null) {
+        return null;
+    }
+    for (long i = 0; i < fields.length(); i++) {
+        let field = fields.get(i);
+        if (field.isConst() || field.isStatic() || (numeric && !convert.isNumericType(field.type()))) {
+            continue;
+        }
+        if (!checker.isAccessAllowed(field.visibility(), field.definingType())) {
+            continue;
+        }
+        if (typemembers.inheritedOrOwnField(reached, field.name()) == field) {
+            return field.name();
+        }
+    }
+    return null;
+}
+
+// The declared type of the slot a write through '?.' or '?[' lands in, the field's or the
+// element's own type. Null when the write lands in no field or element.
+public safeSlotType(BodyChecker checker, Expression target) -> Type? {
+    let field = nullguidance.accessedField(checker, target);
+    if (field != null) {
+        return field.type();
+    }
+    let access = nullguidance.accessStep(target);
+    if (access != null && access.safe() && access.index() != null) {
+        let objectType = checker.result().typeOf(access.receiver().green());
+        if (objectType != null) {
+            Type array = convert.coreOf(objectType);
+            if (array is ArrayType) {
+                return array.element();
+            }
+        }
+    }
+    return null;
+}
+
+// A member write through a class reference mutates the heap object, so any object works; a
+// struct member write needs an addressable struct, so the object must itself be an lvalue.
+// Parentheses name the place they hold, so the test reads through them wherever they stand.
+isLValue(BodyChecker checker, Expression node) -> bool {
+    switch (wording.unwrapParentheses(node)) {
+        is IdentifierExpressionNode ignored -> {
+            return true;
+        },
+        is SubscriptExpressionNode ignored -> {
+            return true;
+        },
+        is ThisExpressionNode ignored -> {
+            return true;
+        },
+        is MemberExpressionNode member -> {
+            let objectType = checker.result().typeOf(member.object().green());
+            if (objectType != null && types.isStructLike(objectType)) {
+                return isLValue(checker, member.object());
+            }
+            return true;
+        },
+        default -> {
+            return false;
+        },
+    }
+}
+
+// Analyzes the left side of a write. A member access takes the write position wherever it
+// stands, as the left side itself, under a '?.', or inside parentheses, which name the place
+// they hold.
+public analyzeWriteTarget(BodyChecker checker, Expression target,
+                          MemberPosition position = MemberPosition.Write) -> Type {
+    switch (target) {
+        is MemberExpressionNode member -> {
+            Type analyzed = checker.analyzeMemberValue(member, position);
+            checker.result().setType(member.green(), analyzed);
+            return analyzed;
+        },
+        is SafeMemberExpressionNode member -> {
+            Type analyzed = checker.analyzeSafeMemberValue(member, position);
+            checker.result().setType(member.green(), analyzed);
+            return analyzed;
+        },
+        is ParenthesizedExpressionNode parenthesized -> {
+            Type analyzed = analyzeWriteTarget(checker, parenthesized.inner(), position);
+            checker.result().setType(parenthesized.green(), analyzed);
+            return analyzed;
+        },
+        default -> {
+            return checker.analyzeExpression(target);
+        },
+    }
+}
+
+public analyzeAssignment(BodyChecker checker, AssignmentExpressionNode node) -> Type {
+    // A plain `x = ...` is a definite assignment of x, so its own identifier on the left is
+    // a write, not a read to check. A compound `x += ...` reads x first, and a member or
+    // subscript target reads its base, which must already be assigned.
+    bool simpleAssign = node.operator().kind() == SyntaxKind.Equals;
+    let target = node.target();
+    // Parentheses around a target name the same storage, so every rule below reads through
+    // them.
+    let writtenTarget = wording.unwrapParentheses(target);
+    let previousTarget = checker.assignment().assignmentTarget();
+    if (simpleAssign && writtenTarget is IdentifierExpressionNode) {
+        let resolved = checker.resolveName(writtenTarget.name().text());
+        if (resolved is LocalName) {
+            checker.assignment().setAssignmentTarget(resolved.binding());
+        }
+    }
+    Type targetType = analyzeWriteTarget(checker, target);
+    checker.assignment().setAssignmentTarget(previousTarget);
+    string operator = node.operator().text();
+    // The levels of the target's own null that a refusal of a compound operator names. None are
+    // named where no write can change the target.
+    long nullLevels = wording.optionalLevels(targetType);
+    // A refused write proves nothing about the target, so it narrows nothing.
+    bool refused = false;
+    switch (writtenTarget) {
+        is ThisExpressionNode ignored -> {
+            reportReceiverAssignment(checker, "this", targetType, operator, node.span());
+            nullLevels = 0;
+            refused = true;
+        },
+        is SuperExpressionNode ignored -> {
+            reportReceiverAssignment(checker, "super", targetType, operator, node.span());
+            nullLevels = 0;
+            refused = true;
+        },
+        is SafeMemberExpressionNode ignored -> {},
+        is SafeSubscriptExpressionNode ignored -> {},
+        default -> {
+            if (!isLValue(checker, target)) {
+                string outcome = "so '{operator}' cannot store its result there";
+                if (operator == "=") {
+                    outcome = "so it cannot be assigned";
+                }
+                checker.reporter().report("{wording.sideNamed(target, "This value")} is not a variable, a "
+                    + "field or an array element, {outcome}.", node.span());
+                nullLevels = 0;
+                refused = true;
+            }
+        },
+    }
+    let staticTarget = checker.result().staticConstFieldOf(writtenTarget.green());
+    if (staticTarget != null) {
+        checker.reporter().report("Cannot assign to '{staticConstDisplay(staticTarget, checker.names())}': "
+            + "a {members.typeLevelFieldWord(staticTarget)} keeps the value its initializer "
+            + "gives it. Change the initializer, or use an instance field.", node.span());
+        nullLevels = 0;
+        refused = true;
+    }
+    if (writtenTarget is IdentifierExpressionNode) {
+        let refusal = reportBindingWrite(checker, writtenTarget);
+        if (refusal == WriteRefusal.Unwritable) {
+            nullLevels = 0;
+        }
+        refused = refused || refusal != WriteRefusal.None;
+    } else if (writtenTarget is MemberExpressionNode) {
+        let root = checker.writtenChainRoot(writtenTarget);
+        if (root != null && checker.reportRefusedWrite(root, "change", writtenTarget.span())) {
+            refused = true;
+        }
+    }
+    Type assignTarget = declaredTargetType(checker, writtenTarget, targetType);
+    Type valueType = checker.analyzeExpressionAdapt(node.value(), assignTarget,
+        literalfixes.assignmentOrigin(checker, node, writtenTarget, assignTarget));
+    // A write through '?.' or '?[' is judged by the slot it lands in, as the same write without
+    // the '?' is.
+    Type writtenType = targetType;
+    bool safe = reportSafeTarget(checker, target, targetType, operator, "", " {operator} ...", node.span());
+    if (safe) {
+        writtenType = assignTarget;
+        nullLevels = wording.optionalLevels(assignTarget);
+        refused = true;
+    }
+    let field = nullguidance.accessedField(checker, writtenTarget);
+    bool throughThis = writtenTarget is MemberExpressionNode
+        && wording.unwrapParentheses(writtenTarget.object()) is ThisExpressionNode;
+    if (field != null && field.isConst()) {
+        if (checkConstFieldWrite(checker, node, field, throughThis, simpleAssign)) {
+            refused = true;
+        }
+        nullLevels = 0;
+    }
+    // What the store actually lands: the right side for '=', the operator's result for 'OP='.
+    Type storedType = valueType;
+    // A slot reached through '?.' or '?[' is refused for its null only once the '?' is gone, so its
+    // compound write is checked as a write to its core type.
+    Type compoundTarget = writtenType;
+    long compoundLevels = nullLevels;
+    if (safe && writtenType is OptionalType) {
+        compoundTarget = convert.coreOf(writtenType);
+        compoundLevels = 0;
+    }
+    if (!(assignTarget is ErrorType) && !(valueType is ErrorType)) {
+        if (simpleAssign) {
+            if (!convert.isAssignableStrict(assignTarget, valueType)) {
+                string hint = nullguidance.valueAssignabilityHint(checker, assignTarget, valueType,
+                    node.value());
+                checker.reporter().report(
+                    "'{wording.oneLineSpelling(wording.unwrapParentheses(node.target()))}' has type "
+                    + "'{checker.names().of(assignTarget)}', but the value assigned to it has type "
+                    + "'{checker.names().of(valueType)}'.{hint}", node.span());
+                refused = true;
+            }
+        } else if (!(targetType is ErrorType) && !(writtenTarget is ThisExpressionNode)
+                && !(writtenTarget is SuperExpressionNode)) {
+            let result = checkCompoundAssignment(checker, node, assignTarget, compoundTarget, valueType,
+                new WriteTarget(compoundLevels), namesDeclaredPlace(checker, writtenTarget));
+            if (result == null) {
+                refused = true;
+            } else {
+                storedType = result;
+            }
+        }
+    }
+    if (assignTarget != targetType && !safe) {
+        checker.result().setType(node.target().green(), assignTarget);
+    }
+    // A refused write to a static or lazy const changes no narrowing.
+    if (staticTarget == null) {
+        narrowing.invalidateForWrite(checker, writtenTarget);
+        if (!refused) {
+            narrowing.establishWriteNarrowing(checker, writtenTarget, storedType);
+        }
+    }
+    if (writtenTarget is IdentifierExpressionNode) {
+        let binding = checker.result().bindingOf(writtenTarget.green());
+        if (binding != null && checker.assignment().unconditionalPosition()) {
+            checker.assignment().markAssigned(binding);
+        }
+    } else if (field != null && simpleAssign && throughThis) {
+        checker.assignment().markThisFieldMaybeAssigned(field, node.span());
+        if (checker.assignment().unconditionalPosition()) {
+            checker.assignment().markThisFieldAssigned(field);
+        }
+    }
+    return assignTarget;
+}
+
+// Enforces the write-once contract of a 'const' field at an assignment naming it, and returns
+// true when it refuses the write. The one legal write is a plain '=' through 'this' inside a
+// constructor of the field's own type, outside any loop, on a path that cannot have assigned it.
+checkConstFieldWrite(BodyChecker checker, AssignmentExpressionNode node, Field field, bool throughThis,
+                     bool simpleAssign) -> bool {
+    string name = field.name();
+    string ownerName = checker.constFieldOwnerName(field);
+    if (!simpleAssign) {
+        string operatorText = node.operator().text();
+        checker.reporter().report("Cannot use '{operatorText}' on field '{name}': a 'const' "
+            + "field is assigned once when the object is constructed and never again. "
+            + "Remove 'const' from the field if it needs to change.", node.span());
+        return true;
+    }
+    if (!checker.frame().inConstructor() || !throughThis) {
+        string sites = "inside a constructor of '{ownerName}' as 'this.{name} = ...'";
+        if (types.authorityOf(field.definingType()) is StructType) {
+            sites = sites + " or by a struct literal like '\{{name}: ...\}'";
+        }
+        checker.reporter().report("Cannot assign a new value to field '{name}': it is 'const', "
+            + "so it is assigned exactly once, " + sites + ". Remove 'const' from the "
+            + "field if it needs to change.", node.span());
+        return true;
+    }
+    if (field.definingType() != checker.assignment().constructorFieldOwner()) {
+        checker.reporter().report("Field '{name}' is 'const' and declared in base class "
+            + "'{ownerName}', so only a constructor of '{ownerName}' can assign it. Pass "
+            + "the value to 'super(...)' instead.", node.span());
+        return true;
+    }
+    if (checker.frame().loopDepth() > 0) {
+        checker.reporter().report("Field '{name}' is 'const' and cannot be assigned inside a "
+            + "loop, which can run more than once. Assign it once, outside the loop.",
+            node.span());
+        return true;
+    }
+    let earlier = checker.assignment().possibleWriteOf(field);
+    if (earlier != null) {
+        checker.reporter().report("Field '{name}' is 'const' and may already be assigned when "
+            + "this line runs. Remove one of the assignments.", node.span(), earlier.span(),
+            "'{name}' is assigned here");
+        return true;
+    }
+    return false;
+}
+
+// 'a OP= b' means 'a = a OP b', so the operator's result has to fit the target. Returns that
+// result, or null when the write is refused.
+checkCompoundAssignment(BodyChecker checker, AssignmentExpressionNode node, Type assignTarget,
+                        Type targetType, Type valueType, WriteTarget written, bool declared) -> Type? {
+    SyntaxKind operator = compoundOperator(node.operator().kind());
+    string operatorText = node.operator().text();
+    if (operator == SyntaxKind.Invalid) {
+        checker.reporter().report("Internal: unsupported compound assignment operator "
+            + "'{operatorText}'.", node.operator().span());
+        return valueType;
+    }
+    Type result = operators.analyzeBinaryOperands(checker, node.span(), operator, operatorText,
+        node.target(), node.value(), targetType, valueType, written);
+    bool storable = result is ErrorType || convert.isAssignableStrict(assignTarget, result);
+    if (!storable) {
+        Type core = convert.coreOf(targetType);
+        string declaredType = checker.names().of(result);
+        if (assignTarget is OptionalType) {
+            declaredType = checker.names().nullableOf(result);
+        }
+        string target = wording.oneLineSpelling(wording.unwrapParentheses(node.target()));
+        string cast = wording.converted(wording.unwrapParentheses(node.value()), checker.names().of(core));
+        string place = declaredPlaceAs(checker, node.target(), declaredType);
+        string fix = "";
+        if (convert.isNumericType(valueType) && convert.isNumericType(core)) {
+            fix = " Write '{cast}'.";
+            if (declared && place.length > 0) {
+                fix = " Write '{cast}', or declare {place}.";
+            }
+        } else if (declared && place.length > 0) {
+            fix = " Declare {place}.";
+        }
+        checker.reporter().report("Cannot store the result of '{operatorText}' back into '{target}', "
+            + "whose type is '{checker.names().of(assignTarget)}': "
+            + "{combinedWords(operator, core, valueType, checker.names())} produces "
+            + "'{checker.names().of(result)}'.{fix}", node.span());
+    }
+    bool nullRefused = written.nullLevels() > 0 && !(valueType is OptionalType)
+        && operators.acceptsCores(operator, targetType, valueType);
+    if (nullRefused) {
+        let guidance = nullguidance.binaryGuidance(checker, node.target(), node.value(), targetType,
+            valueType, true, written, operatorText);
+        checker.reporter().report(nullguidance.withGuidance(checker, operators.sidesRefusal(operator,
+            operatorText, node.target(), node.value(), targetType, valueType, checker.names()), guidance),
+            node.span());
+    }
+    if (result is ErrorType || !storable || nullRefused) {
+        return null;
+    }
+    return result;
+}
+
+// The variable, field or array a compound write lands in, declared so that it takes 'slotType',
+// as in "'count' as 'long'". Empty when no declaration names it.
+declaredPlaceAs(BodyChecker checker, Expression target, string slotType) -> string {
+    Expression core = wording.unwrapParentheses(target);
+    if (core is IdentifierExpressionNode) {
+        return "'{core.name().text()}' as '{slotType}'";
+    }
+    let access = nullguidance.accessStep(core);
+    if (access == null) {
+        return "";
+    }
+    let member = access.member();
+    if (member != null) {
+        return "field '{member}' as '{slotType}'";
+    }
+    Expression receiver = wording.unwrapParentheses(access.receiver());
+    string? array = nullguidance.accessStep(receiver)?.member();
+    if (receiver is IdentifierExpressionNode) {
+        array = receiver.name().text();
+    }
+    let arrayType = narrowing.declaredSlotType(checker, receiver);
+    if (array == null || arrayType == null) {
+        return "";
+    }
+    string levels = "";
+    Type layer = arrayType;
+    while (layer is OptionalType) {
+        levels = "{levels}?";
+        layer = layer.inner();
+    }
+    return "'{array}' as '{slotType}[]{levels}'";
+}
+
+// Reports a write the binding refuses, and returns why it refuses it.
+reportBindingWrite(BodyChecker checker, IdentifierExpressionNode identifier) -> WriteRefusal {
+    let binding = checker.result().bindingOf(identifier.green());
+    if (binding == null) {
+        return WriteRefusal.None;
+    }
+    if (checker.reportRefusedWrite(binding, "assign a new value to", identifier.span())) {
+        return WriteRefusal.Misplaced;
+    }
+    if (!binding.isConst()) {
+        return WriteRefusal.None;
+    }
+    checker.reporter().report(
+        constantRefusal(checker, "Cannot assign a new value to '{binding.name()}'", binding),
+        identifier.span());
+    return WriteRefusal.Unwritable;
+}
+
+// The refusal 'opening' of a write to the constant local 'binding', with the change to its
+// declaration that lets it change. The value an 'is' arm matched has no declaration to change.
+public constantRefusal(BodyChecker checker, string opening, LocalBinding binding) -> string {
+    string name = binding.name();
+    if (definiteassignment.bindingsContain(checker.armBindings(), binding)) {
+        return "{opening}, because '{name}' is the value this 'is' arm matched, and it cannot change. "
+            + "Copy it into a variable if it needs to change, as in 'let changed = {name};'.";
+    }
+    string fix = "Remove 'const' from its declaration";
+    if (definiteassignment.bindingsContain(checker.untypedConstants(), binding)) {
+        fix = "Replace 'const' with 'let' in its declaration";
+    }
+    return "{opening}, because '{name}' is declared 'const'. {fix} if it needs to change.";
+}
+
+// Whether the target names a variable, a field or an element, whose declaration could take another type.
+namesDeclaredPlace(BodyChecker checker, Expression target) -> bool {
+    switch (target) {
+        is IdentifierExpressionNode identifier -> {
+            return checker.result().bindingOf(identifier.green()) != null;
+        },
+        is MemberExpressionNode ignored -> {
+            return narrowing.declaredSlotType(checker, target) != null;
+        },
+        is SubscriptExpressionNode ignored -> {
+            return narrowing.declaredSlotType(checker, target) != null;
+        },
+        default -> {
+            return safeSlotType(checker, target) != null;
+        },
+    }
+}
+
+// The declared type of the written slot: the binding's, field's, or element's own type.
+declaredTargetType(BodyChecker checker, Expression target, Type analyzed) -> Type {
+    switch (target) {
+        is IdentifierExpressionNode identifier -> {
+            let binding = checker.result().bindingOf(identifier.green());
+            if (binding == null) {
+                return analyzed;
+            }
+            return binding.type();
+        },
+        is MemberExpressionNode member -> {
+            return narrowing.declaredSlotType(checker, member) ?? analyzed;
+        },
+        is SubscriptExpressionNode subscript -> {
+            let objectType = checker.result().typeOf(subscript.object().green());
+            if (objectType is ArrayType) {
+                return objectType.element();
+            }
+            return analyzed;
+        },
+        default -> {
+            if (nullguidance.accessStep(target)?.safe() ?? false) {
+                return safeSlotType(checker, target) ?? analyzed;
+            }
+            return analyzed;
+        },
+    }
+}
+
+// "Path.separator", the way a static const reads in a diagnostic.
+staticConstDisplay(Field field, TypeNames names) -> string {
+    let owner = types.authorityOf(field.definingType());
+    if (owner == null) {
+        return field.name();
+    }
+    return "{names.nameOf(owner)}.{field.name()}";
+}
+
+// How an arithmetic operator combines a value with a target, as in "adding 'long' to 'int'".
+combinedWords(SyntaxKind operator, Type target, Type value, TypeNames names) -> string {
+    string first = "'{names.of(target)}'";
+    string second = "'{names.of(value)}'";
+    switch (operator) {
+        Plus -> {
+            return "adding {second} to {first}";
+        },
+        Minus -> {
+            return "subtracting {second} from {first}";
+        },
+        Star -> {
+            return "multiplying {first} by {second}";
+        },
+        Slash -> {
+            return "dividing {first} by {second}";
+        },
+        Percent -> {
+            return "the remainder of dividing {first} by {second}";
+        },
+        default -> {
+            return "combining {first} with {second}";
+        },
+    }
+}
+
+// The binary operator a compound-assignment token stands for ('+=' gives '+'), or Invalid when
+// the token is not a compound assignment.
+compoundOperator(SyntaxKind token) -> SyntaxKind {
+    switch (token) {
+        PlusEquals -> {
+            return SyntaxKind.Plus;
+        },
+        MinusEquals -> {
+            return SyntaxKind.Minus;
+        },
+        StarEquals -> {
+            return SyntaxKind.Star;
+        },
+        SlashEquals -> {
+            return SyntaxKind.Slash;
+        },
+        PercentEquals -> {
+            return SyntaxKind.Percent;
+        },
+        AmpersandEquals -> {
+            return SyntaxKind.Ampersand;
+        },
+        PipeEquals -> {
+            return SyntaxKind.Pipe;
+        },
+        CaretEquals -> {
+            return SyntaxKind.Caret;
+        },
+        LessLessEquals -> {
+            return SyntaxKind.LessLess;
+        },
+        GreaterGreaterEquals -> {
+            return SyntaxKind.GreaterGreater;
+        },
+        GreaterGreaterGreaterEquals -> {
+            return SyntaxKind.GreaterGreaterGreater;
+        },
+        default -> {
+            return SyntaxKind.Invalid;
+        },
+    }
+}
