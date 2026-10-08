@@ -6,6 +6,7 @@ import Visibility from model.types;
 import Type from model.types;
 import sema_support;
 import FakeFileLoader from sema_support;
+import Pipeline from sema_support;
 import Stage from sema_support;
 import PrimitiveKind from model.types;
 
@@ -111,4 +112,140 @@ test "a function type displays the way the language writes it" {
         "(int) -> (int) -> bool");
     try testing.assertEqual(typenames.display(store.functionOf([test, intType], voidType, [])),
         "((int) -> bool, int) -> void");
+}
+
+// A program whose main file imports one 'Kind', 'Box' and 'Pair' and declares a 'Mode', so the
+// other types of those names read with their modules after the quote.
+quotingPipeline() -> Pipeline throws {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/alpha/kinds.ens", "public enum Kind \{ One \}\n");
+    loader.add("/proj/src/beta/kinds.ens", "public enum Kind \{ Two \}\n");
+    loader.add("/proj/src/gamma/kinds.ens", "public enum Kind \{ Three \}\n");
+    loader.add("/proj/src/delta/modes.ens", "public enum Mode \{ Fast \}\n");
+    loader.add("/proj/src/beta/boxes.ens",
+        "public class Box<T> \{\n    public constructor() \{ \}\n\}\n"
+        + "public class Pair<A, B> \{\n    public constructor() \{ \}\n\}\n");
+    loader.add("/proj/src/gamma/boxes.ens", "public class Box<T> \{\n    public constructor() \{ \}\n\}\n");
+    loader.add("/proj/src/main.ens",
+        "import Kind from alpha.kinds;\n"
+        + "import Box from beta.boxes;\n"
+        + "import Pair from beta.boxes;\n"
+        + "public enum Mode \{ Slow \}\n");
+    let pipeline = sema_support.analyze(loader, "/proj/src",
+        ["main.ens", "beta/kinds.ens", "gamma/kinds.ens", "delta/modes.ens", "gamma/boxes.ens"]);
+    try sema_support.assertClean(pipeline);
+    return pipeline;
+}
+
+test "a quoted type is followed by the module of each type the file has no clear name for" {
+    let pipeline = try quotingPipeline();
+    let store = pipeline.store();
+    let names = try sema_support.namesOf(pipeline, "main");
+    Type clear = try sema_support.declaredType(pipeline, "alpha.kinds", "Kind");
+    Type later = try sema_support.declaredType(pipeline, "beta.kinds", "Kind");
+    Type mode = try sema_support.declaredType(pipeline, "delta.modes", "Mode");
+    let box = try sema_support.declaredType(pipeline, "beta.boxes", "Box");
+    let pair = try sema_support.declaredType(pipeline, "beta.boxes", "Pair");
+    let other = try sema_support.declaredType(pipeline, "gamma.boxes", "Box");
+    Type number = store.primitive(PrimitiveKind.Int);
+
+    try testing.assertEqual(names.quoted(clear), "'Kind'");
+    try testing.assertEqual(names.quoted(number), "'int'");
+    try testing.assertEqual(names.quoted(later), "'Kind' (from beta.kinds)");
+    try testing.assertEqual(names.quoted(store.arrayOf(later)), "'Kind[]' (from beta.kinds)");
+    try testing.assertEqual(names.quoted(store.optionalOf(later)), "'Kind?' (from beta.kinds)");
+    try testing.assertEqual(names.quoted(store.instantiationOf(box, [later])),
+        "'Box<Kind>' (Kind from beta.kinds)");
+    try testing.assertEqual(names.quoted(store.instantiationOf(pair, [later, mode])),
+        "'Pair<Kind, Mode>' (Kind from beta.kinds, Mode from delta.modes)");
+    try testing.assertEqual(names.quoted(other), "'Box<T>' (from gamma.boxes)");
+    try testing.assertEqual(names.quoted(store.instantiationOf(other, [number])),
+        "'Box<int>' (from gamma.boxes)");
+    try testing.assertEqual(names.quoted(store.arrayOf(store.instantiationOf(other, [number]))),
+        "'Box<int>[]' (from gamma.boxes)");
+    try testing.assertEqual(names.quoted(store.instantiationOf(other, [clear])),
+        "'Box<Kind>' (Box from gamma.boxes)");
+    try testing.assertEqual(names.quoted(store.instantiationOf(other, [later])),
+        "'Box<Kind>' (Box from gamma.boxes, Kind from beta.kinds)");
+    Type predicate = store.functionOf([later], store.primitive(PrimitiveKind.Bool), []);
+    try testing.assertEqual(names.quoted(predicate), "'(Kind) -> bool' (Kind from beta.kinds)");
+    try testing.assertEqual(names.quotedNullable(predicate), "'((Kind) -> bool)?' (Kind from beta.kinds)");
+    try testing.assertEqual(names.quotedNullable(later), "'Kind?' (from beta.kinds)");
+    try testing.assertEqual(names.quotedName(other), "'Box' (from gamma.boxes)");
+    try testing.assertEqual(names.quotedName(box), "'Box'");
+}
+
+// Each meaning of a name written twice is told apart by where it stands among the names written
+// alike; a name written twice for one type needs no position.
+test "one name written for two types in a quote says which one by position" {
+    let pipeline = try quotingPipeline();
+    let store = pipeline.store();
+    let names = try sema_support.namesOf(pipeline, "main");
+    Type clear = try sema_support.declaredType(pipeline, "alpha.kinds", "Kind");
+    Type later = try sema_support.declaredType(pipeline, "beta.kinds", "Kind");
+    Type third = try sema_support.declaredType(pipeline, "gamma.kinds", "Kind");
+    let pair = try sema_support.declaredType(pipeline, "beta.boxes", "Pair");
+
+    try testing.assertEqual(names.quoted(store.instantiationOf(pair, [clear, later])),
+        "'Pair<Kind, Kind>' (the second Kind from beta.kinds)");
+    try testing.assertEqual(names.quoted(store.instantiationOf(pair, [later, third])),
+        "'Pair<Kind, Kind>' (the first Kind from beta.kinds, the second Kind from gamma.kinds)");
+    try testing.assertEqual(names.quoted(store.instantiationOf(pair, [later, later])),
+        "'Pair<Kind, Kind>' (Kind from beta.kinds)");
+    try testing.assertEqual(names.quoted(store.functionOf([later, clear], later, [])),
+        "'(Kind, Kind) -> Kind' (the first and third Kind from beta.kinds)");
+}
+
+// The code spells each type it writes itself, so every type written is one the note can name.
+test "quoted code is followed by the module of each type it writes, by name" {
+    let pipeline = try quotingPipeline();
+    let store = pipeline.store();
+    let names = try sema_support.namesOf(pipeline, "main");
+    Type clear = try sema_support.declaredType(pipeline, "alpha.kinds", "Kind");
+    Type later = try sema_support.declaredType(pipeline, "beta.kinds", "Kind");
+    let other = try sema_support.declaredType(pipeline, "gamma.boxes", "Box");
+    Type boxed = store.instantiationOf(other, [store.primitive(PrimitiveKind.Int)]);
+
+    try testing.assertEqual(names.quotedCode(["new ", "()"], [boxed]),
+        "'new Box<int>()' (Box from gamma.boxes)");
+    try testing.assertEqual(names.quotedCode(["", " k"], [later]), "'Kind k' (Kind from beta.kinds)");
+    try testing.assertEqual(names.quotedCode(["", ".One"], [clear]), "'Kind.One'");
+    try testing.assertEqual(names.quotedCode(["", ".Two == ", ".One"], [later, clear]),
+        "'Kind.Two == Kind.One' (the first Kind from beta.kinds)");
+    try testing.assertEqual(names.quotedCode(["", ".Two != ", ".One && k == ", ".Two"],
+        [later, clear, later]),
+        "'Kind.Two != Kind.One && k == Kind.Two' (the first and third Kind from beta.kinds)");
+    Type[] none = [];
+    try testing.assertEqual(names.quotedCode(["return 0;"], none), "'return 0;'");
+}
+
+// The module reads as an import of it is written in this file: with the '@' of another package,
+// and without the package's own name inside it.
+test "a module note spells the module the way this file imports it" {
+    let loader = new FakeFileLoader();
+    loader.add("/ens.package", "workspace \{\n"
+        + "    member \"proj\";\n"
+        + "    member \"proj/vendor/tools\";\n"
+        + "\}\n");
+    loader.add("/proj/ens.package",
+        "package demo.app \{\n    ens \"0.1\";\n    dependency acme.tools;\n\}\n");
+    loader.add("/proj/vendor/tools/ens.package", "package acme.tools \{ ens \"0.1\"; \}\n");
+    loader.add("/proj/vendor/tools/src/hammer.ens", "export class Hammer \{ \}\n");
+    loader.add("/proj/src/sizes/parts.ens", "public enum Kind \{ Two \}\n");
+    loader.add("/proj/src/main.ens",
+        "import @acme.tools.hammer;\n"
+        + "import sizes.parts;\n"
+        + "public class Hammer \{ \}\n"
+        + "public class Error \{\n    public constructor() \{ \}\n\}\n"
+        + "public enum Kind \{ One \}\n");
+    let pipeline = sema_support.analyze(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertClean(pipeline);
+    let names = try sema_support.namesOf(pipeline, "main");
+
+    try testing.assertEqual(names.quoted(try sema_support.declaredType(pipeline, "acme.tools.hammer",
+        "Hammer")), "'Hammer' (from @acme.tools.hammer)");
+    try testing.assertEqual(names.quoted(try sema_support.declaredType(pipeline, "std.core", "Error")),
+        "'Error' (from @std.core)");
+    try testing.assertEqual(names.quoted(try sema_support.declaredType(pipeline, "sizes.parts", "Kind")),
+        "'Kind' (from sizes.parts)");
 }

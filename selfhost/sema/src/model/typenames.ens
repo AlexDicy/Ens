@@ -17,6 +17,7 @@ import PrimitiveBinding from model.types;
 import TypeParamType from model.types;
 import InstantiationType from model.types;
 import TypeStore from model.types;
+import support.diagnostics;
 import List from @std.collections.list;
 import Map from @std.collections.map;
 import Set from @std.collections.set;
@@ -307,7 +308,7 @@ export final class TypeNames {
     // 'int', 'Box<string>?', 'Sort[]', 'Kind (from engine.kinds)', '(Sort) -> bool',
     // '((int) -> bool)?'.
     export of(Type type) -> string {
-        return spelled(type, this);
+        return spelled(type, this, this);
     }
 
     // The nullable spelling of a type, for a diagnostic suggesting a type that allows null. It is
@@ -315,7 +316,104 @@ export final class TypeNames {
     // parentheses first: '((int) -> bool)?' is a function reference that may be null, while
     // '(int) -> bool?' is a function whose return may be.
     public nullableOf(Type type) -> string {
-        return spelledSuffixed(type, this) + "?";
+        return spelledSuffixed(type, this, this) + "?";
+    }
+
+    // The type in quotes, spelled as this file names it, then the module of each type in it that
+    // this file has no clear name for: 'Kind' (from sizes.b), 'Box<Kind>' (Kind from sizes.b).
+    export quoted(Type type) -> string {
+        return "'{spelled(type, this, null)}'{this.moduleNoteFor([type], true)}";
+    }
+
+    // The nullable spelling of a type in quotes, with the note quoted() writes after a type:
+    // '((Kind) -> bool)?' (Kind from sizes.b).
+    public quotedNullable(Type type) -> string {
+        return "'{spelledSuffixed(type, this, null)}?'{this.moduleNoteFor([type], true)}";
+    }
+
+    // The name of a declared type without its type parameters in quotes, with the note quoted()
+    // writes after a type: 'Box' (from sizes.c).
+    public quotedName(DeclaredType declared) -> string {
+        Type named = declared;
+        return "'{this.plainNameOf(declared)}'{this.moduleNoteFor([named], true)}";
+    }
+
+    // Code in quotes, written as 'pieces' with each type of 'between' spelled between two of
+    // them, then the module of each of those types that this file has no clear name for:
+    // 'Root.limit' (Root from base).
+    export quotedCode(string[] pieces, Type[] between) -> string {
+        if (pieces.length != between.length + 1) {
+            panic("Internal: quotedCode needs one more piece than types, but has {pieces.length} "
+                + "pieces for {between.length} types");
+        }
+        let code = new StringBuilder();
+        for (long i = 0; i < between.length; i++) {
+            code.append(pieces[i]);
+            code.append(spelled(between[i], this, null));
+        }
+        code.append(pieces[between.length]);
+        return "'{code.toString()}'{this.moduleNoteFor(between, false)}";
+    }
+
+    // What follows a quote of the types in 'mentioned': ' (from sizes.b)' when 'quotesOneType'
+    // and the quote writes no declared type but the one that needs its module, and ' (Kind from
+    // sizes.b, Mode from sizes.d)' otherwise. Where one name is written for two types, the note
+    // says which by position: ' (the second Kind from sizes.b)'. Empty when the file names every
+    // type clearly.
+    moduleNoteFor(Type[] mentioned, bool quotesOneType) -> string {
+        let writtenNames = new List<WrittenType>();
+        for (let type in mentioned) {
+            collectWritten(type, this, writtenNames);
+        }
+        let noted = new List<DeclaredType>();
+        for (let item in writtenNames) {
+            let declared = item.declared;
+            if (declared != null && this.needsModuleNote(declared) && !noted.contains(declared)) {
+                noted.push(declared);
+            }
+        }
+        if (noted.isEmpty()) {
+            return "";
+        }
+        let entries = new StringBuilder();
+        bool positioned = false;
+        for (let declared in noted) {
+            string name = this.plainNameOf(declared);
+            let ordinals = new List<string>();
+            bool shared = false;
+            long seen = 0;
+            for (let item in writtenNames) {
+                if (item.written == name) {
+                    seen++;
+                    if (item.declared == declared) {
+                        ordinals.push(diagnostics.ordinalWord(seen));
+                    } else {
+                        shared = true;
+                    }
+                }
+            }
+            if (!entries.isEmpty()) {
+                entries.append(", ");
+            }
+            if (shared) {
+                positioned = true;
+                entries.append("the {diagnostics.andJoined(ordinals.toArray())} ");
+            }
+            entries.append("{name} from {this.importPathOf(declared)}");
+        }
+        if (quotesOneType && noted.length() == 1 && !positioned) {
+            let only = noted.first();
+            bool alone = headOf(mentioned[0]) == only;
+            for (let item in writtenNames) {
+                if (item.declared != null && item.declared != only) {
+                    alone = false;
+                }
+            }
+            if (alone) {
+                return " (from {this.importPathOf(only)})";
+            }
+        }
+        return " ({entries.toString()})";
     }
 
     // The name this file has for a declared type, without the type parameters its own spelling
@@ -334,13 +432,19 @@ export final class TypeNames {
     // has no name for the type and that name alone does not say which type it is. Empty
     // everywhere else, so a type the reader can write reads as they would write it.
     public moduleNoteOf(DeclaredType declared) -> string {
-        if (this.nameFor(declared) != null) {
-            return "";
-        }
-        if (this.bindsTypeName(declared.name()) || this.namingStore.isRepeatedName(declared.name())) {
+        if (this.needsModuleNote(declared)) {
             return " (from {declared.modulePath()})";
         }
         return "";
+    }
+
+    // Whether a diagnostic in this file names the type's module beside it: the file has no name
+    // for the type, and the type's own name means something else here or names another type too.
+    needsModuleNote(DeclaredType declared) -> bool {
+        if (this.nameFor(declared) != null) {
+            return false;
+        }
+        return this.bindsTypeName(declared.name()) || this.namingStore.isRepeatedName(declared.name());
     }
 
     // The name this file writes for a declared type, or null when no declaration or import of
@@ -518,11 +622,12 @@ export final class TypeNameDirectory {
 // an EIR dump and for an 'Internal:' message; a diagnostic spells a type through the names of the
 // file it is reported in, which is what TypeNames supplies.
 export display(Type type) -> string {
-    return spelled(type, null);
+    return spelled(type, null, null);
 }
 
-// names is the file the spelling is for, or null where no file names the type.
-spelled(Type type, TypeNames? names) -> string {
+// names is the file the spelling is for, or null where no file names the type, and notes the names
+// a module note is read from, or null for a spelling with none.
+spelled(Type type, TypeNames? names, TypeNames? notes) -> string {
     switch (type) {
         is PrimitiveType primitive -> {
             return primitiveName(primitive.kind());
@@ -537,10 +642,10 @@ spelled(Type type, TypeNames? names) -> string {
             return "<error>";
         },
         is OptionalType optional -> {
-            return spelledSuffixed(optional.inner(), names) + "?";
+            return spelledSuffixed(optional.inner(), names, notes) + "?";
         },
         is ArrayType array -> {
-            return spelledSuffixed(array.element(), names) + "[]";
+            return spelledSuffixed(array.element(), names, notes) + "[]";
         },
         is FunctionType functionType -> {
             let builder = new StringBuilder();
@@ -550,10 +655,10 @@ spelled(Type type, TypeNames? names) -> string {
                 if (i > 0) {
                     builder.append(", ");
                 }
-                builder.append(spelled(parameters[i], names));
+                builder.append(spelled(parameters[i], names, notes));
             }
             builder.append(") -> ");
-            builder.append(spelled(functionType.returnType(), names));
+            builder.append(spelled(functionType.returnType(), names, notes));
             Type[] thrown = functionType.thrownTypes();
             for (long i = 0; i < thrown.length; i++) {
                 if (i > 0) {
@@ -561,12 +666,12 @@ spelled(Type type, TypeNames? names) -> string {
                 } else {
                     builder.append(" throws ");
                 }
-                builder.append(spelled(thrown[i], names));
+                builder.append(spelled(thrown[i], names, notes));
             }
             return builder.toString();
         },
         is DeclaredType declared -> {
-            return spelledDeclared(declared, names);
+            return spelledDeclared(declared, names, notes);
         },
         is TypeParamType parameter -> {
             return parameter.name();
@@ -580,20 +685,20 @@ spelled(Type type, TypeNames? names) -> string {
                 if (i > 0) {
                     builder.append(", ");
                 }
-                builder.append(spelled(arguments[i], names));
+                builder.append(spelled(arguments[i], names, notes));
             }
             builder.append(">");
-            builder.append(moduleNoteIn(instantiation.template(), names));
+            builder.append(moduleNoteIn(instantiation.template(), notes));
             return builder.toString();
         },
     }
 }
 
 // A generic template is spelled at its own type parameters, so it reads 'Box<T>' rather than 'Box'.
-spelledDeclared(DeclaredType declared, TypeNames? names) -> string {
+spelledDeclared(DeclaredType declared, TypeNames? names, TypeNames? notes) -> string {
     string[] parameters = declared.typeParameters();
     if (parameters.length == 0) {
-        return nameIn(declared, names) + moduleNoteIn(declared, names);
+        return nameIn(declared, names) + moduleNoteIn(declared, notes);
     }
     let builder = new StringBuilder();
     builder.append(nameIn(declared, names));
@@ -605,7 +710,7 @@ spelledDeclared(DeclaredType declared, TypeNames? names) -> string {
         builder.append(parameters[i]);
     }
     builder.append(">");
-    builder.append(moduleNoteIn(declared, names));
+    builder.append(moduleNoteIn(declared, notes));
     return builder.toString();
 }
 
@@ -618,20 +723,89 @@ nameIn(DeclaredType declared, TypeNames? names) -> string {
 
 // The module a spelling names after a type, which follows the type arguments the type carries
 // so that a generic reads 'Box<int> (from engine.boxes)'.
-moduleNoteIn(DeclaredType declared, TypeNames? names) -> string {
-    if (names == null) {
+moduleNoteIn(DeclaredType declared, TypeNames? notes) -> string {
+    if (notes == null) {
         return "";
     }
-    return names.moduleNoteOf(declared);
+    return notes.moduleNoteOf(declared);
 }
 
 // A type under a '?' or '[]' suffix. A function type takes parentheses there, because the
 // suffixes of the written form bind to the return type instead.
-spelledSuffixed(Type type, TypeNames? names) -> string {
+spelledSuffixed(Type type, TypeNames? names, TypeNames? notes) -> string {
     if (type is FunctionType) {
-        return "(" + spelled(type, names) + ")";
+        return "(" + spelled(type, names, notes) + ")";
     }
-    return spelled(type, names);
+    return spelled(type, names, notes);
+}
+
+// A name a spelling writes, with the declared type it names, or null for a type parameter, which a
+// declared type of the same name can be taken for.
+final class WrittenType {
+    string written;
+    DeclaredType? declared;
+
+    constructor(this.written, this.declared);
+}
+
+// Adds each name the spelling of 'type' writes, in the order the spelling writes them.
+collectWritten(Type type, TypeNames names, List<WrittenType> found) {
+    switch (type) {
+        is OptionalType optional -> {
+            collectWritten(optional.inner(), names, found);
+        },
+        is ArrayType array -> {
+            collectWritten(array.element(), names, found);
+        },
+        is FunctionType functionType -> {
+            for (let parameter in functionType.parameterTypes()) {
+                collectWritten(parameter, names, found);
+            }
+            collectWritten(functionType.returnType(), names, found);
+            for (let thrown in functionType.thrownTypes()) {
+                collectWritten(thrown, names, found);
+            }
+        },
+        is DeclaredType declared -> {
+            found.push(new WrittenType(names.plainNameOf(declared), declared));
+            for (let parameter in declared.typeParameters()) {
+                found.push(new WrittenType(parameter, null));
+            }
+        },
+        is TypeParamType parameter -> {
+            found.push(new WrittenType(parameter.name(), null));
+        },
+        is InstantiationType instantiation -> {
+            let template = instantiation.template();
+            found.push(new WrittenType(names.plainNameOf(template), template));
+            for (let argument in instantiation.arguments()) {
+                collectWritten(argument, names, found);
+            }
+        },
+        default -> { },
+    }
+}
+
+// The declared type a spelling of 'type' opens with once its '?' and '[]' are set aside, or null
+// where it opens with something else, such as a function type.
+headOf(Type type) -> DeclaredType? {
+    switch (type) {
+        is OptionalType optional -> {
+            return headOf(optional.inner());
+        },
+        is ArrayType array -> {
+            return headOf(array.element());
+        },
+        is DeclaredType declared -> {
+            return declared;
+        },
+        is InstantiationType instantiation -> {
+            return instantiation.template();
+        },
+        default -> {
+            return null;
+        },
+    }
 }
 
 public primitiveName(PrimitiveKind kind) -> string {
