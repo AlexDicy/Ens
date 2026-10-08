@@ -1,27 +1,45 @@
-// How a literal is typed with no target, under a cast, as a char literal given an integer type, and
-// as a switch label; also the checks on interpolated strings and the texts for a literal past its range.
+// How a literal takes its type: on its own, under a cast, as a char literal given an integer type,
+// as a switch label, or adapted to the number type it is written against. The module also checks
+// array, struct and interpolated string literals, and writes the texts for a literal past its range.
 import Expression from @ens.frontend.syntax.generated.nodes;
 import LiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
 import PrefixExpressionNode from @ens.frontend.syntax.generated.nodes;
 import ParenthesizedExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ArrayLiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
 import StructLiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
 import InterpolatedStringExpressionNode from @ens.frontend.syntax.generated.nodes;
 import SyntaxKind from @ens.frontend.syntax.generated.kind;
 import model.capabilities;
 import model.convert;
 import model.literalvalues;
-import phases.bodies.nullguidance;
-import phases.bodies.valuejoins;
+import model.typemembers;
+import Field from model.typemembers;
+import TypeNames from model.typenames;
+import model.types;
 import Type from model.types;
 import ErrorType from model.types;
 import PrimitiveType from model.types;
 import PrimitiveKind from model.types;
+import NullType from model.types;
+import ArrayType from model.types;
+import ClassType from model.types;
 import InterpolationObligation from phases.obligations;
+import phases.bodies.literalfixes;
+import OriginKind from phases.bodies.literaltargets;
+import LiteralOrigin from phases.bodies.literaltargets;
+import Widening from phases.bodies.literaltargets;
+import JoinFailure from phases.bodies.literaltargets;
+import HeldMismatch from phases.bodies.literaltargets;
+import JoinText from phases.bodies.literaltargets;
+import phases.bodies.nullguidance;
+import phases.bodies.valuejoins;
+import phases.bodies.wording;
+import List from @std.collections.list;
 import BodyChecker from phases.bodies;
 
 // Records the type a literal inside the parentheses adapted to on the parentheses as well.
 // 'adapted' is null when the literal did not adapt.
-public adaptedInParentheses(BodyChecker checker, ParenthesizedExpressionNode node, Type? adapted) -> Type? {
+adaptedInParentheses(BodyChecker checker, ParenthesizedExpressionNode node, Type? adapted) -> Type? {
     if (adapted != null) {
         checker.result().setType(node.green(), adapted);
     }
@@ -386,4 +404,452 @@ isUnsuffixedFloatLiteral(LiteralExpressionNode literal) -> bool {
     }
     byte last = raw[raw.length - 1];
     return last != 'f' && last != 'F' && last != 'd' && last != 'D';
+}
+
+// Retypes an untyped integer literal to the integer type the target has without its '?', and
+// returns the new type, the error type when it does not fit, or null. A literal that does not fit
+// gets 'fix', or else the change at 'origin'.
+public adaptIntegerLiteral(BodyChecker checker, Expression node, Type target, LiteralOrigin? origin = null,
+                           JoinText? fix = null) -> Type? {
+    if (node is ParenthesizedExpressionNode) {
+        return adaptedInParentheses(checker, node,
+            adaptIntegerLiteral(checker, node.inner(), target, origin, fix));
+    }
+    Type core = convert.coreOf(target);
+    if (core is PrimitiveType) {
+        return adaptIntegerLiteralTo(checker, node, core, origin, fix);
+    }
+    return null;
+}
+
+// adaptIntegerLiteral for a target that is a primitive type.
+adaptIntegerLiteralTo(BodyChecker checker, Expression node, PrimitiveType target, LiteralOrigin? origin,
+                      JoinText? fix) -> Type? {
+    if (!convert.isIntegerType(target)) {
+        return null;
+    }
+    let literal = intLiteralOf(node);
+    if (literal == null) {
+        return null;
+    }
+    let magnitude = literalvalues.integerMagnitude(literal.value().text());
+    if (magnitude == null) {
+        return null;
+    }
+    bool negative = isNegativeLiteral(node);
+    if (!literalvalues.magnitudeFits(negative, magnitude, target.kind())) {
+        string sign = "";
+        if (negative) {
+            sign = "-";
+        }
+        string written = "{sign}{literal.value().text()}";
+        let widening = literalfixes.integerWidening(checker, negative, magnitude, target);
+        let root = checker.targets().joinRoot();
+        if (valuejoins.isCoveredLiteral(checker, wording.unwrapParentheses(node).green())) {
+            checker.result().setType(node.green(), checker.store().errorType());
+            return checker.store().errorType();
+        }
+        if (fix == null && root != null && isJoinLiteral(root, node)) {
+            let failure = new JoinFailure(node.span(), written, literal.value().text(), negative,
+                magnitude, target, origin);
+            failure.setBesideLiteral(checker.targets().besideLiteral());
+            checker.targets().joinFailures().push(failure);
+        } else if (fix == null) {
+            checker.reporter().report(
+                integerTooLarge(written, widening, literalfixes.literalFix(checker, origin, widening)),
+                node.span());
+        } else if (fix.toward() != null && root != null) {
+            let failure = new JoinFailure(node.span(), written, literal.value().text(), negative,
+                magnitude, target, node, fix);
+            checker.targets().joinFailures().push(failure);
+        } else {
+            literalfixes.holdOrReport(checker, node.span(), integerTooLarge(written, widening, fix.fix()),
+                integerTooLarge(written, widening, fix.why()), integerTooLarge(written, widening, ""),
+                fix.clause(), widening);
+            valuejoins.coverJoinLiterals(checker, fix, node);
+        }
+        checker.result().setType(node.green(), checker.store().errorType());
+        return checker.store().errorType();
+    }
+    checker.result().setType(node.green(), target);
+    checker.result().setType(literal.green(), target);
+    return target;
+}
+
+// Retypes a literal to the floating-point core of 'target' and returns the new type, the error
+// type when it does not fit, or null. A literal that does not fit gets 'fix', or else the change
+// at 'origin'.
+public adaptFloatLiteral(BodyChecker checker, Expression node, Type target, LiteralOrigin? origin = null,
+                         JoinText? fix = null) -> Type? {
+    if (node is ParenthesizedExpressionNode) {
+        return adaptedInParentheses(checker, node,
+            adaptFloatLiteral(checker, node.inner(), target, origin, fix));
+    }
+    Type core = convert.coreOf(target);
+    if (core is PrimitiveType) {
+        return adaptFloatLiteralTo(checker, node, core, origin, fix);
+    }
+    return null;
+}
+
+// adaptFloatLiteral for a target that is a primitive type.
+adaptFloatLiteralTo(BodyChecker checker, Expression node, PrimitiveType target, LiteralOrigin? origin,
+                    JoinText? fix) -> Type? {
+    if (target.kind() != PrimitiveKind.Float && target.kind() != PrimitiveKind.Double) {
+        return null;
+    }
+    let literal = floatLiteralOf(node);
+    if (literal == null) {
+        // An untyped integer literal names a floating-point value just as well, so it takes
+        // a floating-point target under the same rule. No 64-bit magnitude reaches either
+        // type's limit, so these always fit and only the precision rounds.
+        let integer = intLiteralOf(node);
+        if (integer == null || literalvalues.integerMagnitude(integer.value().text()) == null) {
+            return null;
+        }
+        checker.result().setType(node.green(), target);
+        checker.result().setType(integer.green(), target);
+        return target;
+    }
+    if (literalfixes.literalOverflows(literal, target.kind())) {
+        double magnitude = literalvalues.floatMagnitude(literal.value().text());
+        string sign = "";
+        if (isNegativeLiteral(node)) {
+            sign = "-";
+        }
+        string written = "{sign}{literal.value().text()}";
+        if (fix == null) {
+            string text = literalfixes.literalFix(checker, origin, valuejoins.floatWidening());
+            checker.reporter().report(floatTooLarge(written, magnitude, target.kind(), text), node.span());
+        } else if (fix.toward() != null && checker.targets().joinRoot() != null) {
+            let failure = new JoinFailure(node.span(), written, literal.value().text(), false, 0, target,
+                node, fix);
+            checker.targets().joinFailures().push(failure);
+        } else {
+            literalfixes.holdOrReport(checker, node.span(),
+                floatTooLarge(written, magnitude, target.kind(), fix.fix()),
+                floatTooLarge(written, magnitude, target.kind(), fix.why()),
+                floatTooLarge(written, magnitude, target.kind(), ""), fix.clause(),
+                valuejoins.floatWidening());
+        }
+        checker.result().setType(node.green(), checker.store().errorType());
+        return checker.store().errorType();
+    }
+    checker.result().setType(node.green(), target);
+    checker.result().setType(literal.green(), target);
+    return target;
+}
+
+// Array literal with no target type: the first element's type drives the rest.
+public analyzeArrayLiteral(BodyChecker checker, ArrayLiteralExpressionNode node) -> Type {
+    let scope = checker.targets().beginJoin(node, false);
+    Type analyzed = analyzeArrayElements(checker, node);
+    valuejoins.endJoin(checker, node, scope);
+    return analyzed;
+}
+
+// The initializer of the untyped local 'name': an array literal there names it when its
+// elements give it no type.
+public analyzeInitializerOf(BodyChecker checker, string name, Expression value) -> Type {
+    if (!(wording.unwrapParentheses(value) is ArrayLiteralExpressionNode)) {
+        return checker.analyzeExpression(value);
+    }
+    checker.targets().setArrayHolderName(name);
+    Type analyzed = checker.analyzeExpression(value);
+    checker.targets().setArrayHolderName(null);
+    return analyzed;
+}
+
+// analyzeArrayLiteral once the array is the join its elements are analyzed in.
+analyzeArrayElements(BodyChecker checker, ArrayLiteralExpressionNode node) -> Type {
+    let holder = checker.targets().arrayHolderName();
+    checker.targets().setArrayHolderName(null);
+    if (node.elementsCount() == 0) {
+        string example = "int[] values = [];";
+        if (holder != null) {
+            checker.reporter().report("An empty '[]' has no element type to give '{holder}'. Declare its "
+                + "type, as in 'int[] {holder} = [];'.", node.span());
+            return checker.store().errorType();
+        }
+        checker.reporter().report("An empty '[]' has no element type here. Write it where an array type is "
+            + "declared, as in '{example}'.", node.span());
+        return checker.store().errorType();
+    }
+    valuejoins.noteJoinValue(checker, node.elements(0), true);
+    Type elementType = checker.analyzeExpression(node.elements(0));
+    if (elementType is ErrorType) {
+        for (long i = 1; i < node.elementsCount(); i++) {
+            valuejoins.noteJoinValue(checker, node.elements(i), true);
+            checker.analyzeExpression(node.elements(i));
+        }
+        return checker.store().errorType();
+    }
+    if (elementType is NullType) {
+        if (holder != null) {
+            checker.reporter().report("'null' alone gives the elements of '{holder}' no type. Declare its "
+                + "type, as in 'string?[] {holder} = [null];'.", node.elements(0).span());
+        } else {
+            checker.reporter().report("'null' alone gives the elements of this array no type. Write it "
+                + "where an array type is declared, as in 'string?[] values = [null];'.",
+                node.elements(0).span());
+        }
+        for (long i = 1; i < node.elementsCount(); i++) {
+            valuejoins.noteJoinValue(checker, node.elements(i), true);
+            checker.analyzeExpression(node.elements(i));
+        }
+        return checker.store().errorType();
+    }
+    for (long i = 1; i < node.elementsCount(); i++) {
+        Type actual = checker.store().errorType();
+        valuejoins.noteJoinValue(checker, node.elements(i), true);
+        let widening = literalfixes.joinWidening(checker, node.elements(i), elementType,
+            checker.targets().joinRoot());
+        if (widening != null && valuejoins.isCoveredLiteral(checker,
+                wording.unwrapParentheses(node.elements(i)).green())) {
+            checker.analyzeExpression(node.elements(i));
+            checker.result().setType(wording.unwrapParentheses(node.elements(i)).green(),
+                checker.store().errorType());
+            continue;
+        }
+        if (widening != null) {
+            let fix = literalfixes.elementFix(checker, node, elementType, widening);
+            checker.analyzeExpression(node.elements(i));
+            actual = adaptIntegerLiteral(checker, node.elements(i), elementType, null, fix)
+                ?? adaptFloatLiteral(checker, node.elements(i), elementType, null, fix) ?? actual;
+        } else {
+            actual = checker.analyzeExpressionAdapt(node.elements(i), elementType);
+        }
+        if (actual is ErrorType) {
+            continue;
+        }
+        if (!convert.isAssignableStrict(elementType, actual)) {
+            valuejoins.holdMismatch(checker, elementMismatch(i, elementType, actual, checker.names())
+                + "{nullguidance.valueAssignabilityHint(checker, elementType, actual, node.elements(i))}",
+                node.elements(i).span());
+        }
+    }
+    return checker.store().arrayOf(elementType);
+}
+
+// Array literal with a target type: each element adapts to the target's element type. The
+// target may be an array or an array under any number of optional levels; the wrapping
+// applies at the use site.
+public analyzeArrayLiteralAdapt(BodyChecker checker, ArrayLiteralExpressionNode node, Type target,
+                                LiteralOrigin? origin) -> Type {
+    // Under a type already refused, an array literal whose elements give it no type reports nothing
+    // more.
+    if (target is ErrorType && (node.elementsCount() == 0 || wording.isNullLiteral(node.elements(0)))) {
+        for (long i = 0; i < node.elementsCount(); i++) {
+            checker.analyzeExpression(node.elements(i));
+        }
+        return checker.store().errorType();
+    }
+    if (target is ErrorType) {
+        return analyzeArrayLiteral(checker, node);
+    }
+    let scope = checker.targets().beginJoin(node, false);
+    Type analyzed = analyzeArrayElementsAdapt(checker, node, target, origin);
+    valuejoins.endJoin(checker, node, scope);
+    return analyzed;
+}
+
+// analyzeArrayLiteralAdapt once the array is the join its elements are analyzed in.
+analyzeArrayElementsAdapt(BodyChecker checker, ArrayLiteralExpressionNode node, Type target,
+                          LiteralOrigin? origin) -> Type {
+    Type arrayType = convert.coreOf(target);
+    if (arrayType is ArrayType) {
+        Type elementType = arrayType.element();
+        LiteralOrigin? elementOrigin = null;
+        bool element = origin != null
+            && (origin.kind() == OriginKind.Parameter || origin.kind() == OriginKind.Fallback);
+        if (origin != null && element) {
+            elementOrigin = new LiteralOrigin(origin.kind(), origin.name(), origin.owner(), elementType);
+            elementOrigin.setConstructed(origin.constructed());
+            elementOrigin.setForElement(true);
+        } else if (origin != null) {
+            elementOrigin = new LiteralOrigin(origin.kind(), origin.name(), "", origin.declared());
+        }
+        let mismatched = new List<long>();
+        let mismatchedTypes = new List<Type>();
+        for (long i = 0; i < node.elementsCount(); i++) {
+            valuejoins.noteJoinValue(checker, node.elements(i), true);
+            Type actual = checker.analyzeExpressionAdapt(node.elements(i), elementType, elementOrigin);
+            if (!(actual is ErrorType) && !convert.isAssignableStrict(elementType, actual)) {
+                mismatched.push(i);
+                mismatchedTypes.push(actual);
+            }
+        }
+        // The refusal of a literal of the array reports the array once, as it does for a '?:',
+        // so an element that does not fit waits for the array and gets no report beside one.
+        for (long j = 0; j < mismatched.length(); j++) {
+            long i = mismatched.get(j);
+            Type actual = mismatchedTypes.get(j);
+            checker.targets().joinMismatches().push(new HeldMismatch(
+                elementMismatch(i, elementType, actual, checker.names())
+                + "{nullguidance.valueAssignabilityHint(checker, elementType, actual, node.elements(i))}",
+                node.elements(i).span()));
+        }
+        return arrayType;
+    }
+    checker.reporter().report("Cannot assign an array literal to '{checker.names().of(target)}', "
+        + "which is not an array type.", node.span());
+    for (long i = 0; i < node.elementsCount(); i++) {
+        checker.analyzeExpression(node.elements(i));
+    }
+    return checker.store().errorType();
+}
+
+// A struct literal with a target type: every field is set by name against the target struct's
+// declared fields, with the same visibility, adaptation, and assignability rules as a direct
+// field write.
+public analyzeStructLiteralAdapt(BodyChecker checker, StructLiteralExpressionNode node, Type target) -> Type {
+    if (target is ErrorType) {
+        return analyzeStructLiteral(checker, node);
+    }
+    Type structType = convert.coreOf(target);
+    if (!types.isStructLike(structType)) {
+        checker.reporter().report(notStructRefusal(checker, target), node.span());
+        for (long i = 0; i < node.fieldsCount(); i++) {
+            checker.analyzeExpression(node.fields(i).value());
+        }
+        return checker.store().errorType();
+    }
+    checker.result().setType(node.green(), structType);
+    let fields = typemembers.fieldsOf(structType);
+    if (fields == null) {
+        return structType;
+    }
+    string structShown = structDisplayName(structType, checker.names());
+    let provided = new List<bool>();
+    for (long i = 0; i < fields.length(); i++) {
+        provided.push(false);
+    }
+    for (long i = 0; i < node.fieldsCount(); i++) {
+        let entry = node.fields(i);
+        string fieldName = entry.name().text();
+        long index = fieldIndexNamed(fields, fieldName);
+        if (index < 0) {
+            checker.reporter().report("Struct '{structShown}' has no field named '{fieldName}'."
+                + fieldsListed(fields), entry.name().span());
+            checker.analyzeExpression(entry.value());
+            continue;
+        }
+        if (provided.get(index)) {
+            checker.reporter().report("Field '{fieldName}' is set twice in this struct literal. Remove the "
+                + "second '{fieldName}: ...'.", entry.name().span());
+            checker.analyzeExpression(entry.value());
+            continue;
+        }
+        provided.set(index, true);
+        let field = fields.get(index);
+        checker.checkMemberAccess(fieldName, field.visibility(), field.definingType(), entry.name().span());
+        Type fieldType = field.type();
+        let origin = literalfixes.valueOrigin(checker, OriginKind.Declared, fieldName, fieldType,
+            entry.value());
+        if (origin != null) {
+            origin.setOwner(structShown);
+        }
+        Type valueType = checker.analyzeExpressionAdapt(entry.value(), fieldType, origin);
+        if (!(valueType is ErrorType) && !(fieldType is ErrorType)
+                && !convert.isAssignableStrict(fieldType, valueType)) {
+            checker.reporter().report("Field '{fieldName}' has type '{checker.names().of(fieldType)}', but "
+                + "its value here has type '{checker.names().of(valueType)}'."
+                + "{nullguidance.valueAssignabilityHint(checker, fieldType, valueType, entry.value())}",
+                entry.value().span());
+        }
+    }
+    for (long i = 0; i < fields.length(); i++) {
+        if (provided.get(i)) {
+            continue;
+        }
+        let field = fields.get(i);
+        if (field.hasDefault()) {
+            continue;
+        }
+        checker.reporter().report("Struct literal for '{structShown}' does not set the field "
+            + "'{field.name()}'. Add '{field.name()}: ...', or give the field a default "
+            + "value.", node.span());
+    }
+    return structType;
+}
+
+// The refusal of a '{...}' literal toward 'target', which is not a struct, with the 'new' that
+// creates an object of a class this file can construct.
+notStructRefusal(BodyChecker checker, Type target) -> string {
+    string shown = checker.names().of(target);
+    Type core = convert.coreOf(target);
+    let authority = types.authorityOf(core);
+    if (authority is ClassType && !authority.isAbstract()) {
+        string opening = "'{shown}' is a class, and a '\{...\}' literal builds only a struct.";
+        let arguments = checker.classConstructionArguments(core);
+        if (arguments != null && checker.names().canSpell(core)) {
+            return "{opening} Write 'new {checker.names().of(core)}{arguments}' to create one.";
+        }
+        return opening;
+    }
+    return "'{shown}' is not a struct, and a '\{...\}' literal builds only a struct.";
+}
+
+fieldIndexNamed(List<Field> fields, string name) -> long {
+    for (long i = 0; i < fields.length(); i++) {
+        if (fields.get(i).name() == name) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+structDisplayName(Type structType, TypeNames names) -> string {
+    let authority = types.authorityOf(structType);
+    if (authority != null) {
+        return authority.name();
+    }
+    return names.of(structType);
+}
+
+// The sentence, opening with a space, that lists the names of 'fields', or empty when there are none.
+fieldsListed(List<Field> fields) -> string {
+    if (fields.length() == 0) {
+        return "";
+    }
+    let listed = new List<string>();
+    for (long i = 0; i < fields.length(); i++) {
+        listed.push(fields.get(i).name());
+    }
+    if (listed.length() == 1) {
+        return " Its only field is '{listed.get(0)}'.";
+    }
+    return " Its fields are {wording.quotedList(listed)}.";
+}
+
+// The refusal of element 'index' of an array literal, whose type 'actual' is not the element type.
+elementMismatch(long index, Type elementType, Type actual, TypeNames names) -> string {
+    return "Element {index + 1} has type '{names.of(actual)}', but the elements of this array have type "
+        + "'{names.of(elementType)}'.";
+}
+
+// Whether 'node' is an untyped integer literal among the values of the join 'root'.
+isJoinLiteral(Expression root, Expression node) -> bool {
+    let literals = new List<Expression>();
+    valuejoins.collectJoinLiterals(root, literals, true);
+    for (let literal in literals) {
+        if (literal.green() == wording.unwrapParentheses(node).green()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The refusal of an integer literal, spelled 'written', past the range of the narrow type of
+// 'widening'. A literal a wider type takes gets 'fix'.
+public integerTooLarge(string written, Widening widening, string fix) -> string {
+    string refusal = integerPastRange(written, widening.negative(), widening.narrow(), widening.narrowName());
+    if (widening.wider().length > 0 && fix.length > 0) {
+        return "{refusal} {fix}";
+    }
+    if (widening.wider().length == 0 && widening.negative() && widening.narrow() != PrimitiveKind.Long
+            && widening.narrow() != PrimitiveKind.Char) {
+        return "{refusal} It is below the smallest value of 'long' too, which is -9223372036854775808.";
+    }
+    return refusal;
 }

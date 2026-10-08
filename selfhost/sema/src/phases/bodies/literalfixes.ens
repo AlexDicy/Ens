@@ -1,0 +1,972 @@
+// Where the type a literal is checked against comes from, and the fix suggested when the literal does
+// not fit that type, with the wider type the fix names. Inside a join or a call, the fix is held
+// until the whole join or call is analyzed.
+import FieldDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import SyntaxNode from @ens.frontend.syntax.node;
+import Expression from @ens.frontend.syntax.generated.nodes;
+import VariableDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import ReturnStatementNode from @ens.frontend.syntax.generated.nodes;
+import SwitchArm from @ens.frontend.syntax.generated.nodes;
+import LiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
+import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
+import BinaryExpressionNode from @ens.frontend.syntax.generated.nodes;
+import PrefixExpressionNode from @ens.frontend.syntax.generated.nodes;
+import AssignmentExpressionNode from @ens.frontend.syntax.generated.nodes;
+import TernaryExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ArrayLiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SyntaxKind from @ens.frontend.syntax.generated.kind;
+import GreenNode from @ens.frontend.syntax.green;
+import Span from @ens.frontend.support.source;
+import model.convert;
+import model.literalvalues;
+import OriginKind from phases.bodies.literaltargets;
+import LiteralOrigin from phases.bodies.literaltargets;
+import PendingLiteralRange from phases.bodies.literaltargets;
+import Widening from phases.bodies.literaltargets;
+import JoinText from phases.bodies.literaltargets;
+import DeferredLiteralFix from phases.bodies.literaltargets;
+import phases.bodies.valuejoins;
+import phases.bodies.literaltyping;
+import phases.bodies.nullguidance;
+import phases.bodies.wording;
+import phases.bodies.narrowing;
+import Parameter from model.typemembers;
+import Signature from model.typemembers;
+import model.typenames;
+import Type from model.types;
+import OptionalType from model.types;
+import ArrayType from model.types;
+import FunctionType from model.types;
+import PrimitiveType from model.types;
+import PrimitiveKind from model.types;
+import List from @std.collections.list;
+import BodyChecker from phases.bodies;
+
+// Holds the refusal 'message' for the join or call being analyzed, with 'plain' ending after the
+// why, or reports it outside both. 'refusal' and 'clause' are its first sentence and its why.
+public holdOrReport(BodyChecker checker, Span span, string message, string plain, string refusal,
+                    string clause, Widening widening) {
+    let held = checker.targets().deferredFixes();
+    if (held == null) {
+        checker.reporter().report(message, span);
+        return;
+    }
+    let fix = new DeferredLiteralFix(span, message, plain, null, "");
+    fix.setAwaitingParameter(checker.targets().awaitingParameter());
+    fix.setRefusal(refusal);
+    fix.setClause(clause);
+    fix.setWidening(widening);
+    held.push(fix);
+}
+
+// Holds the fix of the pending 'float' literal report for the join being analyzed, with the
+// value 'other' of type 'otherType' the literal stands beside.
+holdSuffixed(BodyChecker checker, PendingLiteralRange pending, Expression value, Expression other,
+             Type otherType) {
+    let held = checker.targets().deferredFixes();
+    if (held != null) {
+        let fix = new DeferredLiteralFix(pending.span(), "", "", pending, floatSuffixOf(value));
+        fix.setBeside(wording.oneLineSpelling(wording.unwrapParentheses(other)));
+        fix.setBesideType(checker.names().of(otherType));
+        fix.setAwaitingParameter(checker.targets().awaitingParameter());
+        held.push(fix);
+    }
+}
+
+// Settles the refusals held for one branch or arm beside 'neighbour', which 'where' names. Each
+// then passes to an enclosing join, or is reported when there is none.
+public settleDeferred(BodyChecker checker, List<DeferredLiteralFix> fixes, Expression? neighbour,
+                      Type neighbourType, string where) {
+    for (let held in fixes) {
+        let widening = held.widening() ?? valuejoins.floatWidening();
+        if (!held.settled() && neighbour != null && neighbourType is OptionalType
+                && sameCore(neighbourType, widening)) {
+            held.setSettled(true);
+            held.setMessage(held.plain());
+            let suffixed = held.suffixed();
+            if (suffixed != null) {
+                string named = wording.oneLineSpelling(wording.unwrapParentheses(neighbour));
+                string type = checker.names().of(neighbourType);
+                suffixed.setFix("The '{held.suffix()}' makes the literal a 'float'. Without it the "
+                    + "literal takes its type from '{held.beside()}', a '{held.besideType()}', and "
+                    + "{where} '{named}' is a '{type}'.");
+            }
+        }
+        let outer = checker.targets().deferredFixes();
+        if (outer != null) {
+            outer.push(held);
+        } else if (held.suffixed() == null) {
+            checker.reporter().report(held.message(), held.span());
+        }
+    }
+}
+
+// The pending report of the 'float' literal 'value' when it is too large for 'float', or null.
+pendingSuffixed(BodyChecker checker, Expression value) -> PendingLiteralRange? {
+    GreenNode green = wording.unwrapParentheses(value).green();
+    for (let pending in checker.targets().pendingLiteralRanges()) {
+        if (pending.green() == green && pending.defaultType().kind() == PrimitiveKind.Float) {
+            return pending;
+        }
+    }
+    return null;
+}
+
+// Gives a 'float' literal too large for 'float' the fix for the target it is checked against,
+// set at 'origin'. Under a 'double' target, removing the suffix is the whole fix.
+public noteSuffixedTarget(BodyChecker checker, Expression value, Type target, LiteralOrigin? origin) {
+    let pending = pendingSuffixed(checker, value);
+    if (pending == null || origin == null || isDoubleCore(target)) {
+        return;
+    }
+    string spelled = wording.oneLineSpelling(wording.unwrapParentheses(value));
+    string removal = "remove the '{floatSuffixOf(value)}' from '{spelled}'";
+    string change = originChange(checker, origin, valuejoins.floatWidening());
+    if (change.length > 0) {
+        pending.setFix("{change} and {removal}.");
+        return;
+    }
+    pending.setFix(suffixedWhere(checker, value, origin));
+}
+
+// Gives a 'float' literal too large for 'float' beside the 'float' value 'other' the fix that
+// removes the suffix and converts 'other', under the target of the operator it is an operand of.
+public noteSuffixedOperand(BodyChecker checker, Expression value, Expression other, Type toward,
+                           string operatorText, bool onRight) {
+    let pending = pendingSuffixed(checker, value);
+    if (pending == null || !isFloatCore(toward)) {
+        return;
+    }
+    string plainLiteral = unsuffixedSpelling(value);
+    string written = "{wording.asDouble(other)} {operatorText} {plainLiteral}";
+    string plain = "{wording.oneLineSpelling(other)} {operatorText} {plainLiteral}";
+    string both = "{unsuffixedSpelling(other)} {operatorText} {plainLiteral}";
+    if (!onRight) {
+        written = "{plainLiteral} {operatorText} {wording.asDouble(other)}";
+        plain = "{plainLiteral} {operatorText} {wording.oneLineSpelling(other)}";
+        both = "{plainLiteral} {operatorText} {unsuffixedSpelling(other)}";
+    }
+    pending.setFix(suffixedBesideFix(checker, value, other, toward, written, plain, both,
+        checker.targets().operandTarget(), checker.targets().operandOrigin(),
+        checker.targets().operandJoin()));
+    holdSuffixed(checker, pending, value, other, toward);
+}
+
+// Gives a 'float' literal branch of a '?:', too large for 'float', the fix that removes its suffix
+// and converts the other branch, whose type is 'toward', under the target set at 'origin'.
+public noteSuffixedBranch(BodyChecker checker, TernaryExpressionNode node, bool literalThen, Type toward,
+                          Type? target, LiteralOrigin? origin) {
+    Expression literal = node.elseValue();
+    Expression other = node.thenValue();
+    if (literalThen) {
+        literal = node.thenValue();
+        other = node.elseValue();
+    }
+    let pending = pendingSuffixed(checker, literal);
+    if (pending == null || !isFloatCore(toward) || pendingSuffixed(checker, other) != null) {
+        return;
+    }
+    string condition = wording.oneLineSpelling(node.condition());
+    string plainLiteral = unsuffixedSpelling(literal);
+    string written = "{condition} ? {wording.asDouble(other)} : {plainLiteral}";
+    string plain = "{condition} ? {wording.oneLineSpelling(other)} : {plainLiteral}";
+    string both = "{condition} ? {unsuffixedSpelling(other)} : {plainLiteral}";
+    if (literalThen) {
+        written = "{condition} ? {plainLiteral} : {wording.asDouble(other)}";
+        plain = "{condition} ? {plainLiteral} : {wording.oneLineSpelling(other)}";
+        both = "{condition} ? {plainLiteral} : {unsuffixedSpelling(other)}";
+    }
+    pending.setFix(suffixedBesideFix(checker, literal, other, toward, written, plain, both, target, origin,
+        node));
+    holdSuffixed(checker, pending, literal, other, toward);
+}
+
+// Gives each 'float' literal arm too large for 'float' the fix that removes its suffix and converts
+// an arm with a 'float' value of its own, under the target set at 'origin'.
+public noteSuffixedArms(BodyChecker checker, List<Expression> values, List<SwitchArm> arms, Type? target,
+                        LiteralOrigin? origin) {
+    for (long i = 0; i < values.length(); i++) {
+        let pending = pendingSuffixed(checker, values.get(i));
+        if (pending == null) {
+            continue;
+        }
+        long chosen = -1;
+        long typed = 0;
+        for (long j = 0; j < values.length(); j++) {
+            let other = values.get(j);
+            if (j == i || valuejoins.isUntypedNumberLiteral(other) || pendingSuffixed(checker, other) != null
+                    || !isFloatCore(checker.recordedType(other))) {
+                continue;
+            }
+            typed++;
+            bool plainer = chosen >= 0 && floatSuffixOf(values.get(chosen)).length > 0
+                && floatSuffixOf(other).length == 0;
+            if (chosen < 0 || plainer) {
+                chosen = j;
+            }
+        }
+        if (chosen < 0) {
+            continue;
+        }
+        let other = values.get(chosen);
+        string head = wording.armHead(arms.get(chosen));
+        string bothRemoved = "";
+        if (typed == 1) {
+            bothRemoved = "{head} -> {unsuffixedSpelling(other)}";
+        }
+        pending.setFix(suffixedBesideFix(checker, values.get(i), other, checker.recordedType(other),
+            "{head} -> {wording.asDouble(other)}", "", bothRemoved, target, origin, null));
+        holdSuffixed(checker, pending, values.get(i), other, checker.recordedType(other));
+    }
+}
+
+// The fix for the 'float' literal 'value', too large for 'float', beside 'other' of type
+// 'otherType' in 'join'. An empty 'bothRemoved' means removing the suffix of 'other' is no fix.
+suffixedBesideFix(BodyChecker checker, Expression value, Expression other, Type otherType, string converted,
+                  string suffixRemoved, string bothRemoved, Type? target, LiteralOrigin? origin,
+                  Expression? join) -> string {
+    string spelled = wording.oneLineSpelling(wording.unwrapParentheses(value));
+    string suffix = floatSuffixOf(value);
+    string named = wording.oneLineSpelling(wording.unwrapParentheses(other));
+    string removal = "remove the '{suffix}' from '{spelled}'";
+    if (otherType is OptionalType) {
+        return "The '{suffix}' makes the literal a 'float'. Without it the literal takes its type from "
+            + "'{named}', a '{checker.names().of(otherType)}'.";
+    }
+    string otherSuffix = floatSuffixOf(other);
+    if (otherSuffix.length > 0 && bothRemoved.length > 0) {
+        string also = " and from '{named}'";
+        if (otherSuffix != suffix) {
+            also = " and the '{otherSuffix}' from '{named}'";
+        }
+        if (target == null || isDoubleCore(target)) {
+            return "Remove the '{suffix}' from '{spelled}'{also} ('{bothRemoved}').";
+        }
+        if (origin == null) {
+            return "";
+        }
+        string change = originChange(checker, origin, valuejoins.floatWidening());
+        if (change.length > 0) {
+            return "{change} and {removal}{also} ('{originExample(checker, origin, join, bothRemoved,
+                valuejoins.floatWidening())}').";
+        }
+        return suffixedWhere(checker, value, origin);
+    }
+    if (target == null || isDoubleCore(target)) {
+        return "Remove the '{suffix}' from '{spelled}' and convert '{named}' ('{converted}').";
+    }
+    if (origin == null) {
+        return "";
+    }
+    string change = originChange(checker, origin, valuejoins.floatWidening());
+    if (change.length > 0 && readsPlace(other, originPlace(origin))) {
+        string statement = originStatement(checker, origin, join, suffixRemoved, valuejoins.floatWidening());
+        if (statement.length > 0) {
+            return "{change} and {removal} ('{statement}').";
+        }
+        return "{change} and {removal}.";
+    }
+    if (change.length > 0) {
+        string example = originExample(checker, origin, join, converted, valuejoins.floatWidening());
+        return "{change}, {removal} and convert '{named}' ('{example}').";
+    }
+    return suffixedWhere(checker, value, origin);
+}
+
+// The sentence for a 'float' literal under the parameter or the '??' value at 'origin', whose
+// suffix gives it the type the target has too. Empty for any other origin.
+suffixedWhere(BodyChecker checker, Expression value, LiteralOrigin origin) -> string {
+    string noun = originNoun(origin);
+    if (noun.length == 0) {
+        return "";
+    }
+    string type = originType(checker, origin);
+    return "The '{floatSuffixOf(value)}' makes the literal a 'float', and {noun} is "
+        + "{typenames.typeArticle(type)} '{type}' too.";
+}
+
+// The text after a literal operand that takes its type from the other side of 'operatorText'.
+// The expression is checked against the target set at the operand origin, when it has one.
+operandFix(BodyChecker checker, Expression literal, Expression other, Type toward, string operatorText,
+           bool onRight, Widening widening) -> JoinText {
+    string into = conversionType(checker, checker.targets().operandTarget(), widening);
+    string written = "{wording.converted(other, into)} {operatorText} {wording.oneLineSpelling(literal)}";
+    if (!onRight) {
+        written = "{wording.oneLineSpelling(literal)} {operatorText} {wording.converted(other, into)}";
+    }
+    return joinFix(checker, other, toward, written, "both sides", checker.targets().operandTarget(),
+        checker.targets().operandOrigin(), checker.targets().operandJoin(), widening);
+}
+
+// operandFix for the operand 'node' when it is a literal too large for 'toward', or null.
+public operandLiteralFix(BodyChecker checker, Expression node, Expression other, Type toward,
+                         string operatorText, bool onRight) -> JoinText? {
+    let widening = joinWidening(checker, node, toward);
+    if (widening == null) {
+        return null;
+    }
+    return operandFix(checker, node, other, toward, operatorText, onRight, widening);
+}
+
+// The type a value beside a literal converts to so that the literal takes it: the type of
+// 'target' when it takes the literal and every value beside it, and otherwise the wider type.
+public conversionType(BodyChecker checker, Type? target, Widening widening) -> string {
+    if (target != null && takesLiteral(target, widening)) {
+        return checker.names().of(convert.coreOf(target));
+    }
+    return widening.wider();
+}
+
+// The text after a literal that takes its type 'toward' from 'other' in 'join', whose code with
+// 'other' converted is 'written'. 'target' and 'origin' say what the join is checked against,
+// and 'both' names the values a removed suffix makes 'double'.
+public joinFix(BodyChecker checker, Expression other, Type toward, string written, string both, Type? target,
+               LiteralOrigin? origin, Expression? join, Widening widening) -> JoinText {
+    let text = joinFixText(checker, other, toward, written, both, target, origin, join, widening);
+    text.setCovered(widening.literals());
+    return text;
+}
+
+// joinFix before it records the literals its fix covers.
+joinFixText(BodyChecker checker, Expression other, Type toward, string written, string both, Type? target,
+            LiteralOrigin? origin, Expression? join, Widening widening) -> JoinText {
+    string named = wording.oneLineSpelling(other);
+    if (toward is OptionalType) {
+        string why = wording.takesTypeFrom("'{named}'", checker.names().of(toward));
+        return new JoinText(why, why);
+    }
+    string type = checker.names().of(convert.coreOf(toward));
+    string text = wording.takesTypeFrom("'{named}'", type);
+    if (widening.wider().length == 0) {
+        return new JoinText(text, text);
+    }
+    string advice = joinAdvice(checker, other, type, text, written, both, target, origin, join, widening);
+    let joined = new JoinText(advice, text);
+    joined.setClause(wording.takesTypeClause("'{named}'", type));
+    return joined;
+}
+
+// joinFix once the type 'toward' is known to have no '?': 'text' says where the type comes from.
+joinAdvice(BodyChecker checker, Expression other, string type, string text, string written, string both,
+           Type? target, LiteralOrigin? origin, Expression? join, Widening widening) -> string {
+    string named = wording.oneLineSpelling(other);
+    string suffix = "";
+    if (both.length > 0) {
+        suffix = floatSuffixOf(other);
+    }
+    if (target == null || takesLiteral(target, widening)) {
+        if (suffix.length > 0) {
+            return "{text} Remove the '{suffix}' from '{named}' so that {both} are 'double'.";
+        }
+        return "{text} Convert '{named}' first ('{written}').";
+    }
+    if (origin == null || (widening.joined() && (widening.negative() || widening.lowNegative())
+            && isUnsignedCore(origin.declared()))) {
+        return text;
+    }
+    let declaring = declarationWidening(checker, origin, widening);
+    string change = originChange(checker, origin, declaring);
+    if (change.length > 0 && suffix.length > 0) {
+        return "{text} {change} and remove the '{suffix}' from '{named}'.";
+    }
+    if (change.length > 0 && readsPlace(other, originPlace(origin))) {
+        string statement = "";
+        if (join != null) {
+            statement = originStatement(checker, origin, join, wording.oneLineSpelling(join), declaring);
+        }
+        if (statement.length > 0) {
+            return "{text} {change} ('{statement}').";
+        }
+        return "{text} {change}.";
+    }
+    if (change.length > 0) {
+        string example = originExample(checker, origin, join, written, declaring);
+        return "{text} {change} and convert '{named}' ('{example}').";
+    }
+    string noun = originNoun(origin);
+    if (noun.length > 0) {
+        string declared = originType(checker, origin);
+        return "{wording.takesTypeClause("'{named}'", type)}, and {noun} is "
+            + "{typenames.typeArticle(declared)} '{declared}' too.";
+    }
+    return text;
+}
+
+// The text after a literal that does not fit the type set at 'origin'.
+public literalFix(BodyChecker checker, LiteralOrigin? origin, Widening widening) -> string {
+    if (origin == null || widening.wider().length == 0) {
+        return "";
+    }
+    string change = originChange(checker, origin, widening);
+    if (change.length > 0 && origin.kind() == OriginKind.Returned) {
+        return "{change}.";
+    }
+    if (change.length > 0) {
+        return "{change} instead.";
+    }
+    return originWhere(checker, origin);
+}
+
+// The change that makes the declaration at 'origin' take the wider type, or an empty string where
+// no code can change the type in one edit.
+originChange(BodyChecker checker, LiteralOrigin origin, Widening widening) -> string {
+    string wider = widerSpelling(checker, origin.declared(), widening);
+    if (wider.length == 0) {
+        return "";
+    }
+    switch (origin.kind()) {
+        Declared -> {
+            if (origin.owner().length > 0) {
+                return "Declare field '{origin.name()}' of '{origin.owner()}' as '{wider}'";
+            }
+            return "Declare '{origin.name()}' as '{wider}'";
+        },
+        Returned -> {
+            return "Change the return type of '{origin.name()}' to '{wider}'";
+        },
+        default -> {
+            return "";
+        },
+    }
+}
+
+// The sentence that names the parameter or the '??' value that sets the type at 'origin'. No
+// code changes that type in one edit.
+originWhere(BodyChecker checker, LiteralOrigin origin) -> string {
+    string noun = originNoun(origin);
+    if (noun.length == 0) {
+        return "";
+    }
+    return wording.takesTypeFrom(noun, originType(checker, origin));
+}
+
+// The type set at 'origin' without its '?'.
+public originType(BodyChecker checker, LiteralOrigin origin) -> string {
+    return checker.names().of(convert.coreOf(origin.declared()));
+}
+
+// The fixed code an example shows: the statement at 'origin' around 'written' when 'join' is its
+// whole value, and 'written' alone otherwise.
+originExample(BodyChecker checker, LiteralOrigin origin, Expression? join, string written,
+              Widening widening) -> string {
+    string statement = originStatement(checker, origin, join, written, widening);
+    if (statement.length == 0) {
+        return written;
+    }
+    return statement;
+}
+
+// The statement at 'origin' with 'written' as its value when 'join' is its whole value, or an
+// empty string.
+originStatement(BodyChecker checker, LiteralOrigin origin, Expression? join, string written,
+                Widening widening) -> string {
+    let whole = origin.whole();
+    if (join == null || whole == null || wording.unwrapParentheses(whole).green() != join.green()) {
+        return "";
+    }
+    string wider = widerSpelling(checker, origin.declared(), widening);
+    switch (origin.statement()) {
+        is VariableDeclarationNode declaration -> {
+            string modifier = "";
+            let token = declaration.modifier();
+            if (token != null) {
+                modifier = "{token.text()} ";
+            }
+            return "{modifier}{wider} {declaration.name().text()} = {written};";
+        },
+        is FieldDeclarationNode field -> {
+            string modifiers = "";
+            for (long i = 0; i < field.modifiersCount(); i++) {
+                modifiers = "{modifiers}{field.modifiers(i).text()} ";
+            }
+            return "{modifiers}{wider} {field.name().text()} = {written};";
+        },
+        is ReturnStatementNode ignored -> {
+            return "return {written};";
+        },
+        is AssignmentExpressionNode assignment -> {
+            return "{wording.oneLineSpelling(assignment.target())} {assignment.operator().text()} {written};";
+        },
+        default -> {
+            return "";
+        },
+    }
+}
+
+// The type spelled with the narrow type of 'widening' changed to its wider one, or an empty string
+// when the narrow type is not under its '?' and '[]' levels.
+widerSpelling(BodyChecker checker, Type type, Widening widening) -> string {
+    if (type is OptionalType) {
+        string inner = widerSpelling(checker, type.inner(), widening);
+        if (inner.length == 0) {
+            return "";
+        }
+        return "{inner}?";
+    }
+    if (type is ArrayType) {
+        string element = widerSpelling(checker, type.element(), widening);
+        if (element.length == 0) {
+            return "";
+        }
+        return "{element}[]";
+    }
+    if (type is PrimitiveType && type.kind() == widening.narrow()) {
+        return widening.wider();
+    }
+    return "";
+}
+
+// The widening of an integer literal with 'magnitude' too large for 'target'.
+public integerWidening(BodyChecker checker, bool negative, ulong magnitude,
+                       PrimitiveType target) -> Widening {
+    return new Widening(target.kind(), checker.names().of(target),
+        literaltyping.widerIntegerHolding(negative, magnitude, target.kind()), negative, magnitude);
+}
+
+// The widening of the number literal 'value' when it is too large for the type 'target' has
+// without its '?', or null.
+public overflowWidening(BodyChecker checker, Expression value, Type target) -> Widening? {
+    Type core = convert.coreOf(target);
+    if (floatLiteralOverflows(value, target) && core is PrimitiveType && core.kind() == PrimitiveKind.Float) {
+        return valuejoins.floatWidening();
+    }
+    if (floatLiteralOverflows(value, target)) {
+        return new Widening(PrimitiveKind.Double, "double", "", false, 0);
+    }
+    let literal = literaltyping.intLiteralOf(wording.unwrapParentheses(value));
+    if (literal == null || !(core is PrimitiveType) || !convert.isIntegerType(core)) {
+        return null;
+    }
+    let magnitude = literalvalues.integerMagnitude(literal.value().text());
+    bool negative = literaltyping.isNegativeLiteral(wording.unwrapParentheses(value));
+    if (magnitude == null || literalvalues.magnitudeFits(negative, magnitude, core.kind())) {
+        return null;
+    }
+    return integerWidening(checker, negative, magnitude, core);
+}
+
+// overflowWidening for a literal beside a value of type 'target', whose wider type has every
+// value of 'target' as well as every literal of the join 'root', or of the literal alone.
+public joinWidening(BodyChecker checker, Expression value, Type target,
+                    Expression? root = null) -> Widening? {
+    let widening = overflowWidening(checker, value, target);
+    if (widening == null || !convert.isIntegerType(convert.coreOf(target))) {
+        return widening;
+    }
+    let joined = new Widening(widening.narrow(), widening.narrowName(), "", widening.negative(),
+        widening.magnitude());
+    joined.setJoined(true);
+    let literals = new List<Expression>();
+    valuejoins.collectJoinLiterals(root ?? value, literals, true);
+    valuejoins.spanJoinLiterals(joined, literals);
+    joined.setWider(joinedIntegerHolding(joined));
+    joined.setLiterals(literals);
+    return joined;
+}
+
+// The widening that changes the declaration at 'origin' to the wider type of 'widening'. A joined
+// literal changes the declared type, which need not be the type beside it.
+declarationWidening(BodyChecker checker, LiteralOrigin origin, Widening widening) -> Widening {
+    Type core = convert.coreOf(origin.declared());
+    while (core is ArrayType) {
+        core = convert.coreOf(core.element());
+    }
+    if (!widening.joined() || !(core is PrimitiveType) || !convert.isIntegerType(core)) {
+        return widening;
+    }
+    return new Widening(core.kind(), checker.names().of(core), widening.wider(), widening.negative(),
+        widening.magnitude());
+}
+
+// The origin of the value a lambda returns, when the lambda's type is declared at 'holder'.
+public returnOriginThrough(BodyChecker checker, LiteralOrigin? holder, Type returned) -> LiteralOrigin? {
+    if (holder == null || holder.kind() != OriginKind.Declared
+            || !(convert.coreOf(holder.declared()) is FunctionType)) {
+        return null;
+    }
+    return new LiteralOrigin(OriginKind.Returned, holder.name(), "", returned);
+}
+
+// The origin of 'value', set by 'kind' at 'name' with type 'declared' in 'statement', or null
+// when no number literal in 'value' can need it.
+public valueOrigin(BodyChecker checker, OriginKind kind, string name, Type declared, Expression value,
+                   SyntaxNode? statement = null) -> LiteralOrigin? {
+    if (!valuejoins.mayAdaptLiteral(value)) {
+        return null;
+    }
+    let origin = new LiteralOrigin(kind, name, "", declared);
+    origin.setStatement(statement);
+    origin.setWhole(value);
+    return origin;
+}
+
+// The origin of the value 'node' assigns: the declaration of the variable, field or array it
+// writes, or null when no declaration names what it writes.
+public assignmentOrigin(BodyChecker checker, AssignmentExpressionNode node, Expression target,
+                        Type declared) -> LiteralOrigin? {
+    Expression core = wording.unwrapParentheses(target);
+    if (core is IdentifierExpressionNode) {
+        return valueOrigin(checker, OriginKind.Declared, core.name().text(), declared, node.value(), node);
+    }
+    let access = nullguidance.accessStep(core);
+    if (access == null) {
+        return null;
+    }
+    let member = access.member();
+    if (member != null) {
+        return valueOrigin(checker, OriginKind.Declared, member, declared, node.value(), node);
+    }
+    Expression receiver = wording.unwrapParentheses(access.receiver());
+    string? array = nullguidance.accessStep(receiver)?.member();
+    if (receiver is IdentifierExpressionNode) {
+        array = receiver.name().text();
+    }
+    if (array == null) {
+        return null;
+    }
+    Type arrayType = narrowing.declaredSlotType(checker, receiver) ?? checker.recordedType(receiver);
+    return valueOrigin(checker, OriginKind.Declared, array, arrayType, node.value(), node);
+}
+
+// The origin of an argument passed as parameter 'index' of 'signature', or null when no
+// number literal in 'value' can need it. 'constructed' names the type of a constructor.
+public argumentOrigin(BodyChecker checker, Expression value, Signature signature, long index,
+                      Type parameterType, string constructed = "") -> LiteralOrigin? {
+    if (!valuejoins.mayAdaptLiteral(value)) {
+        return null;
+    }
+    Parameter[] parameters = signature.parameters();
+    if (index < 0 || index >= parameters.length) {
+        return new LiteralOrigin(OriginKind.Parameter, "", "", parameterType);
+    }
+    let origin = new LiteralOrigin(OriginKind.Parameter, parameters[index].name(), signature.name(),
+        parameterType);
+    origin.setConstructed(constructed);
+    return origin;
+}
+
+// The text after a literal branch of a '?:' that takes its type from the other branch, whose
+// type is 'toward', or null unless the branch is a literal too large for it. 'target' is
+// the type the '?:' is checked against, set at 'origin'.
+public ternaryFix(BodyChecker checker, TernaryExpressionNode node, bool literalThen, Type toward,
+                  Type? target, LiteralOrigin? origin) -> JoinText? {
+    Expression literal = node.elseValue();
+    Expression other = node.thenValue();
+    if (literalThen) {
+        literal = node.thenValue();
+        other = node.elseValue();
+    }
+    let widening = joinWidening(checker, literal, toward, checker.targets().joinRoot());
+    if (widening == null || valuejoins.isUntypedNumberLiteral(other)) {
+        return null;
+    }
+    string condition = wording.oneLineSpelling(node.condition());
+    string into = conversionType(checker, target, widening);
+    string written = "{condition} ? {wording.converted(other, into)} : {wording.oneLineSpelling(literal)}";
+    if (literalThen) {
+        written = "{condition} ? {wording.oneLineSpelling(literal)} : {wording.converted(other, into)}";
+    }
+    bool floatJoin = widening.narrow() == PrimitiveKind.Float && floatSuffixOf(literal).length == 0;
+    if (arrayJoinRoot(checker) != null && (widening.joined() || floatJoin)) {
+        return arrayJoinFix(checker, other, toward, target, origin, widening);
+    }
+    return joinFix(checker, other, toward, written, "both branches", target, origin, node, widening);
+}
+
+// The text after a literal element of the array literal 'node' that takes its type 'toward' from
+// the first element.
+public elementFix(BodyChecker checker, ArrayLiteralExpressionNode node, Type toward,
+                  Widening widening) -> JoinText {
+    let array = arrayJoinRoot(checker);
+    if (array != null && array.green() != node.green() && widening.joined()) {
+        return arrayJoinFix(checker, node.elements(0), toward, null, null, widening);
+    }
+    string written = "[{wording.converted(node.elements(0), widening.wider())}";
+    for (long i = 1; i < node.elementsCount(); i++) {
+        written = "{written}, {wording.oneLineSpelling(node.elements(i))}";
+    }
+    string both = "";
+    if (node.elementsCount() == 2) {
+        both = "both elements";
+    }
+    return joinFix(checker, node.elements(0), toward, "{written}]", both, null, null, node, widening);
+}
+
+// The fix of a literal of an array literal that takes its type 'toward' from 'beside', whose
+// refusal waits until every value of the array is analyzed.
+arrayJoinFix(BodyChecker checker, Expression beside, Type toward, Type? target, LiteralOrigin? origin,
+             Widening widening) -> JoinText {
+    let text = new JoinText("", "");
+    text.setBeside(beside);
+    text.setToward(toward);
+    text.setFixTarget(target);
+    text.setFixOrigin(origin);
+    text.setCovered(widening.literals());
+    return text;
+}
+
+// The array literal the current join is, when it is one.
+arrayJoinRoot(BodyChecker checker) -> Expression? {
+    let root = checker.targets().joinRoot();
+    if (root is ArrayLiteralExpressionNode) {
+        return root;
+    }
+    return null;
+}
+
+// The array literal 'array' spelled with each of its values of the type 'toward' converted to the
+// type spelled 'into'.
+public arrayConverted(BodyChecker checker, Expression array, Type toward, string into) -> string {
+    let values = new List<Expression>();
+    valuejoins.collectJoinValues(array, values, true);
+    let changed = new List<GreenNode>();
+    for (let value in values) {
+        if (convert.coreOf(checker.recordedType(value)) == convert.coreOf(toward)) {
+            changed.push(value.green());
+        }
+    }
+    return valuejoins.spelledConverting(array, changed, into);
+}
+
+// The text after a literal arm that takes its type from the first arm before 'limit' that is
+// not an untyped number literal and has the core type of 'toward'. 'target' is the type the
+// switch is checked against, set at 'origin'.
+public switchArmFix(BodyChecker checker, List<Expression> values, List<SwitchArm> arms, long limit,
+                    Type toward, Type? target, LiteralOrigin? origin, Widening widening) -> JoinText? {
+    Type core = convert.coreOf(toward);
+    for (long i = 0; i < limit; i++) {
+        let value = values.get(i);
+        Type analyzed = checker.recordedType(value);
+        if (!valuejoins.isUntypedNumberLiteral(value) && convert.coreOf(analyzed) == core) {
+            string into = conversionType(checker, target, widening);
+            string written = "{wording.armHead(arms.get(i))} -> {wording.converted(value, into)}";
+            if (arrayJoinRoot(checker) != null && widening.joined()) {
+                return arrayJoinFix(checker, value, analyzed, target, origin, widening);
+            }
+            return joinFix(checker, value, analyzed, written, onlyTypedArm(values, i), target, origin, null,
+                widening);
+        }
+    }
+    return null;
+}
+
+// The 'f' or 'F' that makes a floating-point literal a 'float', behind an optional sign, or an
+// empty string when the expression is not such a literal.
+floatSuffixOf(Expression expression) -> string {
+    Expression core = wording.unwrapParentheses(expression);
+    if (core is PrefixExpressionNode) {
+        SyntaxKind operator = core.operator().kind();
+        if (operator == SyntaxKind.Plus || operator == SyntaxKind.Minus) {
+            core = core.operand();
+        }
+    }
+    if (core is LiteralExpressionNode) {
+        if (core.value().kind() == SyntaxKind.FloatLiteral) {
+            if (core.value().text().endsWith("F")) {
+                return "F";
+            }
+            return "f";
+        }
+    }
+    return "";
+}
+
+// The parameter or the '??' value that sets the type at 'origin', or an empty string for any other
+// origin. An element origin names the element type of either.
+originNoun(LiteralOrigin origin) -> string {
+    switch (origin.kind()) {
+        Parameter -> {
+            if (origin.forElement()) {
+                return "the element type of {parameterNoun(origin)}";
+            }
+            return parameterNoun(origin);
+        },
+        Fallback -> {
+            if (origin.forElement()) {
+                return "the element type of '{origin.name()}'";
+            }
+            return "the value of '{origin.name()}'";
+        },
+        default -> {
+            return "";
+        },
+    }
+}
+
+// The parameter at 'origin' as the sentence after 'from' names it.
+public parameterNoun(LiteralOrigin origin) -> string {
+    if (origin.name().length > 0 && origin.constructed().length > 0) {
+        return "parameter '{origin.name()}' of the constructor of '{origin.constructed()}'";
+    }
+    if (origin.name().length > 0) {
+        return "parameter '{origin.name()}' of '{origin.owner()}'";
+    }
+    if (origin.owner().length > 0) {
+        return "the parameter of '{origin.owner()}'";
+    }
+    return "the parameter it is passed to";
+}
+
+// Whether the operator combines two numbers into a number of their type.
+public isArithmeticOperator(SyntaxKind operator) -> bool {
+    return operator == SyntaxKind.Plus || operator == SyntaxKind.Minus || operator == SyntaxKind.Star
+        || operator == SyntaxKind.Slash || operator == SyntaxKind.Percent;
+}
+
+// Whether the value is a floating-point literal too large for the floating-point type 'target' has
+// without its '?'.
+floatLiteralOverflows(Expression value, Type target) -> bool {
+    let literal = literaltyping.floatLiteralOf(wording.unwrapParentheses(value));
+    Type core = convert.coreOf(target);
+    if (literal == null || !(core is PrimitiveType)) {
+        return false;
+    }
+    if (core.kind() != PrimitiveKind.Float && core.kind() != PrimitiveKind.Double) {
+        return false;
+    }
+    return literalOverflows(literal, core.kind());
+}
+
+// Whether the value of the floating-point literal is past the range of 'kind'.
+public literalOverflows(LiteralExpressionNode literal, PrimitiveKind kind) -> bool {
+    return !literalvalues.floatMagnitudeFits(literalvalues.floatMagnitude(literal.value().text()), kind);
+}
+
+// The expression under its parentheses and a leading '+' or '-'.
+public operandCore(Expression value) -> Expression {
+    Expression core = wording.unwrapParentheses(value);
+    while (core is PrefixExpressionNode) {
+        SyntaxKind operator = core.operator().kind();
+        if (operator != SyntaxKind.Plus && operator != SyntaxKind.Minus) {
+            return core;
+        }
+        core = wording.unwrapParentheses(core.operand());
+    }
+    return core;
+}
+
+// The place the assignment at 'origin' writes, on one line, or an empty string.
+originPlace(LiteralOrigin origin) -> string {
+    let statement = origin.statement();
+    if (statement is AssignmentExpressionNode) {
+        return wording.oneLineSpelling(wording.unwrapParentheses(statement.target()));
+    }
+    return "";
+}
+
+// Whether 'value' is 'place', or a sign or arithmetic expression that reads it, so that declaring
+// the place 'double' makes the whole value 'double'.
+readsPlace(Expression value, string place) -> bool {
+    if (place.length == 0) {
+        return false;
+    }
+    Expression core = wording.unwrapParentheses(value);
+    if (wording.oneLineSpelling(core) == place) {
+        return true;
+    }
+    if (core is PrefixExpressionNode) {
+        SyntaxKind operator = core.operator().kind();
+        bool sign = operator == SyntaxKind.Plus || operator == SyntaxKind.Minus;
+        return sign && readsPlace(core.operand(), place);
+    }
+    if (core is BinaryExpressionNode && isArithmeticOperator(core.operator().kind())) {
+        return readsPlace(core.left(), place) || readsPlace(core.right(), place);
+    }
+    return false;
+}
+
+// Whether the type is a number type under at least one '?'.
+public isNullableNumber(Type type) -> bool {
+    return type is OptionalType && convert.isNumericType(convert.coreOf(type));
+}
+
+// Whether the type has the narrow type of 'widening' under its '?' levels.
+public sameCore(Type type, Widening widening) -> bool {
+    Type core = convert.coreOf(type);
+    return core is PrimitiveType && core.kind() == widening.narrow();
+}
+
+// Whether the type under its '?' levels takes the literal of 'widening', and every value beside a
+// joined one.
+public takesLiteral(Type type, Widening widening) -> bool {
+    Type core = convert.coreOf(type);
+    if (!(core is PrimitiveType)) {
+        return false;
+    }
+    if (widening.narrow() == PrimitiveKind.Float || widening.narrow() == PrimitiveKind.Double) {
+        return core.kind() == PrimitiveKind.Double;
+    }
+    if (!convert.isIntegerType(core)
+            || (widening.joined() && !valuejoins.holdsEveryValue(core.kind(), widening.narrow()))) {
+        return false;
+    }
+    return valuejoins.fitsJoinLiterals(widening, core.kind());
+}
+
+// Whether the type is an unsigned integer type under its '?' levels.
+isUnsignedCore(Type type) -> bool {
+    Type core = convert.coreOf(type);
+    return core is PrimitiveType && isUnsignedKind(core.kind());
+}
+
+// Whether the integer kind has no negative values.
+public isUnsignedKind(PrimitiveKind kind) -> bool {
+    return kind == PrimitiveKind.Byte || kind == PrimitiveKind.UShort || kind == PrimitiveKind.UInt
+        || kind == PrimitiveKind.ULong || kind == PrimitiveKind.Char;
+}
+
+// The narrowest integer type with every value of the type beside a joined literal and every literal
+// of its join among its values, preferring the signedness of the type beside it at each width. Empty
+// when no integer type has them all.
+joinedIntegerHolding(Widening widening) -> string {
+    PrimitiveKind beside = widening.narrow();
+    PrimitiveKind[] signed = [PrimitiveKind.Short, PrimitiveKind.Int, PrimitiveKind.Long];
+    PrimitiveKind[] unsigned = [PrimitiveKind.UShort, PrimitiveKind.UInt, PrimitiveKind.ULong];
+    for (long i = 0; i < 3; i++) {
+        PrimitiveKind first = signed[i];
+        PrimitiveKind second = unsigned[i];
+        if (isUnsignedKind(beside)) {
+            first = unsigned[i];
+            second = signed[i];
+        }
+        for (let kind in [first, second]) {
+            if (kind != beside && valuejoins.holdsEveryValue(kind, beside)
+                    && valuejoins.fitsJoinLiterals(widening, kind)) {
+                return literaltyping.primitiveKindName(kind);
+            }
+        }
+    }
+    return "";
+}
+
+// Whether the type is 'float' under its '?' levels.
+public isFloatCore(Type type) -> bool {
+    Type core = convert.coreOf(type);
+    return core is PrimitiveType && core.kind() == PrimitiveKind.Float;
+}
+
+// The literal without its suffix, as in '3.5e38' for '3.5e38f'.
+unsuffixedSpelling(Expression literal) -> string {
+    string spelled = wording.oneLineSpelling(wording.unwrapParentheses(literal));
+    return spelled.substring(0, spelled.length - 1);
+}
+
+// Whether the type is 'double' under its '?' levels.
+isDoubleCore(Type type) -> bool {
+    Type core = convert.coreOf(type);
+    return core is PrimitiveType && core.kind() == PrimitiveKind.Double;
+}
+
+// The values that removing the suffix of arm 'index' makes 'double', when that arm is the only one
+// that is not an untyped number literal, or an empty string otherwise.
+onlyTypedArm(List<Expression> values, long index) -> string {
+    for (long i = 0; i < values.length(); i++) {
+        if (i != index && !valuejoins.isUntypedNumberLiteral(values.get(i))) {
+            return "";
+        }
+    }
+    if (values.length() == 2) {
+        return "both arms";
+    }
+    return "all arms";
+}
