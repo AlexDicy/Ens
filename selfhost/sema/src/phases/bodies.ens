@@ -25,12 +25,6 @@ import RethrowStatementNode from @ens.frontend.syntax.generated.nodes;
 import SwitchStatementNode from @ens.frontend.syntax.generated.nodes;
 import SwitchExpressionNode from @ens.frontend.syntax.generated.nodes;
 import LambdaExpressionNode from @ens.frontend.syntax.generated.nodes;
-import SwitchArm from @ens.frontend.syntax.generated.nodes;
-import ValueArmNode from @ens.frontend.syntax.generated.nodes;
-import TypeArmNode from @ens.frontend.syntax.generated.nodes;
-import DefaultArmNode from @ens.frontend.syntax.generated.nodes;
-import ErrorSwitchArmNode from @ens.frontend.syntax.generated.nodes;
-import ArmBody from @ens.frontend.syntax.generated.nodes;
 import LiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
 import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
 import GenericNameExpressionNode from @ens.frontend.syntax.generated.nodes;
@@ -75,7 +69,6 @@ import TypeResolver from phases.resolve;
 import SemaResult from result;
 import Scope from model.scopes;
 import LocalBinding from model.scopes;
-import BindingKind from model.scopes;
 import phases.calls;
 import CallShape from phases.calls;
 import CallCandidate from phases.calls;
@@ -86,11 +79,10 @@ import program.implicit;
 import model.capabilities;
 import model.convert;
 import NoreturnCalls from model.flow;
-import model.literalvalues;
 import LiteralOrigin from phases.bodies.literaltargets;
-import JoinText from phases.bodies.literaltargets;
 import DeferredLiteralFix from phases.bodies.literaltargets;
 import LiteralTargets from phases.bodies.literaltargets;
+import phases.bodies.switches;
 import phases.bodies.declarations;
 import phases.bodies.statements;
 import phases.bodies.identifiers;
@@ -106,12 +98,9 @@ import phases.bodies.assignments;
 import phases.bodies.literalfixes;
 import phases.bodies.valuejoins;
 import phases.bodies.literaltyping;
-import phases.bodies.nullguidance;
-import AssignmentFlow from phases.bodies.definiteassignment;
 import AssignmentState from phases.bodies.definiteassignment;
 import phases.bodies.wording;
 import phases.bodies.narrowing;
-import NarrowingPath from model.narrow;
 import NarrowingState from model.narrow;
 import model.hierarchy;
 import model.typemembers;
@@ -122,20 +111,16 @@ import TypeNames from model.typenames;
 import model.types;
 import Type from model.types;
 import ErrorType from model.types;
-import StringType from model.types;
 import OptionalType from model.types;
-import PrimitiveKind from model.types;
 import DeclaredType from model.types;
 import ClassType from model.types;
 import StructType from model.types;
 import InterfaceType from model.types;
-import EnumType from model.types;
 import InstantiationType from model.types;
 import TypeParamType from model.types;
 import TypeStore from model.types;
 import ObligationRegistry from phases.obligations;
 import Obligation from phases.obligations;
-import TypeTestObligation from phases.obligations;
 import ArrayElementObligation from phases.obligations;
 import Origin from phases.obligations;
 import phases.obligations;
@@ -224,39 +209,6 @@ public final class NamespaceName extends NameResolution {
     public targetModulePath() -> string {
         return this.namespacePath;
     }
-}
-
-// The end of the refusal of an 'is' arm that matches every value of the switch, from the comma or
-// full stop after that clause. A first arm makes the switch unnecessary, and a later one can be a
-// 'default' arm, since an earlier 'is' arm stays.
-everyValueFix(Type scrutineeType, Expression scrutinee, ArmBody body, bool first) -> string {
-    if (!first) {
-        return ". Use a 'default' arm instead.";
-    }
-    if (scrutineeType is OptionalType) {
-        return " that is not null. Check {wording.sideNamed(scrutinee, "the value")} for null with 'if' "
-            + "instead of switching on it.";
-    }
-    switch (body) {
-        is Expression value -> {
-            string spelled = wording.oneLineSpelling(value);
-            if (spelled.length <= wording.quotedCodeLimit()) {
-                return ", so the switch always takes this arm. Write '{spelled}' instead of the switch.";
-            }
-            return ", so the switch always takes this arm. Write the value of this arm instead of the "
-                + "switch.";
-        },
-        default -> {
-            return ", so the switch always takes this arm. Write the statements of this arm instead of the "
-                + "switch.";
-        },
-    }
-}
-
-// Whether an 'is' arm for 'armType' matches every value of a switch over 'inner'.
-matchesEveryValue(Type inner, Type armType) -> bool {
-    return !(armType is OptionalType) && !(armType is TypeParamType) && types.isClassLike(armType)
-        && (armType == inner || hierarchy.isSubclassOrConforms(inner, armType));
 }
 
 // The callable whose body is being checked: its parameters and receiver, what a 'return' in it
@@ -983,7 +935,7 @@ public final class BodyChecker implements NoreturnCalls {
                 this.assignment().terminate();
             },
             is SwitchStatementNode switched -> {
-                this.checkSwitchArms(switched.scrutinee(), armsOfStatement(switched),
+                switches.checkSwitchArms(this, switched.scrutinee(), switches.armsOfStatement(switched),
                     switched.switchKeyword().span(), false, null);
             },
             default -> { },
@@ -1076,7 +1028,7 @@ public final class BodyChecker implements NoreturnCalls {
                 return functioncalls.analyzeTry(this, tried);
             },
             is SwitchExpressionNode switched -> {
-                return this.analyzeSwitchExpression(switched, null);
+                return switches.analyzeSwitchExpression(this, switched, null);
             },
             is LambdaExpressionNode lambda -> {
                 this.reporter().report("This lambda has no function type to give its parameters and its "
@@ -1125,7 +1077,7 @@ public final class BodyChecker implements NoreturnCalls {
             analyzed = valuejoins.analyzeTernary(this, node, target, origin);
             this.result().setType(node.green(), analyzed);
         } else if (node is SwitchExpressionNode) {
-            analyzed = this.analyzeSwitchExpression(node, target, origin);
+            analyzed = switches.analyzeSwitchExpression(this, node, target, origin);
             this.result().setType(node.green(), analyzed);
         } else {
             this.targets().stash(node, target, origin);
@@ -1158,6 +1110,14 @@ public final class BodyChecker implements NoreturnCalls {
         return literaltyping.adaptIntegerLiteral(this, node, target, origin)
             ?? literaltyping.adaptCharLiteral(this, node, target)
             ?? literaltyping.adaptFloatLiteral(this, node, target, origin) ?? analyzed;
+    }
+
+    public recordedType(Expression expression) -> Type {
+        let recorded = this.result().typeOf(expression.green());
+        if (recorded != null) {
+            return recorded;
+        }
+        return this.store().errorType();
     }
 
     // ---- 'new' expressions ----
@@ -1559,745 +1519,6 @@ public final class BodyChecker implements NoreturnCalls {
             }
         }
     }
-
-    // ---- Switch arms ----
-
-    // A switch used as a value. The target is the type its arms are checked against, and is null where the
-    // surroundings offer none.
-    analyzeSwitchExpression(SwitchExpressionNode node, Type? target, LiteralOrigin? origin = null) -> Type {
-        let scope = this.targets().beginJoin(node, false);
-        Type analyzed = this.analyzeSwitchValues(node, target, origin);
-        valuejoins.endJoin(this, node, scope);
-        return analyzed;
-    }
-
-    analyzeSwitchValues(SwitchExpressionNode node, Type? target, LiteralOrigin? origin) -> Type {
-        Type? fixTarget = target;
-        LiteralOrigin? fixOrigin = origin;
-        if (target == null && this.targets().joinNode() == node.green()) {
-            fixTarget = this.targets().joinTarget();
-            fixOrigin = this.targets().joinOrigin();
-        }
-        this.targets().clearStash();
-        return this.checkSwitchArms(node.scrutinee(), armsOfExpression(node),
-            node.switchKeyword().span(), true, target, fixOrigin, fixTarget);
-    }
-
-    // Checks a switch in either form: the scrutinee kind, the labels or 'is' arm targets, arm
-    // reachability, exhaustiveness, and the unified value type of the expression form.
-    // Exhaustiveness reasons over the unwrapped scrutinee type; a scrutinee whose
-    // narrowing-aware type is still nullable additionally needs a 'null' arm or a default.
-    checkSwitchArms(Expression scrutinee, List<SwitchArm> arms, Span span,
-                            bool requireValue, Type? armTargetType, LiteralOrigin? origin = null,
-                            Type? fixTarget = null) -> Type {
-        Type scrutineeType = this.analyzeExpression(scrutinee);
-        Type inner = convert.bareOf(scrutineeType);
-        bool doublyNullable = !(scrutineeType is ErrorType) && inner is OptionalType;
-        if (doublyNullable) {
-            this.reporter().report(nullguidance.withGuidance(this, "Cannot switch on a value of type "
-                + "'{this.names().of(scrutineeType)}': a 'null ->' arm covers one level of null, "
-                + "and this value may be null at more than one.", nullguidance.nullGuidance(this, scrutinee,
-                scrutineeType, wording.optionalLevels(scrutineeType) - 1)), scrutinee.span());
-        }
-        bool known = !(scrutineeType is ErrorType) && !doublyNullable;
-        bool classScrutinee = known && types.isClassLike(inner);
-        bool valueScrutinee = known && (inner is EnumType || convert.isIntegerType(inner)
-            || inner is StringType);
-        bool typeSwitch = classScrutinee && hasTypeArm(arms);
-        if (known) {
-            if (classScrutinee && !typeSwitch) {
-                this.reporter().report("A switch over a class value needs at least one "
-                    + "'is Type ->' arm.", scrutinee.span());
-            } else if (!classScrutinee && !valueScrutinee) {
-                this.reporter().report("Cannot switch on {wording.sideNamed(scrutinee, "this value")}, "
-                    + "because its type '{this.names().of(scrutineeType)}' is not an enum, an integer, a "
-                    + "string or a class. Compare it with 'if' and 'else' instead.", scrutinee.span());
-            }
-        }
-
-        bool hasDefault = false;
-        bool nullCovered = false;
-        let coveredEnumOrdinals = new Set<long>();
-        let seenIntegerLabels = new Set<long>();
-        let seenStringLabels = new Set<string>();
-        let armTargets = new List<Type>();
-        bool everyValueArm = false;
-        let valueExpressions = new List<Expression>();
-        bool sawValueBlock = false;
-        let switchEntry = this.assignment().snapshot();
-        let entryLayers = this.narrowingState.snapshotLayers();
-        let entryFacts = this.narrowingState.flatten();
-        let armFlows = new List<AssignmentFlow>();
-        let armNarrowings = new List<Map<NarrowingPath, Type>>();
-        let valueArms = new List<SwitchArm>();
-        bool deferLiterals = requireValue && armTargetType != null && hasTypedArm(arms);
-        let outerDeferred = this.targets().deferredFixes();
-        let armDeferred = new List<List<DeferredLiteralFix>>();
-        let armValues = new List<Expression?>();
-        for (long a = 0; a < arms.length(); a++) {
-            long sunk = valueExpressions.length();
-            if (requireValue) {
-                let held = new List<DeferredLiteralFix>();
-                armDeferred.push(held);
-                this.targets().setDeferredFixes(held);
-            }
-            this.assignment().restore(switchEntry);
-            this.narrowingState.restoreLayers(entryLayers);
-            this.assignment().setUnconditionalPosition(true);
-            switch (arms.get(a)) {
-                is DefaultArmNode arm -> {
-                    if (hasDefault) {
-                        this.reporter().report("A switch can have only one 'default' arm.",
-                            arm.span());
-                    }
-                    hasDefault = true;
-                    if (this.walkArmBodyFlow(arm.body(), requireValue, armTargetType,
-                            valueExpressions, armFlows, armNarrowings, deferLiterals, origin, fixTarget)) {
-                        sawValueBlock = true;
-                    }
-                },
-                is TypeArmNode arm -> {
-                    Type armType = this.resolver().resolveType(arm.target());
-                    this.result().setType(arm.target().green(), armType);
-                    Type? armTarget = null;
-                    if (!classScrutinee) {
-                        if (valueScrutinee) {
-                            this.reporter().report("An 'is' arm needs a class switch value, but "
-                                + "this switch is over '{this.names().of(scrutineeType)}'.",
-                                arm.target().span());
-                        }
-                    } else if (!(armType is ErrorType)) {
-                        armTarget = this.checkTypeArmTarget(scrutineeType, inner, armType,
-                            arm.target().span(), scrutinee, arm.body(), armTargets.length() == 0);
-                        if (armTarget == null && matchesEveryValue(inner, armType)) {
-                            everyValueArm = true;
-                        }
-                    }
-                    if (armTarget != null) {
-                        this.checkTypeArmReachable(armTarget, armTargets, arm.target().span());
-                        armTargets.push(armTarget);
-                    }
-                    this.enterScope();
-                    let bindingToken = arm.binding();
-                    if (bindingToken != null) {
-                        Type bindingType = this.store().errorType();
-                        if (armTarget != null) {
-                            bindingType = armTarget;
-                        }
-                        let binding = new LocalBinding(bindingToken.text(), bindingType,
-                            BindingKind.Variable, true, bindingToken.span());
-                        this.matchedArmBindings.push(binding);
-                        let current = this.scope;
-                        if (current != null) {
-                            current.define(binding);
-                        }
-                        this.result().setBinding(arm.green(), binding);
-                    }
-                    if (this.walkArmBodyFlow(arm.body(), requireValue, armTargetType,
-                            valueExpressions, armFlows, armNarrowings, deferLiterals, origin, fixTarget)) {
-                        sawValueBlock = true;
-                    }
-                    this.leaveScope();
-                },
-                is ValueArmNode arm -> {
-                    bool mixReported = false;
-                    for (long i = 0; i < arm.labelsCount(); i++) {
-                        let label = arm.labels(i);
-                        if (isNullLabel(label)) {
-                            this.result().setType(label.green(), this.store().nullType());
-                            if (!(scrutineeType is OptionalType)) {
-                                string removal = "Remove this arm.";
-                                if (arm.labelsCount() > 1) {
-                                    removal = "Remove the 'null' label.";
-                                }
-                                this.reporter().report(
-                                    "{wording.sideNamed(scrutinee, "The value of this switch")} "
-                                    + "has type '{this.names().of(scrutineeType)}', which can never be null, "
-                                    + "so a 'null' arm never runs. {removal}", label.span());
-                            } else if (nullCovered) {
-                                this.reporter().report("This switch already has a 'null' arm. Remove this "
-                                    + "second one.", label.span());
-                            } else {
-                                nullCovered = true;
-                            }
-                            continue;
-                        }
-                        if (typeSwitch) {
-                            if (!mixReported) {
-                                this.reporter().report("Cannot mix value labels with 'is' arms "
-                                    + "in the same switch.", label.span());
-                                mixReported = true;
-                            }
-                            continue;
-                        }
-                        if (!valueScrutinee) {
-                            continue;
-                        }
-                        if (inner is EnumType) {
-                            this.checkEnumLabel(label, inner, coveredEnumOrdinals);
-                        } else if (convert.isIntegerType(inner)) {
-                            this.checkIntegerLabel(label, inner, seenIntegerLabels);
-                        } else {
-                            this.checkStringLabel(label, seenStringLabels);
-                        }
-                    }
-                    if (this.walkArmBodyFlow(arm.body(), requireValue, armTargetType,
-                            valueExpressions, armFlows, armNarrowings, deferLiterals, origin, fixTarget)) {
-                        sawValueBlock = true;
-                    }
-                },
-                // Dropped before the walk begins; the case is here because the arm kinds are
-                // checked for exhaustiveness.
-                is ErrorSwitchArmNode ignored -> { },
-            }
-            Expression? armValue = null;
-            if (valueExpressions.length() > sunk) {
-                valueArms.push(arms.get(a));
-                armValue = valueExpressions.get(valueExpressions.length() - 1);
-            }
-            armValues.push(armValue);
-        }
-        this.targets().setDeferredFixes(outerDeferred);
-        for (long a = 0; a < armDeferred.length(); a++) {
-            Expression? neighbour = null;
-            Type neighbourType = this.store().errorType();
-            for (long b = 0; b < armValues.length(); b++) {
-                let value = armValues.get(b);
-                bool nullable = value != null && literalfixes.isNullableNumber(this.recordedType(value));
-                if (b != a && value != null && neighbour == null && nullable) {
-                    neighbour = value;
-                    neighbourType = this.recordedType(value);
-                }
-            }
-            literalfixes.settleDeferred(this, armDeferred.get(a), neighbour, neighbourType, "the arm");
-        }
-        if (armFlows.length() > 0) {
-            this.assignment().restore(this.assignment().join(armFlows));
-        } else {
-            this.assignment().restore(switchEntry);
-        }
-
-        this.narrowingState.restoreLayers(entryLayers);
-        let survivors = new List<Map<NarrowingPath, Type>>();
-        for (long i = 0; i < armFlows.length(); i++) {
-            if (!armFlows.get(i).terminated()) {
-                survivors.push(armNarrowings.get(i));
-            }
-        }
-        narrowing.applyNarrowingJoin(this, entryFacts, survivors);
-
-        // A switch used as a value with no arm, a type switch whose every arm is refused and one with an
-        // arm refused for matching every value get no refusal of a missing arm.
-        if (valueScrutinee && !hasDefault && (arms.length() > 0 || !requireValue)) {
-            this.checkValueExhaustiveness(inner, coveredEnumOrdinals, span);
-        }
-        if (typeSwitch && !hasDefault && armTargets.length() > 0 && !everyValueArm) {
-            this.checkTypeExhaustiveness(inner, armTargets, span);
-        }
-        if ((valueScrutinee || typeSwitch) && scrutineeType is OptionalType && !nullCovered && !hasDefault) {
-            this.reporter().report("{wording.sideNamed(scrutinee, "The value of this switch")} can be null, "
-                + "and no arm of this switch matches null. Add a 'null ->' arm or a 'default' arm.", span);
-        }
-        if (!requireValue) {
-            return this.store().primitive(PrimitiveKind.Void);
-        }
-        if (sawValueBlock) {
-            return this.store().errorType();
-        }
-        if (valueExpressions.length() == 0) {
-            this.reporter().report("A switch used as a value needs at least one arm.", span);
-            return this.store().errorType();
-        }
-        literalfixes.noteSuffixedArms(this, valueExpressions, valueArms, armTargetType ?? fixTarget, origin);
-        if (deferLiterals && armTargetType != null
-                && !this.adaptLiteralArms(valueExpressions, valueArms, armTargetType, origin)) {
-            return this.store().errorType();
-        }
-        Type unified = this.store().errorType();
-        for (long i = 0; i < valueExpressions.length(); i++) {
-            let expression = valueExpressions.get(i);
-            Type analyzed = this.recordedType(expression);
-            if (analyzed is ErrorType) {
-                return this.store().errorType();
-            }
-            if (i == 0) {
-                unified = analyzed;
-                continue;
-            }
-            JoinText? fix = null;
-            let widening = literalfixes.joinWidening(this, expression, unified, this.targets().joinRoot());
-            if (widening != null) {
-                LiteralOrigin? fixOrigin = null;
-                if (fixTarget != null) {
-                    fixOrigin = origin;
-                }
-                fix = literalfixes.switchArmFix(this, valueExpressions, valueArms, i, unified, fixTarget,
-                    fixOrigin, widening);
-            }
-            this.targets().setBesideLiteral(fix == null);
-            bool refused =
-                literaltyping.adaptIntegerLiteral(this, expression, unified, null, fix) is ErrorType
-                || literaltyping.adaptFloatLiteral(this, expression, unified, null, fix) is ErrorType;
-            this.targets().setBesideLiteral(false);
-            if (refused) {
-                return this.store().errorType();
-            }
-            Type adapted = this.recordedType(expression);
-            if (!(adapted is ErrorType)) {
-                analyzed = adapted;
-            }
-            let joined = convert.unifyValueTypes(unified, analyzed, this.store());
-            if (joined == null) {
-                valuejoins.holdMismatch(this, "Switch arms produce '{this.names().of(unified)}' and "
-                    + "'{this.names().of(analyzed)}', which have no common type. Give every arm "
-                    + "the same type.", span);
-                return this.store().errorType();
-            }
-            unified = joined;
-        }
-        if (types.isVoidType(unified)) {
-            string arm = "{wording.armHead(valueArms.get(0))} -> "
-                + "{wording.oneLineSpelling(valueExpressions.get(0))}";
-            string named = "an arm";
-            if (arm.length <= wording.quotedCodeLimit()) {
-                named = "the arm '{arm}'";
-            }
-            this.reporter().report("This switch is used as a value, but {named} gives no value. Give every "
-                + "arm a value.", span);
-            return this.store().errorType();
-        }
-        for (long i = 0; i < valueExpressions.length(); i++) {
-            literaltyping.adaptIntegerLiteral(this, valueExpressions.get(i), unified);
-            literaltyping.adaptFloatLiteral(this, valueExpressions.get(i), unified);
-        }
-        return unified;
-    }
-
-    // Adapts the literal arms analyzed without the target, or returns false when a literal does not
-    // fit. A floating-point literal takes the type of the other arms when it is a floating-point one,
-    // and an integer literal after an arm with a type of its own the type the arms before it join to
-    // when it is an integer one; either takes the target otherwise.
-    adaptLiteralArms(List<Expression> values, List<SwitchArm> arms, Type target,
-                     LiteralOrigin? origin) -> bool {
-        Type? typed = this.typedArmsJoin(values);
-        if (typed is ErrorType) {
-            return true;
-        }
-        Type? before = null;
-        bool typedBefore = false;
-        for (long i = 0; i < values.length(); i++) {
-            let value = values.get(i);
-            if (!valuejoins.isUntypedNumberLiteral(value)) {
-                before = this.joinedBefore(before, this.recordedType(value));
-                typedBefore = true;
-                continue;
-            }
-            if (literaltyping.floatLiteralOf(wording.unwrapParentheses(value)) == null) {
-                Type? adaptedInteger = null;
-                if (typedBefore && before != null && valuejoins.joinsLiteral(value, before)) {
-                    JoinText? fix = null;
-                    let widening = literalfixes.joinWidening(this, value, before, this.targets().joinRoot());
-                    if (widening != null) {
-                        fix = literalfixes.switchArmFix(this, values, arms, i, before, target, origin,
-                            widening);
-                    }
-                    // With no arm of the joined type before it, that type is the target's, and so is
-                    // the literal's refusal.
-                    LiteralOrigin? through = null;
-                    if (fix == null) {
-                        through = origin;
-                    }
-                    adaptedInteger = literaltyping.adaptIntegerLiteral(this, value, before, through, fix);
-                } else {
-                    adaptedInteger = literaltyping.adaptIntegerLiteral(this, value, target, origin)
-                        ?? literaltyping.adaptFloatLiteral(this, value, target, origin);
-                }
-                if (adaptedInteger is ErrorType) {
-                    return false;
-                }
-                before = this.joinedBefore(before, this.recordedType(value));
-                continue;
-            }
-            Type? adapted = null;
-            if (typed != null && valuejoins.joinsLiteral(value, typed)) {
-                JoinText? fix = null;
-                let widening = literalfixes.joinWidening(this, value, typed, this.targets().joinRoot());
-                if (widening != null) {
-                    fix = literalfixes.switchArmFix(this, values, arms, values.length(), typed, target,
-                        origin, widening);
-                }
-                adapted = literaltyping.adaptIntegerLiteral(this, value, typed, null, fix)
-                    ?? literaltyping.adaptFloatLiteral(this, value, typed, null, fix);
-            } else {
-                adapted = literaltyping.adaptIntegerLiteral(this, value, target, origin)
-                    ?? literaltyping.adaptFloatLiteral(this, value, target, origin);
-            }
-            if (adapted is ErrorType) {
-                return false;
-            }
-            before = this.joinedBefore(before, this.recordedType(value));
-        }
-        return true;
-    }
-
-    // The type the arm values so far join to once 'next' joins them, or null when they have none.
-    joinedBefore(Type? before, Type next) -> Type? {
-        if (next is ErrorType) {
-            return before;
-        }
-        if (before == null) {
-            return next;
-        }
-        return convert.unifyValueTypes(before, next, this.store());
-    }
-
-    // The type the arm values that are not untyped number literals join to, or null when they have
-    // no common type.
-    typedArmsJoin(List<Expression> values) -> Type? {
-        Type? joined = null;
-        for (long i = 0; i < values.length(); i++) {
-            let value = values.get(i);
-            if (valuejoins.isUntypedNumberLiteral(value)) {
-                continue;
-            }
-            Type analyzed = this.recordedType(value);
-            if (joined == null) {
-                joined = analyzed;
-                continue;
-            }
-            joined = convert.unifyValueTypes(joined, analyzed, this.store());
-            if (joined == null) {
-                return null;
-            }
-        }
-        return joined;
-    }
-
-    // An identifier label over an enum scrutinee names a member; any other label must be an
-    // expression of the enum's own type that resolved to a member constant.
-    checkEnumLabel(Expression label, EnumType inner, Set<long> covered) {
-        long ordinal = -1;
-        if (label is IdentifierExpressionNode) {
-            ordinal = enumOrdinal(inner, label.name().text());
-            if (ordinal >= 0) {
-                this.result().setType(label.green(), inner);
-                this.result().setEnumConstant(label.green(), ordinal);
-            } else {
-                this.reporter().report("'{label.name().text()}' is not a member of enum "
-                    + "'{this.names().of(inner)}'.{wording.membersListed(inner)}", label.span());
-            }
-        } else {
-            Type labelType = this.analyzeExpression(label);
-            if (!(labelType is ErrorType) && labelType != inner) {
-                string valueShown = this.names().of(inner);
-                this.reporter().report("Switch label of type "
-                    + "'{this.names().of(labelType)}' does not match the switch value "
-                    + "of type '{valueShown}'. Write a label of type '{valueShown}'.",
-                    label.span());
-            }
-            let constant = this.result().enumConstantOf(label.green());
-            if (constant != null) {
-                ordinal = constant;
-            }
-        }
-        if (ordinal >= 0 && !covered.add(ordinal)) {
-            this.reporter().report("This switch already has an arm for '{wording.oneLineSpelling(label)}'. "
-                + "Remove this second one.", label.span());
-        }
-    }
-
-    // Integer labels are integer constants written in any integer-literal form: an int or long
-    // literal by its value, a char literal by its codepoint, so 'A', 65, and 65L name the same
-    // label. A literal label adapts to the scrutinee, its value fit-checked against the type.
-    checkIntegerLabel(Expression label, Type inner, Set<long> seen) {
-        Type labelType = this.analyzeExpression(label);
-        let value = integerLabelValue(label);
-        if (value == null) {
-            if (!(labelType is ErrorType)) {
-                if (!convert.isAssignableStrict(inner, labelType)
-                        && !convert.isAssignableStrict(labelType, inner)) {
-                    string valueShown = this.names().of(inner);
-                    this.reporter().report("Switch label of type "
-                        + "'{this.names().of(labelType)}' does not match the switch "
-                        + "value of type '{valueShown}'. Write a label of type '{valueShown}'.",
-                        label.span());
-                } else {
-                    string spelled = wording.oneLineSpelling(label);
-                    this.reporter().report("Label '{spelled}' is not an integer constant, and every label of "
-                        + "a switch on an integer must be one, such as '1'. Compare with '{spelled}' in an "
-                        + "'if' instead.", label.span());
-                }
-            }
-            return;
-        }
-        if (label is LiteralExpressionNode && label.value().kind() == SyntaxKind.CharLiteral) {
-            literaltyping.adaptCharLiteral(this, label, inner);
-        } else {
-            literaltyping.adaptIntegerLiteralLabel(this, label, inner);
-        }
-        let adapted = this.result().typeOf(label.green());
-        if (adapted != null && adapted is ErrorType) {
-            return;
-        }
-        if (!seen.add(value)) {
-            this.reporter().report("This switch already has an arm for '{value}'. Remove this second one.",
-                label.span());
-        }
-    }
-
-    checkStringLabel(Expression label, Set<string> seen) {
-        Type labelType = this.analyzeExpression(label);
-        if (!(labelType is ErrorType) && !(labelType is StringType)) {
-            this.reporter().report("Switch label of type '{this.names().of(labelType)}' does not "
-                + "match the switch value of type 'string'. Write a string literal label.",
-                label.span());
-            return;
-        }
-        let text = stringLabelText(label);
-        if (text != null) {
-            if (!seen.add(text)) {
-                this.reporter().report("This switch already has an arm for "
-                    + "'{wording.oneLineSpelling(label)}'. Remove this second one.", label.span());
-            }
-        } else if (!(labelType is ErrorType)) {
-            string spelled = wording.oneLineSpelling(label);
-            this.reporter().report("Label '{spelled}' is not a string literal, and every label of a switch "
-                + "on a string must be one, such as '\"a\"'. Compare with '{spelled}' in an 'if' instead.",
-                label.span());
-        }
-    }
-
-    // The class or interface an 'is' arm matches, or null when the arm is rejected: the
-    // target must be able to match some values of the scrutinee without matching all of them.
-    // 'first' marks an arm with no accepted 'is' arm before it, which the refusal of an arm that
-    // matches every value writes the switch without.
-    checkTypeArmTarget(Type scrutineeType, Type inner, Type armType, Span span, Expression scrutinee,
-                       ArmBody body, bool first) -> Type? {
-        if (armType is OptionalType) {
-            this.reporter().report("The type of an 'is' arm cannot be nullable, because 'is' never matches "
-                + "null. Write 'is {this.names().of(convert.coreOf(armType))}', and add a 'null ->' arm "
-                + "for null.", span);
-            return null;
-        }
-        // A type parameter arm is judged per instantiation; here it still matches and binds as
-        // the parameter.
-        if (armType is TypeParamType) {
-            this.recordObligation(new TypeTestObligation(inner, armType, false, span));
-            return armType;
-        }
-        if (!types.isClassLike(armType)) {
-            this.reporter().report("The type of an 'is' arm must be a class or an interface, and "
-                + "'{this.names().of(armType)}' is neither.", span);
-            return null;
-        }
-        if (armType == inner) {
-            this.reporter().report("'is {this.names().of(armType)}' matches every value of this "
-                + "switch over '{this.names().of(scrutineeType)}'"
-                + everyValueFix(scrutineeType, scrutinee, body, first), span);
-            return null;
-        }
-        if (hierarchy.isSubclassOrConforms(inner, armType)) {
-            this.reporter().report("A value of type '{this.names().of(inner)}' is always a "
-                + "'{this.names().of(armType)}', so this arm matches every value"
-                + everyValueFix(scrutineeType, scrutinee, body, first), span);
-            return null;
-        }
-        if (types.isInterfaceLike(inner)) {
-            return armType;
-        }
-        if (types.isInterfaceLike(armType)) {
-            if (isFinalClass(inner)) {
-                this.reporter().report("A value of type '{this.names().of(inner)}' "
-                    + "can never be a '{this.names().of(armType)}': "
-                    + "'{this.names().of(inner)}' is 'final' and does not implement "
-                    + "it. Remove this arm.", span);
-                return null;
-            }
-            return armType;
-        }
-        if (!hierarchy.isSubclassOf(armType, inner)) {
-            this.reporter().report("A value of type '{this.names().of(inner)}' can never be a "
-                + "'{this.names().of(armType)}', because '{this.names().of(armType)}' is not a subclass of "
-                + "'{this.names().of(inner)}'. Remove this arm.", span);
-            return null;
-        }
-        return armType;
-    }
-
-    // An arm is unreachable when an earlier arm already matches every value of its type.
-    checkTypeArmReachable(Type armTarget, List<Type> earlier, Span span) {
-        for (long i = 0; i < earlier.length(); i++) {
-            if (hierarchy.isSubclassOrConforms(armTarget, earlier.get(i))) {
-                this.reporter().report("This 'is {shortTypeName(armTarget, this.names())}' arm never runs, "
-                    + "because the earlier 'is {shortTypeName(earlier.get(i), this.names())}' arm "
-                    + "already matches every '{shortTypeName(armTarget, this.names())}'. Move it above "
-                    + "that arm, or remove it.", span);
-                return;
-            }
-        }
-    }
-
-    // An enum switch without a default must cover every member; integer and string switches
-    // always need one.
-    checkValueExhaustiveness(Type inner, Set<long> coveredEnumOrdinals, Span span) {
-        if (inner is EnumType) {
-            string[] names = inner.memberNames();
-            let missing = new List<string>();
-            for (long i = 0; i < names.length; i++) {
-                if (!coveredEnumOrdinals.contains(i)) {
-                    missing.push(names[i]);
-                }
-            }
-            if (missing.length() > 0) {
-                let qualified = new List<string>();
-                for (let member in missing) {
-                    qualified.push("{this.names().of(inner)}.{member}");
-                }
-                string add = "Add an arm for each, or a 'default' arm.";
-                if (missing.length() == 1) {
-                    add = "Add an arm for it, or a 'default' arm.";
-                }
-                this.reporter().report("This switch has no arm for {wording.quotedList(qualified)}. {add}",
-                    span);
-            }
-            return;
-        }
-        string shown = this.names().of(inner);
-        this.reporter().report("A switch on '{shown}' must have a 'default' arm, because its arms cannot "
-            + "list every '{shown}' value.", span);
-    }
-
-    // A type switch without a default: an interface or an unsealed or concrete root always
-    // needs one; a sealed abstract root instead needs every direct subclass covered, an arm
-    // for a subclass covering its descendants.
-    checkTypeExhaustiveness(Type inner, List<Type> armTargets, Span span) {
-        string rootName = this.names().of(inner);
-        let authority = types.authorityOf(inner);
-        if (authority is InterfaceType) {
-            this.reporter().report("A switch over '{rootName}' must have a 'default' arm: "
-                + "interfaces are open, so any class anywhere may implement '{rootName}'.",
-                span);
-            return;
-        }
-        if (authority is ClassType) {
-            if (authority.isFinal()) {
-                this.reporter().report("A switch over '{rootName}' must have a 'default' arm, because an arm "
-                    + "for a type parameter may not match every '{rootName}'.", span);
-                return;
-            }
-            if (!authority.isSealed()) {
-                this.reporter().report("A switch over '{rootName}' must have a 'default' arm, because "
-                    + "'{rootName}' is not 'sealed', so it can have subclasses that no arm matches.", span);
-                return;
-            }
-            if (!authority.isAbstract()) {
-                this.reporter().report("A switch over '{rootName}' must have a 'default' arm, because "
-                    + "'{rootName}' is not abstract, so a value can be a '{rootName}' itself, which no "
-                    + "subclass arm matches.", span);
-                return;
-            }
-            let missing = new List<string>();
-            let subclasses = authority.directSubclasses();
-            for (long i = 0; i < subclasses.length(); i++) {
-                let subclass = subclasses.get(i);
-                bool covered = false;
-                for (long j = 0; j < armTargets.length(); j++) {
-                    if (hierarchy.isSubclassOrConforms(subclass, armTargets.get(j))) {
-                        covered = true;
-                        break;
-                    }
-                }
-                if (!covered) {
-                    missing.push(subclass.name());
-                }
-            }
-            if (missing.length() > 0) {
-                string noun = "subclasses";
-                string add = "Add an arm for each, or a 'default' arm.";
-                if (missing.length() == 1) {
-                    noun = "a subclass";
-                    add = "Add an arm for it, or a 'default' arm.";
-                }
-                this.reporter().report("This switch has no arm for {wording.quotedList(missing)}, {noun} of "
-                    + "sealed class '{rootName}'. {add}", span);
-            }
-        }
-    }
-
-    public recordedType(Expression expression) -> Type {
-        let recorded = this.result().typeOf(expression.green());
-        if (recorded != null) {
-            return recorded;
-        }
-        return this.store().errorType();
-    }
-
-    // Walks one switch arm from the state after the scrutinee and records both its assignment
-    // out-state and the narrowings holding at its end, so the arms can be joined: a local
-    // assigned in every arm of an exhaustive switch is assigned after, and a path narrowed by
-    // every arm stays narrowed after.
-    walkArmBodyFlow(ArmBody body, bool requireValue, Type? target, List<Expression> sink,
-                            List<AssignmentFlow> armFlows,
-                            List<Map<NarrowingPath, Type>> armNarrowings,
-                            bool deferLiterals, LiteralOrigin? origin, Type? fixTarget) -> bool {
-        let sawBlock = this.walkArmBody(body, requireValue, target, sink, armNarrowings,
-            deferLiterals, origin, fixTarget);
-        armFlows.push(this.assignment().snapshot());
-        return sawBlock;
-    }
-
-    // With 'deferLiterals', a number literal arm is analyzed without the target, so it can take the
-    // type of the arms that have one. 'origin' is where the target is set, and 'fixTarget'
-    // is the target the arm values of a switch analyzed without one are judged against.
-    walkArmBody(ArmBody body, bool requireValue, Type? target, List<Expression> sink,
-                        List<Map<NarrowingPath, Type>> armNarrowings,
-                        bool deferLiterals, LiteralOrigin? origin, Type? fixTarget) -> bool {
-        switch (body) {
-            is BlockNode block -> {
-                bool sawBlock = false;
-                if (requireValue) {
-                    this.reporter().report("Each arm of a switch used as a value must give a value, as in "
-                        + "'1 -> 0,', not run a '\{ \}' block.", block.span());
-                    sawBlock = true;
-                }
-                this.enterScope();
-                this.walkBlock(block);
-                armNarrowings.push(this.narrowingState.flatten());
-                this.leaveScope();
-                return sawBlock;
-            },
-            is Expression expression -> {
-                if (requireValue) {
-                    valuejoins.noteJoinValue(this, expression);
-                }
-                bool deferred = deferLiterals && valuejoins.isUntypedNumberLiteral(expression);
-                if (target != null && !deferred) {
-                    this.analyzeExpressionAdapt(expression, target, origin);
-                } else {
-                    this.targets().stash(expression, target ?? fixTarget, origin);
-                    this.analyzeExpression(expression);
-                    this.targets().clearStash();
-                }
-                armNarrowings.push(this.narrowingState.flatten());
-                if (requireValue) {
-                    sink.push(expression);
-                }
-                return false;
-            },
-            default -> {
-                armNarrowings.push(this.narrowingState.flatten());
-                return false;
-            },
-        }
-    }
-}
-
-isFinalClass(Type type) -> bool {
-    let authority = types.authorityOf(type);
-    if (authority is ClassType) {
-        return authority.isFinal();
-    }
-    return false;
 }
 
 // A floating-point type converts to text, but `decimal` is reserved rather than
@@ -2306,92 +1527,6 @@ public isTextualFloat(Type core) -> bool {
     return convert.isFloatType(core) && !types.isDecimalType(core);
 }
 
-public enumOrdinal(EnumType enumType, string memberName) -> long {
-    string[] names = enumType.memberNames();
-    for (long i = 0; i < names.length; i++) {
-        if (names[i] == memberName) {
-            return i;
-        }
-    }
-    return -1;
-}
-
-hasTypeArm(List<SwitchArm> arms) -> bool {
-    for (long i = 0; i < arms.length(); i++) {
-        if (arms.get(i) is TypeArmNode) {
-            return true;
-        }
-    }
-    return false;
-}
-
-isNullLabel(Expression label) -> bool {
-    return label is LiteralExpressionNode && label.value().kind() == SyntaxKind.NullKeyword;
-}
-
-
-// Whether a switch has an expression arm that is not an untyped number literal.
-hasTypedArm(List<SwitchArm> arms) -> bool {
-    for (long i = 0; i < arms.length(); i++) {
-        switch (arms.get(i)) {
-            is ValueArmNode arm -> {
-                if (valuejoins.isTypedArmBody(arm.body())) {
-                    return true;
-                }
-            },
-            is TypeArmNode arm -> {
-                if (valuejoins.isTypedArmBody(arm.body())) {
-                    return true;
-                }
-            },
-            is DefaultArmNode arm -> {
-                if (valuejoins.isTypedArmBody(arm.body())) {
-                    return true;
-                }
-            },
-            is ErrorSwitchArmNode ignored -> { },
-        }
-    }
-    return false;
-}
-
-// The constant an integer switch label names: a char literal's codepoint, or an int or long
-// literal's value behind an optional sign.
-integerLabelValue(Expression label) -> long? {
-    if (label is LiteralExpressionNode && label.value().kind() == SyntaxKind.CharLiteral) {
-        return literalvalues.charCodepoint(label.value().text()) as long;
-    }
-    let literal = literaltyping.integerLiteralOf(label, true);
-    if (literal == null) {
-        return null;
-    }
-    let magnitude = literalvalues.integerMagnitude(literal.value().text());
-    if (magnitude == null) {
-        return null;
-    }
-    long value = magnitude as long;
-    if (literaltyping.isNegativeLiteral(label)) {
-        return 0 - value;
-    }
-    return value;
-}
-
-// A string label's decoded value, so two spellings of the same string (for example "\t" and a
-// literal tab) collide as a duplicate.
-stringLabelText(Expression label) -> string? {
-    if (label is LiteralExpressionNode && label.value().kind() == SyntaxKind.StringLiteral) {
-        return literalvalues.decodeString(label.value().text());
-    }
-    return null;
-}
-
-shortTypeName(Type type, TypeNames names) -> string {
-    let authority = types.authorityOf(type);
-    if (authority != null) {
-        return authority.name();
-    }
-    return names.of(type);
-}
 
 // The head a 'new' writes for its type.
 writtenTypeName(TypeNode created, Type resolved, TypeNames names) -> string {
@@ -2558,26 +1693,4 @@ fillLoopBodyMatches(BlockNode body, string arrayName, string indexName) -> bool 
         }
     }
     return false;
-}
-
-// A recovery arm is dropped: the parser could not read what was written there, so there is nothing
-// for the checker to reason about, and the syntax error already says so.
-armsOfStatement(SwitchStatementNode node) -> List<SwitchArm> {
-    let arms = new List<SwitchArm>();
-    for (long i = 0; i < node.armsCount(); i++) {
-        if (!(node.arms(i) is ErrorSwitchArmNode)) {
-            arms.push(node.arms(i));
-        }
-    }
-    return arms;
-}
-
-public armsOfExpression(SwitchExpressionNode node) -> List<SwitchArm> {
-    let arms = new List<SwitchArm>();
-    for (long i = 0; i < node.armsCount(); i++) {
-        if (!(node.arms(i) is ErrorSwitchArmNode)) {
-            arms.push(node.arms(i));
-        }
-    }
-    return arms;
 }
