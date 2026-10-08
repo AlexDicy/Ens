@@ -1,0 +1,224 @@
+import @std.testing;
+import FakeFileLoader from sema_support;
+import Stage from sema_support;
+import sema_support;
+import FileDiagnostic from support.diagnostics;
+import List from @std.collections.list;
+
+test "an external block may only name a native library its manifest declares" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/ens.package", "package demo.app \{\n"
+        + "    ens \"0.1\";\n"
+        + "    native libc system;\n"
+        + "\}\n");
+    loader.add("/proj/src/app.ens",
+        "external from libc \{\n"
+        + "    abs(int value) -> int;\n"
+        + "\}\n"
+        + "external from zlib \{\n"
+        + "    compressBound(ulong sourceLength) -> ulong;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["app.ens"]);
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Signatures]);
+    let found = analysis.signatureDiagnostics();
+    try testing.assertEqual(found.length, 1L);
+    try sema_support.assertDiagnostic(found, 0, "/proj/src/app.ens",
+        "Native library 'zlib' is not declared in '/proj/ens.package', so the build cannot link "
+        + "it. Add 'native zlib;' to that file, or 'native zlib system;' for a library the system "
+        + "provides.");
+}
+
+test "function collection rejects duplicate, generic, main, and external overloads" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/app.ens",
+        "add(int a) -> int \{ return a; \}\n"
+        + "add(int b) -> int \{ return b; \}\n"
+        + "main() \{ \}\n"
+        + "main(int x) \{ \}\n"
+        + "pick<T>(T value) \{ \}\n"
+        + "pick(int value) \{ \}\n"
+        + "dup(long y) -> long \{ return y; \}\n"
+        + "external from m \{\n"
+        + "    dup(int x) -> int;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["app.ens"]);
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Signatures]);
+    let found = analysis.signatureDiagnostics();
+    try testing.assertEqual(found.length, 6L);
+    try sema_support.assertDiagnostic(found, 0, "/proj/src/app.ens",
+        "Function 'add' is already declared with the same parameter types. Two functions can share "
+        + "a name only when their parameters differ in number or type. Rename one of them, or "
+        + "change the parameters of one.");
+    try sema_support.assertDiagnostic(found, 1, "/proj/src/app.ens",
+        "Function 'main' starts the program, so only the program's main module, 'main.ens', can "
+        + "declare it. This file is module 'app'. Rename this function, or move it into "
+        + "'main.ens'.");
+    try sema_support.assertDiagnostic(found, 2, "/proj/src/app.ens",
+        "Function 'main' starts the program, so only the program's main module, 'main.ens', can "
+        + "declare it. This file is module 'app'. Rename this function, or move it into "
+        + "'main.ens'.");
+    try sema_support.assertDiagnostic(found, 3, "/proj/src/app.ens",
+        "Function 'main' is declared more than once, and a program starts at one 'main'. Remove "
+            + "this second 'main', or rename it.");
+    try sema_support.assertDiagnostic(found, 4, "/proj/src/app.ens",
+        "Function 'pick' cannot be overloaded, because one of its declarations is generic, and a "
+        + "generic function cannot share its name. Rename one of them.");
+    try sema_support.assertDiagnostic(found, 5, "/proj/src/app.ens",
+        "External function 'dup' has the same name as function 'dup'. A native library function is "
+        + "looked up by its name alone, so two functions cannot share one. Remove this "
+        + "declaration, or rename the other 'dup'.");
+}
+
+test "main may only be defined in the main module" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main.ens",
+        "import app;\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    loader.add("/proj/src/app.ens",
+        "main() -> int \{\n"
+        + "    return 1;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Signatures]);
+    let found = analysis.signatureDiagnostics();
+    try testing.assertEqual(found.length, 1L);
+    try sema_support.assertDiagnostic(found, 0, "/proj/src/app.ens",
+        "Function 'main' starts the program, so only the program's main module, 'main.ens', can "
+        + "declare it. This file is module 'app'. Rename this function, or move it into "
+        + "'main.ens'.");
+}
+
+test "the entry point rejects a wrong return type, parameters, and type parameters" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/tool.ens",
+        "main<T>(int limit) -> long \{\n"
+        + "    return 0L;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeFileProgram(loader, "/proj/src", "tool.ens");
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Signatures]);
+    let found = analysis.signatureDiagnostics();
+    try testing.assertEqual(found.length, 3L);
+    try sema_support.assertDiagnostic(found, 0, "/proj/src/tool.ens",
+        "Function 'main' is where the program starts, so no code calls it with type arguments, and "
+        + "it cannot declare the type parameter 'T'. Write 'main() -> int' or 'main()', and put "
+        + "the generic code in a function that 'main' calls.");
+    try sema_support.assertDiagnostic(found, 1, "/proj/src/tool.ens",
+        "Function 'main' is where the program starts, and it takes no parameters, so it cannot "
+        + "declare 'limit'. Write 'main() -> int' or 'main()', and read the command line with "
+        + "'environment.arguments()' after 'import @std.environment;'.");
+    try sema_support.assertDiagnostic(found, 2, "/proj/src/tool.ens",
+        "Function 'main' returns 'long', but 'main' can only return 'int' or nothing, because what "
+        + "it returns becomes the program's exit code, the number the program ends with. Write "
+        + "'main() -> int' to choose the exit code, or 'main()' to end with 0.");
+}
+
+test "test declarations are validated in place" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/app.ens",
+        "test \"misplaced\" \{ \}\n");
+    loader.add("/proj/src/checks_test.ens",
+        "import app;\n"
+        + "test \"\" \{ \}\n"
+        + "test \"line\\nbreak\" \{ \}\n"
+        + "test \"value \{1\} here\" \{ \}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["checks_test.ens"]);
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Signatures]);
+    let found = analysis.signatureDiagnostics();
+    try testing.assertEqual(found.length, 4L);
+    try sema_support.assertDiagnostic(found, 0, "/proj/src/app.ens",
+        "A 'test' can only be declared in a file whose name ends in '_test.ens', and this file is "
+            + "'app.ens'. Move the test into a file such as 'app_test.ens'.");
+    try sema_support.assertDiagnostic(found, 1, "/proj/src/checks_test.ens",
+        "This test's description is empty. Write what the test checks between the quotes.");
+    try sema_support.assertDiagnostic(found, 2, "/proj/src/checks_test.ens",
+        "This test's description contains a line break. Write it on one line.");
+    try sema_support.assertDiagnostic(found, 3, "/proj/src/checks_test.ens",
+        "A test description is the test's fixed name, so it cannot contain '\{...\}'. Write the "
+            + "description as plain text.");
+}
+
+// A program 'demo.<name>' in a workspace beside the dependency 'acme.entry', whose main module
+// declares 'main', and 'acme.mid', which imports it.
+entryWorkspace(string name, string mainSource) -> FakeFileLoader {
+    let loader = new FakeFileLoader();
+    loader.add("/ew/ens.package", "workspace \{\n"
+        + "    member \"dep\";\n"
+        + "    member \"mid\";\n"
+        + "    member \"{name}\";\n"
+        + "\}\n");
+    loader.add("/ew/dep/ens.package", "package acme.entry \{ ens \"0.1\"; \}\n");
+    loader.add("/ew/dep/src/main.ens", "main() -> int \{\n    return 0;\n\}\n");
+    loader.add("/ew/mid/ens.package",
+        "package acme.mid \{\n    ens \"0.1\";\n    dependency acme.entry;\n\}\n");
+    loader.add("/ew/mid/src/relay.ens", "import @acme.entry.main;\n"
+        + "start() -> int \{\n    return 0;\n\}\n");
+    loader.add("/ew/{name}/ens.package", "package demo.{name} \{\n    ens \"0.1\";\n"
+        + "    dependency acme.entry;\n    dependency acme.mid;\n\}\n");
+    loader.add("/ew/{name}/src/main.ens", mainSource);
+    return loader;
+}
+
+// The one signature refusal reported in the dependency's main module.
+entryRefusal(FakeFileLoader loader, string name) -> string throws {
+    let analysis = sema_support.analyzeAll(loader, "/ew/{name}/src", ["main.ens"]);
+    let found = new List<FileDiagnostic>();
+    for (let diagnostic in analysis.signatureDiagnostics()) {
+        if (diagnostic.file() == "/ew/dep/src/main.ens") {
+            found.push(diagnostic);
+        }
+    }
+    try testing.assertEqual(found.length(), 1L);
+    return found.get(0).message();
+}
+
+test "a dependency's main offers removing an import only when the program writes it on one line" {
+    string rule = "Function 'main' starts the program, so only the program's main module, "
+        + "'main.ens', can declare it. This file is the main module of package 'acme.entry', a "
+        + "dependency of this program. ";
+    string body = "\nmain() -> int \{\n    return 0;\n\}\n";
+    try testing.assertEqual(try entryRefusal(entryWorkspace("app",
+        "import @acme.entry.main as entry;\n" + body), "app"),
+        rule + "Rename this function, or remove 'import @acme.entry.main as entry;' from module "
+        + "'main'.");
+    try testing.assertEqual(try entryRefusal(entryWorkspace("split",
+        "import @acme.entry\n    .main as entry;\n" + body), "split"), rule + "Rename this function.");
+    try testing.assertEqual(try entryRefusal(entryWorkspace("noted",
+        "import @acme.entry.main /* the entry */ as entry;\n" + body), "noted"),
+        rule + "Rename this function.");
+    try testing.assertEqual(try entryRefusal(entryWorkspace("relayed",
+        "import @acme.mid.relay;\n" + body), "relayed"), rule + "Rename this function.");
+}
+
+test "a 'src/main.ens' in a folder with no manifest is told how to become the main module" {
+    let loader = new FakeFileLoader();
+    loader.add("/prog/src/main.ens", "main() -> int \{\n    return 0;\n\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/prog", ["src/main.ens"]);
+    let found = analysis.signatureDiagnostics();
+    try testing.assertEqual(found.length, 1L);
+    try sema_support.assertDiagnostic(found, 0, "/prog/src/main.ens",
+        "Function 'main' starts the program, so only the program's main module, 'main.ens', can "
+        + "declare it. The program folder has no 'ens.package' file, so 'src/main.ens' is module "
+        + "'src.main' and not the main module. Move this file to 'main.ens' at the root of the "
+        + "program folder, or add an 'ens.package' file so that 'src/main.ens' becomes the main "
+        + "module.");
+}
+
+test "a 'src/main.ens' beside the program's own 'main.ens' keeps the general text" {
+    let loader = new FakeFileLoader();
+    loader.add("/prog/main.ens", "import src.main as other;\n"
+        + "main() -> int \{\n    return 0;\n\}\n");
+    loader.add("/prog/src/main.ens", "public main() -> int \{\n    return 1;\n\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/prog", ["main.ens"]);
+    let found = new List<FileDiagnostic>();
+    for (let diagnostic in analysis.signatureDiagnostics()) {
+        if (diagnostic.file() == "/prog/src/main.ens") {
+            found.push(diagnostic);
+        }
+    }
+    try testing.assertEqual(found.length(), 1L);
+    try testing.assertEqual(found.get(0).message(), "Function 'main' starts the program, so only "
+        + "the program's main module, 'main.ens', can declare it. This file is module 'src.main'. "
+        + "Rename this function, or move it into 'main.ens'.");
+}
