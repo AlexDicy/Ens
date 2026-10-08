@@ -1,0 +1,388 @@
+// How a literal is typed with no target, under a cast, as a char literal given an integer type, and
+// as a switch label; also the checks on interpolated strings and the texts for a literal past its range.
+import Expression from @ens.frontend.syntax.generated.nodes;
+import LiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
+import PrefixExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ParenthesizedExpressionNode from @ens.frontend.syntax.generated.nodes;
+import StructLiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
+import InterpolatedStringExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SyntaxKind from @ens.frontend.syntax.generated.kind;
+import model.capabilities;
+import model.convert;
+import model.literalvalues;
+import phases.bodies.nullguidance;
+import Type from model.types;
+import ErrorType from model.types;
+import PrimitiveType from model.types;
+import PrimitiveKind from model.types;
+import InterpolationObligation from phases.obligations;
+import BodyChecker from phases.bodies;
+
+// Records the type a literal inside the parentheses adapted to on the parentheses as well.
+// 'adapted' is null when the literal did not adapt.
+public adaptedInParentheses(BodyChecker checker, ParenthesizedExpressionNode node, Type? adapted) -> Type? {
+    if (adapted != null) {
+        checker.result().setType(node.green(), adapted);
+    }
+    return adapted;
+}
+
+// A switch integer label adapts to the scrutinee like an int literal does, but also accepts a
+// typed long literal like '65L', which otherwise keeps its 'long' type. The value must fit and
+// the node is retyped so codegen emits it at the scrutinee's width.
+public adaptIntegerLiteralLabel(BodyChecker checker, Expression node, Type target) {
+    if (target is PrimitiveType) {
+        adaptIntegerLiteralLabelTo(checker, node, target);
+    }
+}
+
+adaptIntegerLiteralLabelTo(BodyChecker checker, Expression node, PrimitiveType target) {
+    if (!convert.isIntegerType(target)) {
+        return;
+    }
+    let literal = integerLiteralOf(node, true);
+    if (literal == null) {
+        return;
+    }
+    let magnitude = literalvalues.integerMagnitude(literal.value().text());
+    if (magnitude == null) {
+        return;
+    }
+    bool negative = isNegativeLiteral(node);
+    if (!literalvalues.magnitudeFits(negative, magnitude, target.kind())) {
+        string sign = "";
+        if (negative) {
+            sign = "-";
+        }
+        checker.reporter().report(integerPastRange("{sign}{literal.value().text()}", negative, target.kind(),
+            checker.names().of(target)), node.span());
+        checker.result().setType(node.green(), checker.store().errorType());
+        return;
+    }
+    checker.result().setType(node.green(), target);
+    checker.result().setType(literal.green(), target);
+}
+
+// Retypes a char literal to the integer type the target has without its '?'. Returns the new
+// type, the error type when the code point does not fit, or null when nothing adapts.
+public adaptCharLiteral(BodyChecker checker, Expression node, Type target) -> Type? {
+    if (node is ParenthesizedExpressionNode) {
+        return adaptedInParentheses(checker, node, adaptCharLiteral(checker, node.inner(), target));
+    }
+    Type core = convert.coreOf(target);
+    if (core is PrimitiveType) {
+        return adaptCharLiteralTo(checker, node, core);
+    }
+    return null;
+}
+
+// adaptCharLiteral for a target that is a primitive type.
+adaptCharLiteralTo(BodyChecker checker, Expression node, PrimitiveType target) -> Type? {
+    if (!convert.isIntegerType(target) || target.kind() == PrimitiveKind.Char) {
+        return null;
+    }
+    if (!(node is LiteralExpressionNode) || node.value().kind() != SyntaxKind.CharLiteral) {
+        return null;
+    }
+    ulong codepoint = literalvalues.charCodepoint(node.value().text());
+    if (!literalvalues.magnitudeFits(false, codepoint, target.kind())) {
+        checker.reporter().report("The code point of {node.value().text()}, {codepoint}, is too large for "
+            + "'{checker.names().of(target)}', whose largest value is "
+            + "{literalvalues.integerLimit(target.kind())}.", node.span());
+        checker.result().setType(node.green(), checker.store().errorType());
+        return checker.store().errorType();
+    }
+    checker.result().setType(node.green(), target);
+    return target;
+}
+
+public analyzeLiteral(BodyChecker checker, LiteralExpressionNode node) -> Type {
+    return switch (node.value().kind()) {
+        IntLiteral -> numericLiteral(checker, node, PrimitiveKind.Int),
+        LongLiteral -> numericLiteral(checker, node, PrimitiveKind.Long),
+        FloatLiteral -> numericLiteral(checker, node, PrimitiveKind.Float),
+        DoubleLiteral -> numericLiteral(checker, node, PrimitiveKind.Double),
+        StringLiteral -> checker.store().stringType(),
+        CharLiteral -> checker.store().primitive(PrimitiveKind.Char),
+        TrueKeyword, FalseKeyword -> checker.store().primitive(PrimitiveKind.Bool),
+        NullKeyword -> checker.store().nullType(),
+        default -> checker.store().errorType(),
+    };
+}
+
+// A numeric literal starts at its own default type. Where nothing adapts it, that default
+// has to hold the value, so the ones that do not are recorded and reported at the end.
+numericLiteral(BodyChecker checker, LiteralExpressionNode node, PrimitiveKind kind) -> Type {
+    let defaultType = checker.store().primitive(kind);
+    checker.recordLiteralRange(node, defaultType);
+    return defaultType;
+}
+
+// A cast names the width the value should take, so a literal whose value the target holds
+// adapts to it and stays exact. One the target cannot hold keeps its default type, because
+// a narrowing cast is how the language spells a deliberate truncation.
+public adaptLiteralToCastTarget(BodyChecker checker, Expression node, Type target) {
+    if (!(target is PrimitiveType)) {
+        return;
+    }
+    if (convert.isIntegerType(target)) {
+        let literal = intLiteralOf(node);
+        if (literal == null) {
+            return;
+        }
+        let magnitude = literalvalues.integerMagnitude(literal.value().text());
+        if (magnitude == null || !literalvalues.magnitudeFits(isNegativeLiteral(node),
+                magnitude, target.kind())) {
+            return;
+        }
+        checker.result().setType(node.green(), target);
+        checker.result().setType(literal.green(), target);
+        return;
+    }
+    if (target.kind() != PrimitiveKind.Float && target.kind() != PrimitiveKind.Double) {
+        return;
+    }
+    let literal = floatLiteralOf(node);
+    if (literal == null) {
+        return;
+    }
+    if (!literalvalues.floatMagnitudeFits(
+            literalvalues.floatMagnitude(literal.value().text()), target.kind())) {
+        return;
+    }
+    checker.result().setType(node.green(), target);
+    checker.result().setType(literal.green(), target);
+}
+
+public analyzeInterpolatedString(BodyChecker checker, InterpolatedStringExpressionNode node) -> Type {
+    checkInterpolationHole(checker, node.firstHole());
+    for (long i = 0; i < node.continuationsCount(); i++) {
+        checkInterpolationHole(checker, node.continuations(i).hole());
+    }
+    return checker.store().stringType();
+}
+
+// A hole must be a string, integer, bool, enum, class, interface, or JSON-serializable
+// struct value, or one nullable level over any of them, which prints 'null' when absent; a
+// hole mentioning a type parameter is checked per instantiation.
+checkInterpolationHole(BodyChecker checker, Expression hole) {
+    Type analyzed = checker.analyzeExpression(hole);
+    if (analyzed is ErrorType) {
+        return;
+    }
+    if (convert.containsTypeParam(analyzed)) {
+        checker.recordObligation(new InterpolationObligation(analyzed, hole.span()));
+        return;
+    }
+    let issue = capabilities.interpolationIssue(analyzed, checker.names(),
+        nullguidance.oneLevelGuidance(checker, hole, analyzed));
+    if (issue != null) {
+        checker.reporter().report(issue, hole.span());
+    }
+}
+
+// A '{...}' literal with no target type has nothing to infer against.
+public analyzeStructLiteral(BodyChecker checker, StructLiteralExpressionNode node) -> Type {
+    for (long i = 0; i < node.fieldsCount(); i++) {
+        checker.analyzeExpression(node.fields(i).value());
+    }
+    checker.reporter().report("This '\{...\}' literal has no declared struct type to build. Write it where "
+        + "a struct type is declared, such as a variable, a field, a parameter, an array element or a "
+        + "return value.", node.span());
+    return checker.store().errorType();
+}
+
+// The refusal of a floating-point literal, spelled 'written', whose magnitude is past the range of
+// 'kind'. A literal a 'double' can take gets 'fix'.
+public floatTooLarge(string written, double magnitude, PrimitiveKind kind, string fix) -> string {
+    string refusal = floatPastRange(written, kind);
+    if (kind != PrimitiveKind.Float) {
+        return refusal;
+    }
+    if (literalvalues.floatMagnitudeFits(magnitude, PrimitiveKind.Double)) {
+        if (fix.length == 0) {
+            return refusal;
+        }
+        return "{refusal} {fix}";
+    }
+    if (written.startsWith("-")) {
+        return "{refusal} It is below the smallest value of 'double' too, which is "
+            + "{literalvalues.floatLimit(PrimitiveKind.Double, true)}.";
+    }
+    return "{refusal} It is too large for 'double' too, whose largest value is "
+        + "{literalvalues.floatLimit(PrimitiveKind.Double)}.";
+}
+
+// The sentence that says a literal, spelled 'written', is past the range of 'kind'.
+floatPastRange(string written, PrimitiveKind kind) -> string {
+    string name = "double";
+    if (kind == PrimitiveKind.Float) {
+        name = "float";
+    }
+    if (written.startsWith("-")) {
+        return "Literal {written} is below the smallest value of '{name}', which is "
+            + "{literalvalues.floatLimit(kind, true)}.";
+    }
+    return "Literal {written} is too large for '{name}', whose largest value is "
+        + "{literalvalues.floatLimit(kind)}.";
+}
+
+// The literal an untyped integer adaptation applies to: the literal itself, or one behind a
+// single '+' or '-' prefix. 'allowLong' also accepts a typed long literal, as switch labels do.
+public integerLiteralOf(Expression node, bool allowLong) -> LiteralExpressionNode? {
+    if (node is LiteralExpressionNode) {
+        if (isIntegerLiteralKind(node.value().kind(), allowLong)) {
+            return node;
+        }
+        return null;
+    }
+    if (node is PrefixExpressionNode) {
+        SyntaxKind operator = node.operator().kind();
+        if (operator != SyntaxKind.Plus && operator != SyntaxKind.Minus) {
+            return null;
+        }
+        let operand = node.operand();
+        if (operand is LiteralExpressionNode && isIntegerLiteralKind(operand.value().kind(), allowLong)) {
+            return operand;
+        }
+    }
+    return null;
+}
+
+public intLiteralOf(Expression node) -> LiteralExpressionNode? {
+    return integerLiteralOf(node, false);
+}
+
+isIntegerLiteralKind(SyntaxKind kind, bool allowLong) -> bool {
+    if (kind == SyntaxKind.IntLiteral) {
+        return true;
+    }
+    return allowLong && kind == SyntaxKind.LongLiteral;
+}
+
+public isNegativeLiteral(Expression node) -> bool {
+    if (node is PrefixExpressionNode) {
+        return node.operator().kind() == SyntaxKind.Minus;
+    }
+    return false;
+}
+
+// The integer type a suggestion names for a value too large for 'from': the narrowest wider one of
+// the same signedness that takes it, or else the narrowest of the other signedness at least as wide.
+// Empty when no integer type takes the value, and for 'char'.
+public widerIntegerHolding(bool negative, ulong magnitude, PrimitiveKind from) -> string {
+    if (from == PrimitiveKind.Char) {
+        return "";
+    }
+    bool unsigned = from == PrimitiveKind.Byte || from == PrimitiveKind.UShort || from == PrimitiveKind.UInt
+        || from == PrimitiveKind.ULong;
+    PrimitiveKind[] same = [PrimitiveKind.Short, PrimitiveKind.Int, PrimitiveKind.Long];
+    PrimitiveKind[] other = [PrimitiveKind.UShort, PrimitiveKind.UInt, PrimitiveKind.ULong];
+    if (unsigned) {
+        same = other;
+        other = [PrimitiveKind.Short, PrimitiveKind.Int, PrimitiveKind.Long];
+    }
+    long width = integerWidth(from);
+    for (let kind in same) {
+        if (integerWidth(kind) > width && literalvalues.magnitudeFits(negative, magnitude, kind)) {
+            return primitiveKindName(kind);
+        }
+    }
+    for (let kind in other) {
+        if (integerWidth(kind) >= width && literalvalues.magnitudeFits(negative, magnitude, kind)) {
+            return primitiveKindName(kind);
+        }
+    }
+    return "";
+}
+
+// The bits an integer kind has.
+public integerWidth(PrimitiveKind kind) -> long {
+    return switch (kind) {
+        Byte -> 8,
+        Short, UShort -> 16,
+        Int, UInt -> 32,
+        default -> 64,
+    };
+}
+
+// The name an integer kind is written with.
+public primitiveKindName(PrimitiveKind kind) -> string {
+    return switch (kind) {
+        Short -> "short",
+        UShort -> "ushort",
+        Int -> "int",
+        UInt -> "uint",
+        Long -> "long",
+        default -> "ulong",
+    };
+}
+
+// The sentence stating that an integer literal, spelled 'written', is past the range of the kind
+// spelled 'name'.
+public integerPastRange(string written, bool negative, PrimitiveKind kind, string name) -> string {
+    if (negative) {
+        return "Literal {written} is below the smallest value of '{name}', which is "
+            + "{literalvalues.integerLimit(kind, true)}.";
+    }
+    return "Literal {written} is too large for '{name}', whose largest value is "
+        + "{literalvalues.integerLimit(kind)}.";
+}
+
+// The refusal of an integer literal, spelled 'written', that no integer type takes.
+public beyondEveryInteger(string written, bool negative) -> string {
+    if (negative) {
+        return "Literal {written} is below the smallest value of every integer type. The lowest, "
+            + "'long', has -9223372036854775808 as its smallest value.";
+    }
+    return "Literal {written} is too large for every integer type. The widest, 'ulong', has "
+        + "18446744073709551615 as its largest value.";
+}
+
+// The fix for an integer literal, spelled 'written' and written 'text' without its sign, that
+// nothing gives a type to, which the type 'wider' takes.
+public typedLiteralFix(string written, string text, string wider) -> string {
+    string digits = written;
+    if (text.endsWith("L") || text.endsWith("l")) {
+        digits = written.substring(0, written.length - 1);
+    }
+    if (wider == "long") {
+        return "Write '{digits}L' to make it a 'long'.";
+    }
+    return "Write '{digits} as {wider}'.";
+}
+
+// The unsuffixed floating-point literal a value is written as, behind an optional sign. A
+// suffix names the type, so '1.0f' is a float and '1.0d' a double the way '5L' is a long, and
+// neither adapts.
+public floatLiteralOf(Expression node) -> LiteralExpressionNode? {
+    if (node is LiteralExpressionNode) {
+        if (isUnsuffixedFloatLiteral(node)) {
+            return node;
+        }
+        return null;
+    }
+    if (node is PrefixExpressionNode) {
+        SyntaxKind operator = node.operator().kind();
+        if (operator != SyntaxKind.Plus && operator != SyntaxKind.Minus) {
+            return null;
+        }
+        let operand = node.operand();
+        if (operand is LiteralExpressionNode && isUnsuffixedFloatLiteral(operand)) {
+            return operand;
+        }
+    }
+    return null;
+}
+
+isUnsuffixedFloatLiteral(LiteralExpressionNode literal) -> bool {
+    if (literal.value().kind() != SyntaxKind.DoubleLiteral) {
+        return false;
+    }
+    byte[] raw = literal.value().text().toBytes();
+    if (raw.length == 0) {
+        return false;
+    }
+    byte last = raw[raw.length - 1];
+    return last != 'f' && last != 'F' && last != 'd' && last != 'D';
+}
