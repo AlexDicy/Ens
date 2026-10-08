@@ -1,0 +1,535 @@
+// Checks the statements other than 'switch': local declarations, 'if', 'while', 'for', 'for (... in ...)',
+// 'return' and 'throw'. A condition must have type 'bool', and 'for (... in ...)' takes an array or an
+// 'Iterable'.
+import Type as TypeNode from @ens.frontend.syntax.generated.nodes;
+import BlockNode from @ens.frontend.syntax.generated.nodes;
+import Expression from @ens.frontend.syntax.generated.nodes;
+import VariableDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import IfStatementNode from @ens.frontend.syntax.generated.nodes;
+import WhileStatementNode from @ens.frontend.syntax.generated.nodes;
+import ForStatementNode from @ens.frontend.syntax.generated.nodes;
+import ForEachStatementNode from @ens.frontend.syntax.generated.nodes;
+import ReturnStatementNode from @ens.frontend.syntax.generated.nodes;
+import ExpressionStatementNode from @ens.frontend.syntax.generated.nodes;
+import ThrowStatementNode from @ens.frontend.syntax.generated.nodes;
+import LiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SyntaxKind from @ens.frontend.syntax.generated.kind;
+import Span from @ens.frontend.support.source;
+import LocalBinding from model.scopes;
+import BindingKind from model.scopes;
+import model.convert;
+import OriginKind from phases.bodies.literaltargets;
+import LiteralOrigin from phases.bodies.literaltargets;
+import phases.bodies.literalfixes;
+import phases.bodies.literaltyping;
+import phases.bodies.nullguidance;
+import AssignmentFlow from phases.bodies.definiteassignment;
+import phases.bodies.wording;
+import phases.bodies.narrowing;
+import NarrowingFact from phases.bodies.narrowing;
+import NarrowingPath from model.narrow;
+import model.hierarchy;
+import model.types;
+import Type from model.types;
+import ErrorType from model.types;
+import NullType from model.types;
+import StringType from model.types;
+import OptionalType from model.types;
+import ArrayType from model.types;
+import InterfaceType from model.types;
+import InstantiationType from model.types;
+import TypeParamType from model.types;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+import BodyChecker from phases.bodies;
+
+conditionIsAlwaysTrue(BodyChecker checker, Expression condition) -> bool {
+    if (condition is LiteralExpressionNode) {
+        return condition.value().kind() == SyntaxKind.TrueKeyword;
+    }
+    return false;
+}
+
+public checkVariableDeclaration(BodyChecker checker, VariableDeclarationNode node) {
+    string name = node.name().text();
+    bool isConst = false;
+    let modifier = node.modifier();
+    if (modifier != null && modifier.kind() == SyntaxKind.ConstKeyword) {
+        isConst = true;
+    }
+    let declaredType = node.declaredType();
+    Type bindingType = checker.store().errorType();
+    if (declaredType == null) {
+        bindingType = checkInferredDeclaration(checker, node, name);
+    } else {
+        bindingType = checkTypedDeclaration(checker, node, name, declaredType, isConst);
+    }
+    let binding = new LocalBinding(name, bindingType, BindingKind.Variable, isConst, node.name().span());
+    if (isConst && declaredType == null) {
+        checker.untypedConstants().push(binding);
+    }
+    defineLocal(checker, binding, node.name().span());
+    checker.result().setBinding(node.green(), binding);
+    let initializer = node.initializer();
+    checker.assignment().trackLocal(binding, initializer != null);
+    if (initializer != null) {
+        let initType = checker.result().typeOf(initializer.value().green());
+        if (initType != null) {
+            narrowing.establishAssignmentNarrowing(checker, binding, initType);
+        }
+    }
+}
+
+checkInferredDeclaration(BodyChecker checker, VariableDeclarationNode node, string name) -> Type {
+    let initializer = node.initializer();
+    if (initializer == null) {
+        checker.reporter().report("Variable '{name}' has no declared type, so its type has to "
+            + "come from an initializer. Write 'let {name} = ...;', or declare the type.",
+            node.name().span());
+        return checker.store().errorType();
+    }
+    Type initType = literaltyping.analyzeInitializerOf(checker, name, initializer.value());
+    if (initType is NullType) {
+        checker.reporter().report("'null' alone gives '{name}' no type. Declare its type, as in "
+            + "'string? {name} = null;'.", node.name().span());
+        return checker.store().errorType();
+    }
+    return initType;
+}
+
+checkTypedDeclaration(BodyChecker checker, VariableDeclarationNode node, string name,
+                      TypeNode declaredType, bool isConst) -> Type {
+    Type declared = checker.resolver().resolveType(declaredType);
+    if (types.isVoidType(declared)) {
+        checker.reporter().report("Variable '{name}' cannot have type 'void', because 'void' means no "
+            + "value. Give '{name}' the type of the value it stores.", declaredType.span());
+        declared = checker.store().errorType();
+    }
+    let initializer = node.initializer();
+    if (initializer != null) {
+        Type initType = checker.analyzeExpressionAdapt(initializer.value(), declared,
+            literalfixes.valueOrigin(checker, OriginKind.Declared, name, declared, initializer.value(),
+                node));
+        if (!(declared is ErrorType) && !(initType is ErrorType)
+                && !convert.isAssignableStrict(declared, initType)) {
+            checker.reporter().report("Variable '{name}' has type '{checker.names().of(declared)}', but its "
+                + "value has type '{checker.names().of(initType)}'."
+                + "{nullguidance.valueAssignabilityHint(checker, declared, initType, initializer.value())}",
+                initializer.value().span());
+        }
+        return declared;
+    }
+    if (isConst && !(declared is ErrorType)) {
+        checker.reporter().report("Constant '{name}' must be given its value where it is declared. Write it "
+            + "after the name, as in 'const {checker.names().of(declared)} {name} = ...;'.",
+            node.name().span());
+        return declared;
+    }
+    return declared;
+}
+
+// A local may shadow anything except a sibling local or, at the body's top level, a
+// parameter of the enclosing callable.
+defineLocal(BodyChecker checker, LocalBinding binding, Span span) {
+    let current = checker.currentScope();
+    if (current == null) {
+        return;
+    }
+    bool collides = !current.define(binding);
+    let parameters = checker.frame().parameterScope();
+    if (!collides && parameters != null && current.parent() == parameters
+            && parameters.lookupLocal(binding.name()) != null) {
+        checker.reporter().report("Variable '{binding.name()}' has the same name as a parameter. "
+            + "Rename one of the two.", span);
+        return;
+    }
+    if (collides) {
+        checker.reporter().report("Variable '{binding.name()}' is already declared earlier in this block. "
+            + "Rename one of the two.", span);
+    }
+}
+
+// The narrowing after an 'if' is the intersection of the facts holding at the end of each
+// branch that can fall through; a terminated branch contributes nothing, so the surviving
+// branch's facts pass through unchanged. This subsumes the single-terminating-branch carry:
+// 'if (x == null) { return; }' leaves the else facts, and 'if (x == null) { x = f(); }'
+// narrows x below because the reassigned then-branch and the failed-check else both prove it.
+public checkIfStatement(BodyChecker checker, IfStatementNode node) {
+    Type condition = checker.analyzeExpression(node.condition());
+    checkConditionIsBool(checker, condition, "if", node.condition());
+    let whenTrue = new List<NarrowingFact>();
+    let whenFalse = new List<NarrowingFact>();
+    narrowing.collectNarrowings(checker, node.condition(), true, whenTrue);
+    narrowing.collectNarrowings(checker, node.condition(), false, whenFalse);
+
+    let entryAssign = checker.assignment().snapshot();
+    let entryLayers = checker.narrowing().snapshotLayers();
+    let entryFacts = checker.narrowing().flatten();
+
+    let thenFacts = narrowing.walkBranchCapture(checker, node.thenBranch(), whenTrue);
+    let afterThen = checker.assignment().snapshot();
+    checker.assignment().restore(entryAssign);
+    checker.narrowing().restoreLayers(entryLayers);
+
+    Map<NarrowingPath, Type> elseFacts;
+    let afterElse = entryAssign;
+    let elseClause = node.elseClause();
+    if (elseClause == null) {
+        elseFacts = narrowing.captureConditionBranch(checker, whenFalse);
+    } else {
+        switch (elseClause.body()) {
+            is BlockNode block -> {
+                elseFacts = narrowing.walkBranchCapture(checker, block, whenFalse);
+                afterElse = checker.assignment().snapshot();
+            },
+            is IfStatementNode chained -> {
+                // An 'else if' is reached only when this condition failed, so the chained
+                // 'if' is checked under the negated facts exactly as an else block is.
+                checker.enterScope();
+                narrowing.applyFacts(checker, whenFalse);
+                checkIfStatement(checker, chained);
+                elseFacts = checker.narrowing().flatten();
+                afterElse = checker.assignment().snapshot();
+                checker.leaveScope();
+            },
+            default -> {
+                elseFacts = narrowing.captureConditionBranch(checker, whenFalse);
+            },
+        }
+    }
+    checker.assignment().restore(entryAssign);
+    checker.narrowing().restoreLayers(entryLayers);
+
+    let flows = new List<AssignmentFlow>();
+    flows.push(afterThen);
+    flows.push(afterElse);
+    checker.assignment().restore(checker.assignment().join(flows));
+
+    let survivors = new List<Map<NarrowingPath, Type>>();
+    if (!afterThen.terminated()) {
+        survivors.push(thenFacts);
+    }
+    if (!afterElse.terminated()) {
+        survivors.push(elseFacts);
+    }
+    narrowing.applyNarrowingJoin(checker, entryFacts, survivors);
+}
+
+// The condition is rechecked every iteration and body writes drop narrowing at their own
+// point, so condition narrowing is safe in the body.
+public checkWhileStatement(BodyChecker checker, WhileStatementNode node) {
+    narrowing.preClearLoopBodyWrites(checker, node.body());
+    // The condition re-evaluates every iteration, so writes in it count as loop writes.
+    checker.frame().enterLoop();
+    checker.frame().enterLoopCondition();
+    Type condition = checker.analyzeExpression(node.condition());
+    checker.frame().leaveLoopCondition();
+    checker.frame().leaveLoop();
+    checkConditionIsBool(checker, condition, "while", node.condition());
+    let facts = new List<NarrowingFact>();
+    narrowing.collectNarrowings(checker, node.condition(), true, facts);
+    bool alwaysTrue = conditionIsAlwaysTrue(checker, node.condition());
+    let postCondition = checker.assignment().snapshot();
+    checker.assignment().beginLoop();
+    checker.frame().enterLoop();
+    narrowing.walkBranch(checker, node.body(), facts);
+    checker.frame().leaveLoop();
+    let exits = checker.assignment().endLoop();
+    if (!alwaysTrue) {
+        exits.push(postCondition);
+    }
+    checker.assignment().finishLoop(exits);
+}
+
+public checkForStatement(BodyChecker checker, ForStatementNode node) {
+    checker.enterScope();
+    let initializer = node.initializer();
+    if (initializer != null) {
+        switch (initializer) {
+            is VariableDeclarationNode declaration -> {
+                checkVariableDeclaration(checker, declaration);
+            },
+            is ExpressionStatementNode expression -> {
+                checker.analyzeExpression(expression.expression());
+            },
+            default -> { },
+        }
+    }
+    narrowing.preClearLoopBodyWrites(checker, node.body());
+    let update = node.update();
+    if (update != null) {
+        narrowing.preClearLoopBodyWrites(checker, update);
+    }
+    let facts = new List<NarrowingFact>();
+    let condition = node.condition();
+    bool alwaysTrue = false;
+    if (condition != null) {
+        // The condition re-evaluates every iteration, so writes in it count as loop writes.
+        checker.frame().enterLoop();
+        checker.frame().enterLoopCondition();
+        Type conditionType = checker.analyzeExpression(condition);
+        checker.frame().leaveLoopCondition();
+        checker.frame().leaveLoop();
+        checkConditionIsBool(checker, conditionType, "for", condition);
+        narrowing.collectNarrowings(checker, condition, true, facts);
+        alwaysTrue = conditionIsAlwaysTrue(checker, condition);
+    }
+    let postCondition = checker.assignment().snapshot();
+    checker.assignment().beginLoop();
+    checker.frame().enterLoop();
+    checker.enterScope();
+    narrowing.applyFacts(checker, facts);
+    checker.walkBlock(node.body());
+    if (update != null) {
+        checker.assignment().setUnconditionalPosition(true);
+        bool outerStatements = checker.frame().statementsAllowed();
+        checker.frame().setStatementsAllowed(false);
+        checker.analyzeExpression(update);
+        checker.frame().setStatementsAllowed(outerStatements);
+    }
+    checker.leaveScope();
+    checker.frame().leaveLoop();
+    let exits = checker.assignment().endLoop();
+    if (condition != null && !alwaysTrue) {
+        exits.push(postCondition);
+    }
+    checker.assignment().finishLoop(exits);
+    checker.leaveScope();
+}
+
+// The loop needs an array or a value whose type implements 'Iterable<T>', proven non-null; the
+// element binding takes its annotated type when one is written and the element type otherwise.
+public checkForEachStatement(BodyChecker checker, ForEachStatementNode node) {
+    checker.enterScope();
+    Type iterable = checker.analyzeExpression(node.iterable());
+    Type element = checker.store().errorType();
+    if (!(iterable is ErrorType)) {
+        if (iterable is OptionalType) {
+            checker.reporter().report(nullguidance.maybeNullRefusal(checker, "'for (... in ...)' cannot "
+                + "iterate '{checker.names().of(iterable)}' because it", node.iterable(), iterable),
+                node.iterable().span());
+        } else if (iterable is ArrayType) {
+            element = iterable.element();
+        } else if (types.isClassLike(iterable) || types.isStructLike(iterable)) {
+            element = iterableElementType(checker, iterable, node.declaredType(), node.iterable().span());
+        } else if (iterable is StringType) {
+            checker.reporter().report("A 'string' cannot be iterated directly. "
+                + stringWalkAdvice(node.iterable()), node.iterable().span());
+        } else {
+            checker.reporter().report("'for (... in ...)' needs an array or an iterable value, but "
+                + "{wording.sideNamed(node.iterable(), "the value it walks")} has type "
+                + "'{checker.names().of(iterable)}'. A class or a struct is iterable when it implements "
+                + "'Iterable<T>' from '@std.collections.iterator'.", node.iterable().span());
+        }
+    }
+    Type bindingType = element;
+    let declaredType = node.declaredType();
+    if (declaredType != null) {
+        Type declared = checker.resolver().resolveType(declaredType);
+        if (!(declared is ErrorType) && !(element is ErrorType)
+                && !convert.isAssignableStrict(declared, element)) {
+            string conformance = nullguidance.valueConformanceHint(declared, element, checker.names());
+            // The conformance explanation ends with its own suggestion, which names the
+            // same type the general one would.
+            string fix = "";
+            if (conformance.length == 0) {
+                fix = " Declare it as '{checker.names().of(element)} {node.name().text()}', or with a wider "
+                    + "type.";
+            }
+            checker.reporter().report("Loop variable '{node.name().text()}' has type "
+                + "'{checker.names().of(declared)}', but this loop gives it '{checker.names().of(element)}' "
+                + "values.{conformance}{fix}", declaredType.span());
+        }
+        bindingType = declared;
+    }
+    bool isConst = false;
+    let keyword = node.letKeyword();
+    if (keyword != null && keyword.kind() == SyntaxKind.ConstKeyword) {
+        isConst = true;
+    }
+    let binding = new LocalBinding(node.name().text(), bindingType, BindingKind.Variable,
+        isConst, node.name().span());
+    if (isConst && declaredType == null) {
+        checker.untypedConstants().push(binding);
+    }
+    let current = checker.currentScope();
+    if (current != null) {
+        current.define(binding);
+    }
+    checker.result().setBinding(node.green(), binding);
+    let entry = checker.assignment().snapshot();
+    checker.assignment().trackLocal(binding, assigned: true);
+    checker.assignment().beginLoop();
+    checker.frame().enterLoop();
+    narrowing.preClearLoopBodyWrites(checker, node.body());
+    checker.walkScopedBlock(node.body());
+    checker.frame().leaveLoop();
+    let exits = checker.assignment().endLoop();
+    exits.push(entry);
+    checker.assignment().finishLoop(exits);
+    checker.leaveScope();
+}
+
+// The element type a value yields in a for-in loop. Iteration is nominal: the type must
+// implement 'Iterable<T>' from '@std.collections.iterator', directly or through an
+// interface extending it, and for a class a base class's conformance counts. A value whose
+// own type is 'Iterable<T>' or a sub-interface of it iterates too, and so does a struct that
+// declares the conformance, whose 'makeIterator' is then a direct call.
+iterableElementType(BodyChecker checker, Type core, TypeNode? declaredElement, Span span) -> Type {
+    for (let level in hierarchy.conformanceLadderOf(core)) {
+        let found = iterableArgument(level);
+        if (found != null) {
+            return found;
+        }
+    }
+    string element = "E";
+    string gloss = ", where 'E' is the type of its elements";
+    if (declaredElement != null) {
+        element = wording.greenSpelling(declaredElement.green());
+        gloss = "";
+    }
+    string shown = checker.names().of(core);
+    string kind = "class";
+    if (types.isStructLike(core)) {
+        kind = "struct";
+    }
+    let declared = types.authorityOf(core);
+    if (declared != null) {
+        shown = declared.name();
+    }
+    checker.reporter().report("'{checker.names().of(core)}' cannot be used in 'for (... in ...)', because it "
+        + "does not implement 'Iterable' from '@std.collections.iterator'. Declare '{kind} {shown} "
+        + "implements Iterable<{element}>' and give it the method 'override makeIterator() -> "
+        + "Iterator<{element}>'{gloss}.",
+        span);
+    return checker.store().errorType();
+}
+
+public checkReturnStatement(BodyChecker checker, ReturnStatementNode node) {
+    if (checker.frame().currentNoreturn()) {
+        checker.reporter().report("{checker.frame().currentReturnSubject()} is 'noreturn', so it never "
+            + "returns and cannot contain 'return'. Throw, call 'panic' or call another 'noreturn' "
+            + "function instead.", node.returnKeyword().span());
+        let returned = node.value();
+        if (returned != null) {
+            checker.analyzeExpression(returned);
+        }
+        return;
+    }
+    let expected = checker.frame().currentReturnType();
+    if (expected == null) {
+        string place = "outside any of them";
+        let field = checker.frame().fieldDefaultName();
+        if (field != null) {
+            place = "in the default value of field '{field}'";
+        }
+        checker.reporter().report("'return' can only be used inside the body of a function, a method or a "
+            + "lambda, and this one is {place}. Remove it.", node.returnKeyword().span());
+        let ignored = node.value();
+        if (ignored != null) {
+            checker.analyzeExpression(ignored);
+        }
+        return;
+    }
+    let value = node.value();
+    if (value == null) {
+        if (!types.isVoidType(expected)) {
+            checker.reporter().report("{checker.frame().currentReturnSubject()} returns "
+                + "'{checker.names().of(expected)}', but this 'return' has no value. "
+                + "Write the value after 'return', as in 'return ...;'.", node.returnKeyword().span());
+        }
+        return;
+    }
+    LiteralOrigin? origin = null;
+    let returnOrigin = checker.frame().currentReturnOrigin();
+    if (returnOrigin != null) {
+        origin = literalfixes.valueOrigin(checker, OriginKind.Returned, returnOrigin.name(), expected, value,
+            node);
+    }
+    Type actual = checker.analyzeExpressionAdapt(value, expected, origin);
+    if (types.isVoidType(expected)) {
+        string refusal = "{checker.frame().currentReturnSubject()} returns nothing, so this 'return' cannot "
+            + "have a value.";
+        bool spelled = !(actual is ErrorType) && !(actual is NullType) && !types.isVoidType(actual)
+            && checker.names().canSpell(actual);
+        if (checker.frame().currentReturnHeader().length > 0 && spelled) {
+            refusal = "{refusal} Write 'return;', or declare a return type, as in "
+                + "'{checker.frame().currentReturnHeader()} -> {checker.names().of(actual)}'.";
+        } else if (checker.frame().currentReturnHeader().length > 0) {
+            refusal = "{refusal} Write 'return;', or declare a return type.";
+        } else {
+            refusal = "{refusal} Write 'return;'.";
+        }
+        checker.reporter().report(refusal, value.span());
+        return;
+    }
+    if (!convert.isAssignableStrict(expected, actual)) {
+        checker.reporter().report("{checker.frame().currentReturnSubject()} returns "
+            + "'{checker.names().of(expected)}', but this value has type '{checker.names().of(actual)}'."
+            + "{nullguidance.valueAssignabilityHint(checker, expected, actual, value)}", value.span());
+    }
+}
+
+// A type parameter qualifies as a thrown type through a class bound under 'Error', the active
+// constraint scope included.
+public checkThrowStatement(BodyChecker checker, ThrowStatementNode node) {
+    Type thrown = checker.analyzeExpression(node.value());
+    if (thrown is ErrorType) {
+        return;
+    }
+    let errorClass = checker.resolver().errorClass();
+    if (thrown is TypeParamType) {
+        if (errorClass == null || !hierarchy.isAlwaysSubclassOfUnder(thrown, errorClass,
+                checker.resolver().activeConstraintOwner(), checker.resolver().activeConstraints())) {
+            string parameter = checker.names().of(thrown);
+            string where = "where '{parameter}' is declared";
+            if (thrown.ownerName().length > 0) {
+                where = "in '{thrown.ownerName()}'";
+            }
+            checker.reporter().report("Cannot throw {wording.sideNamed(node.value(), "this value")}, "
+                + "because its type '{parameter}' is a type parameter without the bound 'Error'. Declare "
+                + "it as '<{parameter}: Error>' {where}.", node.value().span());
+        }
+        return;
+    }
+    bool allowed = errorClass != null && types.isClassLike(thrown)
+        && hierarchy.isSubclassOf(thrown, errorClass);
+    if (!allowed) {
+        checker.reporter().report("Cannot throw a value of type '{checker.names().of(thrown)}'. Only an "
+            + "'Error', or an object of a subclass of 'Error', can be thrown.", node.value().span());
+    }
+}
+
+// Refuses the condition 'node' of the statement or operator 'what' unless it is a 'bool'.
+public checkConditionIsBool(BodyChecker checker, Type condition, string what, Expression node) {
+    if (!(condition is ErrorType) && !convert.isBoolType(condition)) {
+        checker.reporter().report("The condition of this '{what}' must be a 'bool', but "
+            + "{wording.sideNamed(node, "the condition")} has type '{checker.names().of(condition)}'.",
+            node.span());
+    }
+}
+
+// The two walks over a string, spelled against the expression the loop was given when that
+// expression is simple enough to quote and against the string itself when it is not.
+stringWalkAdvice(Expression iterated) -> string {
+    let spelling = wording.simpleSpelling(iterated);
+    if (spelling == null) {
+        return "Iterate its 'chars()' to visit its characters, or its 'bytes()' to visit its bytes.";
+    }
+    return "Iterate '{spelling}.chars()' to visit its characters, or '{spelling}.bytes()' to "
+        + "visit its bytes.";
+}
+
+// The element type argument when the type is an 'Iterable<T>' instantiation from
+// '@std.collections.iterator'.
+iterableArgument(Type candidate) -> Type? {
+    if (candidate is InstantiationType) {
+        let template = candidate.template();
+        if (template is InterfaceType && template.name() == "Iterable"
+                && template.modulePath() == "std.collections.iterator"
+                && candidate.arguments().length > 0) {
+            return candidate.arguments()[0];
+        }
+    }
+    return null;
+}

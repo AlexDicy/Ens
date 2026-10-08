@@ -98,6 +98,7 @@ import LiteralOrigin from phases.bodies.literaltargets;
 import JoinText from phases.bodies.literaltargets;
 import DeferredLiteralFix from phases.bodies.literaltargets;
 import LiteralTargets from phases.bodies.literaltargets;
+import phases.bodies.statements;
 import phases.bodies.identifiers;
 import phases.bodies.lambdas;
 import LambdaFrame from phases.bodies.lambdas;
@@ -116,7 +117,6 @@ import AssignmentFlow from phases.bodies.definiteassignment;
 import AssignmentState from phases.bodies.definiteassignment;
 import phases.bodies.wording;
 import phases.bodies.narrowing;
-import NarrowingFact from phases.bodies.narrowing;
 import NarrowingPath from model.narrow;
 import NarrowingState from model.narrow;
 import model.hierarchy;
@@ -130,10 +130,8 @@ import TypeNames from model.typenames;
 import model.types;
 import Type from model.types;
 import ErrorType from model.types;
-import NullType from model.types;
 import StringType from model.types;
 import OptionalType from model.types;
-import ArrayType from model.types;
 import PrimitiveKind from model.types;
 import DeclaredType from model.types;
 import ClassType from model.types;
@@ -1501,13 +1499,6 @@ public final class BodyChecker implements NoreturnCalls {
         return this.names().of(field.definingType());
     }
 
-    conditionIsAlwaysTrue(Expression condition) -> bool {
-        if (condition is LiteralExpressionNode) {
-            return condition.value().kind() == SyntaxKind.TrueKeyword;
-        }
-        return false;
-    }
-
     // ---- Statements ----
 
     public walkBlock(BlockNode block) {
@@ -1517,7 +1508,7 @@ public final class BodyChecker implements NoreturnCalls {
         }
     }
 
-    walkScopedBlock(BlockNode block) {
+    public walkScopedBlock(BlockNode block) {
         this.enterScope();
         this.walkBlock(block);
         this.leaveScope();
@@ -1529,19 +1520,19 @@ public final class BodyChecker implements NoreturnCalls {
                 this.walkScopedBlock(block);
             },
             is VariableDeclarationNode declaration -> {
-                this.checkVariableDeclaration(declaration);
+                statements.checkVariableDeclaration(this, declaration);
             },
             is IfStatementNode conditional -> {
-                this.checkIfStatement(conditional);
+                statements.checkIfStatement(this, conditional);
             },
             is WhileStatementNode loop -> {
-                this.checkWhileStatement(loop);
+                statements.checkWhileStatement(this, loop);
             },
             is ForStatementNode loop -> {
-                this.checkForStatement(loop);
+                statements.checkForStatement(this, loop);
             },
             is ForEachStatementNode loop -> {
-                this.checkForEachStatement(loop);
+                statements.checkForEachStatement(this, loop);
             },
             is BreakStatementNode broken -> {
                 if (this.frame().loopDepth() == 0) {
@@ -1561,7 +1552,7 @@ public final class BodyChecker implements NoreturnCalls {
                 if (this.assignment().constructorFieldOwner() != null) {
                     this.assignment().checkConstructorFieldsAssigned(returned.returnKeyword().span());
                 }
-                this.checkReturnStatement(returned);
+                statements.checkReturnStatement(this, returned);
                 this.assignment().terminate();
             },
             is ExpressionStatementNode expression -> {
@@ -1572,7 +1563,7 @@ public final class BodyChecker implements NoreturnCalls {
                 }
             },
             is ThrowStatementNode thrown -> {
-                this.checkThrowStatement(thrown);
+                statements.checkThrowStatement(this, thrown);
                 this.assignment().noteThrowEscapePoint(this.frame().inCatchClause());
                 this.assignment().terminate();
             },
@@ -1588,466 +1579,6 @@ public final class BodyChecker implements NoreturnCalls {
                     switched.switchKeyword().span(), false, null);
             },
             default -> { },
-        }
-    }
-
-    checkVariableDeclaration(VariableDeclarationNode node) {
-        string name = node.name().text();
-        bool isConst = false;
-        let modifier = node.modifier();
-        if (modifier != null && modifier.kind() == SyntaxKind.ConstKeyword) {
-            isConst = true;
-        }
-        let declaredType = node.declaredType();
-        Type bindingType = this.store().errorType();
-        if (declaredType == null) {
-            bindingType = this.checkInferredDeclaration(node, name);
-        } else {
-            bindingType = this.checkTypedDeclaration(node, name, declaredType, isConst);
-        }
-        let binding = new LocalBinding(name, bindingType, BindingKind.Variable, isConst,
-            node.name().span());
-        if (isConst && declaredType == null) {
-            this.untypedConstantLocals.push(binding);
-        }
-        this.defineLocal(binding, node.name().span());
-        this.result().setBinding(node.green(), binding);
-        let initializer = node.initializer();
-        this.assignment().trackLocal(binding, initializer != null);
-        if (initializer != null) {
-            let initType = this.result().typeOf(initializer.value().green());
-            if (initType != null) {
-                narrowing.establishAssignmentNarrowing(this, binding, initType);
-            }
-        }
-    }
-
-    checkInferredDeclaration(VariableDeclarationNode node, string name) -> Type {
-        let initializer = node.initializer();
-        if (initializer == null) {
-            this.reporter().report("Variable '{name}' has no declared type, so its type has to "
-                + "come from an initializer. Write 'let {name} = ...;', or declare the type.",
-                node.name().span());
-            return this.store().errorType();
-        }
-        Type initType = literaltyping.analyzeInitializerOf(this, name, initializer.value());
-        if (initType is NullType) {
-            this.reporter().report("'null' alone gives '{name}' no type. Declare its type, as in "
-                + "'string? {name} = null;'.", node.name().span());
-            return this.store().errorType();
-        }
-        return initType;
-    }
-
-    checkTypedDeclaration(VariableDeclarationNode node, string name,
-                                  TypeNode declaredType, bool isConst) -> Type {
-        Type declared = this.resolver().resolveType(declaredType);
-        if (types.isVoidType(declared)) {
-            this.reporter().report("Variable '{name}' cannot have type 'void', because 'void' means no "
-                + "value. Give '{name}' the type of the value it stores.", declaredType.span());
-            declared = this.store().errorType();
-        }
-        let initializer = node.initializer();
-        if (initializer != null) {
-            Type initType = this.analyzeExpressionAdapt(initializer.value(), declared,
-                literalfixes.valueOrigin(this, OriginKind.Declared, name, declared, initializer.value(),
-                    node));
-            if (!(declared is ErrorType) && !(initType is ErrorType)
-                    && !convert.isAssignableStrict(declared, initType)) {
-                this.reporter().report("Variable '{name}' has type '{this.names().of(declared)}', but its "
-                    + "value has type '{this.names().of(initType)}'."
-                    + "{nullguidance.valueAssignabilityHint(this, declared, initType, initializer.value())}",
-                    initializer.value().span());
-            }
-            return declared;
-        }
-        if (isConst && !(declared is ErrorType)) {
-            this.reporter().report("Constant '{name}' must be given its value where it is declared. Write it "
-                + "after the name, as in 'const {this.names().of(declared)} {name} = ...;'.",
-                node.name().span());
-            return declared;
-        }
-        return declared;
-    }
-
-    // A local may shadow anything except a sibling local or, at the body's top level, a
-    // parameter of the enclosing callable.
-    defineLocal(LocalBinding binding, Span span) {
-        let current = this.scope;
-        if (current == null) {
-            return;
-        }
-        bool collides = !current.define(binding);
-        let parameters = this.frame().parameterScope();
-        if (!collides && parameters != null && current.parent() == parameters
-                && parameters.lookupLocal(binding.name()) != null) {
-            this.reporter().report("Variable '{binding.name()}' has the same name as a parameter. "
-                + "Rename one of the two.", span);
-            return;
-        }
-        if (collides) {
-            this.reporter().report("Variable '{binding.name()}' is already declared earlier in this block. "
-                + "Rename one of the two.", span);
-        }
-    }
-
-    // The narrowing after an 'if' is the intersection of the facts holding at the end of each
-    // branch that can fall through; a terminated branch contributes nothing, so the surviving
-    // branch's facts pass through unchanged. This subsumes the single-terminating-branch carry:
-    // 'if (x == null) { return; }' leaves the else facts, and 'if (x == null) { x = f(); }'
-    // narrows x below because the reassigned then-branch and the failed-check else both prove it.
-    checkIfStatement(IfStatementNode node) {
-        Type condition = this.analyzeExpression(node.condition());
-        this.checkConditionIsBool(condition, "if", node.condition());
-        let whenTrue = new List<NarrowingFact>();
-        let whenFalse = new List<NarrowingFact>();
-        narrowing.collectNarrowings(this, node.condition(), true, whenTrue);
-        narrowing.collectNarrowings(this, node.condition(), false, whenFalse);
-
-        let entryAssign = this.assignment().snapshot();
-        let entryLayers = this.narrowingState.snapshotLayers();
-        let entryFacts = this.narrowingState.flatten();
-
-        let thenFacts = narrowing.walkBranchCapture(this, node.thenBranch(), whenTrue);
-        let afterThen = this.assignment().snapshot();
-        this.assignment().restore(entryAssign);
-        this.narrowingState.restoreLayers(entryLayers);
-
-        Map<NarrowingPath, Type> elseFacts;
-        let afterElse = entryAssign;
-        let elseClause = node.elseClause();
-        if (elseClause == null) {
-            elseFacts = narrowing.captureConditionBranch(this, whenFalse);
-        } else {
-            switch (elseClause.body()) {
-                is BlockNode block -> {
-                    elseFacts = narrowing.walkBranchCapture(this, block, whenFalse);
-                    afterElse = this.assignment().snapshot();
-                },
-                is IfStatementNode chained -> {
-                    // An 'else if' is reached only when this condition failed, so the chained
-                    // 'if' is checked under the negated facts exactly as an else block is.
-                    this.enterScope();
-                    narrowing.applyFacts(this, whenFalse);
-                    this.checkIfStatement(chained);
-                    elseFacts = this.narrowingState.flatten();
-                    afterElse = this.assignment().snapshot();
-                    this.leaveScope();
-                },
-                default -> {
-                    elseFacts = narrowing.captureConditionBranch(this, whenFalse);
-                },
-            }
-        }
-        this.assignment().restore(entryAssign);
-        this.narrowingState.restoreLayers(entryLayers);
-
-        let flows = new List<AssignmentFlow>();
-        flows.push(afterThen);
-        flows.push(afterElse);
-        this.assignment().restore(this.assignment().join(flows));
-
-        let survivors = new List<Map<NarrowingPath, Type>>();
-        if (!afterThen.terminated()) {
-            survivors.push(thenFacts);
-        }
-        if (!afterElse.terminated()) {
-            survivors.push(elseFacts);
-        }
-        narrowing.applyNarrowingJoin(this, entryFacts, survivors);
-    }
-
-    // The condition is rechecked every iteration and body writes drop narrowing at their own
-    // point, so condition narrowing is safe in the body.
-    checkWhileStatement(WhileStatementNode node) {
-        narrowing.preClearLoopBodyWrites(this, node.body());
-        // The condition re-evaluates every iteration, so writes in it count as loop writes.
-        this.frame().enterLoop();
-        this.frame().enterLoopCondition();
-        Type condition = this.analyzeExpression(node.condition());
-        this.frame().leaveLoopCondition();
-        this.frame().leaveLoop();
-        this.checkConditionIsBool(condition, "while", node.condition());
-        let facts = new List<NarrowingFact>();
-        narrowing.collectNarrowings(this, node.condition(), true, facts);
-        bool alwaysTrue = this.conditionIsAlwaysTrue(node.condition());
-        let postCondition = this.assignment().snapshot();
-        this.assignment().beginLoop();
-        this.frame().enterLoop();
-        narrowing.walkBranch(this, node.body(), facts);
-        this.frame().leaveLoop();
-        let exits = this.assignment().endLoop();
-        if (!alwaysTrue) {
-            exits.push(postCondition);
-        }
-        this.assignment().finishLoop(exits);
-    }
-
-    checkForStatement(ForStatementNode node) {
-        this.enterScope();
-        let initializer = node.initializer();
-        if (initializer != null) {
-            switch (initializer) {
-                is VariableDeclarationNode declaration -> {
-                    this.checkVariableDeclaration(declaration);
-                },
-                is ExpressionStatementNode expression -> {
-                    this.analyzeExpression(expression.expression());
-                },
-                default -> { },
-            }
-        }
-        narrowing.preClearLoopBodyWrites(this, node.body());
-        let update = node.update();
-        if (update != null) {
-            narrowing.preClearLoopBodyWrites(this, update);
-        }
-        let facts = new List<NarrowingFact>();
-        let condition = node.condition();
-        bool alwaysTrue = false;
-        if (condition != null) {
-            // The condition re-evaluates every iteration, so writes in it count as loop writes.
-            this.frame().enterLoop();
-            this.frame().enterLoopCondition();
-            Type conditionType = this.analyzeExpression(condition);
-            this.frame().leaveLoopCondition();
-            this.frame().leaveLoop();
-            this.checkConditionIsBool(conditionType, "for", condition);
-            narrowing.collectNarrowings(this, condition, true, facts);
-            alwaysTrue = this.conditionIsAlwaysTrue(condition);
-        }
-        let postCondition = this.assignment().snapshot();
-        this.assignment().beginLoop();
-        this.frame().enterLoop();
-        this.enterScope();
-        narrowing.applyFacts(this, facts);
-        this.walkBlock(node.body());
-        if (update != null) {
-            this.assignment().setUnconditionalPosition(true);
-            bool outerStatements = this.frame().statementsAllowed();
-            this.frame().setStatementsAllowed(false);
-            this.analyzeExpression(update);
-            this.frame().setStatementsAllowed(outerStatements);
-        }
-        this.leaveScope();
-        this.frame().leaveLoop();
-        let exits = this.assignment().endLoop();
-        if (condition != null && !alwaysTrue) {
-            exits.push(postCondition);
-        }
-        this.assignment().finishLoop(exits);
-        this.leaveScope();
-    }
-
-    // The loop needs an array or a value whose type implements 'Iterable<T>', proven non-null; the
-    // element binding takes its annotated type when one is written and the element type otherwise.
-    checkForEachStatement(ForEachStatementNode node) {
-        this.enterScope();
-        Type iterable = this.analyzeExpression(node.iterable());
-        Type element = this.store().errorType();
-        if (!(iterable is ErrorType)) {
-            if (iterable is OptionalType) {
-                this.reporter().report(nullguidance.maybeNullRefusal(this, "'for (... in ...)' cannot "
-                    + "iterate '{this.names().of(iterable)}' because it", node.iterable(), iterable),
-                    node.iterable().span());
-            } else if (iterable is ArrayType) {
-                element = iterable.element();
-            } else if (types.isClassLike(iterable) || types.isStructLike(iterable)) {
-                element = this.iterableElementType(iterable, node.declaredType(), node.iterable().span());
-            } else if (iterable is StringType) {
-                this.reporter().report("A 'string' cannot be iterated directly. "
-                    + stringWalkAdvice(node.iterable()), node.iterable().span());
-            } else {
-                this.reporter().report("'for (... in ...)' needs an array or an iterable value, but "
-                    + "{wording.sideNamed(node.iterable(), "the value it walks")} has type "
-                    + "'{this.names().of(iterable)}'. A class or a struct is iterable when it implements "
-                    + "'Iterable<T>' from '@std.collections.iterator'.", node.iterable().span());
-            }
-        }
-        Type bindingType = element;
-        let declaredType = node.declaredType();
-        if (declaredType != null) {
-            Type declared = this.resolver().resolveType(declaredType);
-            if (!(declared is ErrorType) && !(element is ErrorType)
-                    && !convert.isAssignableStrict(declared, element)) {
-                string conformance = nullguidance.valueConformanceHint(declared, element, this.names());
-                // The conformance explanation ends with its own suggestion, which names the
-                // same type the general one would.
-                string fix = "";
-                if (conformance.length == 0) {
-                    fix = " Declare it as '{this.names().of(element)} {node.name().text()}', or with a wider "
-                        + "type.";
-                }
-                this.reporter().report("Loop variable '{node.name().text()}' has type "
-                    + "'{this.names().of(declared)}', but this loop gives it '{this.names().of(element)}' "
-                    + "values.{conformance}{fix}", declaredType.span());
-            }
-            bindingType = declared;
-        }
-        bool isConst = false;
-        let keyword = node.letKeyword();
-        if (keyword != null && keyword.kind() == SyntaxKind.ConstKeyword) {
-            isConst = true;
-        }
-        let binding = new LocalBinding(node.name().text(), bindingType, BindingKind.Variable,
-            isConst, node.name().span());
-        if (isConst && declaredType == null) {
-            this.untypedConstantLocals.push(binding);
-        }
-        let current = this.scope;
-        if (current != null) {
-            current.define(binding);
-        }
-        this.result().setBinding(node.green(), binding);
-        let entry = this.assignment().snapshot();
-        this.assignment().trackLocal(binding, assigned: true);
-        this.assignment().beginLoop();
-        this.frame().enterLoop();
-        narrowing.preClearLoopBodyWrites(this, node.body());
-        this.walkScopedBlock(node.body());
-        this.frame().leaveLoop();
-        let exits = this.assignment().endLoop();
-        exits.push(entry);
-        this.assignment().finishLoop(exits);
-        this.leaveScope();
-    }
-
-    // The element type a value yields in a for-in loop. Iteration is nominal: the type must
-    // implement 'Iterable<T>' from '@std.collections.iterator', directly or through an
-    // interface extending it, and for a class a base class's conformance counts. A value whose
-    // own type is 'Iterable<T>' or a sub-interface of it iterates too, and so does a struct that
-    // declares the conformance, whose 'makeIterator' is then a direct call.
-    iterableElementType(Type core, TypeNode? declaredElement, Span span) -> Type {
-        for (let level in hierarchy.conformanceLadderOf(core)) {
-            let found = iterableArgument(level);
-            if (found != null) {
-                return found;
-            }
-        }
-        string element = "E";
-        string gloss = ", where 'E' is the type of its elements";
-        if (declaredElement != null) {
-            element = wording.greenSpelling(declaredElement.green());
-            gloss = "";
-        }
-        string shown = this.names().of(core);
-        string kind = "class";
-        if (types.isStructLike(core)) {
-            kind = "struct";
-        }
-        let declared = types.authorityOf(core);
-        if (declared != null) {
-            shown = declared.name();
-        }
-        this.reporter().report("'{this.names().of(core)}' cannot be used in 'for (... in ...)', because it "
-            + "does not implement 'Iterable' from '@std.collections.iterator'. Declare '{kind} {shown} "
-            + "implements Iterable<{element}>' and give it the method 'override makeIterator() -> "
-            + "Iterator<{element}>'{gloss}.",
-            span);
-        return this.store().errorType();
-    }
-
-    checkReturnStatement(ReturnStatementNode node) {
-        if (this.frame().currentNoreturn()) {
-            this.reporter().report("{this.frame().currentReturnSubject()} is 'noreturn', so it never "
-                + "returns and cannot contain 'return'. Throw, call 'panic' or call another 'noreturn' "
-                + "function instead.", node.returnKeyword().span());
-            let returned = node.value();
-            if (returned != null) {
-                this.analyzeExpression(returned);
-            }
-            return;
-        }
-        let expected = this.frame().currentReturnType();
-        if (expected == null) {
-            string place = "outside any of them";
-            let field = this.frame().fieldDefaultName();
-            if (field != null) {
-                place = "in the default value of field '{field}'";
-            }
-            this.reporter().report("'return' can only be used inside the body of a function, a method or a "
-                + "lambda, and this one is {place}. Remove it.", node.returnKeyword().span());
-            let ignored = node.value();
-            if (ignored != null) {
-                this.analyzeExpression(ignored);
-            }
-            return;
-        }
-        let value = node.value();
-        if (value == null) {
-            if (!types.isVoidType(expected)) {
-                this.reporter().report("{this.frame().currentReturnSubject()} returns "
-                    + "'{this.names().of(expected)}', but this 'return' has no value. "
-                    + "Write the value after 'return', as in 'return ...;'.", node.returnKeyword().span());
-            }
-            return;
-        }
-        LiteralOrigin? origin = null;
-        let returnOrigin = this.frame().currentReturnOrigin();
-        if (returnOrigin != null) {
-            origin = literalfixes.valueOrigin(this, OriginKind.Returned, returnOrigin.name(), expected, value,
-                node);
-        }
-        Type actual = this.analyzeExpressionAdapt(value, expected, origin);
-        if (types.isVoidType(expected)) {
-            string refusal = "{this.frame().currentReturnSubject()} returns nothing, so this 'return' cannot "
-                + "have a value.";
-            bool spelled = !(actual is ErrorType) && !(actual is NullType) && !types.isVoidType(actual)
-                && this.names().canSpell(actual);
-            if (this.frame().currentReturnHeader().length > 0 && spelled) {
-                refusal = "{refusal} Write 'return;', or declare a return type, as in "
-                    + "'{this.frame().currentReturnHeader()} -> {this.names().of(actual)}'.";
-            } else if (this.frame().currentReturnHeader().length > 0) {
-                refusal = "{refusal} Write 'return;', or declare a return type.";
-            } else {
-                refusal = "{refusal} Write 'return;'.";
-            }
-            this.reporter().report(refusal, value.span());
-            return;
-        }
-        if (!convert.isAssignableStrict(expected, actual)) {
-            this.reporter().report("{this.frame().currentReturnSubject()} returns "
-                + "'{this.names().of(expected)}', but this value has type '{this.names().of(actual)}'."
-                + "{nullguidance.valueAssignabilityHint(this, expected, actual, value)}", value.span());
-        }
-    }
-
-    // A type parameter qualifies as a thrown type through a class bound under 'Error', the active
-    // constraint scope included.
-    checkThrowStatement(ThrowStatementNode node) {
-        Type thrown = this.analyzeExpression(node.value());
-        if (thrown is ErrorType) {
-            return;
-        }
-        let errorClass = this.resolver().errorClass();
-        if (thrown is TypeParamType) {
-            if (errorClass == null || !hierarchy.isAlwaysSubclassOfUnder(thrown, errorClass,
-                    this.resolver().activeConstraintOwner(), this.resolver().activeConstraints())) {
-                string parameter = this.names().of(thrown);
-                string where = "where '{parameter}' is declared";
-                if (thrown.ownerName().length > 0) {
-                    where = "in '{thrown.ownerName()}'";
-                }
-                this.reporter().report("Cannot throw {wording.sideNamed(node.value(), "this value")}, "
-                    + "because its type '{parameter}' is a type parameter without the bound 'Error'. Declare "
-                    + "it as '<{parameter}: Error>' {where}.", node.value().span());
-            }
-            return;
-        }
-        bool allowed = errorClass != null && types.isClassLike(thrown)
-            && hierarchy.isSubclassOf(thrown, errorClass);
-        if (!allowed) {
-            this.reporter().report("Cannot throw a value of type '{this.names().of(thrown)}'. Only an "
-                + "'Error', or an object of a subclass of 'Error', can be thrown.", node.value().span());
-        }
-    }
-
-    // Refuses the condition 'node' of the statement or operator 'what' unless it is a 'bool'.
-    public checkConditionIsBool(Type condition, string what, Expression node) {
-        if (!(condition is ErrorType) && !convert.isBoolType(condition)) {
-            this.reporter().report("The condition of this '{what}' must be a 'bool', but "
-                + "{wording.sideNamed(node, "the condition")} has type '{this.names().of(condition)}'.",
-                node.span());
         }
     }
 
@@ -3389,18 +2920,6 @@ isNullLabel(Expression label) -> bool {
     return label is LiteralExpressionNode && label.value().kind() == SyntaxKind.NullKeyword;
 }
 
-// The two walks over a string, spelled against the expression the loop was given when that
-// expression is simple enough to quote and against the string itself when it is not.
-stringWalkAdvice(Expression iterated) -> string {
-    let spelling = wording.simpleSpelling(iterated);
-    if (spelling == null) {
-        return "Iterate its 'chars()' to visit its characters, or its 'bytes()' to visit its "
-            + "bytes.";
-    }
-    return "Iterate '{spelling}.chars()' to visit its characters, or '{spelling}.bytes()' to "
-        + "visit its bytes.";
-}
-
 typeParameterNamesText(Signature signature) -> string {
     string text = "";
     let parameters = signature.typeParameters();
@@ -3642,20 +3161,6 @@ fillLoopBodyMatches(BlockNode body, string arrayName, string indexName) -> bool 
         }
     }
     return false;
-}
-
-// The element type argument when the type is an 'Iterable<T>' instantiation from
-// '@std.collections.iterator'.
-iterableArgument(Type candidate) -> Type? {
-    if (candidate is InstantiationType) {
-        let template = candidate.template();
-        if (template is InterfaceType && template.name() == "Iterable"
-                && template.modulePath() == "std.collections.iterator"
-                && candidate.arguments().length > 0) {
-            return candidate.arguments()[0];
-        }
-    }
-    return null;
 }
 
 // A recovery arm is dropped: the parser could not read what was written there, so there is nothing
