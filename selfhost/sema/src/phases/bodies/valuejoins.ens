@@ -1,0 +1,813 @@
+// The '?:' and '??' expressions, and the joins in which the values of a '?:', a switch or an array
+// literal take one type: their literals, the ranges a literal may not fit, and the refusals held
+// until the whole join is analyzed.
+import Expression from @ens.frontend.syntax.generated.nodes;
+import SwitchExpressionNode from @ens.frontend.syntax.generated.nodes;
+import LambdaExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ArmBody from @ens.frontend.syntax.generated.nodes;
+import LiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
+import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
+import BinaryExpressionNode from @ens.frontend.syntax.generated.nodes;
+import PrefixExpressionNode from @ens.frontend.syntax.generated.nodes;
+import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import TernaryExpressionNode from @ens.frontend.syntax.generated.nodes;
+import NullCoalesceExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ParenthesizedExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ArrayLiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SyntaxKind from @ens.frontend.syntax.generated.kind;
+import GreenNode from @ens.frontend.syntax.green;
+import Span from @ens.frontend.support.source;
+import model.convert;
+import model.literalvalues;
+import OriginKind from phases.bodies.literaltargets;
+import LiteralOrigin from phases.bodies.literaltargets;
+import PendingLiteralRange from phases.bodies.literaltargets;
+import Widening from phases.bodies.literaltargets;
+import JoinFailure from phases.bodies.literaltargets;
+import HeldMismatch from phases.bodies.literaltargets;
+import JoinScope from phases.bodies.literaltargets;
+import JoinText from phases.bodies.literaltargets;
+import DeferredLiteralFix from phases.bodies.literaltargets;
+import phases.bodies.literaltyping;
+import phases.bodies.nullguidance;
+import phases.bodies.wording;
+import phases.bodies.narrowing;
+import Type from model.types;
+import ErrorType from model.types;
+import OptionalType from model.types;
+import PrimitiveType from model.types;
+import PrimitiveKind from model.types;
+import List from @std.collections.list;
+import phases.bodies;
+import BodyChecker from phases.bodies;
+
+public recordLiteralRange(BodyChecker checker, LiteralExpressionNode node, PrimitiveType defaultType) {
+    string text = node.value().text();
+    if (convert.isIntegerType(defaultType)) {
+        let magnitude = literalvalues.integerMagnitude(text);
+        if (magnitude != null && literalvalues.magnitudeFits(false, magnitude, defaultType.kind())) {
+            return;
+        }
+        ulong value = 0;
+        bool parsed = magnitude != null;
+        if (magnitude != null) {
+            value = magnitude;
+        }
+        checker.targets().pendingLiteralRanges().push(new PendingLiteralRange(node.green(), node.span(),
+            defaultType, text, false, parsed, value));
+        return;
+    }
+    if (literalvalues.floatMagnitudeFits(literalvalues.floatMagnitude(text), defaultType.kind())) {
+        return;
+    }
+    checker.targets().pendingLiteralRanges().push(new PendingLiteralRange(node.green(), node.span(),
+        defaultType, text, false, false, 0));
+}
+
+// A sign is a prefix outside the literal, and it moves the integer boundary: the
+// magnitude 2147483648 is not an 'int' on its own but -2147483648 is. The pending entry
+// moves up to the prefix so adaptation and the diagnostic both cover the whole value.
+public retargetLiteralRange(BodyChecker checker, PrefixExpressionNode outer, Expression operand,
+                            bool negative) {
+    let ranges = checker.targets().pendingLiteralRanges();
+    if (ranges.length() == 0) {
+        return;
+    }
+    let pending = ranges.get(ranges.length() - 1);
+    if (pending.green() != operand.green()) {
+        return;
+    }
+    if (negative && pending.parsed() && literalvalues.magnitudeFits(true, pending.magnitude(),
+            pending.defaultType().kind())) {
+        ranges.pop();
+        return;
+    }
+    pending.moveTo(outer.green(), outer.span(), negative);
+}
+
+public reportPendingLiteralRanges(BodyChecker checker) {
+    for (let pending in checker.targets().pendingLiteralRanges()) {
+        // Retyped by a target-typed position, which already judged the value there.
+        let finalType = checker.result().typeOf(pending.green());
+        if ((finalType != null && finalType != pending.defaultType())
+                || isCoveredLiteral(checker, pending.green())) {
+            continue;
+        }
+        string sign = "";
+        if (pending.negative()) {
+            sign = "-";
+        }
+        string typeName = checker.names().of(pending.defaultType());
+        if (convert.isIntegerType(pending.defaultType())) {
+            string written = "{sign}{pending.text()}";
+            string wider = literaltyping.widerIntegerHolding(pending.negative(), pending.magnitude(),
+                pending.defaultType().kind());
+            if (!pending.parsed() || wider.length == 0) {
+                checker.reporter().report(literaltyping.beyondEveryInteger(written, pending.negative()),
+                    pending.span());
+            } else {
+                string refusal = literaltyping.integerPastRange(written, pending.negative(),
+                    pending.defaultType().kind(), typeName);
+                checker.reporter().report(
+                    "{refusal} {literaltyping.typedLiteralFix(written, pending.text(), wider)}",
+                    pending.span());
+            }
+        } else {
+            double magnitude = literalvalues.floatMagnitude(pending.text());
+            string suffix = pending.text().substring(pending.text().length - 1);
+            string fix = pending.fix();
+            if (fix.length == 0) {
+                fix = "Remove the '{suffix}' from '{sign}{pending.text()}'.";
+            }
+            checker.reporter().report(literaltyping.floatTooLarge("{sign}{pending.text()}", magnitude,
+                pending.defaultType().kind(), fix), pending.span());
+        }
+    }
+    checker.targets().resetPendingLiteralRanges();
+}
+
+// Reports the literals of the join 'root' that did not fit the type they were given, once, at the
+// first of them: with the type that takes every literal and every integer value of the join.
+reportJoinFailures(BodyChecker checker, Expression root) {
+    let failures = checker.targets().joinFailures();
+    if (failures.length() == 0) {
+        return;
+    }
+    JoinFailure? uncovered = null;
+    for (let failure in failures) {
+        if (uncovered == null && !coversSpan(checker, root, failure.span())) {
+            uncovered = failure;
+        }
+    }
+    if (uncovered == null) {
+        return;
+    }
+    let first = uncovered;
+    let literal = first.literal();
+    let beside = first.beside();
+    let toward = first.toward();
+    if (literal != null && beside != null && toward != null) {
+        reportArrayJoinLiteral(checker, root, first, literal, beside, toward);
+        return;
+    }
+    PrimitiveKind kind = first.target().kind();
+    let widening = joinFailureWidening(checker, root, first);
+    let literals = widening.literals() ?? new List<Expression>();
+    let values = new List<Expression>();
+    collectJoinValues(root, values, true);
+    Expression? source = null;
+    for (let value in values) {
+        Type core = convert.coreOf(checker.recordedType(value));
+        if (source == null && core is PrimitiveType && core.kind() == kind) {
+            source = value;
+        }
+    }
+    let origin = first.origin();
+    bool negativeUnsigned = (widening.negative() || widening.lowNegative()) && bodies.isUnsignedKind(kind);
+    string fix = "";
+    if (origin != null && !negativeUnsigned) {
+        fix = checker.literalFix(origin, widening);
+    } else if (origin == null && source != null && !first.besideLiteral()) {
+        Expression typed = wording.unwrapParentheses(source);
+        string named = wording.oneLineSpelling(typed);
+        string why = wording.takesTypeFrom("'{named}'", checker.names().of(first.target()));
+        fix = why;
+        if (widening.wider().length > 0) {
+            string converted = wording.converted(typed, widening.wider());
+            string? example = null;
+            if (!(root is ArrayLiteralExpressionNode)) {
+                example = armExample(root, typed.green(), converted);
+            }
+            if (example == null) {
+                let changed = new List<GreenNode>();
+                for (let value in values) {
+                    Type core = convert.coreOf(checker.recordedType(value));
+                    if (core is PrimitiveType && core.kind() == kind) {
+                        changed.push(wording.unwrapParentheses(value).green());
+                    }
+                }
+                example = spelledConverting(root, changed, widening.wider());
+            }
+            fix = "{why} Convert '{named}' first ('{example}').";
+        }
+    } else if (origin == null && widening.wider().length > 0) {
+        fix = literaltyping.typedLiteralFix(first.written(), first.text(), widening.wider());
+    }
+    string refusal = literaltyping.integerPastRange(first.written(), first.negative(), kind,
+        checker.names().of(first.target()));
+    if (fix.length > 0) {
+        refusal = "{refusal} {fix}";
+    }
+    checker.reporter().report(refusal, first.span());
+    for (let literal in literals) {
+        if (literal.span().start != first.span().start
+                || isPendingLiteral(checker.targets().pendingLiteralRanges(), literal)) {
+            checker.targets().coveredLiterals().push(literal.green());
+        }
+    }
+}
+
+// Reports the literal 'first' of the array literal 'root', which takes its type 'toward' from
+// 'beside', with the fix that converts every value of that type in the array.
+reportArrayJoinLiteral(BodyChecker checker, Expression root, JoinFailure first, Expression literal,
+                       Expression beside, Type toward) {
+    if (first.target().kind() == PrimitiveKind.Float) {
+        reportArrayJoinFloat(checker, root, first, literal, beside, toward);
+        return;
+    }
+    let widening = checker.joinWidening(literal, toward, root);
+    if (widening == null) {
+        return;
+    }
+    string into = checker.conversionType(first.fixTarget(), widening);
+    string written = checker.arrayConverted(root, toward, into);
+    let text = checker.joinFix(beside, toward, written, "", first.fixTarget(), first.fixOrigin(), root,
+        widening);
+    checker.reporter().report(bodies.integerTooLarge(first.written(), widening, text.fix()), first.span());
+    let literals = widening.literals() ?? new List<Expression>();
+    for (let other in literals) {
+        if (other.span().start != first.span().start) {
+            checker.targets().coveredLiterals().push(other.green());
+        }
+    }
+}
+
+// reportArrayJoinLiteral for a literal too large for 'float', which the fix converts every 'float'
+// value of the array for. The other literals of the array are covered by the same fix.
+reportArrayJoinFloat(BodyChecker checker, Expression root, JoinFailure first, Expression literal,
+                     Expression beside, Type toward) {
+    let widening = floatWidening();
+    string into = checker.conversionType(first.fixTarget(), widening);
+    string written = checker.arrayConverted(root, toward, into);
+    let text = checker.joinFix(beside, toward, written, "", first.fixTarget(), first.fixOrigin(), root,
+        widening);
+    double magnitude = 0.0;
+    let parsed = literaltyping.floatLiteralOf(literal);
+    if (parsed != null) {
+        magnitude = literalvalues.floatMagnitude(parsed.value().text());
+    }
+    checker.reporter().report(literaltyping.floatTooLarge(first.written(), magnitude, PrimitiveKind.Float,
+        text.fix()), first.span());
+}
+
+// The widening of the first kept literal 'first' of the join 'root': every literal of the join and
+// the type that takes them and every integer value of the join.
+joinFailureWidening(BodyChecker checker, Expression root, JoinFailure first) -> Widening {
+    PrimitiveKind kind = first.target().kind();
+    let literals = new List<Expression>();
+    collectJoinLiterals(root, literals, true);
+    let values = new List<Expression>();
+    collectJoinValues(root, values, true);
+    let widening = new Widening(kind, checker.names().of(first.target()), "", first.negative(),
+        first.magnitude());
+    widening.setJoined(true);
+    spanJoinLiterals(widening, literals);
+    let kinds = new List<PrimitiveKind>();
+    for (let value in values) {
+        Type core = convert.coreOf(checker.recordedType(value));
+        if (core is PrimitiveType && convert.isIntegerType(core)) {
+            kinds.push(core.kind());
+        }
+    }
+    widening.setWider(commonIntegerHolding(kind, kinds.toArray(), widening));
+    return widening;
+}
+
+// Keeps with the literals of the join 'root' each literal of it that nothing gave a type to and
+// that is too large for the type it falls back to, in source order.
+keepPendingJoinLiterals(BodyChecker checker, Expression root) {
+    let literals = new List<Expression>();
+    collectJoinLiterals(root, literals, true);
+    for (let pending in checker.targets().pendingLiteralRanges()) {
+        let finalType = checker.result().typeOf(pending.green());
+        if (!pending.parsed() || !convert.isIntegerType(pending.defaultType())
+                || (finalType != null && finalType != pending.defaultType())) {
+            continue;
+        }
+        for (let literal in literals) {
+            if (literal.green() == pending.green()) {
+                let failure = new JoinFailure(pending.span(),
+                    "{pending.negative() ? "-" : ""}{pending.text()}", pending.text(), pending.negative(),
+                    pending.magnitude(), pending.defaultType(), null);
+                failure.setBesideLiteral(true);
+                insertJoinFailure(checker, failure);
+            }
+        }
+    }
+}
+
+// Adds 'failure' to the literals the current join kept, in source order.
+insertJoinFailure(BodyChecker checker, JoinFailure failure) {
+    let ordered = new List<JoinFailure>();
+    bool placed = false;
+    for (let kept in checker.targets().joinFailures()) {
+        if (!placed && failure.span().start < kept.span().start) {
+            ordered.push(failure);
+            placed = true;
+        }
+        ordered.push(kept);
+    }
+    if (!placed) {
+        ordered.push(failure);
+    }
+    checker.targets().setJoinFailures(ordered);
+}
+
+// Whether a literal of the join 'root' that starts where 'span' does is already covered by a fix.
+coversSpan(BodyChecker checker, Expression root, Span span) -> bool {
+    let literals = new List<Expression>();
+    collectJoinLiterals(root, literals, true);
+    for (let literal in literals) {
+        if (literal.span().start == span.start && isCoveredLiteral(checker, literal.green())) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Whether the literal belongs to a join already refused with a fix that covers it.
+public isCoveredLiteral(BodyChecker checker, GreenNode green) -> bool {
+    for (let covered in checker.targets().coveredLiterals()) {
+        if (covered == green) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Records the literals 'fix' covers besides 'reported', the one its refusal is reported at.
+public coverJoinLiterals(BodyChecker checker, JoinText fix, Expression reported) {
+    let covered = fix.covered();
+    if (covered == null) {
+        return;
+    }
+    for (let literal in covered) {
+        if (literal.green() != wording.unwrapParentheses(reported).green()) {
+            checker.targets().coveredLiterals().push(literal.green());
+        }
+    }
+}
+
+public analyzeTernary(BodyChecker checker, TernaryExpressionNode node, Type? target,
+                      LiteralOrigin? origin = null) -> Type {
+    let scope = checker.targets().beginJoin(node, false);
+    Type analyzed = analyzeTernaryValues(checker, node, target, origin);
+    endJoin(checker, node, scope);
+    return analyzed;
+}
+
+// Keeps the refusal 'message' of a value of the current join until the join ends, when the
+// refusal of a literal of the join covers it, or reports it outside every join.
+public holdMismatch(BodyChecker checker, string message, Span span) {
+    if (checker.targets().joinRoot() == null) {
+        checker.reporter().report(message, span);
+        return;
+    }
+    checker.targets().joinMismatches().push(new HeldMismatch(message, span));
+}
+
+// Ends the join 'join' began with 'scope', reporting the literals it kept when it is outermost.
+public endJoin(BodyChecker checker, Expression join, JoinScope scope) {
+    if (scope.created()) {
+        keepPendingJoinLiterals(checker, join);
+        reportJoinFailures(checker, join);
+        if (checker.targets().joinFailures().length() == 0) {
+            for (let mismatch in checker.targets().joinMismatches()) {
+                checker.reporter().report(mismatch.message(), mismatch.span());
+            }
+        }
+    }
+    checker.targets().endJoin(scope);
+}
+
+// Marks 'value' as the next value of the current join, when it is a join itself, or with 'arrays'
+// an array literal, which the elements of an array literal share their join with.
+public noteJoinValue(BodyChecker checker, Expression value, bool arrays = false) {
+    Expression core = wording.unwrapParentheses(value);
+    if (nullguidance.isJoin(core) || (arrays && core is ArrayLiteralExpressionNode)) {
+        checker.targets().setJoinChild(core.green());
+    }
+}
+
+analyzeTernaryValues(BodyChecker checker, TernaryExpressionNode node, Type? target,
+                     LiteralOrigin? origin) -> Type {
+    Type? fixTarget = target;
+    LiteralOrigin? fixOrigin = origin;
+    if (target == null && checker.targets().joinNode() == node.green()) {
+        fixTarget = checker.targets().joinTarget();
+        fixOrigin = checker.targets().joinOrigin();
+    }
+    checker.targets().clearStash();
+    Type condition = checker.analyzeExpression(node.condition());
+    Expression thenValue = node.thenValue();
+    Expression elseValue = node.elseValue();
+    // A number literal beside a branch with a type of its own takes that branch's type when it
+    // is one of the literal's family, so it is analyzed without the target first.
+    bool thenJoins = isUntypedNumberLiteral(thenValue) && !isUntypedNumberLiteral(elseValue);
+    bool elseJoins = isUntypedNumberLiteral(elseValue) && !isUntypedNumberLiteral(thenValue);
+    Type? thenTarget = target;
+    if (thenJoins) {
+        thenTarget = null;
+    }
+    Type? elseTarget = target;
+    if (elseJoins) {
+        elseTarget = null;
+    }
+    if (thenTarget == null) {
+        checker.targets().stash(thenValue, fixTarget, fixOrigin);
+    }
+    let outerDeferred = checker.targets().deferredFixes();
+    let thenDeferred = new List<DeferredLiteralFix>();
+    checker.targets().setDeferredFixes(thenDeferred);
+    noteJoinValue(checker, thenValue);
+    Type thenType = narrowing.analyzeGuardedBranch(checker, node.condition(), thenValue, true, thenTarget,
+        origin);
+    checker.targets().clearStash();
+    if (elseTarget == null) {
+        checker.targets().stash(elseValue, fixTarget, fixOrigin);
+    }
+    let elseDeferred = new List<DeferredLiteralFix>();
+    checker.targets().setDeferredFixes(elseDeferred);
+    noteJoinValue(checker, elseValue);
+    Type elseType = narrowing.analyzeGuardedBranch(checker, node.condition(), elseValue, false, elseTarget,
+        origin);
+    checker.targets().clearStash();
+    checker.targets().setDeferredFixes(outerDeferred);
+    checker.settleDeferred(thenDeferred, elseValue, elseType, "the other branch");
+    checker.settleDeferred(elseDeferred, thenValue, thenType, "the other branch");
+    checker.checkConditionIsBool(condition, "?:", node.condition());
+    if (thenType is ErrorType || elseType is ErrorType) {
+        return checker.store().errorType();
+    }
+    checker.noteSuffixedBranch(node, true, elseType, fixTarget, fixOrigin);
+    checker.noteSuffixedBranch(node, false, thenType, fixTarget, fixOrigin);
+    if (target != null && thenJoins && !joinsLiteral(thenValue, elseType)) {
+        thenType = checker.adaptIntegerLiteral(thenValue, target, origin)
+            ?? checker.adaptFloatLiteral(thenValue, target, origin) ?? thenType;
+    }
+    if (target != null && elseJoins && !joinsLiteral(elseValue, thenType)) {
+        elseType = checker.adaptIntegerLiteral(elseValue, target, origin)
+            ?? checker.adaptFloatLiteral(elseValue, target, origin) ?? elseType;
+    }
+    JoinText? thenFix = checker.ternaryFix(node, true, elseType, fixTarget, fixOrigin);
+    JoinText? elseFix = checker.ternaryFix(node, false, thenType, fixTarget, fixOrigin);
+    checker.targets().setBesideLiteral(isUntypedNumberLiteral(elseValue));
+    Type adaptedThen = checker.adaptIntegerLiteral(thenValue, elseType, null, thenFix)
+        ?? checker.adaptFloatLiteral(thenValue, elseType, null, thenFix) ?? thenType;
+    checker.targets().setBesideLiteral(isUntypedNumberLiteral(thenValue));
+    Type adaptedElse = checker.adaptIntegerLiteral(elseValue, thenType, null, elseFix)
+        ?? checker.adaptFloatLiteral(elseValue, thenType, null, elseFix) ?? elseType;
+    checker.targets().setBesideLiteral(false);
+    thenType = adaptedThen;
+    elseType = adaptedElse;
+    if (thenType is ErrorType || elseType is ErrorType) {
+        return checker.store().errorType();
+    }
+    let unified = convert.unifyValueTypes(thenType, elseType, checker.store());
+    if (unified != null) {
+        return unified;
+    }
+    holdMismatch(checker, "The two results of this '?:' are '{checker.names().of(thenType)}' and "
+        + "'{checker.names().of(elseType)}', which have no common type. Give both branches the "
+        + "same type.", node.span());
+    return checker.store().errorType();
+}
+
+// '??' is a presence test on the left's declared storage type, so a binding declared
+// optional keeps it legal even after narrowing proved the value non-null; the check is
+// then constant and yields the value.
+public analyzeNullCoalesce(BodyChecker checker, NullCoalesceExpressionNode node) -> Type {
+    Type left = checker.analyzeExpression(node.left());
+    if (!(left is ErrorType)) {
+        left = narrowing.presenceOperandType(checker, node.left(), left);
+    }
+    bool previous = checker.assignment().unconditionalPosition();
+    checker.assignment().setUnconditionalPosition(false);
+    // The fallback takes the type the left side has without its '?', as an assigned value takes
+    // the type of the place it is assigned to.
+    Type right;
+    if (left is OptionalType) {
+        LiteralOrigin? origin = null;
+        if (mayAdaptLiteral(node.right())) {
+            origin = new LiteralOrigin(OriginKind.Fallback, wording.oneLineSpelling(node.left()), "",
+                left.inner());
+        }
+        let outerDeferred = checker.targets().deferredFixes();
+        checker.targets().setDeferredFixes(null);
+        right = checker.analyzeExpressionAdapt(node.right(), left.inner(), origin);
+        checker.targets().setDeferredFixes(outerDeferred);
+    } else {
+        right = checker.analyzeExpression(node.right());
+    }
+    checker.assignment().setUnconditionalPosition(previous);
+    if (left is ErrorType || right is ErrorType) {
+        return checker.store().errorType();
+    }
+    if (!(left is OptionalType)) {
+        string shown = checker.names().of(left);
+        let spelledLeft = wording.shortSpelling(node.left());
+        let spelledRight = wording.shortSpelling(node.right());
+        string removal = "Remove the '??' and the fallback after it";
+        if (spelledRight != null) {
+            removal = "Remove '?? {spelledRight}'";
+        }
+        Expression leftValue = wording.unwrapParentheses(node.left());
+        bool declared = leftValue is IdentifierExpressionNode || leftValue is MemberExpressionNode;
+        if (spelledLeft != null && declared) {
+            checker.reporter().report("'{spelledLeft}' has type '{shown}', which can never be null, so the "
+                + "fallback after '??' is never used. {removal}, or give '{spelledLeft}' a nullable type "
+                + "such as '{checker.names().nullableOf(left)}'.", node.span());
+        } else if (spelledLeft != null) {
+            checker.reporter().report("'{spelledLeft}' has type '{shown}', which can never be null, so the "
+                + "fallback after '??' is never used. {removal}.", node.span());
+        } else {
+            checker.reporter().report("The left side of '??' has type '{shown}', which can never be null, "
+                + "so the fallback after '??' is never used. {removal}.", node.span());
+        }
+        return checker.store().errorType();
+    }
+    Type unwrapped = left.inner();
+    if (convert.isAssignableStrict(unwrapped, right)) {
+        return unwrapped;
+    }
+    if (convert.isAssignableStrict(left, right)) {
+        return left;
+    }
+    string hint = nullguidance.valueAssignabilityHint(checker, unwrapped, right, node.right());
+    string replaced = wording.sideNamed(node.left(), "the left side");
+    string wanted = checker.names().of(unwrapped);
+    checker.reporter().report("The fallback after '??' has type '{checker.names().of(right)}', but it "
+        + "replaces {replaced} when {replaced} is null, so it must have type '{wanted}'.{hint}", node.span());
+    return checker.store().errorType();
+}
+
+// The widening of a 'float' literal too large for 'float'.
+public floatWidening() -> Widening {
+    return new Widening(PrimitiveKind.Float, "float", "double", false, 0);
+}
+
+// Whether the integer kind takes the literal of 'widening' and, for a joined one, every literal of
+// its join.
+public fitsJoinLiterals(Widening widening, PrimitiveKind kind) -> bool {
+    if (!literalvalues.magnitudeFits(widening.negative(), widening.magnitude(), kind)) {
+        return false;
+    }
+    if (!widening.joined()) {
+        return true;
+    }
+    if (widening.beyond() || !literalvalues.magnitudeFits(false, widening.high(), kind)) {
+        return false;
+    }
+    return !widening.lowNegative() || literalvalues.magnitudeFits(true, widening.low(), kind);
+}
+
+// Adds to 'found' each untyped integer literal that is a value of the join 'value', through nested
+// '?:' and switch values and, at the 'top', the elements of an array literal.
+public collectJoinLiterals(Expression value, List<Expression> found, bool top) {
+    let leaves = new List<Expression>();
+    joinLeaves(value, leaves, top);
+    for (let leaf in leaves) {
+        if (literaltyping.intLiteralOf(leaf) != null) {
+            found.push(leaf);
+        }
+    }
+}
+
+// collectJoinLiterals for the values of the join that are no untyped integer literal.
+public collectJoinValues(Expression value, List<Expression> found, bool top) {
+    let leaves = new List<Expression>();
+    joinLeaves(value, leaves, top);
+    for (let leaf in leaves) {
+        if (literaltyping.intLiteralOf(leaf) == null) {
+            found.push(leaf);
+        }
+    }
+}
+
+// Adds to 'found' each value of the join 'value' that is no join itself, through nested '?:' and
+// switch values and, at the 'top' or inside an array literal, the elements of an array literal.
+joinLeaves(Expression value, List<Expression> found, bool top) {
+    Expression core = wording.unwrapParentheses(value);
+    switch (core) {
+        is ArrayLiteralExpressionNode array -> {
+            if (!top) {
+                found.push(core);
+                return;
+            }
+            for (long i = 0; i < array.elementsCount(); i++) {
+                let element = array.elements(i);
+                joinLeaves(element, found, wording.unwrapParentheses(element) is ArrayLiteralExpressionNode);
+            }
+        },
+        is TernaryExpressionNode ternary -> {
+            joinLeaves(ternary.thenValue(), found, false);
+            joinLeaves(ternary.elseValue(), found, false);
+        },
+        is SwitchExpressionNode join -> {
+            for (let arm in bodies.armsOfExpression(join)) {
+                let body = nullguidance.armValue(arm);
+                if (body != null) {
+                    joinLeaves(body, found, false);
+                }
+            }
+        },
+        default -> {
+            found.push(core);
+        },
+    }
+}
+
+// Whether a report of 'literal' waits among 'pending', the literals nothing gave a type to.
+isPendingLiteral(List<PendingLiteralRange> pending, Expression literal) -> bool {
+    for (let range in pending) {
+        if (range.green() == literal.green()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Records on 'widening' the most negative and the largest of the literals.
+public spanJoinLiterals(Widening widening, List<Expression> literals) {
+    for (let literal in literals) {
+        let token = literaltyping.intLiteralOf(literal);
+        let magnitude = token == null ? null : literalvalues.integerMagnitude(token.value().text());
+        if (magnitude == null) {
+            widening.setBeyond(true);
+        } else if (literaltyping.isNegativeLiteral(literal)
+                && (!widening.lowNegative() || magnitude > widening.low())) {
+            widening.setLowNegative(true);
+            widening.setLow(magnitude);
+        } else if (!literaltyping.isNegativeLiteral(literal) && magnitude > widening.high()) {
+            widening.setHigh(magnitude);
+        }
+    }
+    widening.setLiterals(literals);
+}
+
+// The integer type a suggestion names for the literals of a join given the type 'from': the
+// narrowest wider one of the same signedness that takes every literal and every value of each kind
+// in 'kinds', or else the narrowest of the other signedness at least as wide. Empty when none does.
+commonIntegerHolding(PrimitiveKind from, PrimitiveKind[] kinds, Widening widening) -> string {
+    if (from == PrimitiveKind.Char) {
+        return "";
+    }
+    PrimitiveKind[] signed = [PrimitiveKind.Short, PrimitiveKind.Int, PrimitiveKind.Long];
+    PrimitiveKind[] unsigned = [PrimitiveKind.UShort, PrimitiveKind.UInt, PrimitiveKind.ULong];
+    PrimitiveKind[] same = signed;
+    PrimitiveKind[] other = unsigned;
+    if (bodies.isUnsignedKind(from)) {
+        same = unsigned;
+        other = signed;
+    }
+    long width = literaltyping.integerWidth(from);
+    for (let kind in same) {
+        if (literaltyping.integerWidth(kind) > width && takesJoin(kind, kinds, widening)) {
+            return literaltyping.primitiveKindName(kind);
+        }
+    }
+    for (let kind in other) {
+        if (literaltyping.integerWidth(kind) >= width && takesJoin(kind, kinds, widening)) {
+            return literaltyping.primitiveKindName(kind);
+        }
+    }
+    return "";
+}
+
+// Whether the integer kind takes every literal of 'widening' and every value of each kind in 'kinds'.
+takesJoin(PrimitiveKind kind, PrimitiveKind[] kinds, Widening widening) -> bool {
+    for (let inner in kinds) {
+        if (inner != kind && !holdsEveryValue(kind, inner)) {
+            return false;
+        }
+    }
+    return fitsJoinLiterals(widening, kind);
+}
+
+// The arm of a switch in the join 'value' whose value is 'leaf', written with 'replacement' as its
+// value, or null when no switch arm has that value.
+armExample(Expression value, GreenNode leaf, string replacement) -> string? {
+    Expression core = wording.unwrapParentheses(value);
+    switch (core) {
+        is SwitchExpressionNode join -> {
+            for (let arm in bodies.armsOfExpression(join)) {
+                let body = nullguidance.armValue(arm);
+                if (body != null && wording.unwrapParentheses(body).green() == leaf) {
+                    return "{wording.armHead(arm)} -> {replacement}";
+                }
+                if (body != null) {
+                    let inner = armExample(body, leaf, replacement);
+                    if (inner != null) {
+                        return inner;
+                    }
+                }
+            }
+        },
+        is TernaryExpressionNode ternary -> {
+            return armExample(ternary.thenValue(), leaf, replacement)
+                ?? armExample(ternary.elseValue(), leaf, replacement);
+        },
+        default -> { },
+    }
+    return null;
+}
+
+// The value spelled on one line with each of its parts in 'changed' converted to the type 'into'.
+public spelledConverting(Expression value, List<GreenNode> changed, string into) -> string {
+    for (let part in changed) {
+        if (wording.unwrapParentheses(value).green() == part) {
+            return wording.converted(wording.unwrapParentheses(value), into);
+        }
+    }
+    switch (value) {
+        is ParenthesizedExpressionNode inner -> {
+            return "({spelledConverting(inner.inner(), changed, into)})";
+        },
+        is TernaryExpressionNode ternary -> {
+            string then = spelledConverting(ternary.thenValue(), changed, into);
+            return "{wording.oneLineSpelling(ternary.condition())} ? {then} : "
+                + spelledConverting(ternary.elseValue(), changed, into);
+        },
+        is ArrayLiteralExpressionNode array -> {
+            string elements = "";
+            for (long i = 0; i < array.elementsCount(); i++) {
+                if (i > 0) {
+                    elements = "{elements}, ";
+                }
+                elements = elements + spelledConverting(array.elements(i), changed, into);
+            }
+            return "[{elements}]";
+        },
+        is SwitchExpressionNode join -> {
+            string arms = "";
+            for (let arm in bodies.armsOfExpression(join)) {
+                let body = nullguidance.armValue(arm);
+                string spelled = "...";
+                if (body != null) {
+                    spelled = spelledConverting(body, changed, into);
+                }
+                arms = "{arms} {wording.armHead(arm)} -> {spelled},";
+            }
+            return "switch ({wording.oneLineSpelling(join.scrutinee())}) \{{arms} \}";
+        },
+        default -> {
+            return wording.oneLineSpelling(value);
+        },
+    }
+}
+
+// Whether every value of the integer kind 'inner' is a value of the integer kind 'outer'.
+public holdsEveryValue(PrimitiveKind outer, PrimitiveKind inner) -> bool {
+    if (outer == PrimitiveKind.Char) {
+        return inner == PrimitiveKind.Char;
+    }
+    long innerWidth = literaltyping.integerWidth(inner);
+    if (inner == PrimitiveKind.Char) {
+        innerWidth = 21;
+    }
+    if (bodies.isUnsignedKind(inner) && !bodies.isUnsignedKind(outer)) {
+        return literaltyping.integerWidth(outer) > innerWidth;
+    }
+    if (!bodies.isUnsignedKind(inner) && bodies.isUnsignedKind(outer)) {
+        return false;
+    }
+    return literaltyping.integerWidth(outer) >= innerWidth;
+}
+
+// Whether the value is a number literal, or a '?:', switch, lambda, array literal or operator that
+// can contain one, under its parentheses and sign.
+public mayAdaptLiteral(Expression value) -> bool {
+    Expression core = bodies.operandCore(value);
+    if (core is LiteralExpressionNode) {
+        SyntaxKind kind = core.value().kind();
+        return kind == SyntaxKind.FloatLiteral || kind == SyntaxKind.DoubleLiteral
+            || kind == SyntaxKind.IntLiteral;
+    }
+    return core is TernaryExpressionNode || core is SwitchExpressionNode || core is LambdaExpressionNode
+        || core is ArrayLiteralExpressionNode || core is BinaryExpressionNode;
+}
+
+// Whether the untyped number literal 'literal' takes the type 'beside' has, as a floating-point
+// literal takes a floating-point type and an integer literal an integer type.
+public joinsLiteral(Expression literal, Type beside) -> bool {
+    Type core = convert.coreOf(beside);
+    if (literaltyping.floatLiteralOf(wording.unwrapParentheses(literal)) != null) {
+        return bodies.isTextualFloat(core);
+    }
+    return convert.isIntegerType(core);
+}
+
+// Whether the expression is a number literal with no suffix, which takes its type from where it
+// is used.
+public isUntypedNumberLiteral(Expression expression) -> bool {
+    Expression core = wording.unwrapParentheses(expression);
+    return literaltyping.floatLiteralOf(core) != null || literaltyping.intLiteralOf(core) != null;
+}
+
+// Whether an arm body is an expression that is not an untyped number literal.
+public isTypedArmBody(ArmBody body) -> bool {
+    if (body is Expression) {
+        return !isUntypedNumberLiteral(body);
+    }
+    return false;
+}
