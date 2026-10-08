@@ -32,7 +32,9 @@ Interface members carry no visibility of their own: they always follow the inter
 Enum cases follow their enum.
 A member may not be declared more visible than the type that contains it: an `export` method on a `public` class, or a `public` field of a file-private class, is an error, never a silent cap.
 A declaration's signature may not mention a type less visible than the declaration itself; this covers parameter types, the return type, declared thrown types, field types, a base class, implemented interfaces, and generic arguments and bounds.
-A protected member is held to the same rule at the widest scope its class can be subclassed from: the file for a `final`, `sealed`, or file-private class, the package for an open `public` class, and everywhere for an open `export` class, whose external subclassers must be able to name every type its protected members mention.
+A protected member is held to the same rule at the widest scope its class can be subclassed from: the file for a `final` or file-private class, the package for an open `public` class, and everywhere for an open `export` class, whose external subclassers must be able to name every type its protected members mention.
+For a `sealed` class, that scope is the widest one any of its subclasses can be subclassed from, and its own file at least.
+So the protected members of a sealed class whose subclasses are all `final` stay within its file, while one open `public` subclass widens them to the package.
 A `test` declaration sees its file's private top-level declarations and the unmarked members of its file-private types like any other code in the file, but not a member private to its type.
 
 ```ens
