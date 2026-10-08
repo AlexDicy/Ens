@@ -1,0 +1,616 @@
+// Checks 'new' expressions and struct construction: the constructor chosen for the call, the sizes of
+// a new array, and its element type. A canonical fill loop right after a new array proves that every
+// element is assigned.
+import Type as TypeNode from @ens.frontend.syntax.generated.nodes;
+import BlockNode from @ens.frontend.syntax.generated.nodes;
+import Expression from @ens.frontend.syntax.generated.nodes;
+import VariableDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import ForStatementNode from @ens.frontend.syntax.generated.nodes;
+import ExpressionStatementNode from @ens.frontend.syntax.generated.nodes;
+import LiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
+import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
+import BinaryExpressionNode from @ens.frontend.syntax.generated.nodes;
+import PrefixExpressionNode from @ens.frontend.syntax.generated.nodes;
+import PostfixExpressionNode from @ens.frontend.syntax.generated.nodes;
+import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ArgumentListNode from @ens.frontend.syntax.generated.nodes;
+import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SubscriptExpressionNode from @ens.frontend.syntax.generated.nodes;
+import AssignmentExpressionNode from @ens.frontend.syntax.generated.nodes;
+import NewExpressionNode from @ens.frontend.syntax.generated.nodes;
+import NamedTypeNode from @ens.frontend.syntax.generated.nodes;
+import OptionalTypeNode from @ens.frontend.syntax.generated.nodes;
+import SyntaxKind from @ens.frontend.syntax.generated.kind;
+import GreenNode from @ens.frontend.syntax.green;
+import GreenToken from @ens.frontend.syntax.green;
+import Span from @ens.frontend.support.source;
+import phases.calls;
+import CallShape from phases.calls;
+import CallCandidate from phases.calls;
+import model.capabilities;
+import model.convert;
+import DeferredLiteralFix from phases.bodies.literaltargets;
+import phases.bodies.declarations;
+import phases.bodies.identifiers;
+import phases.bodies.functioncalls;
+import ChosenParameter from phases.bodies.functioncalls;
+import BuiltShape from phases.bodies.functioncalls;
+import phases.bodies.staticmembers;
+import phases.bodies.memberaccess;
+import phases.bodies.wording;
+import model.hierarchy;
+import model.typemembers;
+import TypeNames from model.typenames;
+import model.types;
+import Type from model.types;
+import ErrorType from model.types;
+import OptionalType from model.types;
+import ClassType from model.types;
+import StructType from model.types;
+import InterfaceType from model.types;
+import InstantiationType from model.types;
+import ArrayElementObligation from phases.obligations;
+import List from @std.collections.list;
+import BodyChecker from phases.bodies;
+
+// The head this file writes for a struct a diagnostic offers to build, or null where it has
+// no spelling for it. An instantiation keeps its type arguments, which its literal and its
+// constructor call both need.
+structHead(BodyChecker checker, Type structType, string written) -> string? {
+    if (!(structType is InstantiationType)) {
+        return written;
+    }
+    if (!checker.names().canSpell(structType)) {
+        return null;
+    }
+    return checker.names().of(structType);
+}
+
+// A struct built by a call it has no constructor for. The literal is left out where this
+// file cannot set every field the literal has to set.
+reportStructWithoutConstructor(BodyChecker checker, CallExpressionNode node, Type structType, string name) {
+    string refusal = "Struct '{name}' has no constructor to call.";
+    let head = structHead(checker, structType, name);
+    string? literal = null;
+    if (head != null) {
+        literal = identifiers.structLiteralExample(checker, head, structType);
+    }
+    if (literal == null) {
+        checker.reporter().report(refusal + " Add a 'constructor(...)' to it.", node.span());
+        return;
+    }
+    checker.reporter().report(refusal + " Build it with a literal, for example '{literal}', or "
+        + "add a 'constructor(...)'.", node.span());
+}
+
+// 'new' written on a struct, which a constructor call or an aggregate literal builds instead.
+// 'written' is the head the 'new' carries.
+reportNewOnStruct(BodyChecker checker, NewExpressionNode node, Type structType, string written) {
+    string refusal = "'new' builds a class, and '{written}' is a struct.";
+    let head = structHead(checker, structType, written);
+    string route = "";
+    if (head != null) {
+        route = identifiers.structValueRoute(checker, head, structType);
+    }
+    if (route.length == 0) {
+        checker.reporter().report(refusal + " Remove 'new', and add a 'constructor(...)' to '{written}' to "
+            + "call.", node.span());
+        return;
+    }
+    checker.reporter().report("{refusal} {route}.", node.span());
+}
+
+// 'StructName(args)': a by-value struct built through its constructor. Resolution mirrors
+// class-constructor resolution (overloads, named and optional arguments) with no allocation.
+public analyzeStructConstructorCall(BodyChecker checker, CallExpressionNode node, Type structType,
+                                    string name) -> Type {
+    let arguments = node.arguments();
+    Type target = structType;
+    if (target is StructType && target.isGeneric()) {
+        let typeArguments = node.typeArguments();
+        if (typeArguments == null) {
+            checker.reporter().report(staticmembers.unshownTypeArguments("'{name}'", target.typeParameters(),
+                "{name}<", ">{functioncalls.argumentsSpelling(arguments)}",
+                staticmembers.exampleTypeArgument(arguments)), node.span());
+            functioncalls.analyzeArgumentsOnly(checker, arguments);
+            return structType;
+        }
+        target = checker.resolver().instantiateGeneric(target, name, typeArguments, node.span());
+        if (target is ErrorType) {
+            functioncalls.analyzeArgumentsOnly(checker, arguments);
+            return target;
+        }
+    }
+    checker.result().setType(node.green(), target);
+    let allConstructors = typemembers.constructorsOf(target);
+    let constructors = memberaccess.existingOnly(checker, allConstructors);
+    if (constructors.length() < allConstructors.length()
+            && memberaccess.reportUnmetConstraintCall(checker, allConstructors, constructors, arguments,
+                node.span())) {
+        functioncalls.analyzeArgumentsOnly(checker, arguments);
+        return target;
+    }
+    if (constructors.length() == 0) {
+        reportStructWithoutConstructor(checker, node, target, name);
+        functioncalls.analyzeArgumentsOnly(checker, arguments);
+        return target;
+    }
+    if (constructors.length() > 1 || functioncalls.usesNamedArguments(arguments)) {
+        let built = functioncalls.buildCallShape(checker, arguments, constructors.length() == 1);
+        let candidates = new List<CallCandidate>();
+        for (long i = 0; i < constructors.length(); i++) {
+            candidates.push(new CallCandidate(constructors.get(i).signature(),
+                constructors.get(i), memberaccess.isAccessAllowed(checker, constructors.get(i).visibility(),
+                    constructors.get(i).definingType())));
+        }
+        let resolved = calls.resolveCall(candidates, built.shape(), checker.reporter(),
+            node.span(), name, "Constructor", checker.names());
+        if (!resolved.failed()) {
+            let chosen = resolved.chosen();
+            if (chosen != null) {
+                let chosenMethod = chosen.method();
+                if (chosenMethod != null) {
+                    if (!chosen.isAccessible()) {
+                        memberaccess.checkConstructorAccess(checker, target, chosenMethod, node.span());
+                    }
+                    checker.result().setMethod(node.green(), chosenMethod);
+                }
+                functioncalls.checkResolvedArguments(checker, built, resolved, node.green());
+            }
+        }
+        return target;
+    }
+    let structConstructor = constructors.get(0);
+    memberaccess.checkConstructorAccess(checker, target, structConstructor, node.span());
+    checker.result().setMethod(node.green(), structConstructor);
+    functioncalls.checkDirectArguments(checker, "Constructor", name, structConstructor.signature(),
+        arguments, node.span(), checker.names().of(target));
+    return target;
+}
+
+// analyzeCall for a 'new' expression. The arguments of a generic type's constructor reach the
+// object it builds.
+public analyzeNew(BodyChecker checker, NewExpressionNode node) -> Type {
+    let outerDeferred = checker.targets().deferredFixes();
+    let held = new List<DeferredLiteralFix>();
+    checker.targets().setDeferredFixes(held);
+    bool outerAwaiting = checker.targets().awaitingParameter();
+    checker.targets().setAwaitingParameter(false);
+    let outerChosen = checker.targets().chosenParameters();
+    checker.targets().setChosenParameters(new List<ChosenParameter>());
+    Type created = analyzeNewOf(checker, node);
+    functioncalls.settleParameters(checker, held);
+    checker.targets().setAwaitingParameter(outerAwaiting);
+    checker.targets().setChosenParameters(outerChosen);
+    checker.targets().setDeferredFixes(outerDeferred);
+    bool generic = convert.coreOf(created) is InstantiationType;
+    functioncalls.settleArguments(checker, held, outerDeferred, new List<Span>(), generic);
+    return created;
+}
+
+analyzeNewOf(BodyChecker checker, NewExpressionNode node) -> Type {
+    let created = node.createdType();
+    if (node.dimensionsCount() > 0) {
+        return analyzeArrayNew(checker, node, created);
+    }
+    if (created is OptionalTypeNode) {
+        checker.reporter().report("'new' always produces a value, so its type cannot be nullable. Remove "
+            + "the '?'.", created.span());
+    }
+    Type t = checker.resolver().resolveType(created);
+    if (t is OptionalType) {
+        t = t.inner();
+    }
+    let arguments = node.arguments();
+    if (t is ErrorType) {
+        if (arguments != null) {
+            functioncalls.analyzeArgumentsOnly(checker, arguments);
+        }
+        return checker.store().errorType();
+    }
+    string shownName = writtenTypeName(created, t, checker.names());
+    if (!types.isClassLike(t)) {
+        if (types.isStructLike(t)) {
+            reportNewOnStruct(checker, node, t, shownName);
+        } else {
+            checker.reporter().report("'new' creates an object of a class, and '{checker.names().of(t)}' is "
+                + "not a class.", node.span());
+        }
+        if (arguments != null) {
+            functioncalls.analyzeArgumentsOnly(checker, arguments);
+        }
+        return checker.store().errorType();
+    }
+    let authority = types.authorityOf(t);
+    // A type nothing can instantiate has already been reported as such, so the constructor's
+    // own visibility is not checked: widening it would not make the type instantiable.
+    bool uninstantiable = false;
+    if (authority is InterfaceType) {
+        checker.reporter().report("Cannot create an instance of interface '{shownName}'. Create "
+            + "one of a class that implements it.", node.span());
+        uninstantiable = true;
+    } else if (authority is ClassType && authority.isAbstract()) {
+        checker.reporter().report("Cannot create an instance of abstract class '{shownName}'. "
+            + "Create one of a subclass that is not abstract.", node.span());
+        uninstantiable = true;
+    }
+    let allConstructors = typemembers.constructorsOf(t);
+    let constructors = memberaccess.existingOnly(checker, allConstructors);
+    if (constructors.length() < allConstructors.length()
+            && memberaccess.reportUnmetConstraintCall(checker, allConstructors, constructors, arguments,
+                node.span())) {
+        if (arguments != null) {
+            functioncalls.analyzeArgumentsOnly(checker, arguments);
+        }
+        return t;
+    }
+    if (allConstructors.length() == 0) {
+        let blocked = declarations.excludedImplicitBaseConstructor(checker, t);
+        if (blocked != null) {
+            string clause = declarations.excludedConstructorClause(checker, blocked,
+                declarations.currentMemberWord(checker));
+            if (clause.length > 0) {
+                string owner = checker.names().of(blocked.definingType());
+                string needs = "so it needs the zero-argument constructor of its base class '{owner}'";
+                let direct = hierarchy.baseOf(t);
+                if (direct != null && direct != blocked.definingType()) {
+                    needs = "and neither does its base class '{checker.names().of(direct)}', so it needs "
+                        + "the zero-argument constructor of '{owner}'";
+                }
+                checker.reporter().report("Cannot construct '{shownName}'. It declares no constructor, "
+                    + "{needs}. " + clause, node.span());
+                if (arguments != null) {
+                    functioncalls.analyzeArgumentsOnly(checker, arguments);
+                }
+                return t;
+            }
+        }
+    }
+    long argumentCount = 0;
+    if (arguments != null) {
+        argumentCount = arguments.argumentsCount();
+    }
+    bool named = arguments != null && functioncalls.usesNamedArguments(arguments);
+    if (constructors.length() > 1 || (constructors.length() > 0 && named)) {
+        let built = buildShapeOrEmpty(checker, arguments);
+        let candidates = new List<CallCandidate>();
+        for (long i = 0; i < constructors.length(); i++) {
+            candidates.push(new CallCandidate(constructors.get(i).signature(),
+                constructors.get(i), memberaccess.isAccessAllowed(checker, constructors.get(i).visibility(),
+                    constructors.get(i).definingType())));
+        }
+        let resolved = calls.resolveCall(candidates, built.shape(), checker.reporter(),
+            node.span(), shownName, "Constructor", checker.names());
+        if (!resolved.failed()) {
+            let chosen = resolved.chosen();
+            if (chosen != null) {
+                let chosenMethod = chosen.method();
+                if (chosenMethod != null) {
+                    if (!chosen.isAccessible() && !uninstantiable) {
+                        memberaccess.checkConstructorAccess(checker, t, chosenMethod, node.span());
+                    }
+                    checker.result().setMethod(node.green(), chosenMethod);
+                }
+                functioncalls.checkResolvedArguments(checker, built, resolved, node.green());
+            }
+        }
+    } else if (constructors.length() > 0) {
+        let classConstructor = constructors.get(0);
+        if (!uninstantiable) {
+            memberaccess.checkConstructorAccess(checker, t, classConstructor, node.span());
+        }
+        checker.result().setMethod(node.green(), classConstructor);
+        if (arguments != null) {
+            functioncalls.checkDirectArguments(checker, "Constructor", shownName,
+                classConstructor.signature(), arguments, node.span(), checker.names().of(t));
+        }
+    } else if (argumentCount > 0) {
+        checker.reporter().report("Class '{shownName}' declares no constructor, so 'new {shownName}(...)' "
+            + "takes no arguments. Write 'new {shownName}()'.", node.span());
+        if (arguments != null) {
+            functioncalls.analyzeArgumentsOnly(checker, arguments);
+        }
+    }
+    return t;
+}
+
+buildShapeOrEmpty(BodyChecker checker, ArgumentListNode? arguments) -> BuiltShape {
+    if (arguments != null) {
+        return functioncalls.buildCallShape(checker, arguments, false);
+    }
+    return new BuiltShape(new CallShape(), new List<Expression?>());
+}
+
+// 'new T[n]': every allocated slot starts as T's zero value, so T must be defaultable -
+// unless a fill loop right after the declaration proves every slot is written first, or
+// the trailing dimensions are unsized and the slots hold nullable inner arrays.
+analyzeArrayNew(BodyChecker checker, NewExpressionNode node, TypeNode created) -> Type {
+    Type element = checker.resolver().resolveType(created);
+    let sizes = new List<Expression>();
+    long unsized = 0;
+    for (long i = 0; i < node.dimensionsCount(); i++) {
+        let size = node.dimensions(i).size();
+        if (size != null && unsized == 0) {
+            sizes.push(size);
+        } else {
+            unsized++;
+        }
+    }
+    if (element is ErrorType) {
+        analyzeSizes(checker, sizes);
+        return checker.store().errorType();
+    }
+    if (types.isVoidType(element)) {
+        checker.reporter().report("Cannot create an array of 'void', because 'void' means no value.",
+            created.span());
+        analyzeSizes(checker, sizes);
+        return checker.store().errorType();
+    }
+    if (sizes.length() == 0) {
+        string shown = checker.names().of(element);
+        checker.reporter().report("'new {shown}[...]' needs at least one size. Write "
+            + "'new {shown}[size]' for one row, or 'new {shown}[size][]' for a grid whose "
+            + "rows are filled later.", node.span());
+        return checker.store().arrayOf(element);
+    }
+    Type slotElement = element;
+    if (unsized == 0) {
+        // A canonical fill loop assigns every slot whatever the element type turns out to be,
+        // so the proof holds for a type parameter as much as for a reference.
+        bool singleDimension = sizes.length() == 1;
+        bool proven = singleDimension && checker.isFillProven(node.green());
+        string fillName = "items";
+        let declared = checker.arrayNewName(node.green());
+        if (declared != null) {
+            fillName = declared;
+        }
+        if (!proven && !validateArrayElement(checker, element, created.span(), singleDimension, fillName)) {
+            analyzeSizes(checker, sizes);
+            return checker.store().errorType();
+        }
+    } else {
+        Type innerArray = element;
+        for (long i = 0; i < unsized; i++) {
+            innerArray = checker.store().arrayOf(innerArray);
+        }
+        slotElement = checker.store().optionalOf(innerArray);
+    }
+    analyzeSizes(checker, sizes);
+    Type arrayType = slotElement;
+    for (long i = 0; i < sizes.length(); i++) {
+        arrayType = checker.store().arrayOf(arrayType);
+    }
+    return arrayType;
+}
+
+analyzeSizes(BodyChecker checker, List<Expression> sizes) {
+    for (long i = 0; i < sizes.length(); i++) {
+        Type sizeType = checker.analyzeExpression(sizes.get(i));
+        if (!(sizeType is ErrorType) && !convert.isIntegerType(sizeType)) {
+            checker.reporter().report("The size of an array must be an integer, but "
+                + "{wording.sideNamed(sizes.get(i), "the size")} has type '{checker.names().of(sizeType)}'.",
+                sizes.get(i).span());
+        }
+    }
+}
+
+// An element type that mentions a type parameter settles nothing here about whether a freshly
+// allocated slot is a valid value, so the judgment waits for the concrete arguments of every
+// instantiation that occurs. The raw store is the one type where slots holding no value is
+// the point; see @std.collections.rawarray.
+validateArrayElement(BodyChecker checker, Type element, Span span, bool hasFillName, string fillName)
+                     -> bool {
+    if (element is ErrorType) {
+        return false;
+    }
+    if (convert.containsTypeParam(element)) {
+        if (!inRawStorageAllocator(checker)) {
+            checker.recordObligation(new ArrayElementObligation(element, span));
+        }
+        return true;
+    }
+    let issue = capabilities.arrayElementIssue(element, hasFillName, fillName, checker.names());
+    if (issue == null) {
+        return true;
+    }
+    checker.reporter().report(issue, span);
+    return false;
+}
+
+inRawStorageAllocator(BodyChecker checker) -> bool {
+    return checker.modulePath() == "std.collections.rawarray" && checker.obligationOwnerName() == "RawArray";
+}
+
+// Records single-dimension array-new declaration initializers (for diagnostic wording)
+// and proves the ones immediately followed by their canonical fill loop.
+public noteArrayFillLoop(BodyChecker checker, BlockNode block, long index) {
+    let statement = block.statements(index);
+    if (statement is VariableDeclarationNode) {
+        let initializer = statement.initializer();
+        if (initializer == null) {
+            return;
+        }
+        let value = initializer.value();
+        if (value is NewExpressionNode) {
+            if (value.dimensionsCount() != 1 || value.dimensions(0).size() == null) {
+                return;
+            }
+            string name = statement.name().text();
+            if (name.length == 0) {
+                return;
+            }
+            checker.noteArrayNewName(value.green(), name);
+            if (index + 1 >= block.statementsCount()) {
+                return;
+            }
+            let next = block.statements(index + 1);
+            if (next is ForStatementNode && isArrayFillLoop(next, name)) {
+                checker.noteFillProven(value.green());
+            }
+        }
+    }
+}
+
+// The head a 'new' writes for its type.
+writtenTypeName(TypeNode created, Type resolved, TypeNames names) -> string {
+    if (created is NamedTypeNode) {
+        return created.name().text();
+    }
+    return names.of(resolved);
+}
+
+identName(Expression node) -> string {
+    if (node is IdentifierExpressionNode) {
+        return node.name().text();
+    }
+    return "";
+}
+
+isIntegerLiteralText(Expression node, string text) -> bool {
+    if (node is LiteralExpressionNode) {
+        SyntaxKind kind = node.value().kind();
+        if (kind == SyntaxKind.IntLiteral || kind == SyntaxKind.LongLiteral) {
+            return node.value().text() == text;
+        }
+    }
+    return false;
+}
+
+isPlainIndexType(TypeNode reference) -> bool {
+    if (reference is NamedTypeNode) {
+        string name = reference.name().text();
+        if (name != "long" && name != "int") {
+            return false;
+        }
+        return reference.qualifier() == null && reference.typeArguments() == null;
+    }
+    return false;
+}
+
+// A step-by-one update on the index: 'i = i + 1', 'i++', or '++i'.
+isUnitIncrement(Expression update, string indexName) -> bool {
+    if (update is AssignmentExpressionNode) {
+        if (update.operator().kind() != SyntaxKind.Equals) {
+            return false;
+        }
+        if (identName(update.target()) != indexName) {
+            return false;
+        }
+        return isPlusOne(update.value(), indexName);
+    }
+    if (update is PostfixExpressionNode) {
+        return update.operator().kind() == SyntaxKind.PlusPlus && identName(update.operand()) == indexName;
+    }
+    if (update is PrefixExpressionNode) {
+        return update.operator().kind() == SyntaxKind.PlusPlus && identName(update.operand()) == indexName;
+    }
+    return false;
+}
+
+isPlusOne(Expression value, string indexName) -> bool {
+    if (value is BinaryExpressionNode) {
+        return value.operator().kind() == SyntaxKind.Plus
+            && identName(value.left()) == indexName
+            && isIntegerLiteralText(value.right(), "1");
+    }
+    return false;
+}
+
+// Any identifier token spelling the name counts as a mention; the fill expression must
+// provably never read the array.
+mentionsIdentifier(GreenNode node, string name) -> bool {
+    for (long i = 0; i < node.slotCount(); i++) {
+        let child = node.slot(i);
+        if (child == null) {
+            continue;
+        }
+        if (child is GreenToken) {
+            if (child.kind() == SyntaxKind.Identifier && child.text() == name) {
+                return true;
+            }
+        } else if (child is GreenNode) {
+            if (mentionsIdentifier(child, name)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Matches 'for (long i = 0; i < name.length; i = i + 1) { name[i] = expr; }' (the update also
+// accepts 'i++' and '++i') with a fresh 'long'/'int' index and 'expr' never mentioning 'name'.
+isArrayFillLoop(ForStatementNode loop, string arrayName) -> bool {
+    let indexName = fillLoopIndexName(loop, arrayName);
+    if (indexName == null) {
+        return false;
+    }
+    if (!fillLoopConditionMatches(loop.condition(), arrayName, indexName)) {
+        return false;
+    }
+    let update = loop.update();
+    if (update == null || !isUnitIncrement(update, indexName)) {
+        return false;
+    }
+    return fillLoopBodyMatches(loop.body(), arrayName, indexName);
+}
+
+// The fresh 'long'/'int' index the loop declares starting at 0, or null when the initializer
+// does not match.
+fillLoopIndexName(ForStatementNode loop, string arrayName) -> string? {
+    let initializer = loop.initializer();
+    if (initializer is VariableDeclarationNode) {
+        let declaredType = initializer.declaredType();
+        if (declaredType != null && !isPlainIndexType(declaredType)) {
+            return null;
+        }
+        let initialValue = initializer.initializer();
+        if (initialValue == null || !isIntegerLiteralText(initialValue.value(), "0")) {
+            return null;
+        }
+        string indexName = initializer.name().text();
+        if (indexName.length == 0 || indexName == arrayName) {
+            return null;
+        }
+        return indexName;
+    }
+    return null;
+}
+
+fillLoopConditionMatches(Expression? condition, string arrayName, string indexName) -> bool {
+    if (condition is BinaryExpressionNode) {
+        if (condition.operator().kind() != SyntaxKind.Less) {
+            return false;
+        }
+        if (identName(condition.left()) != indexName) {
+            return false;
+        }
+        let lengthAccess = condition.right();
+        if (lengthAccess is MemberExpressionNode) {
+            return identName(lengthAccess.object()) == arrayName && lengthAccess.member().text() == "length";
+        }
+    }
+    return false;
+}
+
+fillLoopBodyMatches(BlockNode body, string arrayName, string indexName) -> bool {
+    if (body.statementsCount() != 1) {
+        return false;
+    }
+    let statement = body.statements(0);
+    if (statement is ExpressionStatementNode) {
+        let assignment = statement.expression();
+        if (assignment is AssignmentExpressionNode) {
+            if (assignment.operator().kind() != SyntaxKind.Equals) {
+                return false;
+            }
+            let slot = assignment.target();
+            if (slot is SubscriptExpressionNode) {
+                if (identName(slot.object()) != arrayName || identName(slot.index()) != indexName) {
+                    return false;
+                }
+                return !mentionsIdentifier(assignment.value().green(), arrayName);
+            }
+        }
+    }
+    return false;
+}
