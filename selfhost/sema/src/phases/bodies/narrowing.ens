@@ -1,0 +1,660 @@
+// Narrowing: the facts a condition proves, how they flow through branches, joins and writes, and the
+// casts and type tests that establish them.
+import SyntaxNode from @ens.frontend.syntax.node;
+import BlockNode from @ens.frontend.syntax.generated.nodes;
+import Expression from @ens.frontend.syntax.generated.nodes;
+import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ThisExpressionNode from @ens.frontend.syntax.generated.nodes;
+import BinaryExpressionNode from @ens.frontend.syntax.generated.nodes;
+import PrefixExpressionNode from @ens.frontend.syntax.generated.nodes;
+import PostfixExpressionNode from @ens.frontend.syntax.generated.nodes;
+import OutArgumentNode from @ens.frontend.syntax.generated.nodes;
+import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SubscriptExpressionNode from @ens.frontend.syntax.generated.nodes;
+import CastExpressionNode from @ens.frontend.syntax.generated.nodes;
+import CheckedCastExpressionNode from @ens.frontend.syntax.generated.nodes;
+import TypeTestExpressionNode from @ens.frontend.syntax.generated.nodes;
+import AssignmentExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ParenthesizedExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SyntaxKind from @ens.frontend.syntax.generated.kind;
+import Span from @ens.frontend.support.source;
+import LocalBinding from model.scopes;
+import model.capabilities;
+import model.convert;
+import phases.bodies.wording;
+import model.narrow;
+import NarrowingPath from model.narrow;
+import model.typemembers;
+import model.types;
+import Type from model.types;
+import ErrorType from model.types;
+import NullType from model.types;
+import OptionalType from model.types;
+import ArrayType from model.types;
+import PrimitiveKind from model.types;
+import EnumType from model.types;
+import TypeParamType from model.types;
+import TypeTestObligation from phases.obligations;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+import BodyChecker from phases.bodies;
+import LiteralOrigin from phases.bodies;
+
+// One fact a condition can prove: the storage path, the type the check proves for it, and
+// whether the proof holds where the condition is true or where it is false.
+public final class NarrowingFact {
+    protected NarrowingPath path;
+    protected Type proven;
+    protected bool narrowsWhenTrue;
+
+    protected constructor(this.path, this.proven, this.narrowsWhenTrue);
+}
+
+// The path of a stable place, or null when the expression names none. A stable place is a
+// local, a parameter, 'this', a static or lazy const read through its type, or a 'const' field
+// reached through a stable place.
+public buildNarrowingPath(BodyChecker checker, Expression expression) -> NarrowingPath? {
+    Expression core = wording.unwrapParentheses(expression);
+    switch (core) {
+        is IdentifierExpressionNode identifier -> {
+            let binding = checker.result().bindingOf(identifier.green());
+            if (binding == null) {
+                return null;
+            }
+            return narrow.bindingPath(binding);
+        },
+        is ThisExpressionNode ignored -> {
+            let receiver = checker.frame().thisBinding();
+            if (receiver == null) {
+                return null;
+            }
+            return narrow.bindingPath(receiver);
+        },
+        is MemberExpressionNode member -> {
+            if (!checker.readsConstField(member)) {
+                return null;
+            }
+            let typeLevel = checker.result().staticConstFieldOf(member.green());
+            if (typeLevel != null) {
+                return narrow.typeLevelPath(typeLevel);
+            }
+            let object = buildNarrowingPath(checker, member.object());
+            if (object == null) {
+                return null;
+            }
+            return object.extended(narrow.fieldSegment(member.member().text()));
+        },
+        default -> {
+            return null;
+        },
+    }
+}
+
+// The type narrowing proved for a field read here, or the field's declared type when it proved none.
+public narrowedFieldType(BodyChecker checker, MemberExpressionNode read, Type declared) -> Type {
+    if (!(declared is OptionalType) && !types.isClassLike(declared)) {
+        return declared;
+    }
+    let path = buildNarrowingPath(checker, read);
+    if (path == null) {
+        return declared;
+    }
+    return checker.narrowing().provenType(path) ?? declared;
+}
+
+// Recognizes 'x == null' and 'x != null' over a narrowable path whose analyzed type is
+// still optional. The equality analysis resets a fully-proven operand back to its declared
+// storage type, so a redundant re-check re-proves the same fact rather than widening it.
+detectNullCheck(BodyChecker checker, Expression condition) -> NarrowingFact? {
+    if (!(condition is BinaryExpressionNode)) {
+        return null;
+    }
+    SyntaxKind operator = condition.operator().kind();
+    if (operator != SyntaxKind.EqualsEquals && operator != SyntaxKind.NotEquals) {
+        return null;
+    }
+    Expression left = wording.unwrapParentheses(condition.left());
+    Expression right = wording.unwrapParentheses(condition.right());
+    Expression? checked = null;
+    if (wording.isNullLiteral(right) && !wording.isNullLiteral(left)) {
+        checked = left;
+    } else if (wording.isNullLiteral(left) && !wording.isNullLiteral(right)) {
+        checked = right;
+    }
+    if (checked == null) {
+        return null;
+    }
+    let checkedType = checker.result().typeOf(checked.green());
+    if (!(checkedType is OptionalType)) {
+        return null;
+    }
+    let path = buildNarrowingPath(checker, checked);
+    if (path == null) {
+        return null;
+    }
+    // One check strips one level, off the sharpest type proven for the path so far: a
+    // re-check of a value already proven present at every level proves nothing new.
+    Type presence = checker.narrowing().provenType(path) ?? checkedType;
+    if (!(presence is OptionalType)) {
+        return null;
+    }
+    return new NarrowingFact(path, presence.inner(), operator == SyntaxKind.NotEquals);
+}
+
+// A type test proves its operand is the target exactly when the test succeeds, so the
+// fact carries only positive polarity: failing a bare 'is' proves nothing. A '!' around
+// the test flips the polarity in collectNarrowings.
+detectTypeTest(BodyChecker checker, TypeTestExpressionNode test) -> NarrowingFact? {
+    let testType = checker.result().typeOf(test.green());
+    if (testType == null || !convert.isBoolType(testType)) {
+        return null;
+    }
+    let target = checker.result().typeOf(test.target().green());
+    if (target == null || target is OptionalType || !types.isClassLike(target)) {
+        return null;
+    }
+    let path = buildNarrowingPath(checker, test.value());
+    if (path == null) {
+        return null;
+    }
+    return new NarrowingFact(path, target, true);
+}
+
+// The facts a condition proves on the side where it evaluated to 'conditionHolds':
+// negation flips the polarity, '&&' facts hold where the conjunction held, '||' facts
+// hold where the disjunction failed, and both descend into their operands.
+public collectNarrowings(BodyChecker checker, Expression condition, bool conditionHolds,
+                         List<NarrowingFact> sink) {
+    Expression core = wording.unwrapParentheses(condition);
+    if (core is PrefixExpressionNode && core.operator().kind() == SyntaxKind.Exclamation) {
+        collectNarrowings(checker, core.operand(), !conditionHolds, sink);
+        return;
+    }
+    if (core is TypeTestExpressionNode) {
+        let fact = detectTypeTest(checker, core);
+        if (fact != null && conditionHolds) {
+            sink.push(fact);
+        }
+        return;
+    }
+    if (core is BinaryExpressionNode) {
+        SyntaxKind operator = core.operator().kind();
+        bool descend = (conditionHolds && operator == SyntaxKind.AmpersandAmpersand)
+            || (!conditionHolds && operator == SyntaxKind.PipePipe);
+        if (descend) {
+            collectNarrowings(checker, core.left(), conditionHolds, sink);
+            collectNarrowings(checker, core.right(), conditionHolds, sink);
+            return;
+        }
+    }
+    let fact = detectNullCheck(checker, core);
+    if (fact != null && fact.narrowsWhenTrue == conditionHolds) {
+        sink.push(fact);
+    }
+}
+
+public applyFacts(BodyChecker checker, List<NarrowingFact> facts) {
+    for (long i = 0; i < facts.length(); i++) {
+        checker.narrowing().narrow(facts.get(i).path, facts.get(i).proven);
+    }
+}
+
+public walkBranch(BodyChecker checker, BlockNode block, List<NarrowingFact> facts) {
+    checker.enterScope();
+    applyFacts(checker, facts);
+    checker.walkBlock(block);
+    checker.leaveScope();
+}
+
+// Walks a branch under the facts its condition proves and returns the narrowings that hold
+// at its end, captured before the branch scope is discarded.
+public walkBranchCapture(BodyChecker checker, BlockNode block, List<NarrowingFact> facts)
+                         -> Map<NarrowingPath, Type> {
+    checker.enterScope();
+    applyFacts(checker, facts);
+    checker.walkBlock(block);
+    let captured = checker.narrowing().flatten();
+    checker.leaveScope();
+    return captured;
+}
+
+// The narrowings on the implicit path where a condition failed and no statements run: the
+// else side of an 'if' without an 'else', and the fall-through of a switch scrutinee.
+public captureConditionBranch(BodyChecker checker, List<NarrowingFact> facts) -> Map<NarrowingPath, Type> {
+    checker.enterScope();
+    applyFacts(checker, facts);
+    let captured = checker.narrowing().flatten();
+    checker.leaveScope();
+    return captured;
+}
+
+// The proven type common to two branch end-states for one path: identity, or the wider of
+// two types related by assignability, or null when neither contains the other.
+unifyNarrowed(BodyChecker checker, Type left, Type right) -> Type? {
+    if (left == right) {
+        return left;
+    }
+    if (convert.isAssignableStrict(left, right)) {
+        return left;
+    }
+    if (convert.isAssignableStrict(right, left)) {
+        return right;
+    }
+    return null;
+}
+
+// The intersection of the surviving branch end-states: a path keeps a proof only where every
+// survivor proves it, unified to the type they share.
+intersectNarrowings(BodyChecker checker, List<Map<NarrowingPath, Type>> survivors)
+                    -> Map<NarrowingPath, Type> {
+    let result = new Map<NarrowingPath, Type>();
+    let first = survivors.get(0);
+    for (let key in first.keys()) {
+        let value = first.get(key);
+        if (value != null) {
+            result.set(key, value);
+        }
+    }
+    for (long i = 1; i < survivors.length(); i++) {
+        let other = survivors.get(i);
+        let merged = new Map<NarrowingPath, Type>();
+        for (let key in result.keys()) {
+            let mine = result.get(key);
+            let theirs = other.get(key);
+            if (mine != null && theirs != null) {
+                let unified = unifyNarrowed(checker, mine, theirs);
+                if (unified != null) {
+                    merged.set(key, unified);
+                }
+            }
+        }
+        result = merged;
+    }
+    return result;
+}
+
+// Whether a path's root is still nameable after the merge, so a proof on a binding local to
+// one branch does not leak out when that branch is the only survivor. A type-level field is
+// nameable everywhere.
+pathRootInScope(BodyChecker checker, NarrowingPath path) -> bool {
+    let root = path.root();
+    if (root == null) {
+        return true;
+    }
+    if (checker.frame().thisBinding() != null && root == checker.frame().thisBinding()) {
+        return true;
+    }
+    let current = checker.currentScope();
+    if (current == null) {
+        return false;
+    }
+    return current.lookup(root.name()) == root;
+}
+
+// Installs the intersection of the surviving branches as the narrowing after a merge: a path
+// stays narrowed only where every falling-through branch proves it, an entry proof a branch
+// dropped is dropped, and a proof a branch newly established is added.
+public applyNarrowingJoin(BodyChecker checker, Map<NarrowingPath, Type> entryFacts,
+                          List<Map<NarrowingPath, Type>> survivors) {
+    if (survivors.length() == 0) {
+        return;
+    }
+    let joined = intersectNarrowings(checker, survivors);
+    for (let key in entryFacts.keys()) {
+        if (joined.get(key) == null) {
+            checker.narrowing().clearPath(key);
+        }
+    }
+    for (let key in joined.keys()) {
+        let joinedType = joined.get(key);
+        if (joinedType == null) {
+            continue;
+        }
+        let entryType = entryFacts.get(key);
+        if (entryType != null && entryType == joinedType) {
+            continue;
+        }
+        if (!pathRootInScope(checker, key)) {
+            continue;
+        }
+        checker.narrowing().clearPath(key);
+        checker.narrowing().narrow(key, joinedType);
+    }
+}
+
+// Analyzes a '?:' branch or the right side of '&&' or '||' under the facts the condition proves
+// there. 'target' is the type the branch is checked against, set at 'origin', or null.
+public analyzeGuardedBranch(BodyChecker checker, Expression condition, Expression branch, bool conditionHolds,
+                            Type? target, LiteralOrigin? origin = null) -> Type {
+    let facts = new List<NarrowingFact>();
+    collectNarrowings(checker, condition, conditionHolds, facts);
+    checker.narrowing().push();
+    applyFacts(checker, facts);
+    bool previous = checker.assignment().unconditionalPosition();
+    checker.assignment().setUnconditionalPosition(false);
+    Type analyzed = checker.store().errorType();
+    if (target != null) {
+        analyzed = checker.analyzeExpressionAdapt(branch, target, origin);
+    } else {
+        analyzed = checker.analyzeExpression(branch);
+    }
+    checker.assignment().setUnconditionalPosition(previous);
+    checker.narrowing().pop();
+    return analyzed;
+}
+
+// The declared type of the storage an expression reads, or null when it reads no single
+// declared slot: the binding's, 'this's, field's, or array element's own type.
+public declaredSlotType(BodyChecker checker, Expression expression) -> Type? {
+    Expression core = wording.unwrapParentheses(expression);
+    switch (core) {
+        is IdentifierExpressionNode identifier -> {
+            let binding = checker.result().bindingOf(identifier.green());
+            if (binding == null) {
+                return null;
+            }
+            return binding.type();
+        },
+        is ThisExpressionNode ignored -> {
+            return checker.frame().thisType();
+        },
+        is MemberExpressionNode member -> {
+            let typeLevel = checker.result().staticConstFieldOf(member.green());
+            if (typeLevel != null) {
+                return typeLevel.type();
+            }
+            let objectType = checker.result().typeOf(member.object().green());
+            if (objectType == null) {
+                return null;
+            }
+            let field = typemembers.inheritedOrOwnField(objectType, member.member().text());
+            if (field == null) {
+                return null;
+            }
+            return field.type();
+        },
+        is SubscriptExpressionNode subscript -> {
+            let objectType = checker.result().typeOf(subscript.object().green());
+            if (objectType is ArrayType) {
+                return objectType.element();
+            }
+            return null;
+        },
+        default -> {
+            return null;
+        },
+    }
+}
+
+// A presence operator ('== null', '!= null', '??', '?.', '?[') consults the declared storage
+// type, so a re-check of a proven-non-null declared-optional stays legal. The operand is
+// retyped back to the declared type, and a declared non-optional keeps its analyzed type and
+// is rejected by the operator's own rule. A value still nullable after narrowing needs nothing
+// restored, since the operator tests the level it has now.
+public presenceOperandType(BodyChecker checker, Expression operand, Type analyzed) -> Type {
+    if (analyzed is OptionalType) {
+        return analyzed;
+    }
+    let declared = declaredSlotType(checker, operand);
+    if (declared == null || !(declared is OptionalType) || declared == analyzed) {
+        return analyzed;
+    }
+    Expression current = operand;
+    checker.result().setType(current.green(), declared);
+    while (current is ParenthesizedExpressionNode) {
+        current = current.inner();
+        checker.result().setType(current.green(), declared);
+    }
+    return declared;
+}
+
+// The deepest level a stored value proves present in storage of optional declared type. A
+// bare value proves every wrapped level, and a 'T?' stored into a 'T??' proves the outer one.
+// Null when the store proves nothing, so the storage keeps its declared type.
+provenByStore(BodyChecker checker, Type declared, Type stored) -> Type? {
+    if (!(declared is OptionalType)) {
+        return null;
+    }
+    if (stored is ErrorType || stored is NullType) {
+        return null;
+    }
+    Type proven = declared;
+    while (proven is OptionalType && convert.isAssignableStrict(proven.inner(), stored)) {
+        proven = proven.inner();
+    }
+    if (proven == declared) {
+        return null;
+    }
+    return proven;
+}
+
+// Narrows a binding to what its initializer proves, for a declaration, whose name is bound
+// here rather than written as an expression.
+public establishAssignmentNarrowing(BodyChecker checker, LocalBinding binding, Type value) {
+    let proven = provenByStore(checker, binding.type(), value);
+    if (proven == null) {
+        return;
+    }
+    checker.narrowing().narrow(narrow.bindingPath(binding), proven);
+}
+
+// Narrows the place a write stored into, after invalidateForWrite has dropped what the place
+// held before. Only a stable place has a path, so a write to any other place narrows nothing.
+public establishWriteNarrowing(BodyChecker checker, Expression target, Type stored) {
+    let declared = declaredSlotType(checker, target);
+    if (declared == null) {
+        return;
+    }
+    let proven = provenByStore(checker, declared, stored);
+    if (proven == null) {
+        return;
+    }
+    let path = buildNarrowingPath(checker, target);
+    if (path == null) {
+        return;
+    }
+    checker.narrowing().narrow(path, proven);
+}
+
+// A write drops the narrowings of the storage it replaces. A binding write drops every path
+// from that binding, and a member write drops every path that starts with the written one.
+public invalidateForWrite(BodyChecker checker, Expression target) {
+    if (target is IdentifierExpressionNode) {
+        let binding = checker.result().bindingOf(target.green());
+        if (binding != null) {
+            checker.narrowing().clearForRoot(binding);
+            return;
+        }
+    }
+    if (target is MemberExpressionNode) {
+        let path = buildNarrowingPath(checker, target);
+        if (path != null) {
+            checker.narrowing().clearPrefixedBy(path);
+        }
+    }
+}
+
+// Loop-entry pre-clearing: before the loop body is analyzed, drop every narrowing whose
+// storage the body may write, so a fact a later body write kills cannot be read stale on a
+// following iteration. The condition re-establishes its own narrowing each iteration, so a
+// condition-derived fact is not pre-cleared. Roots resolve by name against the current scope,
+// since the body nodes are not analyzed yet.
+public preClearLoopBodyWrites(BodyChecker checker, SyntaxNode node) {
+    switch (node) {
+        is AssignmentExpressionNode assignment -> {
+            preClearWrite(checker, assignment.target());
+        },
+        is PrefixExpressionNode prefix -> {
+            let operator = prefix.operator().kind();
+            if (operator == SyntaxKind.PlusPlus || operator == SyntaxKind.MinusMinus) {
+                preClearWrite(checker, prefix.operand());
+            }
+        },
+        is PostfixExpressionNode postfix -> {
+            let operator = postfix.operator().kind();
+            if (operator == SyntaxKind.PlusPlus || operator == SyntaxKind.MinusMinus) {
+                preClearWrite(checker, postfix.operand());
+            }
+        },
+        is OutArgumentNode outArgument -> {
+            let binding = checker.lookupBinding(outArgument.name().text());
+            if (binding != null) {
+                checker.narrowing().clearForRoot(binding);
+            }
+        },
+        default -> { },
+    }
+    for (let child in node.childNodes()) {
+        preClearLoopBodyWrites(checker, child);
+    }
+}
+
+// Only a local or a parameter can be written in a loop and hold a narrowing, since a 'const'
+// field takes no write there and nothing else narrows. Parentheses name the place they hold.
+preClearWrite(BodyChecker checker, Expression target) {
+    Expression written = wording.unwrapParentheses(target);
+    if (written is IdentifierExpressionNode) {
+        let binding = checker.lookupBinding(written.name().text());
+        if (binding != null) {
+            checker.narrowing().clearForRoot(binding);
+        }
+    }
+}
+
+public analyzeCast(BodyChecker checker, CastExpressionNode node) -> Type {
+    Type source = checker.analyzeExpression(node.value());
+    Type target = checker.resolver().resolveType(node.target());
+    if (source is ErrorType || target is ErrorType) {
+        return checker.store().errorType();
+    }
+    checker.adaptLiteralToCastTarget(node.value(), target);
+    let retyped = checker.result().typeOf(node.value().green());
+    if (retyped != null) {
+        source = retyped;
+    }
+    if (source is EnumType) {
+        if (!source.isNumeric()) {
+            checker.reporter().report(enumNeedsValuesMessage(checker, source), node.span());
+            return checker.store().errorType();
+        }
+        if (!convert.isIntegerType(target)) {
+            checker.reporter().report("Cannot convert enum '{checker.names().of(source)}' to "
+                + "'{checker.names().of(target)}' with 'as'. An enum whose members have values converts "
+                + "only to an integer type, such as 'int' or 'long'.", node.span());
+            return checker.store().errorType();
+        }
+        return target;
+    }
+    if (target is EnumType) {
+        if (target.isNumeric()) {
+            checker.reporter().report("Converting '{checker.names().of(source)}' to enum "
+                + "'{checker.names().of(target)}' fails when no member has that value. Use "
+                + "'as?', which gives '{checker.names().of(target)}?' and is null when no "
+                + "member matches.", node.span());
+        } else {
+            checker.reporter().report(enumNeedsValuesMessage(checker, target), node.span());
+        }
+        return checker.store().errorType();
+    }
+    if (!convert.isNumericType(source) || !convert.isNumericType(target)) {
+        checker.reporter().report("Cannot convert '{checker.names().of(source)}' to "
+            + "'{checker.names().of(target)}' with 'as'. 'as' converts only between numbers, and between an "
+            + "enum and an integer.", node.span());
+        return checker.store().errorType();
+    }
+    return target;
+}
+
+// Guidance when a plain enum is used in a numeric conversion: it names the enum and shows how
+// to make it numeric using its own first member.
+enumNeedsValuesMessage(BodyChecker checker, EnumType enumType) -> string {
+    string member = "First";
+    let names = enumType.memberNames();
+    if (names.length > 0) {
+        member = names[0];
+    }
+    return "Enum '{checker.names().nameOf(enumType)}' assigns no values to its members, so it "
+        + "does not convert to or from an integer. Give the members values, for example "
+        + "'{member} = 0'.";
+}
+
+public analyzeTypeTest(BodyChecker checker, TypeTestExpressionNode node) -> Type {
+    Type source = checker.analyzeExpression(node.value());
+    Type target = checker.resolver().resolveType(node.target());
+    checker.result().setType(node.target().green(), target);
+    if (source is ErrorType || target is ErrorType) {
+        return checker.store().errorType();
+    }
+    if (!checkClassTypeTest(checker, node.value(), source, target, false, node.span())) {
+        return checker.store().errorType();
+    }
+    return checker.store().primitive(PrimitiveKind.Bool);
+}
+
+public analyzeCheckedCast(BodyChecker checker, CheckedCastExpressionNode node) -> Type {
+    Type source = checker.analyzeExpression(node.value());
+    Type target = checker.resolver().resolveType(node.target());
+    if (source is ErrorType || target is ErrorType) {
+        return checker.store().errorType();
+    }
+    if (target is EnumType) {
+        if (!target.isNumeric()) {
+            checker.reporter().report(enumNeedsValuesMessage(checker, target), node.span());
+            return checker.store().errorType();
+        }
+        if (!convert.isIntegerType(source)) {
+            checker.reporter().report("Cannot convert '{checker.names().of(source)}' to enum "
+                + "'{checker.names().of(target)}' with 'as?'. Only an integer can be matched against the "
+                + "values of an enum's members.", node.span());
+            return checker.store().errorType();
+        }
+        return checker.store().optionalOf(target);
+    }
+    if (source is EnumType && source.isNumeric() && convert.isIntegerType(target)) {
+        checker.reporter().report("Converting enum '{checker.names().of(source)}' to "
+            + "'{checker.names().of(target)}' always succeeds. Write 'as' instead of 'as?'.", node.span());
+        return checker.store().errorType();
+    }
+    if (!checkClassTypeTest(checker, node.value(), source, target, true, node.span())) {
+        return checker.store().errorType();
+    }
+    return checker.store().optionalOf(target);
+}
+
+// The 'is' and 'as?' rule set: the target must be a plain class or interface, and the pair
+// must be able to succeed without always succeeding. Open-typed operands defer to each
+// instantiation.
+checkClassTypeTest(BodyChecker checker, Expression value, Type source, Type target, bool isCast,
+                   Span span) -> bool {
+    string operator = "is";
+    if (isCast) {
+        operator = "as?";
+    }
+    if (target is OptionalType) {
+        string core = checker.names().of(convert.coreOf(target));
+        if (isCast) {
+            checker.reporter().report("The type after 'as?' cannot be nullable, because "
+                + "'as? {core}' already produces '{core}?'. Write 'as? {core}'.", span);
+        } else {
+            checker.reporter().report("The type after 'is' cannot be nullable, because 'is' never matches "
+                + "null. Write 'is {core}'.", span);
+        }
+        return false;
+    }
+    if (!(target is TypeParamType) && !types.isClassLike(target)) {
+        checker.reporter().report("The type after '{operator}' must be a class or an interface, and "
+            + "'{checker.names().of(target)}' is neither.", span);
+        return false;
+    }
+    if (convert.containsTypeParam(source) || convert.containsTypeParam(target)) {
+        checker.recordObligation(new TypeTestObligation(source, target, isCast, span));
+        return true;
+    }
+    let issue = capabilities.typeTestIssue(source, target, isCast, checker.names(),
+        checker.oneLevelGuidance(value, source));
+    if (issue != null) {
+        checker.reporter().report(issue, span);
+        return false;
+    }
+    return true;
+}

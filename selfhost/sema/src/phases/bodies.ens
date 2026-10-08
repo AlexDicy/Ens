@@ -112,6 +112,8 @@ import phases.bodies.definiteassignment;
 import AssignmentFlow from phases.bodies.definiteassignment;
 import AssignmentState from phases.bodies.definiteassignment;
 import phases.bodies.wording;
+import phases.bodies.narrowing;
+import NarrowingFact from phases.bodies.narrowing;
 import model.narrow;
 import NarrowingPath from model.narrow;
 import NarrowingState from model.narrow;
@@ -216,16 +218,6 @@ class NamespaceName extends NameResolution {
     protected string targetModulePath;
 
     protected constructor(this.targetModulePath);
-}
-
-// One fact a condition can prove: the storage path, the type the check proves for it, and
-// whether the proof holds where the condition is true or where it is false.
-class NarrowingFact {
-    protected NarrowingPath path;
-    protected Type proven;
-    protected bool narrowsWhenTrue;
-
-    protected constructor(this.path, this.proven, this.narrowsWhenTrue);
 }
 
 // How a refusal describes a field or element that can change, as in "'t.count' is a field".
@@ -1528,7 +1520,7 @@ public final class BodyChecker implements NoreturnCalls {
     // The lambdas whose bodies are being checked, outermost first. Empty in ordinary code; a
     // name the innermost one does not declare itself is a capture.
     List<LambdaFrame> lambdaFrames;
-    NarrowingState narrowing;
+    NarrowingState narrowingState;
     // The 'const' locals declared without a type, and the values 'is' arms matched. A refused write to
     // a constant local gives each its own fix.
     List<LocalBinding> untypedConstants;
@@ -1558,7 +1550,7 @@ public final class BodyChecker implements NoreturnCalls {
         this.canonicalModulePath = context.module().canonicalPath();
         this.modulePackagePrefix = context.module().packagePrefix();
         this.lambdaFrames = new List<LambdaFrame>();
-        this.narrowing = new NarrowingState();
+        this.narrowingState = new NarrowingState();
         this.callableFrame = new CallableFrame(null);
         this.untypedConstants = new List<LocalBinding>();
         this.literalTargets = new LiteralTargets();
@@ -1610,6 +1602,15 @@ public final class BodyChecker implements NoreturnCalls {
 
     public packagePrefix() -> string {
         return this.modulePackagePrefix;
+    }
+
+    public narrowing() -> NarrowingState {
+        return this.narrowingState;
+    }
+
+    // The innermost scope of the body being checked, or null outside one.
+    public currentScope() -> Scope? {
+        return this.scope;
     }
 
     public frame() -> CallableFrame {
@@ -1722,7 +1723,7 @@ public final class BodyChecker implements NoreturnCalls {
         this.obligationOwnerDisplay = "";
     }
 
-    recordObligation(Obligation obligation) {
+    public recordObligation(Obligation obligation) {
         let owner = this.obligationOwner;
         if (owner != null) {
             obligation.setGuards(this.activeGuardsFor(owner));
@@ -1784,7 +1785,7 @@ public final class BodyChecker implements NoreturnCalls {
     checkTestBody(TestDeclarationNode node) {
         let parameterScope = new Scope(null);
         this.scope = parameterScope;
-        this.narrowing = new NarrowingState();
+        this.narrowingState = new NarrowingState();
         let outerFrame = this.callableFrame;
         this.callableFrame = new CallableFrame(parameterScope, null, null, null, node,
             this.store().primitive(PrimitiveKind.Void), null, "A test", "", isStatic: false,
@@ -1823,7 +1824,7 @@ public final class BodyChecker implements NoreturnCalls {
         }
         let parameterScope = new Scope(null);
         this.scope = parameterScope;
-        this.narrowing = new NarrowingState();
+        this.narrowingState = new NarrowingState();
         LocalBinding? thisBinding = null;
         if (receiver != null) {
             thisBinding = new LocalBinding("this", receiver, BindingKind.Parameter, true,
@@ -2178,7 +2179,7 @@ public final class BodyChecker implements NoreturnCalls {
         let fields = typemembers.fieldsOf(owner);
         long pushed = this.pushOwnerTypeParameters(owner);
         this.scope = new Scope(null);
-        this.narrowing = new NarrowingState();
+        this.narrowingState = new NarrowingState();
         let outerFrame = this.callableFrame;
         this.callableFrame = new CallableFrame(owner);
         // Type-level fields stay out on both sides. A static const's initializer is the
@@ -2228,7 +2229,7 @@ public final class BodyChecker implements NoreturnCalls {
     checkLazyInitializers(DeclaredType owner, MemberListNode body) {
         long pushed = this.pushOwnerTypeParameters(owner);
         this.scope = new Scope(null);
-        this.narrowing = new NarrowingState();
+        this.narrowingState = new NarrowingState();
         let outerFrame = this.callableFrame;
         this.callableFrame = new CallableFrame(owner);
         for (long i = 0; i < body.membersCount(); i++) {
@@ -2288,7 +2289,7 @@ public final class BodyChecker implements NoreturnCalls {
     checkParameterDefaults(Signature signature, Type? owner, FunctionDeclarationNode node) {
         long pushed = this.pushCallableTypeParameters(signature, owner);
         this.scope = new Scope(null);
-        this.narrowing = new NarrowingState();
+        this.narrowingState = new NarrowingState();
         let outerFrame = this.callableFrame;
         this.callableFrame = new CallableFrame(owner);
         Parameter[] parameters = signature.parameters();
@@ -2321,20 +2322,20 @@ public final class BodyChecker implements NoreturnCalls {
 
     // ---- Scopes and names ----
 
-    enterScope() {
+    public enterScope() {
         this.scope = new Scope(this.scope);
-        this.narrowing.push();
+        this.narrowingState.push();
     }
 
-    leaveScope() {
+    public leaveScope() {
         let current = this.scope;
         if (current != null) {
             this.scope = current.parent();
         }
-        this.narrowing.pop();
+        this.narrowingState.pop();
     }
 
-    lookupBinding(string name) -> LocalBinding? {
+    public lookupBinding(string name) -> LocalBinding? {
         let current = this.scope;
         if (current == null) {
             return null;
@@ -2394,58 +2395,6 @@ public final class BodyChecker implements NoreturnCalls {
 
     // ---- Narrowing ----
 
-    // The path of a stable place, or null when the expression names none. A stable place is a
-    // local, a parameter, 'this', a static or lazy const read through its type, or a 'const' field
-    // reached through a stable place.
-    buildNarrowingPath(Expression expression) -> NarrowingPath? {
-        Expression core = wording.unwrapParentheses(expression);
-        switch (core) {
-            is IdentifierExpressionNode identifier -> {
-                let binding = this.result().bindingOf(identifier.green());
-                if (binding == null) {
-                    return null;
-                }
-                return narrow.bindingPath(binding);
-            },
-            is ThisExpressionNode ignored -> {
-                let receiver = this.frame().thisBinding();
-                if (receiver == null) {
-                    return null;
-                }
-                return narrow.bindingPath(receiver);
-            },
-            is MemberExpressionNode member -> {
-                if (!this.readsConstField(member)) {
-                    return null;
-                }
-                let typeLevel = this.result().staticConstFieldOf(member.green());
-                if (typeLevel != null) {
-                    return narrow.typeLevelPath(typeLevel);
-                }
-                let object = this.buildNarrowingPath(member.object());
-                if (object == null) {
-                    return null;
-                }
-                return object.extended(narrow.fieldSegment(member.member().text()));
-            },
-            default -> {
-                return null;
-            },
-        }
-    }
-
-    // The type narrowing proved for a field read here, or the field's declared type when it proved none.
-    narrowedFieldType(MemberExpressionNode read, Type declared) -> Type {
-        if (!(declared is OptionalType) && !types.isClassLike(declared)) {
-            return declared;
-        }
-        let path = this.buildNarrowingPath(read);
-        if (path == null) {
-            return declared;
-        }
-        return this.narrowing.provenType(path) ?? declared;
-    }
-
     // The outermost step that keeps a value from being a stable place, which is an array element
     // or an instance field that is not 'const'. Null when the value reads neither. A field read
     // through its type name is never the step. Its declaration is refused without 'const'.
@@ -2472,7 +2421,7 @@ public final class BodyChecker implements NoreturnCalls {
 
     // Whether the member access reads a 'const' field, either an instance field or a static or
     // lazy one reached through its type. False when the object has no analyzed type.
-    readsConstField(MemberExpressionNode member) -> bool {
+    public readsConstField(MemberExpressionNode member) -> bool {
         let typeLevel = this.result().staticConstFieldOf(member.green());
         if (typeLevel != null) {
             return typeLevel.isConst();
@@ -2536,7 +2485,7 @@ public final class BodyChecker implements NoreturnCalls {
 
     // The null guidance for 'value' of type 'type' in a use that takes one '?', or an empty string
     // unless the type has more.
-    oneLevelGuidance(Expression value, Type type) -> string {
+    public oneLevelGuidance(Expression value, Type type) -> string {
         if (!(type is OptionalType) || !(type.inner() is OptionalType)) {
             return "";
         }
@@ -2652,7 +2601,7 @@ public final class BodyChecker implements NoreturnCalls {
             held = wording.oneLineSpelling(operand);
         } else if (!this.frame().statementsAllowed()) {
             form = OperandForm.NoFix;
-        } else if (this.buildNarrowingPath(operand) != null) {
+        } else if (narrowing.buildNarrowingPath(this, operand) != null) {
             form = OperandForm.Stable;
             held = wording.simpleSpelling(operand) ?? spelling;
         } else if (read != null && read.safe && !writesBack) {
@@ -2660,7 +2609,7 @@ public final class BodyChecker implements NoreturnCalls {
                 form = OperandForm.Guarded;
                 guard = wording.oneLineSpelling(wording.unwrapParentheses(read.receiver));
                 let slot = this.safeSlotType(wording.unwrapParentheses(operand));
-                if (this.buildNarrowingPath(read.receiver) != null && slot != null
+                if (narrowing.buildNarrowingPath(this, read.receiver) != null && slot != null
                         && !(slot is OptionalType)) {
                     held = read.plainSpelling();
                 }
@@ -2756,7 +2705,7 @@ public final class BodyChecker implements NoreturnCalls {
     safeStep(Expression operand) -> Expression? {
         Expression core = wording.unwrapParentheses(operand);
         let access = accessStep(core);
-        if (access != null && access.safe && this.buildNarrowingPath(access.receiver) != null) {
+        if (access != null && access.safe && narrowing.buildNarrowingPath(this, access.receiver) != null) {
             return core;
         }
         return null;
@@ -2922,224 +2871,6 @@ public final class BodyChecker implements NoreturnCalls {
         return this.withGuidance(" The value may be null here.", this.nullGuidance(value, source, levels));
     }
 
-    // Recognizes 'x == null' and 'x != null' over a narrowable path whose analyzed type is
-    // still optional. The equality analysis resets a fully-proven operand back to its declared
-    // storage type, so a redundant re-check re-proves the same fact rather than widening it.
-    detectNullCheck(Expression condition) -> NarrowingFact? {
-        if (!(condition is BinaryExpressionNode)) {
-            return null;
-        }
-        SyntaxKind operator = condition.operator().kind();
-        if (operator != SyntaxKind.EqualsEquals && operator != SyntaxKind.NotEquals) {
-            return null;
-        }
-        Expression left = wording.unwrapParentheses(condition.left());
-        Expression right = wording.unwrapParentheses(condition.right());
-        Expression? checked = null;
-        if (wording.isNullLiteral(right) && !wording.isNullLiteral(left)) {
-            checked = left;
-        } else if (wording.isNullLiteral(left) && !wording.isNullLiteral(right)) {
-            checked = right;
-        }
-        if (checked == null) {
-            return null;
-        }
-        let checkedType = this.result().typeOf(checked.green());
-        if (!(checkedType is OptionalType)) {
-            return null;
-        }
-        let path = this.buildNarrowingPath(checked);
-        if (path == null) {
-            return null;
-        }
-        // One check strips one level, off the sharpest type proven for the path so far: a
-        // re-check of a value already proven present at every level proves nothing new.
-        Type presence = this.narrowing.provenType(path) ?? checkedType;
-        if (!(presence is OptionalType)) {
-            return null;
-        }
-        return new NarrowingFact(path, presence.inner(), operator == SyntaxKind.NotEquals);
-    }
-
-    // A type test proves its operand is the target exactly when the test succeeds, so the
-    // fact carries only positive polarity: failing a bare 'is' proves nothing. A '!' around
-    // the test flips the polarity in collectNarrowings.
-    detectTypeTest(TypeTestExpressionNode test) -> NarrowingFact? {
-        let testType = this.result().typeOf(test.green());
-        if (testType == null || !convert.isBoolType(testType)) {
-            return null;
-        }
-        let target = this.result().typeOf(test.target().green());
-        if (target == null || target is OptionalType || !types.isClassLike(target)) {
-            return null;
-        }
-        let path = this.buildNarrowingPath(test.value());
-        if (path == null) {
-            return null;
-        }
-        return new NarrowingFact(path, target, true);
-    }
-
-    // The facts a condition proves on the side where it evaluated to 'conditionHolds':
-    // negation flips the polarity, '&&' facts hold where the conjunction held, '||' facts
-    // hold where the disjunction failed, and both descend into their operands.
-    collectNarrowings(Expression condition, bool conditionHolds, List<NarrowingFact> sink) {
-        Expression core = wording.unwrapParentheses(condition);
-        if (core is PrefixExpressionNode && core.operator().kind() == SyntaxKind.Exclamation) {
-            this.collectNarrowings(core.operand(), !conditionHolds, sink);
-            return;
-        }
-        if (core is TypeTestExpressionNode) {
-            let fact = this.detectTypeTest(core);
-            if (fact != null && conditionHolds) {
-                sink.push(fact);
-            }
-            return;
-        }
-        if (core is BinaryExpressionNode) {
-            SyntaxKind operator = core.operator().kind();
-            bool descend = (conditionHolds && operator == SyntaxKind.AmpersandAmpersand)
-                || (!conditionHolds && operator == SyntaxKind.PipePipe);
-            if (descend) {
-                this.collectNarrowings(core.left(), conditionHolds, sink);
-                this.collectNarrowings(core.right(), conditionHolds, sink);
-                return;
-            }
-        }
-        let fact = this.detectNullCheck(core);
-        if (fact != null && fact.narrowsWhenTrue == conditionHolds) {
-            sink.push(fact);
-        }
-    }
-
-    applyFacts(List<NarrowingFact> facts) {
-        for (long i = 0; i < facts.length(); i++) {
-            this.narrowing.narrow(facts.get(i).path, facts.get(i).proven);
-        }
-    }
-
-    walkBranch(BlockNode block, List<NarrowingFact> facts) {
-        this.enterScope();
-        this.applyFacts(facts);
-        this.walkBlock(block);
-        this.leaveScope();
-    }
-
-    // Walks a branch under the facts its condition proves and returns the narrowings that hold
-    // at its end, captured before the branch scope is discarded.
-    walkBranchCapture(BlockNode block, List<NarrowingFact> facts)
-            -> Map<NarrowingPath, Type> {
-        this.enterScope();
-        this.applyFacts(facts);
-        this.walkBlock(block);
-        let captured = this.narrowing.flatten();
-        this.leaveScope();
-        return captured;
-    }
-
-    // The narrowings on the implicit path where a condition failed and no statements run: the
-    // else side of an 'if' without an 'else', and the fall-through of a switch scrutinee.
-    captureConditionBranch(List<NarrowingFact> facts) -> Map<NarrowingPath, Type> {
-        this.enterScope();
-        this.applyFacts(facts);
-        let captured = this.narrowing.flatten();
-        this.leaveScope();
-        return captured;
-    }
-
-    // The proven type common to two branch end-states for one path: identity, or the wider of
-    // two types related by assignability, or null when neither contains the other.
-    unifyNarrowed(Type left, Type right) -> Type? {
-        if (left == right) {
-            return left;
-        }
-        if (convert.isAssignableStrict(left, right)) {
-            return left;
-        }
-        if (convert.isAssignableStrict(right, left)) {
-            return right;
-        }
-        return null;
-    }
-
-    // The intersection of the surviving branch end-states: a path keeps a proof only where every
-    // survivor proves it, unified to the type they share.
-    intersectNarrowings(List<Map<NarrowingPath, Type>> survivors)
-            -> Map<NarrowingPath, Type> {
-        let result = new Map<NarrowingPath, Type>();
-        let first = survivors.get(0);
-        for (let key in first.keys()) {
-            let value = first.get(key);
-            if (value != null) {
-                result.set(key, value);
-            }
-        }
-        for (long i = 1; i < survivors.length(); i++) {
-            let other = survivors.get(i);
-            let merged = new Map<NarrowingPath, Type>();
-            for (let key in result.keys()) {
-                let mine = result.get(key);
-                let theirs = other.get(key);
-                if (mine != null && theirs != null) {
-                    let unified = this.unifyNarrowed(mine, theirs);
-                    if (unified != null) {
-                        merged.set(key, unified);
-                    }
-                }
-            }
-            result = merged;
-        }
-        return result;
-    }
-
-    // Whether a path's root is still nameable after the merge, so a proof on a binding local to
-    // one branch does not leak out when that branch is the only survivor. A type-level field is
-    // nameable everywhere.
-    pathRootInScope(NarrowingPath path) -> bool {
-        let root = path.root();
-        if (root == null) {
-            return true;
-        }
-        if (this.frame().thisBinding() != null && root == this.frame().thisBinding()) {
-            return true;
-        }
-        let current = this.scope;
-        if (current == null) {
-            return false;
-        }
-        return current.lookup(root.name()) == root;
-    }
-
-    // Installs the intersection of the surviving branches as the narrowing after a merge: a path
-    // stays narrowed only where every falling-through branch proves it, an entry proof a branch
-    // dropped is dropped, and a proof a branch newly established is added.
-    applyNarrowingJoin(Map<NarrowingPath, Type> entryFacts, List<Map<NarrowingPath, Type>> survivors) {
-        if (survivors.length() == 0) {
-            return;
-        }
-        let joined = this.intersectNarrowings(survivors);
-        for (let key in entryFacts.keys()) {
-            if (joined.get(key) == null) {
-                this.narrowing.clearPath(key);
-            }
-        }
-        for (let key in joined.keys()) {
-            let joinedType = joined.get(key);
-            if (joinedType == null) {
-                continue;
-            }
-            let entryType = entryFacts.get(key);
-            if (entryType != null && entryType == joinedType) {
-                continue;
-            }
-            if (!this.pathRootInScope(key)) {
-                continue;
-            }
-            this.narrowing.clearPath(key);
-            this.narrowing.narrow(key, joinedType);
-        }
-    }
-
     // ---- Definite assignment ----
 
     // Records the this-field shorthand parameters as assigned before the body runs, so a
@@ -3194,208 +2925,9 @@ public final class BodyChecker implements NoreturnCalls {
         return false;
     }
 
-    // Analyzes a '?:' branch or the right side of '&&' or '||' under the facts the condition proves
-    // there. 'target' is the type the branch is checked against, set at 'origin', or null.
-    analyzeGuardedBranch(Expression condition, Expression branch, bool conditionHolds, Type? target,
-                         LiteralOrigin? origin = null) -> Type {
-        let facts = new List<NarrowingFact>();
-        this.collectNarrowings(condition, conditionHolds, facts);
-        this.narrowing.push();
-        this.applyFacts(facts);
-        bool previous = this.assignment().unconditionalPosition();
-        this.assignment().setUnconditionalPosition(false);
-        Type analyzed = this.store().errorType();
-        if (target != null) {
-            analyzed = this.analyzeExpressionAdapt(branch, target, origin);
-        } else {
-            analyzed = this.analyzeExpression(branch);
-        }
-        this.assignment().setUnconditionalPosition(previous);
-        this.narrowing.pop();
-        return analyzed;
-    }
-
-    // The declared type of the storage an expression reads, or null when it reads no single
-    // declared slot: the binding's, 'this's, field's, or array element's own type.
-    declaredSlotType(Expression expression) -> Type? {
-        Expression core = wording.unwrapParentheses(expression);
-        switch (core) {
-            is IdentifierExpressionNode identifier -> {
-                let binding = this.result().bindingOf(identifier.green());
-                if (binding == null) {
-                    return null;
-                }
-                return binding.type();
-            },
-            is ThisExpressionNode ignored -> {
-                return this.frame().thisType();
-            },
-            is MemberExpressionNode member -> {
-                let typeLevel = this.result().staticConstFieldOf(member.green());
-                if (typeLevel != null) {
-                    return typeLevel.type();
-                }
-                let objectType = this.result().typeOf(member.object().green());
-                if (objectType == null) {
-                    return null;
-                }
-                let field = typemembers.inheritedOrOwnField(objectType, member.member().text());
-                if (field == null) {
-                    return null;
-                }
-                return field.type();
-            },
-            is SubscriptExpressionNode subscript -> {
-                let objectType = this.result().typeOf(subscript.object().green());
-                if (objectType is ArrayType) {
-                    return objectType.element();
-                }
-                return null;
-            },
-            default -> {
-                return null;
-            },
-        }
-    }
-
-    // A presence operator ('== null', '!= null', '??', '?.', '?[') consults the declared storage
-    // type, so a re-check of a proven-non-null declared-optional stays legal. The operand is
-    // retyped back to the declared type, and a declared non-optional keeps its analyzed type and
-    // is rejected by the operator's own rule. A value still nullable after narrowing needs nothing
-    // restored, since the operator tests the level it has now.
-    presenceOperandType(Expression operand, Type analyzed) -> Type {
-        if (analyzed is OptionalType) {
-            return analyzed;
-        }
-        let declared = this.declaredSlotType(operand);
-        if (declared == null || !(declared is OptionalType) || declared == analyzed) {
-            return analyzed;
-        }
-        Expression current = operand;
-        this.result().setType(current.green(), declared);
-        while (current is ParenthesizedExpressionNode) {
-            current = current.inner();
-            this.result().setType(current.green(), declared);
-        }
-        return declared;
-    }
-
-    // The deepest level a stored value proves present in storage of optional declared type. A
-    // bare value proves every wrapped level, and a 'T?' stored into a 'T??' proves the outer one.
-    // Null when the store proves nothing, so the storage keeps its declared type.
-    provenByStore(Type declared, Type stored) -> Type? {
-        if (!(declared is OptionalType)) {
-            return null;
-        }
-        if (stored is ErrorType || stored is NullType) {
-            return null;
-        }
-        Type proven = declared;
-        while (proven is OptionalType && convert.isAssignableStrict(proven.inner(), stored)) {
-            proven = proven.inner();
-        }
-        if (proven == declared) {
-            return null;
-        }
-        return proven;
-    }
-
-    // Narrows a binding to what its initializer proves, for a declaration, whose name is bound
-    // here rather than written as an expression.
-    establishAssignmentNarrowing(LocalBinding binding, Type value) {
-        let proven = this.provenByStore(binding.type(), value);
-        if (proven == null) {
-            return;
-        }
-        this.narrowing.narrow(narrow.bindingPath(binding), proven);
-    }
-
-    // Narrows the place a write stored into, after invalidateForWrite has dropped what the place
-    // held before. Only a stable place has a path, so a write to any other place narrows nothing.
-    establishWriteNarrowing(Expression target, Type stored) {
-        let declared = this.declaredSlotType(target);
-        if (declared == null) {
-            return;
-        }
-        let proven = this.provenByStore(declared, stored);
-        if (proven == null) {
-            return;
-        }
-        let path = this.buildNarrowingPath(target);
-        if (path == null) {
-            return;
-        }
-        this.narrowing.narrow(path, proven);
-    }
-
-    // A write drops the narrowings of the storage it replaces. A binding write drops every path
-    // from that binding, and a member write drops every path that starts with the written one.
-    invalidateForWrite(Expression target) {
-        if (target is IdentifierExpressionNode) {
-            let binding = this.result().bindingOf(target.green());
-            if (binding != null) {
-                this.narrowing.clearForRoot(binding);
-                return;
-            }
-        }
-        if (target is MemberExpressionNode) {
-            let path = this.buildNarrowingPath(target);
-            if (path != null) {
-                this.narrowing.clearPrefixedBy(path);
-            }
-        }
-    }
-
-    // Loop-entry pre-clearing: before the loop body is analyzed, drop every narrowing whose
-    // storage the body may write, so a fact a later body write kills cannot be read stale on a
-    // following iteration. The condition re-establishes its own narrowing each iteration, so a
-    // condition-derived fact is not pre-cleared. Roots resolve by name against the current scope,
-    // since the body nodes are not analyzed yet.
-    preClearLoopBodyWrites(SyntaxNode node) {
-        switch (node) {
-            is AssignmentExpressionNode assignment -> {
-                this.preClearWrite(assignment.target());
-            },
-            is PrefixExpressionNode prefix -> {
-                let operator = prefix.operator().kind();
-                if (operator == SyntaxKind.PlusPlus || operator == SyntaxKind.MinusMinus) {
-                    this.preClearWrite(prefix.operand());
-                }
-            },
-            is PostfixExpressionNode postfix -> {
-                let operator = postfix.operator().kind();
-                if (operator == SyntaxKind.PlusPlus || operator == SyntaxKind.MinusMinus) {
-                    this.preClearWrite(postfix.operand());
-                }
-            },
-            is OutArgumentNode outArgument -> {
-                let binding = this.lookupBinding(outArgument.name().text());
-                if (binding != null) {
-                    this.narrowing.clearForRoot(binding);
-                }
-            },
-            default -> { },
-        }
-        for (let child in node.childNodes()) {
-            this.preClearLoopBodyWrites(child);
-        }
-    }
-
-    // Only a local or a parameter can be written in a loop and hold a narrowing, since a 'const'
-    // field takes no write there and nothing else narrows. Parentheses name the place they hold.
-    preClearWrite(Expression target) {
-        Expression written = wording.unwrapParentheses(target);
-        if (written is IdentifierExpressionNode) {
-            let binding = this.lookupBinding(written.name().text());
-            if (binding != null) {
-                this.narrowing.clearForRoot(binding);
-            }
-        }
-    }
-
     // ---- Statements ----
 
-    walkBlock(BlockNode block) {
+    public walkBlock(BlockNode block) {
         for (long i = 0; i < block.statementsCount(); i++) {
             this.noteArrayFillLoop(block, i);
             this.walkStatement(block.statements(i));
@@ -3502,7 +3034,7 @@ public final class BodyChecker implements NoreturnCalls {
         if (initializer != null) {
             let initType = this.result().typeOf(initializer.value().green());
             if (initType != null) {
-                this.establishAssignmentNarrowing(binding, initType);
+                narrowing.establishAssignmentNarrowing(this, binding, initType);
             }
         }
     }
@@ -3585,46 +3117,46 @@ public final class BodyChecker implements NoreturnCalls {
         this.checkConditionIsBool(condition, "if", node.condition());
         let whenTrue = new List<NarrowingFact>();
         let whenFalse = new List<NarrowingFact>();
-        this.collectNarrowings(node.condition(), true, whenTrue);
-        this.collectNarrowings(node.condition(), false, whenFalse);
+        narrowing.collectNarrowings(this, node.condition(), true, whenTrue);
+        narrowing.collectNarrowings(this, node.condition(), false, whenFalse);
 
         let entryAssign = this.assignment().snapshot();
-        let entryLayers = this.narrowing.snapshotLayers();
-        let entryFacts = this.narrowing.flatten();
+        let entryLayers = this.narrowingState.snapshotLayers();
+        let entryFacts = this.narrowingState.flatten();
 
-        let thenFacts = this.walkBranchCapture(node.thenBranch(), whenTrue);
+        let thenFacts = narrowing.walkBranchCapture(this, node.thenBranch(), whenTrue);
         let afterThen = this.assignment().snapshot();
         this.assignment().restore(entryAssign);
-        this.narrowing.restoreLayers(entryLayers);
+        this.narrowingState.restoreLayers(entryLayers);
 
         Map<NarrowingPath, Type> elseFacts;
         let afterElse = entryAssign;
         let elseClause = node.elseClause();
         if (elseClause == null) {
-            elseFacts = this.captureConditionBranch(whenFalse);
+            elseFacts = narrowing.captureConditionBranch(this, whenFalse);
         } else {
             switch (elseClause.body()) {
                 is BlockNode block -> {
-                    elseFacts = this.walkBranchCapture(block, whenFalse);
+                    elseFacts = narrowing.walkBranchCapture(this, block, whenFalse);
                     afterElse = this.assignment().snapshot();
                 },
                 is IfStatementNode chained -> {
                     // An 'else if' is reached only when this condition failed, so the chained
                     // 'if' is checked under the negated facts exactly as an else block is.
                     this.enterScope();
-                    this.applyFacts(whenFalse);
+                    narrowing.applyFacts(this, whenFalse);
                     this.checkIfStatement(chained);
-                    elseFacts = this.narrowing.flatten();
+                    elseFacts = this.narrowingState.flatten();
                     afterElse = this.assignment().snapshot();
                     this.leaveScope();
                 },
                 default -> {
-                    elseFacts = this.captureConditionBranch(whenFalse);
+                    elseFacts = narrowing.captureConditionBranch(this, whenFalse);
                 },
             }
         }
         this.assignment().restore(entryAssign);
-        this.narrowing.restoreLayers(entryLayers);
+        this.narrowingState.restoreLayers(entryLayers);
 
         let flows = new List<AssignmentFlow>();
         flows.push(afterThen);
@@ -3638,13 +3170,13 @@ public final class BodyChecker implements NoreturnCalls {
         if (!afterElse.terminated()) {
             survivors.push(elseFacts);
         }
-        this.applyNarrowingJoin(entryFacts, survivors);
+        narrowing.applyNarrowingJoin(this, entryFacts, survivors);
     }
 
     // The condition is rechecked every iteration and body writes drop narrowing at their own
     // point, so condition narrowing is safe in the body.
     checkWhileStatement(WhileStatementNode node) {
-        this.preClearLoopBodyWrites(node.body());
+        narrowing.preClearLoopBodyWrites(this, node.body());
         // The condition re-evaluates every iteration, so writes in it count as loop writes.
         this.frame().enterLoop();
         this.frame().enterLoopCondition();
@@ -3653,12 +3185,12 @@ public final class BodyChecker implements NoreturnCalls {
         this.frame().leaveLoop();
         this.checkConditionIsBool(condition, "while", node.condition());
         let facts = new List<NarrowingFact>();
-        this.collectNarrowings(node.condition(), true, facts);
+        narrowing.collectNarrowings(this, node.condition(), true, facts);
         bool alwaysTrue = this.conditionIsAlwaysTrue(node.condition());
         let postCondition = this.assignment().snapshot();
         this.assignment().beginLoop();
         this.frame().enterLoop();
-        this.walkBranch(node.body(), facts);
+        narrowing.walkBranch(this, node.body(), facts);
         this.frame().leaveLoop();
         let exits = this.assignment().endLoop();
         if (!alwaysTrue) {
@@ -3681,10 +3213,10 @@ public final class BodyChecker implements NoreturnCalls {
                 default -> { },
             }
         }
-        this.preClearLoopBodyWrites(node.body());
+        narrowing.preClearLoopBodyWrites(this, node.body());
         let update = node.update();
         if (update != null) {
-            this.preClearLoopBodyWrites(update);
+            narrowing.preClearLoopBodyWrites(this, update);
         }
         let facts = new List<NarrowingFact>();
         let condition = node.condition();
@@ -3697,14 +3229,14 @@ public final class BodyChecker implements NoreturnCalls {
             this.frame().leaveLoopCondition();
             this.frame().leaveLoop();
             this.checkConditionIsBool(conditionType, "for", condition);
-            this.collectNarrowings(condition, true, facts);
+            narrowing.collectNarrowings(this, condition, true, facts);
             alwaysTrue = this.conditionIsAlwaysTrue(condition);
         }
         let postCondition = this.assignment().snapshot();
         this.assignment().beginLoop();
         this.frame().enterLoop();
         this.enterScope();
-        this.applyFacts(facts);
+        narrowing.applyFacts(this, facts);
         this.walkBlock(node.body());
         if (update != null) {
             this.assignment().setUnconditionalPosition(true);
@@ -3787,7 +3319,7 @@ public final class BodyChecker implements NoreturnCalls {
         this.assignment().trackLocal(binding, assigned: true);
         this.assignment().beginLoop();
         this.frame().enterLoop();
-        this.preClearLoopBodyWrites(node.body());
+        narrowing.preClearLoopBodyWrites(this, node.body());
         this.walkScopedBlock(node.body());
         this.frame().leaveLoop();
         let exits = this.assignment().endLoop();
@@ -3936,7 +3468,7 @@ public final class BodyChecker implements NoreturnCalls {
 
     // ---- Expressions ----
 
-    analyzeExpression(Expression node) -> Type {
+    public analyzeExpression(Expression node) -> Type {
         Type analyzed = this.analyzeExpressionInner(node);
         this.result().setType(node.green(), analyzed);
         return analyzed;
@@ -3984,13 +3516,13 @@ public final class BodyChecker implements NoreturnCalls {
                 return this.analyzeSafeSubscript(subscript);
             },
             is CastExpressionNode cast -> {
-                return this.analyzeCast(cast);
+                return narrowing.analyzeCast(this, cast);
             },
             is CheckedCastExpressionNode cast -> {
-                return this.analyzeCheckedCast(cast);
+                return narrowing.analyzeCheckedCast(this, cast);
             },
             is TypeTestExpressionNode test -> {
-                return this.analyzeTypeTest(test);
+                return narrowing.analyzeTypeTest(this, test);
             },
             is AssignmentExpressionNode assignment -> {
                 return this.analyzeAssignment(assignment);
@@ -4037,7 +3569,7 @@ public final class BodyChecker implements NoreturnCalls {
     // Analyzes toward a target type, which gives a lambda, an array or struct literal, an untyped
     // literal and a generic call the type they lack. A '?:', a switch and parentheses pass the target
     // on, and 'origin' is where it is set.
-    analyzeExpressionAdapt(Expression node, Type target, LiteralOrigin? origin = null) -> Type {
+    public analyzeExpressionAdapt(Expression node, Type target, LiteralOrigin? origin = null) -> Type {
         if (node is ParenthesizedExpressionNode) {
             Type adapted = this.analyzeExpressionAdapt(node.inner(), target, origin);
             this.result().setType(node.green(), adapted);
@@ -4214,7 +3746,7 @@ public final class BodyChecker implements NoreturnCalls {
     checkLambdaBody(LambdaExpressionNode node, Signature signature) -> LambdaCapture[] {
         let lambdaFrame = new LambdaFrame(this.scope, this.frame().thisType());
         let outerScope = this.scope;
-        let outerNarrowing = this.narrowing;
+        let outerNarrowing = this.narrowingState;
         let outerFrame = this.callableFrame;
         let outerDeferred = this.targets().deferredFixes();
         bool outerAwaiting = this.targets().awaitingParameter();
@@ -4222,7 +3754,7 @@ public final class BodyChecker implements NoreturnCalls {
 
         this.lambdaFrames.push(lambdaFrame);
         this.scope = new Scope(null);
-        this.narrowing = new NarrowingState();
+        this.narrowingState = new NarrowingState();
         let innerFrame = outerFrame.forLambda(node, signature.returnType(),
             this.returnOriginThrough(this.targets().lambdaHolder(), signature.returnType()));
         this.callableFrame = innerFrame;
@@ -4251,7 +3783,7 @@ public final class BodyChecker implements NoreturnCalls {
 
         this.lambdaFrames.pop();
         this.scope = outerScope;
-        this.narrowing = outerNarrowing;
+        this.narrowingState = outerNarrowing;
         this.callableFrame = outerFrame;
         // A 'super(...)' in the lambda counts as the enclosing constructor's own.
         if (innerFrame.sawSuperCall()) {
@@ -4643,7 +4175,7 @@ public final class BodyChecker implements NoreturnCalls {
     // A cast names the width the value should take, so a literal whose value the target holds
     // adapts to it and stays exact. One the target cannot hold keeps its default type, because
     // a narrowing cast is how the language spells a deliberate truncation.
-    adaptLiteralToCastTarget(Expression node, Type target) {
+    public adaptLiteralToCastTarget(Expression node, Type target) {
         if (!(target is PrimitiveType)) {
             return;
         }
@@ -5013,7 +4545,7 @@ public final class BodyChecker implements NoreturnCalls {
             is LocalName local -> {
                 this.result().setBinding(node.green(), local.binding);
                 this.assignment().checkDefiniteAssignment(local.binding, node.name().span());
-                let proven = this.narrowing.provenType(narrow.bindingPath(local.binding));
+                let proven = this.narrowingState.provenType(narrow.bindingPath(local.binding));
                 if (proven != null) {
                     return proven;
                 }
@@ -5614,7 +5146,7 @@ public final class BodyChecker implements NoreturnCalls {
         // the result, so a check on the left narrows the right: 'x != null && x.ready()'.
         if (operator == SyntaxKind.AmpersandAmpersand || operator == SyntaxKind.PipePipe) {
             Type shortLeft = this.analyzeExpression(node.left());
-            Type shortRight = this.analyzeGuardedBranch(node.left(), node.right(),
+            Type shortRight = narrowing.analyzeGuardedBranch(this, node.left(), node.right(),
                 operator == SyntaxKind.AmpersandAmpersand, null);
             if (shortLeft is ErrorType || shortRight is ErrorType) {
                 return this.store().errorType();
@@ -6279,7 +5811,7 @@ public final class BodyChecker implements NoreturnCalls {
         if (array == null) {
             return null;
         }
-        Type arrayType = this.declaredSlotType(receiver) ?? this.recordedType(receiver);
+        Type arrayType = narrowing.declaredSlotType(this, receiver) ?? this.recordedType(receiver);
         return this.valueOrigin(OriginKind.Declared, array, arrayType, node.value(), node);
     }
 
@@ -6459,9 +5991,9 @@ public final class BodyChecker implements NoreturnCalls {
         Type leftSide = adapted[0];
         Type rightSide = adapted[1];
         if (rightSide is NullType) {
-            leftSide = this.presenceOperandType(leftNode, leftSide);
+            leftSide = narrowing.presenceOperandType(this, leftNode, leftSide);
         } else if (leftSide is NullType) {
-            rightSide = this.presenceOperandType(rightNode, rightSide);
+            rightSide = narrowing.presenceOperandType(this, rightNode, rightSide);
         }
         if (this.reportFunctionComparison(span, leftSide, rightSide)) {
             return this.store().primitive(PrimitiveKind.Bool);
@@ -6794,8 +6326,8 @@ public final class BodyChecker implements NoreturnCalls {
         if (safe || refusal != WriteRefusal.None) {
             return changedType;
         }
-        this.invalidateForWrite(changed);
-        this.establishWriteNarrowing(changed, operandType);
+        narrowing.invalidateForWrite(this, changed);
+        narrowing.establishWriteNarrowing(this, changed, operandType);
         return changedType;
     }
 
@@ -7172,9 +6704,9 @@ public final class BodyChecker implements NoreturnCalls {
         }
         // A refused write to a static or lazy const changes no narrowing.
         if (staticTarget == null) {
-            this.invalidateForWrite(writtenTarget);
+            narrowing.invalidateForWrite(this, writtenTarget);
             if (!refused) {
-                this.establishWriteNarrowing(writtenTarget, storedType);
+                narrowing.establishWriteNarrowing(this, writtenTarget, storedType);
             }
         }
         if (writtenTarget is IdentifierExpressionNode) {
@@ -7308,7 +6840,7 @@ public final class BodyChecker implements NoreturnCalls {
         if (receiver is IdentifierExpressionNode) {
             array = receiver.name().text();
         }
-        let arrayType = this.declaredSlotType(receiver);
+        let arrayType = narrowing.declaredSlotType(this, receiver);
         if (array == null || arrayType == null) {
             return "";
         }
@@ -7361,10 +6893,10 @@ public final class BodyChecker implements NoreturnCalls {
                 return this.result().bindingOf(identifier.green()) != null;
             },
             is MemberExpressionNode ignored -> {
-                return this.declaredSlotType(target) != null;
+                return narrowing.declaredSlotType(this, target) != null;
             },
             is SubscriptExpressionNode ignored -> {
-                return this.declaredSlotType(target) != null;
+                return narrowing.declaredSlotType(this, target) != null;
             },
             default -> {
                 return this.safeSlotType(target) != null;
@@ -7383,7 +6915,7 @@ public final class BodyChecker implements NoreturnCalls {
                 return binding.type();
             },
             is MemberExpressionNode member -> {
-                return this.declaredSlotType(member) ?? analyzed;
+                return narrowing.declaredSlotType(this, member) ?? analyzed;
             },
             is SubscriptExpressionNode subscript -> {
                 let objectType = this.result().typeOf(subscript.object().green());
@@ -7471,7 +7003,8 @@ public final class BodyChecker implements NoreturnCalls {
         let thenDeferred = new List<DeferredLiteralFix>();
         this.targets().setDeferredFixes(thenDeferred);
         this.noteJoinValue(thenValue);
-        Type thenType = this.analyzeGuardedBranch(node.condition(), thenValue, true, thenTarget, origin);
+        Type thenType = narrowing.analyzeGuardedBranch(this, node.condition(), thenValue, true, thenTarget,
+            origin);
         this.targets().clearStash();
         if (elseTarget == null) {
             this.targets().stash(elseValue, fixTarget, fixOrigin);
@@ -7479,7 +7012,8 @@ public final class BodyChecker implements NoreturnCalls {
         let elseDeferred = new List<DeferredLiteralFix>();
         this.targets().setDeferredFixes(elseDeferred);
         this.noteJoinValue(elseValue);
-        Type elseType = this.analyzeGuardedBranch(node.condition(), elseValue, false, elseTarget, origin);
+        Type elseType = narrowing.analyzeGuardedBranch(this, node.condition(), elseValue, false, elseTarget,
+            origin);
         this.targets().clearStash();
         this.targets().setDeferredFixes(outerDeferred);
         this.settleDeferred(thenDeferred, elseValue, elseType, "the other branch");
@@ -7528,7 +7062,7 @@ public final class BodyChecker implements NoreturnCalls {
     analyzeNullCoalesce(NullCoalesceExpressionNode node) -> Type {
         Type left = this.analyzeExpression(node.left());
         if (!(left is ErrorType)) {
-            left = this.presenceOperandType(node.left(), left);
+            left = narrowing.presenceOperandType(this, node.left(), left);
         }
         bool previous = this.assignment().unconditionalPosition();
         this.assignment().setUnconditionalPosition(false);
@@ -7590,143 +7124,6 @@ public final class BodyChecker implements NoreturnCalls {
         return this.store().errorType();
     }
 
-    analyzeCast(CastExpressionNode node) -> Type {
-        Type source = this.analyzeExpression(node.value());
-        Type target = this.resolver().resolveType(node.target());
-        if (source is ErrorType || target is ErrorType) {
-            return this.store().errorType();
-        }
-        this.adaptLiteralToCastTarget(node.value(), target);
-        let retyped = this.result().typeOf(node.value().green());
-        if (retyped != null) {
-            source = retyped;
-        }
-        if (source is EnumType) {
-            if (!source.isNumeric()) {
-                this.reporter().report(this.enumNeedsValuesMessage(source), node.span());
-                return this.store().errorType();
-            }
-            if (!convert.isIntegerType(target)) {
-                this.reporter().report("Cannot convert enum '{this.names().of(source)}' to "
-                    + "'{this.names().of(target)}' with 'as'. An enum whose members have values converts "
-                    + "only to an integer type, such as 'int' or 'long'.", node.span());
-                return this.store().errorType();
-            }
-            return target;
-        }
-        if (target is EnumType) {
-            if (target.isNumeric()) {
-                this.reporter().report("Converting '{this.names().of(source)}' to enum "
-                    + "'{this.names().of(target)}' fails when no member has that value. Use "
-                    + "'as?', which gives '{this.names().of(target)}?' and is null when no "
-                    + "member matches.", node.span());
-            } else {
-                this.reporter().report(this.enumNeedsValuesMessage(target), node.span());
-            }
-            return this.store().errorType();
-        }
-        if (!convert.isNumericType(source) || !convert.isNumericType(target)) {
-            this.reporter().report("Cannot convert '{this.names().of(source)}' to "
-                + "'{this.names().of(target)}' with 'as'. 'as' converts only between numbers, and between an "
-                + "enum and an integer.", node.span());
-            return this.store().errorType();
-        }
-        return target;
-    }
-
-    // Guidance when a plain enum is used in a numeric conversion: it names the enum and shows how
-    // to make it numeric using its own first member.
-    enumNeedsValuesMessage(EnumType enumType) -> string {
-        string member = "First";
-        let names = enumType.memberNames();
-        if (names.length > 0) {
-            member = names[0];
-        }
-        return "Enum '{this.names().nameOf(enumType)}' assigns no values to its members, so it "
-            + "does not convert to or from an integer. Give the members values, for example "
-            + "'{member} = 0'.";
-    }
-
-    analyzeTypeTest(TypeTestExpressionNode node) -> Type {
-        Type source = this.analyzeExpression(node.value());
-        Type target = this.resolver().resolveType(node.target());
-        this.result().setType(node.target().green(), target);
-        if (source is ErrorType || target is ErrorType) {
-            return this.store().errorType();
-        }
-        if (!this.checkClassTypeTest(node.value(), source, target, false, node.span())) {
-            return this.store().errorType();
-        }
-        return this.store().primitive(PrimitiveKind.Bool);
-    }
-
-    analyzeCheckedCast(CheckedCastExpressionNode node) -> Type {
-        Type source = this.analyzeExpression(node.value());
-        Type target = this.resolver().resolveType(node.target());
-        if (source is ErrorType || target is ErrorType) {
-            return this.store().errorType();
-        }
-        if (target is EnumType) {
-            if (!target.isNumeric()) {
-                this.reporter().report(this.enumNeedsValuesMessage(target), node.span());
-                return this.store().errorType();
-            }
-            if (!convert.isIntegerType(source)) {
-                this.reporter().report("Cannot convert '{this.names().of(source)}' to enum "
-                    + "'{this.names().of(target)}' with 'as?'. Only an integer can be matched against the "
-                    + "values of an enum's members.", node.span());
-                return this.store().errorType();
-            }
-            return this.store().optionalOf(target);
-        }
-        if (source is EnumType && source.isNumeric() && convert.isIntegerType(target)) {
-            this.reporter().report("Converting enum '{this.names().of(source)}' to "
-                + "'{this.names().of(target)}' always succeeds. Write 'as' instead of 'as?'.", node.span());
-            return this.store().errorType();
-        }
-        if (!this.checkClassTypeTest(node.value(), source, target, true, node.span())) {
-            return this.store().errorType();
-        }
-        return this.store().optionalOf(target);
-    }
-
-    // The 'is' and 'as?' rule set: the target must be a plain class or interface, and the pair
-    // must be able to succeed without always succeeding. Open-typed operands defer to each
-    // instantiation.
-    checkClassTypeTest(Expression value, Type source, Type target, bool isCast, Span span) -> bool {
-        string operator = "is";
-        if (isCast) {
-            operator = "as?";
-        }
-        if (target is OptionalType) {
-            string core = this.names().of(convert.coreOf(target));
-            if (isCast) {
-                this.reporter().report("The type after 'as?' cannot be nullable, because "
-                    + "'as? {core}' already produces '{core}?'. Write 'as? {core}'.", span);
-            } else {
-                this.reporter().report("The type after 'is' cannot be nullable, because 'is' never matches "
-                    + "null. Write 'is {core}'.", span);
-            }
-            return false;
-        }
-        if (!(target is TypeParamType) && !types.isClassLike(target)) {
-            this.reporter().report("The type after '{operator}' must be a class or an interface, and "
-                + "'{this.names().of(target)}' is neither.", span);
-            return false;
-        }
-        if (convert.containsTypeParam(source) || convert.containsTypeParam(target)) {
-            this.recordObligation(new TypeTestObligation(source, target, isCast, span));
-            return true;
-        }
-        let issue = capabilities.typeTestIssue(source, target, isCast, this.names(),
-            this.oneLevelGuidance(value, source));
-        if (issue != null) {
-            this.reporter().report(issue, span);
-            return false;
-        }
-        return true;
-    }
-
     analyzeSubscript(SubscriptExpressionNode node) -> Type {
         Type objectType = this.analyzeExpression(node.object());
         let outerDeferred = this.targets().deferredFixes();
@@ -7765,7 +7162,7 @@ public final class BodyChecker implements NoreturnCalls {
         if (objectType is ErrorType) {
             return this.store().errorType();
         }
-        objectType = this.presenceOperandType(node.object(), objectType);
+        objectType = narrowing.presenceOperandType(this, node.object(), objectType);
         if (!(objectType is OptionalType)) {
             if (!(objectType is ArrayType)) {
                 this.reporter().report(this.notArrayRefusal(node.object(), objectType), node.span());
@@ -8615,7 +8012,7 @@ public final class BodyChecker implements NoreturnCalls {
                         found.field.definingType(), node.member().span())) {
                     this.result().markMemberAccessDenied(node.green());
                 }
-                return this.narrowedFieldType(node, found.field.type());
+                return narrowing.narrowedFieldType(this, node, found.field.type());
             },
             is MethodMember found -> {
                 if (found.candidates.length() <= 1) {
@@ -8799,7 +8196,7 @@ public final class BodyChecker implements NoreturnCalls {
         if (objectType is ErrorType) {
             return this.store().errorType();
         }
-        objectType = this.presenceOperandType(node.object(), objectType);
+        objectType = narrowing.presenceOperandType(this, node.object(), objectType);
         if (!(objectType is OptionalType)) {
             let spelled = wording.shortSpelling(node.object());
             if (spelled == null) {
@@ -9096,7 +8493,7 @@ public final class BodyChecker implements NoreturnCalls {
             this.checkMemberAccess(name, field.visibility(), field.definingType(),
                 node.member().span());
             this.result().setStaticConstField(node.green(), field);
-            return this.narrowedFieldType(node, field.type());
+            return narrowing.narrowedFieldType(this, node, field.type());
         }
         let statics = this.availableStatics(head, name);
         if (statics.length() > 0) {
@@ -11196,7 +10593,7 @@ public final class BodyChecker implements NoreturnCalls {
         }
         // 'out' lets the callee write the caller's variable directly, so it drops even the
         // binding's own narrowing.
-        this.narrowing.clearForRoot(binding);
+        this.narrowingState.clearForRoot(binding);
     }
 
     analyzeExtraExternalArgument(Argument argument) {
@@ -11565,8 +10962,8 @@ public final class BodyChecker implements NoreturnCalls {
         let valueExpressions = new List<Expression>();
         bool sawValueBlock = false;
         let switchEntry = this.assignment().snapshot();
-        let entryLayers = this.narrowing.snapshotLayers();
-        let entryFacts = this.narrowing.flatten();
+        let entryLayers = this.narrowingState.snapshotLayers();
+        let entryFacts = this.narrowingState.flatten();
         let armFlows = new List<AssignmentFlow>();
         let armNarrowings = new List<Map<NarrowingPath, Type>>();
         let valueArms = new List<SwitchArm>();
@@ -11582,7 +10979,7 @@ public final class BodyChecker implements NoreturnCalls {
                 this.targets().setDeferredFixes(held);
             }
             this.assignment().restore(switchEntry);
-            this.narrowing.restoreLayers(entryLayers);
+            this.narrowingState.restoreLayers(entryLayers);
             this.assignment().setUnconditionalPosition(true);
             switch (arms.get(a)) {
                 is DefaultArmNode arm -> {
@@ -11717,14 +11114,14 @@ public final class BodyChecker implements NoreturnCalls {
             this.assignment().restore(switchEntry);
         }
 
-        this.narrowing.restoreLayers(entryLayers);
+        this.narrowingState.restoreLayers(entryLayers);
         let survivors = new List<Map<NarrowingPath, Type>>();
         for (long i = 0; i < armFlows.length(); i++) {
             if (!armFlows.get(i).terminated()) {
                 survivors.push(armNarrowings.get(i));
             }
         }
-        this.applyNarrowingJoin(entryFacts, survivors);
+        narrowing.applyNarrowingJoin(this, entryFacts, survivors);
 
         // A switch used as a value with no arm, a type switch whose every arm is refused and one with an
         // arm refused for matching every value get no refusal of a missing arm.
@@ -12199,7 +11596,7 @@ public final class BodyChecker implements NoreturnCalls {
                 }
                 this.enterScope();
                 this.walkBlock(block);
-                armNarrowings.push(this.narrowing.flatten());
+                armNarrowings.push(this.narrowingState.flatten());
                 this.leaveScope();
                 return sawBlock;
             },
@@ -12215,14 +11612,14 @@ public final class BodyChecker implements NoreturnCalls {
                     this.analyzeExpression(expression);
                     this.targets().clearStash();
                 }
-                armNarrowings.push(this.narrowing.flatten());
+                armNarrowings.push(this.narrowingState.flatten());
                 if (requireValue) {
                     sink.push(expression);
                 }
                 return false;
             },
             default -> {
-                armNarrowings.push(this.narrowing.flatten());
+                armNarrowings.push(this.narrowingState.flatten());
                 return false;
             },
         }
