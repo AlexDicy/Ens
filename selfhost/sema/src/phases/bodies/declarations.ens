@@ -1,0 +1,648 @@
+// Walks the declarations of a module: functions, tests, and the members of structs, classes and
+// primitive bindings. Each body, field default, lazy initializer and parameter default is checked in a
+// frame of its own, and a constructor is checked against the base constructor it must call.
+import StructDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import ClassDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import PrimitiveDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import TestDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import FunctionDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import FieldDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import MemberListNode from @ens.frontend.syntax.generated.nodes;
+import CatchClauseNode from @ens.frontend.syntax.generated.nodes;
+import Span from @ens.frontend.support.source;
+import Scope from model.scopes;
+import LocalBinding from model.scopes;
+import BindingKind from model.scopes;
+import model.convert;
+import model.flow;
+import ExitScope from model.flow;
+import phases.members;
+import OriginKind from phases.bodies.literaltargets;
+import LiteralOrigin from phases.bodies.literaltargets;
+import phases.bodies.memberaccess;
+import phases.bodies.literalfixes;
+import phases.bodies.nullguidance;
+import phases.bodies.wording;
+import model.hierarchy;
+import model.typemembers;
+import Field from model.typemembers;
+import Method from model.typemembers;
+import Parameter from model.typemembers;
+import Signature from model.typemembers;
+import TypeNames from model.typenames;
+import model.types;
+import Type from model.types;
+import ErrorType from model.types;
+import PrimitiveKind from model.types;
+import DeclaredType from model.types;
+import ClassType from model.types;
+import StructType from model.types;
+import TypeParamType from model.types;
+import List from @std.collections.list;
+import BodyChecker from phases.bodies;
+import CallableFrame from phases.bodies;
+
+// What a type argument must be to satisfy the bound 'bound', spelled 'shown' where it is used.
+boundKindText(Type bound, Type shown, TypeNames names) -> string {
+    if (types.isInterfaceLike(bound)) {
+        return "implements '{names.of(shown)}'";
+    }
+    return "is '{names.of(shown)}' or a subclass of it";
+}
+
+public checkTopLevelFunction(BodyChecker checker, FunctionDeclarationNode node) {
+    let entries = checker.context().functions().all();
+    for (long i = 0; i < entries.length(); i++) {
+        let entry = entries.get(i);
+        if (entry.isExternal() || entry.isBuiltin()) {
+            continue;
+        }
+        if (entry.signature().declaration() == node.green()) {
+            checkParameterDefaults(checker, entry.signature(), null, node);
+            checkCallableBody(checker, entry.signature(), null, null, null, node);
+            return;
+        }
+    }
+}
+
+public checkStructBodies(BodyChecker checker, StructDeclarationNode node) {
+    let found = checker.store().findDeclared(checker.modulePath(), node.name().text());
+    if (found is StructType && found.declaration() == node.green()) {
+        checker.enterObligationOwner(found);
+        checkFieldDefaults(checker, found, node.body());
+        checkLazyInitializers(checker, found, node.body());
+        checkMemberBodies(checker, found, found.methods(), found.staticMethods(), node.body());
+        checker.leaveObligationOwner();
+    }
+}
+
+public checkClassBodies(BodyChecker checker, ClassDeclarationNode node) {
+    let found = checker.store().findDeclared(checker.modulePath(), node.name().text());
+    if (found is ClassType && found.declaration() == node.green()) {
+        checker.enterObligationOwner(found);
+        checkFieldDefaults(checker, found, node.body());
+        checkLazyInitializers(checker, found, node.body());
+        checkMemberBodies(checker, found, found.methods(), found.staticMethods(), node.body());
+        checker.leaveObligationOwner();
+    }
+}
+
+// A binding's members belong to the primitive, so 'this' inside one is the primitive value
+// and the members reachable without a receiver are the binding's own.
+public checkPrimitiveBindingBodies(BodyChecker checker, PrimitiveDeclarationNode node) {
+    let primitive = types.primitiveNamed(checker.store(), node.name().text());
+    if (primitive == null) {
+        return;
+    }
+    let binding = types.bindingOf(primitive);
+    if (binding == null || binding.declaration() != node.green()) {
+        return;
+    }
+    checkMemberBodies(checker, primitive, binding.methods(), binding.staticMethods(), node.body());
+}
+
+checkMemberBodies(BodyChecker checker, Type owner, List<Method> methods, List<Method> staticMethods,
+                  MemberListNode body) {
+    for (long i = 0; i < body.membersCount(); i++) {
+        let member = body.members(i);
+        if (member is FunctionDeclarationNode) {
+            let method = members.methodDeclaredBy(methods, member.green());
+            if (method != null) {
+                checkParameterDefaults(checker, method.signature(), owner, member);
+                checkCallableBody(checker, method.signature(), owner, owner, method, member);
+                continue;
+            }
+            let staticMethod = members.methodDeclaredBy(staticMethods, member.green());
+            if (staticMethod != null) {
+                checkParameterDefaults(checker, staticMethod.signature(), owner, member);
+                checkCallableBody(checker, staticMethod.signature(), null, owner, staticMethod, member);
+            }
+        }
+    }
+}
+
+public checkTestBody(BodyChecker checker, TestDeclarationNode node) {
+    let parameterScope = new Scope(null);
+    let bodyFrame = new CallableFrame(parameterScope, null, null, null, node,
+        checker.store().primitive(PrimitiveKind.Void), null, "A test", "", isStatic: false,
+        isNoreturn: false, isConstructor: false);
+    let outerFrame = checker.enterBody(parameterScope, bodyFrame);
+    checker.assignment().reset();
+    checker.enterScope();
+    checker.walkBlock(node.body());
+    checker.leaveScope();
+    checker.leaveBody(outerFrame);
+}
+
+// Checks one callable's body: the parameter scope (with 'this' for instance methods), a
+// child scope for the body's locals, and the catch clauses as siblings that cannot read those
+// locals. A static method takes its owner but no receiver: the owner's type parameters are
+// in scope and its members are reachable, while 'this' does not exist.
+checkCallableBody(BodyChecker checker, Signature signature, Type? receiver, Type? owner, Method? method,
+                  FunctionDeclarationNode node) {
+    bool ownsObligations = false;
+    if (owner == null && signature.isGeneric()) {
+        let declaration = signature.declaration();
+        if (declaration != null) {
+            ownsObligations = true;
+            checker.enterFunctionObligationOwner(declaration, signature.name(),
+                "{signature.name()}<{typeParameterNamesText(signature)}>");
+        }
+    }
+    long pushed = pushCallableTypeParameters(checker, signature, owner);
+    // Inside a conditional member, the constrained parameters carry the member's extra
+    // bounds: lookups, bound checks, and existence checks all read the scope.
+    bool pushedConstraints = false;
+    if (method != null && method.isConditional() && owner is DeclaredType) {
+        checker.resolver().pushMemberConstraints(owner.declaration(), method.constraints());
+        pushedConstraints = true;
+    }
+    let parameterScope = new Scope(null);
+    LocalBinding? thisBinding = null;
+    if (receiver != null) {
+        thisBinding = new LocalBinding("this", receiver, BindingKind.Parameter, true, signature.nameSpan());
+    }
+    string returnSubject = "Function '{signature.name()}'";
+    string headerArguments = wording.greenSpelling(node.parameters().green());
+    if (headerArguments.length > wording.quotedCodeLimit()) {
+        headerArguments = "(...)";
+    }
+    string returnHeader = "{signature.name()}{headerArguments}";
+    if (method != null && method.isConstructor() && owner != null) {
+        returnSubject = "The constructor of '{checker.names().of(owner)}'";
+        returnHeader = "";
+    } else if (method != null) {
+        returnSubject = "Method '{signature.name()}'";
+    }
+    let bodyFrame = new CallableFrame(parameterScope, thisBinding, receiver, owner, node,
+        signature.returnType(),
+        new LiteralOrigin(OriginKind.Returned, signature.name(), "", signature.returnType()),
+        returnSubject, returnHeader, isStatic: method != null && method.isStatic(),
+        isNoreturn: signature.isNoreturn(), isConstructor: method != null && method.isConstructor());
+    let outerFrame = checker.enterBody(parameterScope, bodyFrame);
+    if (receiver != null) {
+        checker.result().setReceiver(node.green(), receiver);
+    }
+
+    Parameter[] parameters = signature.parameters();
+    let parameterList = node.parameters();
+    for (long i = 0; i < parameters.length; i++) {
+        let parameter = parameters[i];
+        let binding = new LocalBinding(parameter.name(), parameter.type(),
+            BindingKind.Parameter, false, parameter.span());
+        checker.frame().parametersInReach().push(binding);
+        let scope = checker.frame().parameterScope();
+        if (scope != null && !scope.define(binding)) {
+            string declaredIn = "'{signature.name()}'";
+            if (method != null && method.isConstructor() && owner != null) {
+                declaredIn = "the constructor of '{checker.names().of(owner)}'";
+            }
+            checker.reporter().report("Parameter '{parameter.name()}' is declared twice in {declaredIn}. "
+                + "Rename one of the two.", parameter.span());
+        }
+        if (i < parameterList.parametersCount()) {
+            checker.result().setBinding(parameterList.parameters(i).green(), binding);
+        }
+    }
+
+    checker.assignment().reset();
+    // A constructor also tracks its own fields: a this-field shorthand parameter assigns
+    // the field before the body runs, and every own non-defaultable field must be assigned
+    // on every path that leaves the body normally.
+    if (checker.frame().inConstructor() && receiver != null) {
+        seedConstructorFields(checker, signature, receiver);
+    }
+    let body = node.body();
+    if (body != null) {
+        checker.enterScope();
+        checker.walkBlock(body);
+        checker.leaveScope();
+    }
+    if (checker.assignment().constructorFieldOwner() != null) {
+        checker.assignment().checkConstructorFieldsAssigned(signature.nameSpan());
+    }
+
+    checkConstructorChainsToBase(checker, signature, node);
+
+    for (long i = 0; i < node.catchClausesCount(); i++) {
+        checkCatchClause(checker, node.catchClauses(i));
+    }
+
+    checkReturnPaths(checker, signature, node);
+
+    checker.leaveBody(outerFrame);
+    if (pushedConstraints) {
+        checker.resolver().popMemberConstraints();
+    }
+    checker.resolver().popTypeParameters(pushed);
+    if (ownsObligations) {
+        checker.leaveObligationOwner();
+    }
+}
+
+pushCallableTypeParameters(BodyChecker checker, Signature signature, Type? owner) -> long {
+    long pushed = 0;
+    if (signature.isGeneric()) {
+        checker.resolver().pushTypeParameters(signature.typeParameters());
+        pushed = pushed + signature.typeParameters().length;
+    }
+    if (owner is DeclaredType) {
+        pushed = pushed + pushOwnerTypeParameters(checker, owner);
+    }
+    return pushed;
+}
+
+// How many of the declaration's own type parameters went into scope, for the caller to
+// pop on its way back out.
+pushOwnerTypeParameters(BodyChecker checker, DeclaredType owner) -> long {
+    if (!owner.isGeneric()) {
+        return 0;
+    }
+    TypeParamType[] parameters = owner.typeParameterTypes();
+    checker.resolver().pushTypeParameters(parameters);
+    return parameters.length;
+}
+
+// A constructor that does not call 'super(...)' runs the base constructor its class's implicit
+// chain chooses, so that chain must choose one that exists here.
+checkConstructorChainsToBase(BodyChecker checker, Signature signature, FunctionDeclarationNode node) {
+    if (!checker.frame().inConstructor() || checker.frame().sawSuperCall()) {
+        return;
+    }
+    let receiver = checker.frame().thisType();
+    if (receiver != null) {
+        checkImplicitBaseChain(checker, receiver, signature, node.body() != null, signature.nameSpan());
+    }
+}
+
+// The implicit chain of the receiver's class runs the base constructor it chooses. A chosen
+// constructor that the receiver's type arguments exclude is refused here. A chain that chooses
+// none is refused here only when the receiver's class makes the choice. Otherwise a base class
+// with no constructor makes it, and that class is refused where it is declared.
+public checkImplicitBaseChain(BodyChecker checker, Type receiver, Signature? declared, bool declaredHasBody,
+                              Span at) {
+    let current = types.authorityOf(receiver);
+    if (!(current is ClassType)) {
+        return;
+    }
+    let chain = typemembers.implicitBaseConstructor(receiver);
+    let owner = chain.owner();
+    if (owner == null) {
+        return;
+    }
+    let chosen = chain.chosen();
+    if (chosen != null) {
+        if (checker.resolver().memberExists(chosen)) {
+            return;
+        }
+        string clause = excludedConstructorClause(checker, chosen, "constructor");
+        if (clause.length > 0) {
+            string shownOwner = checker.names().of(owner);
+            string baseText = "its base class '{shownOwner}' with the zero-argument constructor of "
+                + "'{shownOwner}'.";
+            let direct = hierarchy.baseOf(receiver);
+            if (direct != null && direct != owner) {
+                string shownDirect = checker.names().of(direct);
+                baseText = "its base class '{shownDirect}'. '{shownDirect}' declares no constructor, so "
+                    + "it runs the zero-argument constructor of '{shownOwner}'.";
+            }
+            checker.reporter().report("The constructor of '{checker.names().nameOf(current)}' cannot "
+                + "initialize " + baseText + " " + clause, at);
+        }
+        return;
+    }
+    if (declared == null || chain.chooser() != receiver) {
+        return;
+    }
+    string opening = "The constructor of '{checker.names().nameOf(current)}' does not call 'super(...)'";
+    checker.reporter().report(typemembers.implicitBaseRefusal(opening, chain, declared, declaredHasBody, "",
+        checker.names()), at);
+}
+
+// Why an excluded conditional base constructor does not exist here, and the fix. 'memberWord'
+// names the declaration an open type parameter's bound can be added to, empty when none can take it.
+public excludedConstructorClause(BodyChecker checker, Method excluded, string memberWord) -> string {
+    let template = types.authorityOf(excluded.definingType());
+    let failed = checker.resolver().firstUnmetConstraint(excluded);
+    if (template == null || failed == null) {
+        return "";
+    }
+    string example = memberaccess.typeParameterExample(template);
+    string templateShown = "{checker.names().nameOf(template)}<{example}>";
+    string parameterName = template.typeParameters()[failed.parameterIndex()];
+    string declaredBound = checker.names().of(failed.bound());
+    Type argument = hierarchy.typeArgumentsOf(excluded.definingType())[failed.parameterIndex()];
+    string shownArgument = checker.names().of(argument);
+    if (argument is TypeParamType) {
+        return "That constructor exists only when '{parameterName}' satisfies '{declaredBound}', and "
+            + "nothing here requires that of '{shownArgument}'. "
+            + memberaccess.addBoundAdvice(memberWord, shownArgument, checker.names().of(failed.boundHere()));
+    }
+    string failurePhrase = "which does not implement '{checker.names().of(failed.boundHere())}'";
+    if (!types.isInterfaceLike(failed.bound())) {
+        failurePhrase = "which is not '{checker.names().of(failed.boundHere())}' or a subclass of it";
+    }
+    return "That constructor exists only when '{parameterName}' satisfies '{declaredBound}', and in "
+        + "'{checker.names().of(excluded.definingType())}', '{parameterName}' is "
+        + "'{shownArgument}', {failurePhrase}. Give '{checker.names().nameOf(template)}' a zero-argument "
+        + "constructor without that condition, or use a type argument that "
+        + boundKindText(failed.bound(), failed.boundHere(), checker.names()) + ".";
+}
+
+// The declaration the bound of an open type parameter used here can be added to: "method",
+// "constructor" or "function", or empty in a test or outside a callable.
+public currentMemberWord(BodyChecker checker) -> string {
+    if (!checker.frame().inCallableBody() || checker.frame().currentReturnSubject() == "A test") {
+        return "";
+    }
+    if (checker.frame().inConstructor()) {
+        return "constructor";
+    }
+    if (checker.frame().thisType() != null || checker.frame().inStaticMethod()) {
+        return "method";
+    }
+    return "function";
+}
+
+// The base constructor a class with no constructor of its own runs, when this instantiation
+// excludes it. It is null when that constructor exists or the chain runs none.
+public excludedImplicitBaseConstructor(BodyChecker checker, Type classType) -> Method? {
+    let chosen = typemembers.implicitBaseConstructor(classType).chosen();
+    if (chosen == null || checker.resolver().memberExists(chosen)) {
+        return null;
+    }
+    return chosen;
+}
+
+// A non-void callable must exit on every path: through its body and through each catch
+// clause it declares. A 'noreturn' callable carries the stronger obligation that no path
+// completes at all.
+checkReturnPaths(BodyChecker checker, Signature signature, FunctionDeclarationNode node) {
+    if (signature.isNoreturn()) {
+        checkNoreturnBody(checker, signature, node);
+        return;
+    }
+    Type returned = signature.returnType();
+    if (types.isVoidType(returned) || returned is ErrorType) {
+        return;
+    }
+    let body = node.body();
+    if (body == null) {
+        return;
+    }
+    if (!flow.blockTerminates(body, ExitScope.Function, checker)) {
+        checker.reporter().report("{checker.frame().currentReturnSubject()} returns "
+            + "'{checker.names().of(returned)}', but a path through its body ends without a 'return'. "
+            + "Add a 'return' at the end of every path.", signature.nameSpan());
+        return;
+    }
+    for (long i = 0; i < node.catchClausesCount(); i++) {
+        let clause = node.catchClauses(i);
+        if (!flow.blockTerminates(clause.body(), ExitScope.Function, checker)) {
+            checker.reporter().report("{checker.frame().currentReturnSubject()} returns "
+                + "'{checker.names().of(returned)}', but a path through its 'catch' clause ends without a "
+                + "'return'. Add a 'return' at the end of every path.", clause.span());
+        }
+    }
+}
+
+// A 'noreturn' body must be unable to complete normally: every path ends by throwing,
+// calling 'panic' or another 'noreturn' function, or looping forever. A bodiless form
+// (abstract or interface method) carries the contract without a body to check.
+checkNoreturnBody(BodyChecker checker, Signature signature, FunctionDeclarationNode node) {
+    let body = node.body();
+    if (body == null) {
+        return;
+    }
+    if (!flow.blockTerminates(body, ExitScope.Function, checker)) {
+        string subject = checker.frame().currentReturnSubject();
+        checker.reporter().report("{subject} is declared 'noreturn', but a path "
+            + "through its body ends normally. End every path by throwing, calling 'panic' or calling "
+            + "another 'noreturn' function.", signature.nameSpan());
+    }
+    for (long i = 0; i < node.catchClausesCount(); i++) {
+        let clause = node.catchClauses(i);
+        if (!flow.blockTerminates(clause.body(), ExitScope.Function, checker)) {
+            string subject = checker.frame().currentReturnSubject();
+            checker.reporter().report("{subject} is declared 'noreturn', but a "
+                + "path through its 'catch' clause ends normally. End every path by throwing, calling "
+                + "'panic' or calling another 'noreturn' function.", clause.span());
+        }
+    }
+}
+
+// Catch clauses scope against the parameter scope, so body locals stay invisible. The binding
+// resolves and the body walks like any other.
+checkCatchClause(BodyChecker checker, CatchClauseNode clause) {
+    checker.enterCatchScope();
+    Type caught = checker.resolver().resolveType(clause.caughtType());
+    let binding = new LocalBinding(clause.name().text(), caught, BindingKind.Variable,
+        false, clause.name().span());
+    let owner = checker.currentScope();
+    if (owner != null) {
+        owner.define(binding);
+    }
+    checker.result().setBinding(clause.green(), binding);
+    checker.frame().enterCatchClause();
+    checker.assignment().enterCatchPath();
+    checker.assignment().trackLocal(binding, assigned: true);
+    checker.enterScope();
+    checker.walkBlock(clause.body());
+    checker.leaveScope();
+    // A catch that falls through without rethrowing returns the object normally, so its
+    // fields must be assigned there too.
+    if (checker.assignment().constructorFieldOwner() != null) {
+        checker.assignment().checkConstructorFieldsAssigned(clause.catchKeyword().span());
+    }
+    checker.frame().leaveCatchClause();
+    checker.leaveCatchScope();
+}
+
+// Field defaults type against the declared field type. Every sibling field is in scope, not only
+// the ones declared earlier: which of them a default may name is one rule with one precise
+// message, and the checks phase owns it, so a default that names itself or a later field is typed
+// here without being reported a second time as an undefined name.
+// The owner's type parameters are in scope too, because a default is built once per
+// instantiation, where each of them stands for one written type argument.
+checkFieldDefaults(BodyChecker checker, DeclaredType owner, MemberListNode body) {
+    let fields = typemembers.fieldsOf(owner);
+    long pushed = pushOwnerTypeParameters(checker, owner);
+    let outerFrame = checker.enterBody(new Scope(null), new CallableFrame(owner));
+    // Type-level fields stay out on both sides. A static const's initializer is the
+    // compile-time constant the constants phase evaluates, and a lazy const's runs on the
+    // first read with no instance in reach, so neither is an expression over sibling fields.
+    for (long i = 0; i < body.membersCount(); i++) {
+        let member = body.members(i);
+        if (member is FieldDeclarationNode && !members.isTypeLevelField(member)) {
+            let sink = checker.currentScope();
+            if (sink != null) {
+                sink.define(new LocalBinding(member.name().text(),
+                    fieldTypeOrError(checker, fields, member.name().text()),
+                    BindingKind.SiblingField, false, member.name().span()));
+            }
+        }
+    }
+    for (long i = 0; i < body.membersCount(); i++) {
+        let member = body.members(i);
+        if (member is FieldDeclarationNode && !members.isTypeLevelField(member)) {
+            let defaultValue = member.defaultValue();
+            if (defaultValue != null) {
+                Type expected = fieldTypeOrError(checker, fields, member.name().text());
+                let value = defaultValue.value();
+                checker.frame().setFieldDefaultName(member.name().text());
+                Type actual = checker.analyzeExpressionAdapt(value, expected,
+                    literalfixes.valueOrigin(checker, OriginKind.Declared, member.name().text(), expected,
+                        value, member));
+                if (!(expected is ErrorType) && !(actual is ErrorType)
+                        && !convert.isAssignableStrict(expected, actual)) {
+                    checker.reporter().report("Field '{member.name().text()}' has type "
+                        + "'{checker.names().of(expected)}', but its default value has type "
+                        + "'{checker.names().of(actual)}'."
+                        + "{nullguidance.valueAssignabilityHint(checker, expected, actual, value)}",
+                        value.span());
+                }
+            }
+        }
+    }
+    checker.leaveBody(outerFrame);
+    checker.resolver().popTypeParameters(pushed);
+}
+
+// A lazy const's initializer types against the declared type at module scope. It runs on the
+// first read with no instance in reach, so neither 'this' nor a sibling field is visible.
+// The owner's type parameters are in scope so that a use of one is refused as the type
+// parameter it is rather than as an unknown name.
+checkLazyInitializers(BodyChecker checker, DeclaredType owner, MemberListNode body) {
+    long pushed = pushOwnerTypeParameters(checker, owner);
+    let outerFrame = checker.enterBody(new Scope(null), new CallableFrame(owner));
+    for (long i = 0; i < body.membersCount(); i++) {
+        let member = body.members(i);
+        if (!(member is FieldDeclarationNode) || !members.fieldModifiers(member).declaresLazy) {
+            continue;
+        }
+        let field = members.findField(typemembers.staticFieldsOf(owner), member.name().text());
+        let initializer = member.defaultValue();
+        if (field == null || initializer == null) {
+            continue;
+        }
+        // A type the shape check already refused stands for nothing the value could match,
+        // so the read below judges the initializer on its own.
+        Type expected = field.type();
+        if (convert.containsTypeParam(expected) || types.isVoidType(expected)) {
+            expected = checker.store().errorType();
+        }
+        let value = initializer.value();
+        checker.resolver().pushTypeParameterRefusal(lazyTypeParameterRefusal(checker, owner, field));
+        Type actual = checker.analyzeExpressionAdapt(value, expected,
+            literalfixes.valueOrigin(checker, OriginKind.Declared, field.name(), expected, value, member));
+        checker.resolver().popTypeParameterRefusal();
+        if (!(expected is ErrorType) && !(actual is ErrorType)
+                && !convert.isAssignableStrict(expected, actual)) {
+            checker.reporter().report("Lazy const '{checker.names().nameOf(owner)}.{field.name()}' has type "
+                + "'{checker.names().of(expected)}', but its initializer has type "
+                + "'{checker.names().of(actual)}'."
+                + "{nullguidance.valueAssignabilityHint(checker, expected, actual, value)}", value.span());
+        }
+    }
+    checker.leaveBody(outerFrame);
+    checker.resolver().popTypeParameters(pushed);
+}
+
+// The refusal a type parameter written anywhere inside a lazy const's initializer reads.
+lazyTypeParameterRefusal(BodyChecker checker, DeclaredType owner, Field field) -> string {
+    string ownerName = checker.names().nameOf(owner);
+    return "The initializer of lazy const '{ownerName}.{field.name()}' cannot use a type parameter, "
+        + "because one lazy const value is shared by every type argument of '{ownerName}'. Remove "
+        + "'lazy const' to give each instance its own '{field.name()}'.";
+}
+
+fieldTypeOrError(BodyChecker checker, List<Field>? fields, string name) -> Type {
+    let field = members.findField(fields, name);
+    if (field != null) {
+        return field.type();
+    }
+    return checker.store().errorType();
+}
+
+// Parameter defaults type against the declared parameter type, at module scope: neither
+// the other parameters nor 'this' are visible inside a default.
+// The type parameters of the callable and of its owner are in scope, because a default is
+// built in the instantiation the call reaches.
+checkParameterDefaults(BodyChecker checker, Signature signature, Type? owner, FunctionDeclarationNode node) {
+    long pushed = pushCallableTypeParameters(checker, signature, owner);
+    let outerFrame = checker.enterBody(new Scope(null), new CallableFrame(owner));
+    Parameter[] parameters = signature.parameters();
+    let parameterList = node.parameters();
+    for (long i = 0; i < parameterList.parametersCount(); i++) {
+        let parameterNode = parameterList.parameters(i);
+        let defaultValue = parameterNode.defaultValue();
+        if (defaultValue == null) {
+            continue;
+        }
+        Type expected = checker.store().errorType();
+        if (i < parameters.length) {
+            expected = parameters[i].type();
+        }
+        let value = defaultValue.value();
+        Type actual = checker.analyzeExpressionAdapt(value, expected,
+            literalfixes.valueOrigin(checker, OriginKind.Declared, parameterNode.name().text(), expected,
+                value));
+        if (!(expected is ErrorType) && !(actual is ErrorType)
+                && !convert.isAssignableStrict(expected, actual)) {
+            checker.reporter().report("Parameter '{parameterNode.name().text()}' has type "
+                + "'{checker.names().of(expected)}', but its default value has type "
+                + "'{checker.names().of(actual)}'."
+                + "{nullguidance.valueAssignabilityHint(checker, expected, actual, value)}", value.span());
+        }
+    }
+    checker.leaveBody(outerFrame);
+    checker.resolver().popTypeParameters(pushed);
+}
+
+// Records the this-field shorthand parameters as assigned before the body runs, so a
+// constructor whose only initialization is 'constructor(this.field)' starts complete.
+// A shorthand parameter is a write, so it meets the same const rule and the same
+// member-access check an ordinary write to the field meets.
+// A const base field reports that refusal alone, since const holds inside the declaring
+// package too.
+seedConstructorFields(BodyChecker checker, Signature signature, Type receiver) {
+    checker.assignment().enterConstructor(receiver);
+    if (typemembers.fieldsOf(receiver) == null) {
+        return;
+    }
+    Parameter[] parameters = signature.parameters();
+    for (long i = 0; i < parameters.length; i++) {
+        let parameter = parameters[i];
+        if (!parameter.bindsField()) {
+            continue;
+        }
+        let field = typemembers.inheritedOrOwnField(receiver, parameter.name());
+        if (field == null) {
+            continue;
+        }
+        if (field.isConst() && field.definingType() != receiver) {
+            string baseName = checker.constFieldOwnerName(field);
+            checker.reporter().report("Parameter 'this.{field.name()}' assigns field '{field.name()}', "
+                + "which is 'const' in base class '{baseName}'. Only a constructor of '{baseName}' can "
+                + "assign it. Declare an ordinary parameter, as in '{checker.names().of(field.type())} "
+                + "{field.name()}', and pass it to 'super(...)'.", parameter.span());
+        } else {
+            memberaccess.checkMemberAccess(checker, field.name(), field.visibility(), field.definingType(),
+                parameter.span());
+        }
+        checker.assignment().seedField(field, parameter.span());
+    }
+    checker.assignment().finishSeeding();
+}
+
+typeParameterNamesText(Signature signature) -> string {
+    string text = "";
+    let parameters = signature.typeParameters();
+    for (long i = 0; i < parameters.length; i++) {
+        if (i > 0) {
+            text = text + ", ";
+        }
+        text = text + parameters[i].name();
+    }
+    return text;
+}
