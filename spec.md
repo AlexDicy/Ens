@@ -3,8 +3,9 @@
 
 Primitive types: `bool (1)`, `byte (1)`, `short (2)`, `ushort (2)`, `int (4)`, `uint (4)`, `long (8)`, `ulong (8)`, `float (4)`, `double (8)`, `char (4)`. `byte` is unsigned (0..255); `short`/`int`/`long` are signed; `ushort`/`uint`/`ulong` are their unsigned counterparts.
 `char` is an unsigned 32-bit Unicode scalar value (0..0x10FFFF); it counts as an integer type, and converts to text as the character it denotes.
-Being a code point rather than a quantity, a `char` reaches the integer types on its own but never `float` or `double`: arithmetic on a code point in integers is meaningful, while a code point as a floating-point number is a mistake rather than an intent.
+Being a code point rather than a quantity, a `char` converts to `int`, `uint`, `long` and `ulong` on its own, since each of them has room for every code point, but never `float` or `double`: arithmetic on a code point in integers is meaningful, while a code point as a floating-point number is a mistake rather than an intent.
 Write `c as double` where the number behind the character is what is wanted.
+`byte`, `short` and `ushort` have room for only some code points, so a `char` converts to them only through `as`, as in `c as byte`.
 
 Visibility has three tiers, `private` < `public` < `export`, with `protected` alongside them.
 Everything is private by default.
