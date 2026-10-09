@@ -1532,6 +1532,7 @@ switch (shape) {                  // an open hierarchy needs default
 ```
 
 Expressions, types and blocks may only nest so deeply inside one declaration, and nesting past that limit is a compile error.
+A chain of `else if` branches counts toward the same limit.
 
 ---
 
