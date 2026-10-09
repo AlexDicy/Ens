@@ -26,6 +26,8 @@ import NamePosition from phases.bodies.memberaccess;
 import LambdaFit from phases.bodies.functionvalues;
 import LambdaFix from phases.bodies.functionvalues;
 import StaticCallText from phases.bodies.memberaccess;
+import QuotedCode from model.typenames;
+import support.diagnostics;
 import phases.bodies.literalfixes;
 import phases.bodies.literaltyping;
 import phases.bodies.nullguidance;
@@ -219,27 +221,36 @@ public analyzeStaticMemberValue(BodyChecker checker, MemberExpressionNode node, 
     if (statics.length() > 0) {
         // A head written with type arguments keeps them, so the call this names resolves
         // the way the written head did.
-        string ownerName = checker.names().nameOf(owner);
         string quotedOwner = checker.names().quotedName(owner);
         if (head is InstantiationType) {
-            ownerName = checker.names().of(head);
             quotedOwner = checker.names().quoted(head);
         }
         string subject = "'{name}' is a static method of {quotedOwner}";
         if (wanted != null && position == MemberPosition.Read) {
             let fix = functionvalues.lambdaFix(checker, "method", name,
                 reachedSignatures(checker, statics, wanted), wanted, checker.names().plainNameOf(owner));
-            checker.reporter().report(functionvalues.functionValueRefusal(subject, fix, "{ownerName}.{name}"),
+            string spelling = quotedStaticCall(checker, head, owner, fix.before(), ".{name}{fix.after()}");
+            checker.reporter().report(functionvalues.functionValueRefusal(subject, fix, spelling),
                 node.member().span());
             return checker.store().errorType();
         }
-        string call = memberaccess.methodCallText("{ownerName}.{name}", statics);
-        checker.reporter().report(memberaccess.methodAsValueMessage(subject, call, position),
+        let call = new StaticCallText(statics);
+        string quotedCall = quotedStaticCall(checker, head, owner, call.prefix(), ".{name}{call.suffix()}");
+        checker.reporter().report(memberaccess.methodAsValueMessage(subject, quotedCall, position),
             node.member().span());
         return checker.store().errorType();
     }
     reportMissingStatic(checker, head, owner, name, node.member().span(), -1, wanted);
     return checker.store().errorType();
+}
+
+// Code in quotes that writes 'head', which a static method of 'owner' is reached through, between
+// 'before' and 'after': with the type arguments written on it, and by its name alone where none are.
+quotedStaticCall(BodyChecker checker, Type head, DeclaredType owner, string before, string after) -> string {
+    if (head is InstantiationType) {
+        return checker.names().quotedCode([before, after], [head]);
+    }
+    return checker.names().quotedNamedCode([before, after], [owner]);
 }
 
 // Interfaces and external types carry no statics, and neither does a primitive the standard
@@ -381,13 +392,14 @@ checkStaticsAccess(BodyChecker checker, string name, List<Method> statics, long 
             return false;
         }
     }
-    string shown = name;
+    string shown = "'{name}'";
     for (let method in statics) {
         if (method.visibility() != first.visibility()) {
-            shown = overloadSpelling(checker, name, first);
+            shown = quotedOverload(checker, name, first);
         }
     }
-    memberaccess.checkMemberAccess(checker, shown, first.visibility(), first.definingType(), at, followUp);
+    memberaccess.checkQuotedMemberAccess(checker, shown, first.visibility(), first.definingType(), at,
+        followUp);
     return false;
 }
 
@@ -399,14 +411,15 @@ usableOverloadsNote(BodyChecker checker, string name, List<Method> statics, long
     let reached = reachedOverloads(checker, statics, argumentCount, wanted);
     for (let method in reached) {
         if (memberaccess.isAccessAllowed(checker, method.visibility(), method.definingType())) {
-            usable.push(overloadSpelling(checker, name, method));
+            usable.push(quotedOverload(checker, name, method));
         }
     }
     if (usable.length() == reached.length()) {
         return "";
     }
     string taking = takingPhrase(checker, reached, argumentCount);
-    return " Of the '{name}' methods{taking}, code here can use only {wording.quotedList(usable)}.";
+    return " Of the '{name}' methods{taking}, code here can use only "
+        + "{diagnostics.andJoined(usable.toArray())}.";
 }
 
 // The signatures of the static methods of 'statics' a lambda given 'wanted' can call, the ones code
@@ -444,13 +457,19 @@ takingPhrase(BodyChecker checker, List<Method> reached, long argumentCount) -> s
     return " that take {argumentCount} arguments";
 }
 
-// One overload of the static method 'name', by its parameter types: 'name(int, string)'.
-overloadSpelling(BodyChecker checker, string name, Method method) -> string {
-    let parameterTypes = new List<string>();
-    for (let parameter in method.signature().parameters()) {
-        parameterTypes.push(checker.names().of(parameter.type()));
+// One overload of the static method 'name' in quotes, by its parameter types: 'name(int, string)'.
+quotedOverload(BodyChecker checker, string name, Method method) -> string {
+    let code = new QuotedCode();
+    code.write("{name}(");
+    Parameter[] parameters = method.signature().parameters();
+    for (long i = 0; i < parameters.length; i++) {
+        if (i > 0) {
+            code.write(", ");
+        }
+        code.writeType(parameters[i].type());
     }
-    return "{name}({string.joined(parameterTypes.toArray(), ", ")})";
+    code.write(")");
+    return code.quotedFor(checker.names());
 }
 
 // The refusal of the static methods 'reached' named 'name' when a call can mean any of them, code
@@ -489,7 +508,7 @@ reportUnusableOverloads(BodyChecker checker, string name, List<Method> reached, 
         } else if (i > 0) {
             listed = listed + ", ";
         }
-        listed = listed + "'{overloadSpelling(checker, name, method)}' {reason}";
+        listed = listed + "{quotedOverload(checker, name, method)} {reason}";
     }
     string taking = takingPhrase(checker, reached, argumentCount);
     checker.reporter().report("None of the '{name}' methods of {kind} {owner}{taking} can be used here: "
@@ -528,9 +547,10 @@ public analyzeStaticCall(BodyChecker checker, CallExpressionNode node, MemberExp
             if (writtenOnMethod.argumentsCount() == owner.typeParameters().length) {
                 listed = written.substring(1, written.length - 1);
             }
+            string example = checker.names().quotedNamedCode(["",
+                "<{listed}>.{name}{functioncalls.argumentsSpelling(arguments)}"], [owner]);
             checker.reporter().report("Type arguments are never written after a method name. Write them "
-                + "after the type name, as in '{checker.names().nameOf(owner)}<{listed}>.{name}"
-                + "{functioncalls.argumentsSpelling(arguments)}'.", writtenOnMethod.span());
+                + "after the type name, as in {example}.", writtenOnMethod.span());
         } else {
             checker.reporter().report("Type arguments are never written after a method name, and "
                 + "{checker.names().quotedName(owner)} is not generic. Remove '{written}'.",
@@ -541,9 +561,9 @@ public analyzeStaticCall(BodyChecker checker, CallExpressionNode node, MemberExp
     }
     let constField = members.findField(typemembers.staticFieldsOf(head), name);
     if (constField != null) {
-        checker.reporter().report("'{checker.names().nameOf(owner)}.{name}' is a "
-            + "{members.typeLevelFieldWord(constField)}, not a method. Remove the "
-            + "parentheses.", node.span());
+        string constant = checker.names().quotedNamedCode(["", ".{name}"], [owner]);
+        checker.reporter().report("{constant} is a {members.typeLevelFieldWord(constField)}, not a "
+            + "method. Remove the parentheses.", node.span());
         functioncalls.analyzeArgumentsOnly(checker, arguments);
         return checker.store().errorType();
     }
@@ -632,10 +652,10 @@ analyzeInferredStaticCall(BodyChecker checker, CallExpressionNode node, MemberEx
         return checker.store().errorType();
     }
     if (functioncalls.usesNamedArguments(arguments)) {
-        string templateName = checker.names().nameOf(template);
         string quotedTemplate = checker.names().quotedName(template);
         string listed = concreteTypeArguments(template.typeParameters().length);
-        string example = "'{templateName}<{listed}>.{name}{functioncalls.argumentsSpelling(arguments)}'";
+        string example = checker.names().quotedNamedCode(["",
+            "<{listed}>.{name}{functioncalls.argumentsSpelling(arguments)}"], [template]);
         let open = openTypeParameter(template, templateStatics, indexes);
         if (open.length > 0) {
             checker.reporter().report("When the type arguments of {quotedTemplate} come from the arguments, "
@@ -688,11 +708,13 @@ analyzeInferredStaticCall(BodyChecker checker, CallExpressionNode node, MemberEx
         return checker.store().errorType();
     }
     if (completedIndexes.length() == 0) {
-        string templateName = checker.names().nameOf(template);
         string quotedTemplate = checker.names().quotedName(template);
-        checker.reporter().report(unshownTypeArguments(quotedTemplate, template.typeParameters(),
-            "{templateName}<", ">.{name}{functioncalls.argumentsSpelling(arguments)}",
-            exampleTypeArgument(arguments)), node.span());
+        string listed = concreteTypeArguments(template.typeParameters().length,
+            exampleTypeArgument(arguments));
+        string example = checker.names().quotedNamedCode(["",
+            "<{listed}>.{name}{functioncalls.argumentsSpelling(arguments)}"], [template]);
+        checker.reporter().report(unshownTypeArguments(quotedTemplate, template.typeParameters(), example),
+            node.span());
         return checker.store().errorType();
     }
     let boundedIndexes = new List<long>();
@@ -816,8 +838,8 @@ checkInferredStaticCall(BodyChecker checker, CallExpressionNode node, MemberExpr
                 Parameter[] templateParameters = templateCandidate.signature().parameters();
                 string provenance = "";
                 if (i < templateParameters.length) {
-                    provenance = inference.provenance(templateParameters[i].type(),
-                        checker.names().nameOf(template), ".{resolved.name()}(...)", checker.names());
+                    provenance = inference.provenance(templateParameters[i].type(), "",
+                        ".{resolved.name()}(...)", checker.names(), template);
                 }
                 string hint = nullguidance.valueAssignabilityHint(checker, parameterType, actual, argument);
                 checker.reporter().report(functioncalls.argumentMismatch("{i + 1}", "'{resolved.name()}'",
@@ -1001,39 +1023,31 @@ public exampleTypeArgument(ArgumentListNode? arguments) -> string {
     return "int";
 }
 
-// One 'int' for each of 'count' type parameters, as an example writes them: "int, int".
-concreteTypeArguments(long count) -> string {
+// One 'example' for each of 'count' type parameters, as an example writes them: "int, int".
+public concreteTypeArguments(long count, string example = "int") -> string {
     string listed = "";
     for (long i = 0; i < count; i++) {
         if (i > 0) {
             listed = listed + ", ";
         }
-        listed = listed + "int";
+        listed = listed + example;
     }
     return listed;
 }
 
-// The refusal of a call to the generic 'subject' that shows none of its type arguments 'parameters'.
-// The example writes 'example' for each, between 'head' and 'tail'.
-public unshownTypeArguments(string subject, string[] parameters, string head, string tail, string example)
-        -> string {
-    string listed = "";
-    for (long i = 0; i < parameters.length; i++) {
-        if (i > 0) {
-            listed = listed + ", ";
-        }
-        listed = listed + example;
-    }
+// The refusal of a call to the generic 'subject' that shows none of its type arguments 'parameters',
+// with 'example', the call written with them, in quotes.
+public unshownTypeArguments(string subject, string[] parameters, string example) -> string {
     if (parameters.length == 1) {
         return "{subject} is generic, and this call does not show what its type argument '{parameters[0]}' "
-            + "is. Write it, as in '{head}{listed}{tail}'.";
+            + "is. Write it, as in {example}.";
     }
     let quoted = new List<string>();
     for (let parameter in parameters) {
         quoted.push(parameter);
     }
     return "{subject} is generic, and this call does not show what its type arguments "
-        + "{wording.quotedList(quoted)} are. Write them, as in '{head}{listed}{tail}'.";
+        + "{wording.quotedList(quoted)} are. Write them, as in {example}.";
 }
 
 // Whether a call with 'count' arguments can reach 'method', counting its optional parameters.
