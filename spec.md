@@ -1264,6 +1264,8 @@ int n = arr.length;      // error: long -> int, can be forced with `arr.length a
 Integer literals without a type suffix adapt to the surrounding type when it's an integer that fits the value. With no context they default to `int`. Values out of range produce a specific error.
 Where a nullable type such as `byte?` is expected, a literal adapts to the type without the `?`, so `byte? small = 1;` compiles, and so does `small += 1;` right after it.
 A literal in parentheses adapts the same way as the literal alone.
+A `char` literal beside an integer value adapts to that value's type the same way, so with `byte b`, `b + 'a'` is a `byte` and `b == '€'` is an error, because the code point of `'€'` does not fit a `byte`.
+Beside a `char` or an untyped integer literal it stays a `char`, so `'a' + 1` is a `char`.
 
 That default is held to the same rule as any other type, so a literal nothing gives a type to must fit the type it falls back to, and a value past it is an error naming the type that would hold it rather than a silent truncation.
 A cast counts as naming a type: a literal whose value the target holds adapts to it, while one the target cannot hold keeps its default and is truncated by the cast, which is what a narrowing cast is for.
