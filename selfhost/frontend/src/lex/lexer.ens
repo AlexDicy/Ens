@@ -428,6 +428,7 @@ class Lexer {
     lexCharacter(long startPosition) {
         this.advance();
         bool closed = false;
+        long reportedBefore = this.diagnostics.length();
         while (!this.atEnd()) {
             let c = this.peek(0);
             if (c == '\'') {
@@ -447,6 +448,11 @@ class Lexer {
         if (!closed) {
             this.report("This character has no closing quote on its line. Write one character "
                 + "between two single quotes, for example 'a'.", startPosition, this.position);
+        } else if (this.diagnostics.length() == reportedBefore) {
+            let literal = this.sourceText.substring(startPosition, this.position);
+            if (characterLiteralLength(literal) != 1) {
+                this.report(characterLengthRefusal(literal), startPosition, this.position);
+            }
         }
         this.emit(SyntaxKind.CharLiteral, startPosition);
     }
@@ -746,6 +752,163 @@ utf8SequenceLength(byte lead) -> long {
         return 2;
     }
     return 1;
+}
+
+// The number of characters between the quotes of the character literal 'literal', where an escape
+// counts as one and so does each code point written in UTF-8.
+characterLiteralLength(string literal) -> long {
+    long count = 0;
+    long index = 1;
+    while (index < literal.length - 1) {
+        byte c = literal.byteAt(index);
+        if (c == '\\') {
+            count++;
+            index += escapeLength(literal, index);
+            continue;
+        }
+        if (!isContinuationByte(c)) {
+            count++;
+        }
+        index++;
+    }
+    return count;
+}
+
+// The refusal of the character literal 'literal', which has no character or more than one.
+characterLengthRefusal(string literal) -> string {
+    long count = characterLiteralLength(literal);
+    string content = literal.substring(1, literal.length - 1);
+    if (count == 0) {
+        return "'' has no character between its quotes, but a character literal must have exactly "
+            + "one. Write the character between the quotes, as in 'a', or write '\"\"' for an empty "
+            + "string.";
+    }
+    string text = "'\"{stringContent(content)}\"'";
+    if (hasJoiningMark(content)) {
+        return "{literal} is made of {count} Unicode code points, but a character literal must have "
+            + "exactly one. A code point is one numbered entry in Unicode, and some characters, such as "
+            + "a letter with a separate accent mark, take more than one. Write {text} to make it a "
+            + "string.";
+    }
+    return "{literal} has {count} characters, but a character literal must have exactly one. Write "
+        + "{text} to make it a string, or keep one character, as in '{firstCharacter(content)}'.";
+}
+
+// Whether a character after the first in 'content' is a mark that joins the character before it,
+// such as a combining accent, so the two are shown as one character.
+hasJoiningMark(string content) -> bool {
+    long index = 0;
+    bool first = true;
+    while (index < content.length) {
+        if (isContinuationByte(content.byteAt(index))) {
+            index++;
+            continue;
+        }
+        long length = characterBytes(content, index);
+        if (!first && joinsPrevious(codePointAt(content, index, length))) {
+            return true;
+        }
+        first = false;
+        index += length;
+    }
+    return false;
+}
+
+// Whether 'codePoint' is a combining mark, the zero-width joiner or a variation selector, each of
+// which changes the character before it rather than standing alone.
+joinsPrevious(long codePoint) -> bool {
+    return (codePoint >= 0x0300 && codePoint <= 0x036F) || (codePoint >= 0x1AB0 && codePoint <= 0x1AFF)
+        || (codePoint >= 0x1DC0 && codePoint <= 0x1DFF) || (codePoint >= 0x20D0 && codePoint <= 0x20FF)
+        || (codePoint >= 0xFE20 && codePoint <= 0xFE2F) || codePoint == 0x200D
+        || (codePoint >= 0xFE00 && codePoint <= 0xFE0F);
+}
+
+// The bytes of the character that starts at 'index' of 'text': an escape, or one code point.
+characterBytes(string text, long index) -> long {
+    byte lead = text.byteAt(index);
+    if (lead == '\\') {
+        return escapeLength(text, index);
+    }
+    long length = utf8SequenceLength(lead);
+    if (index + length > text.length) {
+        return text.length - index;
+    }
+    return length;
+}
+
+// The code point the character of 'length' bytes at 'index' of 'text' writes, an escape decoded.
+codePointAt(string text, long index, long length) -> long {
+    byte lead = text.byteAt(index);
+    if (lead == '\\' && length == 6) {
+        long value = 0;
+        for (long digit = index + 2; digit < index + 6; digit++) {
+            value = value * 16 + hexValue(text.byteAt(digit));
+        }
+        return value;
+    }
+    if (lead == '\\') {
+        return text.byteAt(index + 1) as long;
+    }
+    if (length == 1) {
+        return lead as long;
+    }
+    long leadBits = switch (length) {
+        2 -> 0x1F,
+        3 -> 0x0F,
+        default -> 0x07,
+    };
+    long value = (lead as long) & leadBits;
+    for (long next = index + 1; next < index + length; next++) {
+        value = value * 64 + ((text.byteAt(next) as long) & 0x3F);
+    }
+    return value;
+}
+
+hexValue(byte c) -> long {
+    if (isDigit(c)) {
+        return (c - '0') as long;
+    }
+    if (c >= 'a' && c <= 'f') {
+        return (c - 'a') as long + 10;
+    }
+    return (c - 'A') as long + 10;
+}
+
+// The bytes of the escape that starts at 'index' of 'text', without the UTF-8 continuation bytes
+// of an escaped character outside ASCII.
+escapeLength(string text, long index) -> long {
+    if (index + 5 < text.length && text.byteAt(index + 1) == 'u' && isHexDigit(text.byteAt(index + 2))
+            && isHexDigit(text.byteAt(index + 3)) && isHexDigit(text.byteAt(index + 4))
+            && isHexDigit(text.byteAt(index + 5))) {
+        return 6;
+    }
+    return 2;
+}
+
+// What a string literal writes to hold the characters the character literal content 'content'
+// writes: the same escapes, with '"', '{' and '}' escaped as a string needs them.
+stringContent(string content) -> string {
+    string written = "";
+    long runStart = 0;
+    long index = 0;
+    while (index < content.length) {
+        byte c = content.byteAt(index);
+        if (c == '\\') {
+            index += escapeLength(content, index);
+            continue;
+        }
+        if (c == '"' || c == '{' || c == '}') {
+            written = written + content.substring(runStart, index) + "\\";
+            runStart = index;
+        }
+        index++;
+    }
+    return written + content.substring(runStart, content.length);
+}
+
+// The first character the content of a character literal writes, an escape included.
+firstCharacter(string content) -> string {
+    return content.substring(0, characterBytes(content, 0));
 }
 
 singleCharacterKind(byte c) -> SyntaxKind? {

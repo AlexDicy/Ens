@@ -1649,6 +1649,8 @@ Strings are immutable text values, written with double quotes (`"hello"`), and a
 
 Inside a string or `char` literal a backslash begins an escape.
 The accepted escapes are `\n`, `\r`, `\t`, `\b`, `\f`, `\0`, `\\`, `\"`, `\'`, `\{`, `\}`, and `\uXXXX` for a Unicode scalar written as exactly four hexadecimal digits; any other escape, or a `\u` not followed by four hex digits, is a compile error.
+A `char` literal has exactly one character or one escape between single quotes, as in `'a'` or `'\n'`, so `''` and `'ab'` are compile errors.
+That one character is one code point, so a letter written with a separate combining accent is two characters and needs a string.
 
 - `==` and `!=` compare **contents**, not identity, so `"ab" == "a" + "b"` is true.
 - `s.length` returns the number of UTF-8 **bytes** as a `long`.
