@@ -82,6 +82,9 @@ public lowerCheckedCast(LoweringContext lowering, CheckedCastExpressionNode cast
     if (target is EnumType) {
         return lowerEnumCast(lowering, cast, resultType, target);
     }
+    if (primitives.isCharType(target)) {
+        return lowerCharCast(lowering, cast, resultType, target);
+    }
     if (!supportedScrutinee(lowering, cast.value(), cast.span(), "as?")
             || !supportedTarget(lowering, target, cast.span(), "as?")) {
         return -1;
@@ -152,6 +155,74 @@ lowerEnumCast(LoweringContext lowering, CheckedCastExpressionNode cast, Type res
     long merged = builder.newTemp(resultType);
     builder.append(new EirLoadSlot(merged, resultType, slot));
     return merged;
+}
+
+// 'value as? char': the character as a present tagged optional when the integer is a code point,
+// at most 0x10FFFF and outside 0xD800..0xDFFF, and the absent one otherwise. The check runs on the
+// value widened to 'ulong', where a negative value of a signed type is past every code point.
+lowerCharCast(LoweringContext lowering, CheckedCastExpressionNode cast, Type resultType, Type target)
+        -> long {
+    let sourceType = lowering.typeOf(cast.value());
+    if (sourceType == null) {
+        return -1;
+    }
+    if (!primitives.isIntegerType(sourceType)) {
+        lowering.unsupported("'as?' from {lowering.names().quoted(sourceType)} to 'char'", cast.span());
+        return -1;
+    }
+    long value = expressions.lower(lowering, cast.value());
+    if (value < 0) {
+        return -1;
+    }
+    let builder = lowering.builder();
+    let boolType = lowering.store().primitive(PrimitiveKind.Bool);
+    let wideType = lowering.store().primitive(PrimitiveKind.ULong);
+    long wide = conversions.convert(lowering, value, wideType, cast.span());
+    if (wide < 0) {
+        return -1;
+    }
+    long inRange = compareWide(lowering, EirBinaryOp.CmpLeUnsigned, wide, 0x10FFFF);
+    long below = compareWide(lowering, EirBinaryOp.CmpLtUnsigned, wide, 0xD800);
+    long above = compareWide(lowering, EirBinaryOp.CmpGtUnsigned, wide, 0xDFFF);
+    long outside = builder.newTemp(boolType);
+    builder.append(new EirBinary(outside, boolType, EirBinaryOp.Or, below, above));
+    long valid = builder.newTemp(boolType);
+    builder.append(new EirBinary(valid, boolType, EirBinaryOp.And, inRange, outside));
+    long slot = builder.addSlot("charcast", resultType, false, false);
+    long wrapBlock = builder.newBlock("charcast.valid");
+    long missBlock = builder.newBlock("charcast.invalid");
+    long mergeBlock = builder.newBlock("charcast.end");
+    builder.terminate(new EirBranch(valid, wrapBlock, missBlock));
+    builder.moveTo(wrapBlock);
+    long character = conversions.convert(lowering, wide, target, cast.span());
+    if (character < 0) {
+        return -1;
+    }
+    long wrapped = builder.newTemp(resultType);
+    builder.append(new EirWrapOptional(wrapped, resultType, character));
+    builder.append(new EirStoreSlot(slot, wrapped));
+    builder.terminate(new EirJump(mergeBlock));
+    builder.moveTo(missBlock);
+    long absent = builder.newTemp(resultType);
+    builder.append(new EirAbsentOptional(absent, resultType));
+    builder.append(new EirStoreSlot(slot, absent));
+    builder.terminate(new EirJump(mergeBlock));
+    builder.moveTo(mergeBlock);
+    long merged = builder.newTemp(resultType);
+    builder.append(new EirLoadSlot(merged, resultType, slot));
+    return merged;
+}
+
+// The 'bool' result of comparing the 'ulong' 'wide' with 'bound' by 'operation'.
+compareWide(LoweringContext lowering, EirBinaryOp operation, long wide, long bound) -> long {
+    let builder = lowering.builder();
+    let wideType = lowering.store().primitive(PrimitiveKind.ULong);
+    let boolType = lowering.store().primitive(PrimitiveKind.Bool);
+    long constant = builder.newTemp(wideType);
+    builder.append(new EirConstInt(constant, wideType, bound));
+    long result = builder.newTemp(boolType);
+    builder.append(new EirBinary(result, boolType, operation, wide, constant));
+    return result;
 }
 
 // A switch whose arms test the scrutinee's runtime type: the tests run in source order, a null

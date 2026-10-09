@@ -1231,7 +1231,15 @@ Errno? e = code as? Errno;             // the matching member, or null
 Errno chosen = 13 as? Errno ?? Errno.EPERM;
 ```
 
-The target must be a class or an interface (or, for `as?` only, a numeric enum); testing against a struct, a primitive, a plain enum, an array, or a string is a compile error, and so is a nullable target like `as? Circle?`, whose result would already be nullable.
+An integer converts to a `char` with `as?`, which evaluates to `char?`: the character whose code point the integer is, or `null` when the integer is negative, past 0x10FFFF, or a surrogate from 0xD800 through 0xDFFF.
+A `byte` or a `char` is always a code point, so it converts with `as`, and `as?` from either is an error.
+
+```ens
+char? c = code as? char;              // the character, or null
+char shown = code as? char ?? '?';
+```
+
+The target must be a class or an interface (or, for `as?` only, a numeric enum or `char`); testing against a struct, another primitive, a plain enum, an array, or a string is a compile error, and so is a nullable target like `as? Circle?`, whose result would already be nullable.
 The scrutinee must be a class, an interface, or a nullable form of either, and the target must be related to it: a test that could never succeed (unrelated classes) and a test the static type already satisfies (always true) are both compile errors.
 A nullable scrutinee tested against a type it already satisfies is the exception: for `Base? x`, the test `x is Base` is a combined null-plus-type check and is allowed.
 An interface target over a class scrutinee is an error only in the impossible case, a `final` class that does not implement it (any other class could have an implementing subclass), or the always-true case where the static class already implements it.
