@@ -131,7 +131,7 @@ A struct method that changes the struct it is called on is marked `mutating`, wr
 A method changes the struct when it writes a field of `this` at any depth, with `=`, a compound assignment, `++`, or `--`, or when it calls a `mutating` method on `this` or on a struct field of `this`.
 Writing an element of an array that a field holds is not a change to the struct, because an array is a reference.
 Such a method without the marker is an error, while marking a method that changes nothing is allowed.
-A `mutating` method is called only on a value that may change, so a call on a `const` local, a `const` field, a `lazy const`, a struct a lambda captured, `this` in a method that is not `mutating`, or a struct a call returns is an error.
+A `mutating` method is called only on a value that may change, so a call on a `const` local, a `const` field, a `lazy const`, a struct a lambda captured, the variable of a for-each loop, `this` in a method that is not `mutating`, or a struct a call returns is an error.
 An interface method may be marked `mutating`, a struct that implements it marks its method exactly when the interface does, and a call through a generic bound follows the interface's marker.
 A class implementing that interface writes no marker, because a class method changes its object through a reference.
 
@@ -1347,9 +1347,13 @@ for (int x in xs) {     // x takes each element in turn
 }
 ```
 
+When the elements are structs, the loop variable is a copy of each element, and writing a field of it or calling a `mutating` method on it is an error, because the array would not change.
+To change the elements, loop over the indexes with the C-style form and write `xs[i]`, as in `xs[i].count += 1;`.
+
 A class or a struct is iterable when it implements the `Iterable<T>` interface from `@std.collections.iterator`, directly or through an interface that extends it; its single method `makeIterator() -> Iterator<T>` returns an `Iterator<T>`, an interface with the single method `next() -> T?`.
 Iterating a struct needs no interface value, because the loop calls `makeIterator()` on the struct itself; the iterator it answers is a class or an interface value as any other iterator is.
 The loop calls `makeIterator()` once, then draws values with `next()` until it answers null.
+The same rule applies to the structs an iterable value produces, since the variable is a copy of what `next()` returns.
 `next()` answers the value it moved onto, or null once the walk is over, and every call after that answers null too.
 When the element type is itself nullable, `next()` answers a nested optional, so a `null` held by a present result is an element and only an absent result ends the loop.
 A value whose static type is `Iterable<T>` itself, or an interface extending it, can also be iterated.

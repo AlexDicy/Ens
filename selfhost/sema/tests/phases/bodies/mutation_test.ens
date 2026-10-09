@@ -1,7 +1,9 @@
 // The 'mutating' rules in method bodies: a struct method that changes 'this' must be 'mutating', and a
-// 'mutating' method is refused on every value whose change would be refused or lost.
+// 'mutating' method is refused on every value whose change would be refused or lost, a for-each
+// variable among them.
 import @std.testing;
 import sema_support;
+import FakeFileLoader from sema_support;
 
 test "a struct method that changes 'this' is reported once, at the method, with a note at the change" {
     let analysis = try sema_support.analyzeOne(program());
@@ -65,6 +67,164 @@ test "a 'mutating' call is refused on a value whose change would be refused or l
         + "computes and store it where the lambda is called, or keep the value in a field of an "
         + "object the lambda uses.");
     try testing.assertEqual(reported.length, 11L);
+}
+
+// A for-each variable copies its element, so a change through it is refused with a fix that
+// indexes the array, while a read and a change to a class element are allowed.
+test "a change through a for-each variable of struct type is refused, with the indexes as the fix" {
+    let analysis = try sema_support.analyzeOne("public struct Counter \{\n"
+        + "    public int value;\n"
+        + "    public mutating bump() \{\n"
+        + "        this.value += 1;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public struct Pair \{\n"
+        + "    public Counter left;\n"
+        + "\}\n"
+        + "public class Box \{\n"
+        + "    public int size = 0;\n"
+        + "\}\n"
+        + "makeCounters() -> Counter[] \{\n"
+        + "    return [\{value: 0\}];\n"
+        + "\}\n"
+        + "changes(Counter[] counters, Pair[] pairs, Box[] boxes) -> int \{\n"
+        + "    int total = 0;\n"
+        + "    for (let counter in counters) \{\n"
+        + "        counter.value = 1;\n"
+        + "        counter.value--;\n"
+        + "        total += counter.value;\n"
+        + "    \}\n"
+        + "    for (let pair in pairs) \{\n"
+        + "        pair.left.bump();\n"
+        + "    \}\n"
+        + "    for (let counter in makeCounters()) \{\n"
+        + "        counter.bump();\n"
+        + "    \}\n"
+        + "    for (let counter in [counters[0]]) \{\n"
+        + "        counter.value = 5;\n"
+        + "        counter.bump();\n"
+        + "    \}\n"
+        + "    for (let box in boxes) \{\n"
+        + "        box.size = 2;\n"
+        + "    \}\n"
+        + "    return total;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string file = "/proj/src/main.ens";
+    string copied = "because 'counter' is a copy of an element of 'counters', so 'counters' would not "
+        + "change.";
+    string indexes = "Loop over the indexes of 'counters', as in "
+        + "'for (long i = 0; i < counters.length; i++)', and write 'counters[i]' instead of 'counter'.";
+    string gloss = "'bump' is 'mutating', which marks a method that changes the struct it is called on.";
+    try sema_support.assertDiagnostic(reported, 0, file,
+        "Cannot assign to 'counter.value', {copied} {indexes}");
+    try sema_support.assertDiagnostic(reported, 1, file,
+        "The '--' operator cannot change 'counter.value', {copied} {indexes}");
+    try sema_support.assertDiagnostic(reported, 2, file,
+        "Cannot call 'bump' on 'pair.left', because 'pair' is a copy of an element of 'pairs', so "
+        + "'pairs' would not change. {gloss} Loop over the indexes of 'pairs', as in "
+        + "'for (long i = 0; i < pairs.length; i++)', and write 'pairs[i]' instead of 'pair'.");
+    try sema_support.assertDiagnostic(reported, 3, file,
+        "Cannot call 'bump' on 'counter', because 'counter' is a copy of an element of the array "
+        + "'makeCounters()' returns, so that array would not change. {gloss} Store the array in a local "
+        + "first, as in "
+        + "'let elements = makeCounters();', then loop over its indexes, as in "
+        + "'for (long i = 0; i < elements.length; i++)', and write 'elements[i]' instead of 'counter'.");
+    try sema_support.assertDiagnostic(reported, 4, file,
+        "Cannot assign to 'counter.value', because 'counter' is a copy of an element of "
+        + "'[counters[0]]', so that array would not change.");
+    try sema_support.assertDiagnostic(reported, 5, file,
+        "Cannot call 'bump' on 'counter', because 'counter' is a copy of an element of "
+        + "'[counters[0]]', so that array would not change. {gloss}");
+    try testing.assertEqual(reported.length, 6L);
+}
+
+// An iterable with no indexed 'set' has no way to store the element back, so its fix keeps the
+// change in a copy. One that declares 'length()', 'get' and 'set' gets them in its fix.
+test "a change through a for-each variable over an iterable value is refused, with 'set' where it has one" {
+    let loader = new FakeFileLoader();
+    loader.add("/stdlib/std/ens.package", "package std \{ ens \"0.1\"; \}\n");
+    loader.add("/stdlib/std/src/collections/iterator.ens",
+        "export interface Iterator<T> \{\n"
+        + "    next() -> T?;\n"
+        + "\}\n"
+        + "export interface Iterable<T> \{\n"
+        + "    makeIterator() -> Iterator<T>;\n"
+        + "\}\n");
+    loader.add("/proj/src/main.ens",
+        "import Iterable from @std.collections.iterator;\n"
+        + "import Iterator from @std.collections.iterator;\n"
+        + "public struct Counter \{\n"
+        + "    public int value;\n"
+        + "\}\n"
+        + "class Once implements Iterator<Counter> \{\n"
+        + "    bool done = false;\n"
+        + "    protected constructor();\n"
+        + "    protected override next() -> Counter? \{\n"
+        + "        if (this.done) \{\n"
+        + "            return null;\n"
+        + "        \}\n"
+        + "        this.done = true;\n"
+        + "        Counter one = \{value: 1\};\n"
+        + "        return one;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "class Shelf implements Iterable<Counter> \{\n"
+        + "    protected constructor();\n"
+        + "    protected override makeIterator() -> Iterator<Counter> \{\n"
+        + "        return new Once();\n"
+        + "    \}\n"
+        + "\}\n"
+        + "class Rack implements Iterable<Counter> \{\n"
+        + "    Counter[] slots = [];\n"
+        + "    protected constructor();\n"
+        + "    protected override makeIterator() -> Iterator<Counter> \{\n"
+        + "        return new Once();\n"
+        + "    \}\n"
+        + "    length() -> long \{\n"
+        + "        return this.slots.length;\n"
+        + "    \}\n"
+        + "    get(long index) -> Counter \{\n"
+        + "        return this.slots[index];\n"
+        + "    \}\n"
+        + "    set(long index, Counter value) \{\n"
+        + "        this.slots[index] = value;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "changes(Shelf shelf, Rack rack) \{\n"
+        + "    for (let counter in shelf) \{\n"
+        + "        counter.value = 2;\n"
+        + "    \}\n"
+        + "    for (let counter in new Shelf()) \{\n"
+        + "        counter.value++;\n"
+        + "    \}\n"
+        + "    for (let counter in rack) \{\n"
+        + "        counter.value = 3;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    let reported = analysis.bodyDiagnostics();
+    string file = "/proj/src/main.ens";
+    string copy = "If only the copy should change, copy 'counter' into a variable first, as in "
+        + "'let changed = counter;'.";
+    try sema_support.assertDiagnostic(reported, 0, file,
+        "Cannot assign to 'counter.value', because 'counter' is a copy of a value 'shelf' produces, so "
+        + "'shelf' would not change. {copy}");
+    try sema_support.assertDiagnostic(reported, 1, file,
+        "The '++' operator cannot change 'counter.value', because 'counter' is a copy of a value from "
+        + "'new Shelf()', so it would not change. {copy}");
+    try sema_support.assertDiagnostic(reported, 2, file,
+        "Cannot assign to 'counter.value', because 'counter' is a copy of a value 'rack' produces, so "
+        + "'rack' would not change. Loop over the indexes of 'rack' instead, as in "
+        + "'for (long i = 0; i < rack.length(); i++)', copy 'rack.get(i)' into a local, change the "
+        + "local, and store it back with 'rack.set(i, ...)'.");
+    try testing.assertEqual(reported.length, 3L);
 }
 
 program() -> string {

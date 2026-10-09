@@ -1,7 +1,9 @@
 // Where a change to a struct value lands, and the 'mutating' rules that follow from it: a struct
 // method that changes 'this' must be 'mutating', and a 'mutating' method is called only on a value
 // that may change.
+import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
 import Expression from @ens.frontend.syntax.generated.nodes;
+import ForEachStatementNode from @ens.frontend.syntax.generated.nodes;
 import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
 import ThisExpressionNode from @ens.frontend.syntax.generated.nodes;
 import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
@@ -13,6 +15,7 @@ import model.typemembers;
 import Field from model.typemembers;
 import Method from model.typemembers;
 import model.types;
+import ArrayType from model.types;
 import Type from model.types;
 import TypeParamType from model.types;
 import StructType from model.types;
@@ -30,19 +33,22 @@ public enum PlaceRootKind {
     ConstantField,
     Receiver,
     Local,
+    LoopVariable,
 }
 
-// The value a change to a struct value lands in: a local, 'this', a lazy const or a 'const'
-// field, which is the value itself where it is 'direct' and a value holding it otherwise.
+// The value a change to a struct value lands in: a local, the variable of a for-each 'loop', 'this',
+// a lazy const or a 'const' field, which is the value itself where it is 'direct' and a value
+// holding it otherwise.
 public final class PlaceRoot {
     PlaceRootKind rootKind;
     LocalBinding? rootBinding;
+    ForEachStatementNode? rootLoop;
     Field? rootField;
     MemberExpressionNode? rootMember;
     bool rootIsDirect;
 
-    protected constructor(this.rootKind, this.rootBinding, this.rootField, this.rootMember,
-                          this.rootIsDirect);
+    protected constructor(this.rootKind, this.rootBinding, this.rootLoop, this.rootField,
+                          this.rootMember, this.rootIsDirect);
 
     public kind() -> PlaceRootKind {
         return this.rootKind;
@@ -50,6 +56,10 @@ public final class PlaceRoot {
 
     public binding() -> LocalBinding? {
         return this.rootBinding;
+    }
+
+    public loop() -> ForEachStatementNode? {
+        return this.rootLoop;
     }
 
     public field() -> Field? {
@@ -82,22 +92,26 @@ public placeRoot(BodyChecker checker, Expression holder) -> PlaceRoot? {
                 if (binding == null) {
                     return null;
                 }
-                if (binding.isConst()) {
-                    return new PlaceRoot(PlaceRootKind.ConstantLocal, binding, null, null, direct);
+                let loop = loopOf(checker, binding);
+                if (loop != null) {
+                    return new PlaceRoot(PlaceRootKind.LoopVariable, binding, loop, null, null, direct);
                 }
-                return new PlaceRoot(PlaceRootKind.Local, binding, null, null, direct);
+                if (binding.isConst()) {
+                    return new PlaceRoot(PlaceRootKind.ConstantLocal, binding, null, null, null, direct);
+                }
+                return new PlaceRoot(PlaceRootKind.Local, binding, null, null, null, direct);
             },
             is ThisExpressionNode ignored -> {
-                return new PlaceRoot(PlaceRootKind.Receiver, null, null, null, direct);
+                return new PlaceRoot(PlaceRootKind.Receiver, null, null, null, null, direct);
             },
             is MemberExpressionNode member -> {
                 let typeLevel = checker.result().staticConstFieldOf(member.green());
                 if (typeLevel != null) {
-                    return new PlaceRoot(PlaceRootKind.LazyConstant, null, typeLevel, member, direct);
+                    return new PlaceRoot(PlaceRootKind.LazyConstant, null, null, typeLevel, member, direct);
                 }
                 let field = nullguidance.accessedField(checker, member);
                 if (field != null && field.isConst()) {
-                    return new PlaceRoot(PlaceRootKind.ConstantField, null, field, member, direct);
+                    return new PlaceRoot(PlaceRootKind.ConstantField, null, null, field, member, direct);
                 }
                 current = wording.unwrapParentheses(member.object());
                 direct = false;
@@ -114,6 +128,106 @@ public placeRoot(BodyChecker checker, Expression holder) -> PlaceRoot? {
 // parameter, which a struct can be passed as.
 changesWithItsValue(Type type) -> bool {
     return types.isStructLike(type) || type is TypeParamType;
+}
+
+// The for-each loop whose variable 'binding' is, or null for any other local.
+loopOf(BodyChecker checker, LocalBinding binding) -> ForEachStatementNode? {
+    for (let loop in checker.forEachLoops()) {
+        if (checker.result().bindingOf(loop.green()) == binding) {
+            return loop;
+        }
+    }
+    return null;
+}
+
+// The refusal of a change, opening with 'opening', to the variable 'binding' of 'loop' or to a
+// part of it, with 'gloss' before the fix where the change is a call. The fix writes the element
+// back through its index where the walked value has indexes, and keeps the change in a copy where
+// it has none. An array that is neither named nor returned by a call, such as a literal, gets no
+// fix, because its elements are copies already.
+public loopVariableRefusal(BodyChecker checker, string opening, string gloss, LocalBinding binding,
+                           ForEachStatementNode loop) -> string {
+    string name = binding.name();
+    Expression walked = wording.unwrapParentheses(loop.iterable());
+    string spelled = wording.oneLineSpelling(walked);
+    bool place = assignments.isLValue(checker, walked);
+    let walkedType = checker.result().typeOf(walked.green());
+    bool array = walkedType is ArrayType;
+    string copied = "a copy of an element of '{spelled}', so '{spelled}' would not change";
+    if (array && walked is CallExpressionNode) {
+        copied = "a copy of an element of the array '{spelled}' returns, so that array would not change";
+    } else if (array && !place) {
+        copied = "a copy of an element of '{spelled}', so that array would not change";
+    } else if (!array && place) {
+        copied = "a copy of a value '{spelled}' produces, so '{spelled}' would not change";
+    } else if (!array) {
+        copied = "a copy of a value from '{spelled}', so it would not change";
+    }
+    string reason = "{opening}, because '{name}' is {copied}.{gloss}";
+    if (!array) {
+        if (place && walkedType != null && setsByIndex(walkedType, binding.type())) {
+            string index = nullguidance.freeLocalName(checker, "", "i");
+            return "{reason} Loop over the indexes of '{spelled}' instead, as in "
+                + "'for (long {index} = 0; {index} < {spelled}.length(); {index}++)', copy "
+                + "'{spelled}.get({index})' into a local, change the local, and store it back with "
+                + "'{spelled}.set({index}, ...)'.";
+        }
+        string copy = nullguidance.freeLocalName(checker, "", "changed");
+        return "{reason} If only the copy should change, copy '{name}' into a variable first, as in "
+            + "'let {copy} = {name};'.";
+    }
+    if (!place && !(walked is CallExpressionNode)) {
+        return reason;
+    }
+    if (!place) {
+        string local = nullguidance.freeLocalName(checker, "", "elements");
+        string index = nullguidance.freeLocalName(checker, "", "i", local);
+        return "{reason} Store the array in a local first, as in 'let {local} = {spelled};', then loop "
+            + "over its indexes, as in {countingLoop(index, local)}, and write '{local}[{index}]' "
+            + "instead of '{name}'.";
+    }
+    string index = nullguidance.freeLocalName(checker, "", "i");
+    return "{reason} Loop over the indexes of '{spelled}', as in {countingLoop(index, spelled)}, and "
+        + "write '{spelled}[{index}]' instead of '{name}'.";
+}
+
+// Whether 'walked' declares 'length()', 'get(long)' giving 'element' values and 'set(long, ...)'
+// taking them, so a loop can copy an element out by its index and store it back.
+setsByIndex(Type walked, Type element) -> bool {
+    let declared = typemembers.methodsOf(walked);
+    if (declared == null) {
+        return false;
+    }
+    bool counts = false;
+    bool reads = false;
+    bool writes = false;
+    for (let method in declared) {
+        if (method.isStatic()) {
+            continue;
+        }
+        let signature = method.signature();
+        let parameters = signature.parameters();
+        switch (method.name()) {
+            "length" -> {
+                counts = counts || (parameters.length == 0 && types.isLongType(signature.returnType()));
+            },
+            "get" -> {
+                reads = reads || (parameters.length == 1 && types.isLongType(parameters[0].type())
+                    && convert.isAssignableStrict(element, signature.returnType()));
+            },
+            "set" -> {
+                writes = writes || (parameters.length == 2 && types.isLongType(parameters[0].type())
+                    && convert.isAssignableStrict(parameters[1].type(), element));
+            },
+            default -> { },
+        }
+    }
+    return counts && reads && writes;
+}
+
+// A loop that counts 'index' through the indexes of 'array', quoted.
+countingLoop(string index, string array) -> string {
+    return "'for (long {index} = 0; {index} < {array}.length; {index}++)'";
 }
 
 // Whether 'method' of the struct 'receiver' implements a 'mutating' requirement of an interface the
@@ -175,9 +289,9 @@ public refuseUnmarkedWrite(BodyChecker checker, Expression target, Span at) -> b
 }
 
 // Refuses a call to the 'mutating' method 'method' on 'receiver' where the change could not land:
-// a constant, a struct a lambda captured, 'this' in a method that is not 'mutating', or a value
-// with no storage of its own. A class object or an interface value changes through its reference
-// instead, so a call on one is never refused.
+// a constant, a struct a lambda captured, the variable of a for-each loop, 'this' in a method that
+// is not 'mutating', or a value with no storage of its own. A class object or an interface value
+// changes through its reference instead, so a call on one is never refused.
 public checkMutatingCall(BodyChecker checker, Expression receiver, Method method, Span at) {
     if (!method.isMutating()) {
         return;
@@ -231,13 +345,27 @@ public checkMutatingCall(BodyChecker checker, Expression receiver, Method method
         Local -> {
             let binding = root.binding();
             if (binding != null && lambdas.isCapturedBinding(checker, binding)) {
-                checker.reporter().report("{opening} inside a lambda. {gloss} A lambda works on copies of "
-                    + "what it captures, so the '{binding.name()}' outside it would not change. Return "
-                    + "the value the lambda computes and store it where the lambda is called, or keep "
-                    + "the value in a field of an object the lambda uses.", at);
+                checker.reporter().report(capturedCallRefusal(opening, gloss, binding), at);
+            }
+        },
+        LoopVariable -> {
+            let binding = root.binding();
+            let loop = root.loop();
+            if (binding != null && lambdas.isCapturedBinding(checker, binding)) {
+                checker.reporter().report(capturedCallRefusal(opening, gloss, binding), at);
+            } else if (binding != null && loop != null) {
+                checker.reporter().report(loopVariableRefusal(checker, opening, " {gloss}", binding, loop),
+                    at);
             }
         },
     }
+}
+
+capturedCallRefusal(string opening, string gloss, LocalBinding binding) -> string {
+    return "{opening} inside a lambda. {gloss} A lambda works on copies of what it captures, so the "
+        + "'{binding.name()}' outside it would not change. Return the value the lambda computes and "
+        + "store it where the lambda is called, or keep the value in a field of an object the lambda "
+        + "uses.";
 }
 
 constantLocalCallRefusal(BodyChecker checker, string opening, string gloss, LocalBinding binding,
