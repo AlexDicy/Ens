@@ -605,12 +605,13 @@ bool Parser::looksLikeFuncDecl(bool allowShorthand) const {
         idx++;
         while (idx < tokens.size() && isTrivia(tokens[idx].kind)) idx++;
     }
-    // Skip optional method modifiers (override / final / abstract / noreturn / static).
+    // Skip optional method modifiers (override / final / abstract / noreturn / static / mutating).
     while (idx < tokens.size() && (tokens[idx].kind == SyntaxKind::KwOverride ||
                                    tokens[idx].kind == SyntaxKind::KwFinal ||
                                    tokens[idx].kind == SyntaxKind::KwAbstract ||
                                    tokens[idx].kind == SyntaxKind::KwNoreturn ||
-                                   tokens[idx].kind == SyntaxKind::KwStatic)) {
+                                   tokens[idx].kind == SyntaxKind::KwStatic ||
+                                   tokens[idx].kind == SyntaxKind::KwMutating)) {
         idx++;
         while (idx < tokens.size() && isTrivia(tokens[idx].kind)) idx++;
     }
@@ -644,7 +645,7 @@ void Parser::parseFuncDecl() {
     builder.startNode(SyntaxKind::FuncDecl);
     parseVisibilityModifier();
     while (at(SyntaxKind::KwOverride) || at(SyntaxKind::KwFinal) || at(SyntaxKind::KwAbstract) ||
-           at(SyntaxKind::KwNoreturn) || at(SyntaxKind::KwStatic)) {
+           at(SyntaxKind::KwNoreturn) || at(SyntaxKind::KwStatic) || at(SyntaxKind::KwMutating)) {
         bump();  // method modifier; analyzer validates context
     }
     if (at(SyntaxKind::KwConstructor) || at(SyntaxKind::KwDestructor)) {
@@ -944,7 +945,8 @@ bool Parser::looksLikeKeywordNamedMethod() const {
                                    tokens[idx].kind == SyntaxKind::KwFinal ||
                                    tokens[idx].kind == SyntaxKind::KwAbstract ||
                                    tokens[idx].kind == SyntaxKind::KwNoreturn ||
-                                   tokens[idx].kind == SyntaxKind::KwStatic)) {
+                                   tokens[idx].kind == SyntaxKind::KwStatic ||
+                                   tokens[idx].kind == SyntaxKind::KwMutating)) {
         idx++;
         skipTrivia();
     }

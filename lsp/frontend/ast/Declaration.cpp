@@ -191,7 +191,7 @@ std::optional<SyntaxNode> FuncDecl::nameToken() const {
         if (isTrivia(c.kind()) || c.kind() == SyntaxKind::VisibilityModifier) continue;
         if (c.kind() == SyntaxKind::KwOverride || c.kind() == SyntaxKind::KwFinal ||
             c.kind() == SyntaxKind::KwAbstract || c.kind() == SyntaxKind::KwNoreturn ||
-            c.kind() == SyntaxKind::KwStatic)
+            c.kind() == SyntaxKind::KwStatic || c.kind() == SyntaxKind::KwMutating)
             continue;  // skip method modifiers
         if (c.kind() == SyntaxKind::Identifier) return c;
         break;
