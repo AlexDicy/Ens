@@ -13,6 +13,7 @@ import FunctionDeclarationNode from syntax.generated.nodes;
 import CallExpressionNode from syntax.generated.nodes;
 import ErrorExpressionNode from syntax.generated.nodes;
 import IdentifierExpressionNode from syntax.generated.nodes;
+import TernaryExpressionNode from syntax.generated.nodes;
 import SyntaxNode from syntax.node;
 import List from @std.collections.list;
 import StringBuilder from @std.text.stringbuilder;
@@ -424,26 +425,62 @@ test "an expression abandoned at an operator still fills one slot" {
     try testing.assertEqual(result.diagnostics()[0].message(),
         "This expression is nested too deeply to compile. Split it into smaller expressions, "
         + "each stored in a local variable.");
-    let call = callIn(factory.createRoot(result.root()));
-    if (call == null) {
-        try testing.fail("the call to 'pick' is missing from the tree");
-    } else {
+    let call = nodeIn(factory.createRoot(result.root()), SyntaxKind.CallExpression);
+    if (call is CallExpressionNode) {
         let arguments = call.arguments();
         try testing.assertEqual(arguments.argumentsCount(), 2L);
         try testing.assertTrue(arguments.arguments(0) is ErrorExpressionNode,
             "the abandoned argument is one error expression");
         try testing.assertTrue(arguments.arguments(1) is IdentifierExpressionNode,
             "the argument after it keeps its own slot");
+    } else {
+        try testing.fail("the call to 'pick' is missing from the tree");
     }
 }
 
-// The first call found under 'root', or null when there is none.
-callIn(SyntaxNode root) -> CallExpressionNode? {
+// Each value is placed so that its hole, its first branch or its label is entered at the limit and
+// abandoned at the '+'. The abandoned expression stops before the '}', ':' or '->' after it, and a
+// type's '?' inside it, as in 'int?', opens no conditional. So the string, the conditional and the
+// arm keep their own tokens and the limit is the only problem.
+test "an expression abandoned before its parent's next token leaves that token to the parent" {
+    string[] values = ["\"a\{x + 1\}b\"", "flag ? x + 1 : x", "switch (x) \{ 0 + 1 -> 1, default -> 0 \}",
+        "flag ? x + pick<int?>(1) : x"];
+    long[] depths = [497L, 496L, 497L, 496L];
+    for (long i = 0; i < values.length; i++) {
+        let text = returnedInParentheses(values[i], depths[i]);
+        let result = parser_support.parseText(text);
+        try parser_support.assertRoundTrip(text, result);
+        try parser_support.assertDiagnosticCount(result, 1);
+        try testing.assertEqual(result.diagnostics()[0].message(),
+            "This expression is nested too deeply to compile. Split it into smaller expressions, "
+            + "each stored in a local variable.");
+    }
+    let result = parser_support.parseText(returnedInParentheses(values[1], depths[1]));
+    let conditional = nodeIn(factory.createRoot(result.root()), SyntaxKind.TernaryExpression);
+    if (conditional is TernaryExpressionNode) {
+        try testing.assertTrue(conditional.thenValue() is ErrorExpressionNode,
+            "the abandoned branch is one error expression");
+        try testing.assertEqual(conditional.colon().text(), ":");
+        try testing.assertTrue(conditional.elseValue() is IdentifierExpressionNode,
+            "the branch after the ':' keeps its own slot");
+    } else {
+        try testing.fail("the conditional is missing from the tree");
+    }
+}
+
+// A function returning 'value' inside 'depth' parentheses.
+returnedInParentheses(string value, long depth) -> string {
+    return "deep(bool flag, int x) -> int \{\n    return " + repeated("(", depth) + value
+        + repeated(")", depth) + ";\n\}\n";
+}
+
+// The first node of 'kind' found under 'root', or null when there is none.
+nodeIn(SyntaxNode root, SyntaxKind kind) -> SyntaxNode? {
     let pending = new List<SyntaxNode>();
     pending.push(root);
     while (!pending.isEmpty()) {
         let node = pending.pop();
-        if (node is CallExpressionNode) {
+        if (node.kind() == kind) {
             return node;
         }
         for (let child in node.childNodes()) {
