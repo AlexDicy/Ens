@@ -14,6 +14,8 @@ import model.capabilities;
 import model.convert;
 import LiteralOrigin from phases.bodies.literaltargets;
 import JoinText from phases.bodies.literaltargets;
+import Widening from phases.bodies.literaltargets;
+import model.literalvalues;
 import phases.bodies.assignments;
 import WriteTarget from phases.bodies.assignments;
 import WriteRefusal from phases.bodies.assignments;
@@ -136,6 +138,152 @@ adaptedOperand(BodyChecker checker, Expression node, Type type, Type toward, Exp
         ?? charOperand(checker, node, toward, other, fix) ?? type;
 }
 
+// Refuses a comparison of a value with an integer or char literal its integer type cannot hold,
+// whose outcome is then the same for every value. True when it reported one.
+reportFixedComparison(BodyChecker checker, Span span, string operatorText, Expression leftNode,
+                      Expression rightNode, Type left, Type right) -> bool {
+    return reportFixedSide(checker, span, operatorText, rightNode, leftNode, left)
+        || reportFixedSide(checker, span, operatorText, leftNode, rightNode, right);
+}
+
+// reportFixedComparison for the literal 'literal' compared with 'other' of type 'otherType'.
+reportFixedSide(BodyChecker checker, Span span, string operatorText, Expression literal, Expression other,
+                Type otherType) -> bool {
+    if (!isAdaptingLiteral(literal) || isAdaptingLiteral(other)) {
+        return false;
+    }
+    Type core = convert.coreOf(otherType);
+    string? text = null;
+    if (core is PrimitiveType && core.kind() == PrimitiveKind.Float) {
+        text = floatComparison(checker, operatorText, literal, other, otherType);
+    } else if (convert.isIntegerType(core)) {
+        text = integerComparison(checker, operatorText, literal, other, otherType);
+    }
+    if (text == null) {
+        return false;
+    }
+    checker.reporter().report(text, span);
+    checker.result().setType(literal.green(), checker.store().errorType());
+    return true;
+}
+
+// The refusal of comparing 'other' with the integer or char literal 'literal', past the range of
+// the integer type 'otherType', or null when it fits or is past every integer type.
+integerComparison(BodyChecker checker, string operatorText, Expression literal, Expression other,
+                  Type otherType) -> string? {
+    let alone = literalfixes.overflowWidening(checker, literal, otherType);
+    let widening = literalfixes.joinWidening(checker, literal, otherType);
+    if (alone == null || widening == null || alone.wider().length == 0) {
+        return null;
+    }
+    return fixedComparison(checker, operatorText, literal, other, otherType, widening);
+}
+
+// The refusal of comparing 'other' with the floating-point literal 'literal' past the range of
+// 'float', or null when it fits 'float' or is past 'double' too. An ordering has no single outcome,
+// since the value may be an infinity or a NaN, so it states the range instead.
+floatComparison(BodyChecker checker, string operatorText, Expression literal, Expression other,
+                Type otherType) -> string? {
+    let written = literaltyping.floatLiteralOf(wording.unwrapParentheses(literal));
+    if (written == null || !literalfixes.literalOverflows(written, PrimitiveKind.Float)
+            || !literalvalues.floatMagnitudeFits(literalvalues.floatMagnitude(written.value().text()),
+                PrimitiveKind.Double)) {
+        return null;
+    }
+    string value = wording.oneLineSpelling(wording.unwrapParentheses(literal));
+    Expression compared = wording.unwrapParentheses(other);
+    string named = wording.oneLineSpelling(compared);
+    string fix = "";
+    let declarable = declarableName(checker, compared);
+    if (declarable != null) {
+        fix = " Declare {declarable} as 'double' if it should hold that value.";
+    }
+    bool negative = value.startsWith("-");
+    if (operatorText != "==" && operatorText != "!=") {
+        return "{literaltyping.floatPastRange(value, PrimitiveKind.Float)} "
+            + "{wording.takesTypeFrom("'{named}'", convert.coreOf(otherType), checker.names())}{fix}";
+    }
+    string bound = "whose largest value is {literalvalues.floatLimit(PrimitiveKind.Float)}";
+    if (negative) {
+        bound = "whose smallest value is {literalvalues.floatLimit(PrimitiveKind.Float, true)}";
+    }
+    string outcome = "never equal to";
+    if (operatorText == "!=") {
+        outcome = "always different from";
+    }
+    return "'{named}' is {typenames.typeArticle(checker.names().of(otherType))} "
+        + "{checker.names().quoted(otherType)}, {bound}, so it is {outcome} {value}.{fix}";
+}
+
+// How a fix names what 'compared' writes when a declaration in this package can change its type: a
+// local, a parameter, or a field of a type this package declares. Null for anything else.
+declarableName(BodyChecker checker, Expression compared) -> string? {
+    if (compared is IdentifierExpressionNode) {
+        if (checker.result().bindingOf(compared.green()) != null) {
+            return "'{wording.oneLineSpelling(compared)}'";
+        }
+        return null;
+    }
+    let field = nullguidance.accessedField(checker, compared);
+    if (field == null) {
+        return null;
+    }
+    let authority = types.authorityOf(field.definingType());
+    if (authority == null || authority.packagePrefix() != checker.packagePrefix()) {
+        return null;
+    }
+    return "field '{field.name()}' of {checker.names().quotedName(authority)}";
+}
+
+// Whether the operand is an untyped number literal or a char literal, which takes the integer type
+// of the value beside it.
+isAdaptingLiteral(Expression operand) -> bool {
+    return valuejoins.isUntypedNumberLiteral(operand)
+        || literaltyping.charLiteralOf(wording.unwrapParentheses(operand)) != null;
+}
+
+// The refusal of comparing 'other' of type 'otherType' with 'literal', which lies past the end of
+// that type that 'widening' names, so the comparison has one outcome.
+fixedComparison(BodyChecker checker, string operatorText, Expression literal, Expression other,
+                Type otherType, Widening widening) -> string {
+    Expression compared = wording.unwrapParentheses(other);
+    string named = wording.oneLineSpelling(compared);
+    string type = checker.names().quoted(otherType);
+    string article = typenames.typeArticle(checker.names().of(otherType));
+    bool character = literaltyping.charLiteralOf(wording.unwrapParentheses(literal)) != null;
+    string value = wording.oneLineSpelling(wording.unwrapParentheses(literal));
+    if (character) {
+        value = "{value}, whose code point, its number in Unicode, is {widening.magnitude()}";
+    }
+    let kind = widening.narrow();
+    string bound = "whose largest value is {literalvalues.integerLimit(kind)}";
+    string outcome = "always less than";
+    if (widening.negative()) {
+        bound = "whose smallest value is {literalvalues.integerLimit(kind, true)}";
+        outcome = "always greater than";
+    }
+    if (operatorText == "==") {
+        outcome = "never equal to";
+    } else if (operatorText == "!=") {
+        outcome = "always different from";
+    }
+    string fix = "";
+    let declarable = declarableName(checker, compared);
+    if (declarable != null) {
+        if (character) {
+            fix = " If {declarable} should hold characters, declare it as 'char'.";
+        } else if (widening.wider().length > 0 && widening.negative()
+                && literalfixes.isUnsignedKind(kind)) {
+            fix = " Declare {declarable} as a signed type, such as '{widening.wider()}', if it should hold "
+                + "that value.";
+        } else if (widening.wider().length > 0) {
+            fix = " Declare {declarable} as a wider type, such as '{widening.wider()}', if it should hold "
+                + "that value.";
+        }
+    }
+    return "'{named}' is {article} {type}, {bound}, so it is {outcome} {value}.{fix}";
+}
+
 // A char literal operand takes the integer type of the value beside it, as a number literal does,
 // but not the 'int' an untyped number literal beside it falls back to.
 charOperand(BodyChecker checker, Expression node, Type toward, Expression other, JoinText? fix) -> Type? {
@@ -196,6 +344,9 @@ analyzeArithmetic(BodyChecker checker, Span span, SyntaxKind operator, string op
 // legal on a binding declared optional even where narrowing already proved the value non-null.
 analyzeEquality(BodyChecker checker, Span span, string operatorText, Expression leftNode,
                 Expression rightNode, Type left, Type right) -> Type {
+    if (reportFixedComparison(checker, span, operatorText, leftNode, rightNode, left, right)) {
+        return checker.store().primitive(PrimitiveKind.Bool);
+    }
     Type[] adapted = adaptOperands(checker, leftNode, rightNode, left, right, operatorText);
     Type leftSide = adapted[0];
     Type rightSide = adapted[1];
@@ -297,6 +448,9 @@ checkStructEquatable(BodyChecker checker, Type leftSide, Type rightSide, Span sp
 
 analyzeComparison(BodyChecker checker, Span span, SyntaxKind operator, string operatorText,
                   Expression leftNode, Expression rightNode, Type left, Type right) -> Type {
+    if (reportFixedComparison(checker, span, operatorText, leftNode, rightNode, left, right)) {
+        return checker.store().primitive(PrimitiveKind.Bool);
+    }
     Type[] adapted = adaptOperands(checker, leftNode, rightNode, left, right, operatorText);
     if (adapted[0] is ErrorType || adapted[1] is ErrorType) {
         return checker.store().primitive(PrimitiveKind.Bool);
