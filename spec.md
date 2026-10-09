@@ -590,8 +590,12 @@ A function cannot be imported by name with an alias any more than without one.
 
 A diagnostic names a type the way the file it is reported in can name it, which is the name that file declares or imports it under.
 A type the file has no name for is named on its own.
-Where the file gives that name another meaning, or another module declares a type of the same name, the module it comes from follows the name, as in `Ruler (from engine.sizing)`.
-So a type a message suggests writing can be written exactly as the message spells it.
+Where the file gives that name another meaning, or another module declares a type of the same name, the module it comes from follows the quoted name, as in `'Ruler' (from engine.sizing)`.
+Where the quote also names another declared type, such as a type argument, the type's name comes before its module, as in `'Box<Ruler>' (Ruler from engine.sizing)`.
+Where one name in a quote stands for two types, the module note says which by position, as in `'Pair<Ruler, Ruler>' (the second Ruler from engine.sizing)`.
+The module is written as the file would import it, so a type of the standard library reads as in `'Path' (from @std.fs)`.
+A quote with no module after it can be written in that file exactly as the message spells it, after any import the message says to add.
+Where a module follows the quote, the file first needs an import that gives the type a name, as in `import Ruler as SizingRuler from engine.sizing;`.
 
 A file and a folder with the same name may sit side by side: `io.ens` next to an `io/` folder makes `import io;` resolve to the file, while `import io.streams;` resolves to `streams.ens` inside the folder.
 
