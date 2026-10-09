@@ -243,6 +243,7 @@ Open work is tracked as GitHub issues on `AlexDicy/Ens`, never in a file in the 
   `design-ruling-needed` marks an issue that waits for a decision from Alex, and nobody works on it until Alex comments the ruling and removes the label.
 - A finding outside the change under review is filed, not fixed and not written down anywhere else.
   Search open and closed issues for a fragment of the text first (`gh issue list --state all --search "..."`), and comment on a match instead of filing a second one.
+  A finding the same session fixes next needs no issue: the fix lands as its own commit, and an issue would only be opened to be closed.
 - A commit subject that fixes an issue says `fixes #N` wherever it reads naturally, as in `Report a struct value cycle once, fixes #N`.
   GitHub closes the issue when the commit is pushed, so agents never close one.
 - Before committing, rerun the repros of the open issues that quote a text the change edits.
