@@ -346,6 +346,7 @@ Speaker? quiet = null;     // nullable interface reference
 ---
 
 Classes, structs, and functions may be generic: they declare type parameters in angle brackets and work uniformly over any type argument. A type parameter can be used as a field type, a parameter or return type, a local type, and as the element type of an array.
+A type-parameter list names at least one type parameter, so an empty `<>` is an error.
 A method does not declare type parameters of its own; a type-parameter list on a member constrains the enclosing type's parameters instead, as described under conditional members below.
 A type parameter takes its name for the whole of the declaration that introduces it, so that name is the parameter in a bound, in a member's signature, in a field or parameter default, and in a body alike.
 A class, struct, interface, enum, function, or module of that name declared or imported outside is unreachable under that name inside, while a parameter or a local of that name declared inside takes the name back for the values written after it.
