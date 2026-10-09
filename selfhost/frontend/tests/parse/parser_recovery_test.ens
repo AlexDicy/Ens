@@ -10,6 +10,11 @@ import ExternalTypeDeclarationNode from syntax.generated.nodes;
 import InterfaceDeclarationNode from syntax.generated.nodes;
 import ClassDeclarationNode from syntax.generated.nodes;
 import FunctionDeclarationNode from syntax.generated.nodes;
+import CallExpressionNode from syntax.generated.nodes;
+import ErrorExpressionNode from syntax.generated.nodes;
+import IdentifierExpressionNode from syntax.generated.nodes;
+import SyntaxNode from syntax.node;
+import List from @std.collections.list;
 import StringBuilder from @std.text.stringbuilder;
 
 parseFile(string text) -> SourceFileNode {
@@ -294,6 +299,80 @@ test "deeply nested blocks are bounded by the same guard" {
     try testing.assertEqual(result.diagnostics()[0].message(),
         "These blocks are nested too deeply to compile. Move the inner blocks into functions of "
         + "their own.");
+}
+
+// An 'if' holds blocks, so a deep nest of them reaches the bound at an 'if' and reports the blocks,
+// not the condition of the innermost one.
+test "a deep nest of 'if' statements is bounded by the same guard" {
+    let text = "main() \{\n    int x = 0;\n    " + repeated("if (x > 0) \{ ", 600) + "x = 1;"
+        + repeated(" \}", 600) + "\n\}\n";
+    let result = parser_support.parseText(text);
+    try parser_support.assertRoundTrip(text, result);
+    try parser_support.assertDiagnosticCount(result, 1);
+    try testing.assertEqual(result.diagnostics()[0].message(),
+        "These blocks are nested too deeply to compile. Move the inner blocks into functions of "
+        + "their own.");
+}
+
+// A switch arm's block and a lambda's block body are blocks like any other, so a deep nest of either
+// reaches the bound at a block and reports the blocks once. The statement after the nest still
+// parses, so its own problem is the second diagnostic.
+test "switch arm blocks and lambda block bodies are bounded by the same guard" {
+    string[] opens = ["switch (x) \{ 0 -> \{ ", "() -> int f = () -> \{ "];
+    string[] closes = [" \}, default -> \{ \}, \}", " return 1; \};"];
+    for (long i = 0; i < opens.length; i++) {
+        let text = "main() \{\n    int x = 0;\n    \{ " + repeated(opens[i], 600) + "x = 1;"
+            + repeated(closes[i], 600) + " \}\n    int after = ;\n\}\n";
+        let result = parser_support.parseText(text);
+        try parser_support.assertRoundTrip(text, result);
+        try parser_support.assertDiagnosticCount(result, 2);
+        try testing.assertEqual(result.diagnostics()[0].message(),
+            "These blocks are nested too deeply to compile. Move the inner blocks into functions of "
+            + "their own.");
+        try testing.assertEqual(result.diagnostics()[1].message(),
+            "Expected a value, such as '42', a variable's name or a call like 'count()'.");
+    }
+}
+
+// Inside 496 parentheses the call's first argument is entered one level under the limit, so the
+// limit is reached at its '>' after 'x' was read. The abandoned argument takes 'x' with it and
+// fills its one slot, so the call keeps its two arguments.
+test "an expression abandoned at an operator still fills one slot" {
+    let text = "deepArgument(int x) -> int \{\n    return " + repeated("(", 496) + "pick(x > 0, x)"
+        + repeated(")", 496) + ";\n\}\n";
+    let result = parser_support.parseText(text);
+    try parser_support.assertRoundTrip(text, result);
+    try parser_support.assertDiagnosticCount(result, 1);
+    try testing.assertEqual(result.diagnostics()[0].message(),
+        "This expression is nested too deeply to compile. Split it into smaller expressions, "
+        + "each stored in a local variable.");
+    let call = callIn(factory.createRoot(result.root()));
+    if (call == null) {
+        try testing.fail("the call to 'pick' is missing from the tree");
+    } else {
+        let arguments = call.arguments();
+        try testing.assertEqual(arguments.argumentsCount(), 2L);
+        try testing.assertTrue(arguments.arguments(0) is ErrorExpressionNode,
+            "the abandoned argument is one error expression");
+        try testing.assertTrue(arguments.arguments(1) is IdentifierExpressionNode,
+            "the argument after it keeps its own slot");
+    }
+}
+
+// The first call found under 'root', or null when there is none.
+callIn(SyntaxNode root) -> CallExpressionNode? {
+    let pending = new List<SyntaxNode>();
+    pending.push(root);
+    while (!pending.isEmpty()) {
+        let node = pending.pop();
+        if (node is CallExpressionNode) {
+            return node;
+        }
+        for (let child in node.childNodes()) {
+            pending.push(child);
+        }
+    }
+    return null;
 }
 
 // A statement the parser cannot read as a type keeps the reading it was written as, so the type

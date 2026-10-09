@@ -1531,6 +1531,8 @@ switch (shape) {                  // an open hierarchy needs default
 }
 ```
 
+Expressions, types and blocks may only nest so deeply inside one declaration, and nesting past that limit is a compile error.
+
 ---
 
 Arrays are written with `T[]` and are reference types: declaring an array variable binds a pointer to a heap allocation, and copying the variable copies the pointer.
