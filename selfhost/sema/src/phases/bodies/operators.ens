@@ -7,6 +7,7 @@ import ThisExpressionNode from @ens.frontend.syntax.generated.nodes;
 import SuperExpressionNode from @ens.frontend.syntax.generated.nodes;
 import BinaryExpressionNode from @ens.frontend.syntax.generated.nodes;
 import PrefixExpressionNode from @ens.frontend.syntax.generated.nodes;
+import LiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
 import PostfixExpressionNode from @ens.frontend.syntax.generated.nodes;
 import SyntaxKind from @ens.frontend.syntax.generated.kind;
 import Span from @ens.frontend.support.source;
@@ -138,26 +139,81 @@ adaptedOperand(BodyChecker checker, Expression node, Type type, Type toward, Exp
         ?? charOperand(checker, node, toward, other, fix) ?? type;
 }
 
-// Refuses a comparison of a value with an integer or char literal its integer type cannot hold,
-// whose outcome is then the same for every value. True when it reported one.
+// Refuses a comparison of a value with a literal its type cannot hold, or, for an integer type, one
+// it can never equal, whose outcome is then the same for every value. True when it reported one.
 reportFixedComparison(BodyChecker checker, Span span, string operatorText, Expression leftNode,
                       Expression rightNode, Type left, Type right) -> bool {
     return reportFixedSide(checker, span, operatorText, rightNode, leftNode, left)
         || reportFixedSide(checker, span, operatorText, leftNode, rightNode, right);
 }
 
+// A literal operand of a comparison: its token, and whether a '-' is written before it.
+final class ComparedLiteral {
+    LiteralExpressionNode literalToken;
+    bool literalNegative;
+
+    constructor(this.literalToken, this.literalNegative);
+
+    token() -> LiteralExpressionNode {
+        return this.literalToken;
+    }
+
+    negative() -> bool {
+        return this.literalNegative;
+    }
+
+    kind() -> SyntaxKind {
+        return this.literalToken.value().kind();
+    }
+}
+
+// The number or char literal 'operand' writes, under parentheses and one sign, which may be
+// written outside parentheses of its own, as in '300', '-1.5', '(2.5)' or '-(1.5)'. Null for anything else.
+comparedLiteralOf(Expression operand) -> ComparedLiteral? {
+    Expression core = wording.unwrapParentheses(operand);
+    bool negative = false;
+    if (core is PrefixExpressionNode) {
+        SyntaxKind operator = core.operator().kind();
+        if (operator != SyntaxKind.Plus && operator != SyntaxKind.Minus) {
+            return null;
+        }
+        negative = operator == SyntaxKind.Minus;
+        core = wording.unwrapParentheses(core.operand());
+    }
+    if (!(core is LiteralExpressionNode)) {
+        return null;
+    }
+    return switch (core.value().kind()) {
+        IntLiteral, DoubleLiteral, FloatLiteral -> new ComparedLiteral(core, negative),
+        CharLiteral -> negative ? null : new ComparedLiteral(core, false),
+        default -> null,
+    };
+}
+
 // reportFixedComparison for the literal 'literal' compared with 'other' of type 'otherType'.
 reportFixedSide(BodyChecker checker, Span span, string operatorText, Expression literal, Expression other,
                 Type otherType) -> bool {
-    if (!isAdaptingLiteral(literal) || isAdaptingLiteral(other)) {
+    let constant = comparedLiteralOf(literal);
+    Type core = convert.coreOf(otherType);
+    if (constant == null || comparedLiteralOf(other) != null || !(core is PrimitiveType)) {
         return false;
     }
-    Type core = convert.coreOf(otherType);
+    SyntaxKind kind = constant.kind();
+    bool floating = kind == SyntaxKind.DoubleLiteral || kind == SyntaxKind.FloatLiteral;
     string? text = null;
-    if (core is PrimitiveType && core.kind() == PrimitiveKind.Float) {
-        text = floatComparison(checker, operatorText, literal, other, otherType);
-    } else if (convert.isIntegerType(core)) {
-        text = integerComparison(checker, operatorText, literal, other, otherType);
+    if (core.kind() == PrimitiveKind.Float && literaltyping.floatLiteralOf(constant.token()) != null) {
+        text = floatComparison(checker, operatorText, literal, constant, other, otherType);
+    } else if (convert.isIntegerType(core) && floating) {
+        PrimitiveKind literalKind = PrimitiveKind.Double;
+        if (kind == SyntaxKind.FloatLiteral) {
+            literalKind = PrimitiveKind.Float;
+        }
+        if (convert.numericCommonType(core, checker.store().primitive(literalKind)) != null) {
+            text = wholeNumberComparison(checker, operatorText, literal, constant, literalKind, other,
+                core.kind(), otherType);
+        }
+    } else if (convert.isIntegerType(core) && !floating) {
+        text = integerComparison(checker, operatorText, literal, constant, other, core, otherType);
     }
     if (text == null) {
         return false;
@@ -167,25 +223,38 @@ reportFixedSide(BodyChecker checker, Span span, string operatorText, Expression 
     return true;
 }
 
-// The refusal of comparing 'other' with the integer or char literal 'literal', past the range of
-// the integer type 'otherType', or null when it fits or is past every integer type.
-integerComparison(BodyChecker checker, string operatorText, Expression literal, Expression other,
-                  Type otherType) -> string? {
-    let alone = literalfixes.overflowWidening(checker, literal, otherType);
-    let widening = literalfixes.joinWidening(checker, literal, otherType);
-    if (alone == null || widening == null || alone.wider().length == 0) {
+// The refusal of comparing 'other' with the integer or char literal 'constant', past the range of
+// the integer type 'core', or null when it fits or is past every integer type.
+integerComparison(BodyChecker checker, string operatorText, Expression literal, ComparedLiteral constant,
+                  Expression other, PrimitiveType core, Type otherType) -> string? {
+    PrimitiveKind kind = core.kind();
+    string written = constant.token().value().text();
+    if (constant.kind() == SyntaxKind.CharLiteral) {
+        ulong codepoint = literalvalues.charCodepoint(written);
+        if (kind == PrimitiveKind.Char || literalvalues.magnitudeFits(false, codepoint, kind)) {
+            return null;
+        }
+        return fixedComparison(checker, operatorText, literal, other, otherType,
+            literalfixes.charWidening(checker, codepoint, core));
+    }
+    let magnitude = literalvalues.integerMagnitude(written);
+    bool negative = constant.negative();
+    if (magnitude == null || literalvalues.magnitudeFits(negative, magnitude, kind)
+            || literaltyping.widerIntegerHolding(negative, magnitude, kind).length == 0) {
         return null;
     }
+    let widening = new Widening(kind, checker.names().of(core),
+        literalfixes.comparedIntegerHolding(kind, negative, magnitude), negative, magnitude);
     return fixedComparison(checker, operatorText, literal, other, otherType, widening);
 }
 
-// The refusal of comparing 'other' with the floating-point literal 'literal' past the range of
+// The refusal of comparing 'other' with the floating-point literal 'constant' past the range of
 // 'float', or null when it fits 'float' or is past 'double' too. An ordering has no single outcome,
 // since the value may be an infinity or a NaN, so it states the range instead.
-floatComparison(BodyChecker checker, string operatorText, Expression literal, Expression other,
-                Type otherType) -> string? {
-    let written = literaltyping.floatLiteralOf(wording.unwrapParentheses(literal));
-    if (written == null || !literalfixes.literalOverflows(written, PrimitiveKind.Float)
+floatComparison(BodyChecker checker, string operatorText, Expression literal, ComparedLiteral constant,
+                Expression other, Type otherType) -> string? {
+    let written = constant.token();
+    if (!literalfixes.literalOverflows(written, PrimitiveKind.Float)
             || !literalvalues.floatMagnitudeFits(literalvalues.floatMagnitude(written.value().text()),
                 PrimitiveKind.Double)) {
         return null;
@@ -198,13 +267,12 @@ floatComparison(BodyChecker checker, string operatorText, Expression literal, Ex
     if (declarable != null) {
         fix = " Declare {declarable} as 'double' if it should hold that value.";
     }
-    bool negative = value.startsWith("-");
     if (operatorText != "==" && operatorText != "!=") {
         return "{literaltyping.floatPastRange(value, PrimitiveKind.Float)} "
             + "{wording.takesTypeFrom("'{named}'", convert.coreOf(otherType), checker.names())}{fix}";
     }
     string bound = "whose largest value is {literalvalues.floatLimit(PrimitiveKind.Float)}";
-    if (negative) {
+    if (constant.negative()) {
         bound = "whose smallest value is {literalvalues.floatLimit(PrimitiveKind.Float, true)}";
     }
     string outcome = "never equal to";
@@ -213,6 +281,93 @@ floatComparison(BodyChecker checker, string operatorText, Expression literal, Ex
     }
     return "'{named}' is {typenames.typeArticle(checker.names().of(otherType))} "
         + "{checker.names().quoted(otherType)}, {bound}, so it is {outcome} {value}.{fix}";
+}
+
+// The refusal of comparing 'other' with the floating-point literal 'constant' that no value of the
+// integer kind 'kind' equals, or null. Every value of the kind is exact in 'literalKind'.
+wholeNumberComparison(BodyChecker checker, string operatorText, Expression literal, ComparedLiteral constant,
+                      PrimitiveKind literalKind, Expression other, PrimitiveKind kind, Type otherType)
+                      -> string? {
+    double magnitude = literalvalues.floatMagnitude(constant.token().value().text());
+    if (!literalvalues.floatMagnitudeFits(magnitude, literalKind)) {
+        return null;
+    }
+    if (literalKind == PrimitiveKind.Float) {
+        magnitude = (magnitude as float) as double;
+    }
+    bool negative = constant.negative();
+    double value = magnitude;
+    if (negative) {
+        value = -magnitude;
+    }
+    bool equality = operatorText == "==" || operatorText == "!=";
+    bool whole = literalvalues.isWholeNumber(magnitude);
+    bool fractional = false;
+    string why = "whose largest value is {literalvalues.integerLimit(kind)}";
+    string outcome = "always less than";
+    if (value < literalvalues.integerLimitAsDouble(kind, true)) {
+        why = "whose smallest value is {literalvalues.integerLimit(kind, true)}";
+        outcome = "always greater than";
+    } else if (value <= literalvalues.integerLimitAsDouble(kind)) {
+        if (!equality || whole) {
+            return null;
+        }
+        why = "whose values are all whole numbers";
+        fractional = true;
+    }
+    if (operatorText == "==") {
+        outcome = "never equal to";
+    } else if (operatorText == "!=") {
+        outcome = "always different from";
+    }
+    Expression compared = wording.unwrapParentheses(other);
+    string fix = "";
+    let declarable = declarableName(checker, compared);
+    string wider = "";
+    if (whole && magnitude < 18446744073709551616.0) {
+        wider = literalfixes.comparedIntegerHolding(kind, negative, magnitude as ulong);
+    }
+    if (wider.length > 0 && !comparesWith(checker, wider, literalKind)) {
+        wider = "";
+    }
+    if (declarable != null && fractional) {
+        fix = " Declare {declarable} as 'double' if it should hold that value, or compare with a whole "
+            + "number.";
+    } else if (declarable != null && wider.length > 0) {
+        fix = integerTypeFix(declarable, wider, negative && literalfixes.isUnsignedKind(kind));
+    } else if (declarable != null) {
+        fix = " Declare {declarable} as 'double' if it should hold that value.";
+    }
+    return "'{wording.oneLineSpelling(compared)}' is {typenames.typeArticle(checker.names().of(otherType))} "
+        + "{checker.names().quoted(otherType)}, {why}, so it is {outcome} "
+        + "{wording.oneLineSpelling(wording.unwrapParentheses(literal))}.{fix}";
+}
+
+// Whether a value of the integer type named 'name' compares with a value of 'literalKind', so a fix
+// that declares it still compiles.
+comparesWith(BodyChecker checker, string name, PrimitiveKind literalKind) -> bool {
+    PrimitiveKind? kind = switch (name) {
+        "short" -> PrimitiveKind.Short,
+        "ushort" -> PrimitiveKind.UShort,
+        "int" -> PrimitiveKind.Int,
+        "uint" -> PrimitiveKind.UInt,
+        "long" -> PrimitiveKind.Long,
+        "ulong" -> PrimitiveKind.ULong,
+        default -> null,
+    };
+    if (kind == null) {
+        return false;
+    }
+    return convert.numericCommonType(checker.store().primitive(kind),
+        checker.store().primitive(literalKind)) != null;
+}
+
+// The fix that declares 'declarable' as the integer type 'wider', a signed one where 'signed'.
+integerTypeFix(string declarable, string wider, bool signed) -> string {
+    if (signed) {
+        return " Declare {declarable} as a signed type, such as '{wider}', if it should hold that value.";
+    }
+    return " Declare {declarable} as a wider type, such as '{wider}', if it should hold that value.";
 }
 
 // How a fix names what 'compared' writes when a declaration in this package can change its type: a
@@ -233,13 +388,6 @@ declarableName(BodyChecker checker, Expression compared) -> string? {
         return null;
     }
     return "field '{field.name()}' of {checker.names().quotedName(authority)}";
-}
-
-// Whether the operand is an untyped number literal or a char literal, which takes the integer type
-// of the value beside it.
-isAdaptingLiteral(Expression operand) -> bool {
-    return valuejoins.isUntypedNumberLiteral(operand)
-        || literaltyping.charLiteralOf(wording.unwrapParentheses(operand)) != null;
 }
 
 // The refusal of comparing 'other' of type 'otherType' with 'literal', which lies past the end of
@@ -269,17 +417,11 @@ fixedComparison(BodyChecker checker, string operatorText, Expression literal, Ex
     }
     string fix = "";
     let declarable = declarableName(checker, compared);
-    if (declarable != null) {
-        if (character) {
-            fix = " If {declarable} should hold characters, declare it as 'char'.";
-        } else if (widening.wider().length > 0 && widening.negative()
-                && literalfixes.isUnsignedKind(kind)) {
-            fix = " Declare {declarable} as a signed type, such as '{widening.wider()}', if it should hold "
-                + "that value.";
-        } else if (widening.wider().length > 0) {
-            fix = " Declare {declarable} as a wider type, such as '{widening.wider()}', if it should hold "
-                + "that value.";
-        }
+    if (declarable != null && character) {
+        fix = " If {declarable} should hold characters, declare it as 'char'.";
+    } else if (declarable != null && widening.wider().length > 0) {
+        fix = integerTypeFix(declarable, widening.wider(),
+            widening.negative() && literalfixes.isUnsignedKind(kind));
     }
     return "'{named}' is {article} {type}, {bound}, so it is {outcome} {value}.{fix}";
 }

@@ -1266,6 +1266,8 @@ Where a nullable type such as `byte?` is expected, a literal adapts to the type 
 A literal in parentheses adapts the same way as the literal alone.
 A `char` literal beside an integer value adapts to that value's type the same way, so with `byte b`, `b + 'a'` is a `byte` and `b == '€'` is an error, because the code point of `'€'` does not fit a `byte`.
 Beside a `char` or an untyped integer literal it stays a `char`, so `'a' + 1` is a `char`.
+Comparing an integer value with a floating-point literal that no value of its type can equal is an error, whether the literal is past the range of the type, as in `b == 1e30` with `byte b`, or has a fraction, as in `b == 1.5`.
+An ordering is an error only when every value of the type is on the same side of the literal, as in `b < 1e30`, so `b < 1.5` compares as usual.
 
 That default is held to the same rule as any other type, so a literal nothing gives a type to must fit the type it falls back to, and a value past it is an error naming the type that would hold it rather than a silent truncation.
 A cast counts as naming a type: a literal whose value the target holds adapts to it, while one the target cannot hold keeps its default and is truncated by the cast, which is what a narrowing cast is for.
