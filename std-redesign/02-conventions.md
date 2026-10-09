@@ -11,7 +11,7 @@ Today `List.pop()` on empty silently corrupts the count; under this rule it pani
 ## Error taxonomy
 
 One error class per module, each carrying a `kind` enum that is also per module.
-The classes: `IoError`, `FileSystemError`, `ProcessError`, `EncodingError`, `TestFailure`, plus abstract `Error` in core, and the `SystemError` the surviving `@std.system` keeps until its process family goes (see 09-todos.md).
+The classes: `IoError`, `FileSystemError`, `ProcessError`, `EncodingError`, `TestFailure`, plus abstract `Error` in core, and the `SystemError` the surviving `@std.system` keeps until its process family goes (see 09-notes.md).
 Typed-throws lists stay one type long, so a new failure condition is a new enum member and no signature changes.
 A per-condition class hierarchy was rejected: it is Java checked exceptions, where every new failure mode propagates a signature change to every caller.
 

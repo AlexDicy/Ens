@@ -231,3 +231,19 @@ A comment only states what the code cannot; never phase tags, decision rationale
 - When opening a pull request, prefer small diffs a human can actually review over one huge drop; split large efforts into a sequence of reviewable changes.
 - Spec changes are user-facing only and written one sentence per line.
 - In reports and reviews, label behavioral claims as verified (you ran it) or inferred (you reasoned from code); do not present inference as established fact.
+
+### Open work
+
+Open work is tracked as GitHub issues on `AlexDicy/Ens`, never in a file in the tree; `std-redesign/09-notes.md` keeps the accepted limits and standing rulings that are not work.
+
+- One issue is one change that lands as one commit.
+  Its title names the defect as it stands, with code in backticks, as in `` `Node<Node<T>>` inside `Node<T>` is reported twice ``, and its body follows `.github/ISSUE_TEMPLATE/defect.md`.
+- Each issue carries one area label (`frontend`, `sema`, `codegen`, `std`, `driver`, `lsp`, `infra`), chosen by the folder that changes, and one kind label (`soundness`, `bug`, `diagnostic-text`, `cleanup`, `feature`, `test-coverage`), the first that matches in that order.
+  A `diagnostic-text` issue also carries a `diagnostic-rule:N` for each Diagnostics rule its text breaks.
+  `design-ruling-needed` marks an issue that waits for a decision from Alex, and nobody works on it until Alex comments the ruling and removes the label.
+- A finding outside the change under review is filed, not fixed and not written down anywhere else.
+  Search open and closed issues for a fragment of the text first (`gh issue list --state all --search "..."`), and comment on a match instead of filing a second one.
+- A commit subject that fixes an issue says `fixes #N` wherever it reads naturally, as in `Report a struct value cycle once, fixes #N`.
+  GitHub closes the issue when the commit is pushed, so agents never close one.
+- Before committing, rerun the repros of the open issues that quote a text the change edits.
+  One that the change fixes and a test pins joins the subject; one whose output changed gets a comment with the new output and the local commit hash.
