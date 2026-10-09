@@ -114,7 +114,91 @@ public reportUnchangeable(BodyChecker checker, Expression changed, Type changedT
             + "needs to change.", span);
         return WriteRefusal.Unwritable;
     }
+    if (!safe) {
+        string written = wording.oneLineSpelling(wording.unwrapParentheses(changed));
+        let refusal = constantStructRefusal(checker, changed,
+            "The '{operator}' operator cannot change '{written}'");
+        if (refusal != null) {
+            checker.reporter().report(refusal, span);
+            return WriteRefusal.Unwritable;
+        }
+    }
     return WriteRefusal.None;
+}
+
+// The refusal of a write to a field of a constant struct, opening with 'opening', which names the
+// write. A struct's fields are part of its value, so a chain of struct fields changes the value at
+// the start of the chain, and the write is refused where that value is a lazy const, a 'const'
+// local or a 'const' field. Null where the chain reaches a class reference, an array element or
+// anything else with storage of its own first.
+constantStructRefusal(BodyChecker checker, Expression target, string opening) -> string? {
+    Expression current = wording.unwrapParentheses(target);
+    while (current is MemberExpressionNode) {
+        Expression holder = wording.unwrapParentheses(current.object());
+        let holderType = checker.result().typeOf(holder.green());
+        if (holderType == null || !types.isStructLike(holderType)) {
+            return null;
+        }
+        switch (holder) {
+            is IdentifierExpressionNode identifier -> {
+                let binding = checker.result().bindingOf(identifier.green());
+                if (binding == null || !binding.isConst()) {
+                    return null;
+                }
+                return constantLocalStructRefusal(checker, opening, binding);
+            },
+            is MemberExpressionNode member -> {
+                let typeLevel = checker.result().staticConstFieldOf(member.green());
+                if (typeLevel != null) {
+                    return lazyStructRefusal(checker, opening, member, typeLevel);
+                }
+                let field = nullguidance.accessedField(checker, member);
+                if (field != null && field.isConst()) {
+                    return constantFieldStructRefusal(checker, opening, member, field);
+                }
+                current = member;
+            },
+            default -> {
+                return null;
+            },
+        }
+    }
+    return null;
+}
+
+lazyStructRefusal(BodyChecker checker, string opening, MemberExpressionNode member, Field field) -> string {
+    string word = members.typeLevelFieldWord(field);
+    string local = nullguidance.freeLocalName(checker, "", field.name());
+    string copy = "let {local} = {wording.oneLineSpelling(member)};";
+    return "{opening}, because it is part of the {word} {quotedStaticConst(field, checker.names())}. "
+        + "A struct's fields are part of its value, and a {word} keeps the value its initializer "
+        + "gives it. Change the initializer, or copy the value into a variable and change the copy, "
+        + "as in '{copy}'.";
+}
+
+constantLocalStructRefusal(BodyChecker checker, string opening, LocalBinding binding) -> string {
+    string name = binding.name();
+    string fix = "Remove 'const' from the declaration of '{name}'";
+    if (definiteassignment.bindingsContain(checker.untypedConstants(), binding)) {
+        fix = "Replace 'const' with 'let' in the declaration of '{name}'";
+    }
+    return "{opening}, because it is part of '{name}', which is declared 'const'. A struct's fields "
+        + "are part of its value, so writing one would change a 'const' value. {fix} if it needs to "
+        + "change.";
+}
+
+constantFieldStructRefusal(BodyChecker checker, string opening, MemberExpressionNode member, Field field)
+        -> string {
+    string name = field.name();
+    string fix = "Remove 'const' from the field if it needs to change.";
+    bool throughThis = wording.unwrapParentheses(member.object()) is ThisExpressionNode;
+    if (checker.frame().inConstructor() && throughThis) {
+        fix = "Give '{name}' its whole value in its one assignment, as in 'this.{name} = ...;', or "
+            + "remove 'const' from the field if it needs to change.";
+    }
+    return "{opening}, because it is part of field '{name}', which is 'const'. A struct's fields are "
+        + "part of its value, so writing one would change the value the field was given when the "
+        + "object was constructed. {fix}";
 }
 
 // Refuses assigning to 'this' or to 'super', neither of which is a variable, and names a
@@ -395,6 +479,18 @@ public analyzeAssignment(BodyChecker checker, AssignmentExpressionNode node) -> 
             refused = true;
         }
         nullLevels = 0;
+    } else if (!refused) {
+        string written = wording.oneLineSpelling(writtenTarget);
+        string opening = "Cannot use '{operator}' on '{written}'";
+        if (simpleAssign) {
+            opening = "Cannot assign to '{written}'";
+        }
+        let constant = constantStructRefusal(checker, writtenTarget, opening);
+        if (constant != null) {
+            checker.reporter().report(constant, node.span());
+            refused = true;
+            nullLevels = 0;
+        }
     }
     // What the store actually lands: the right side for '=', the operator's result for 'OP='.
     Type storedType = valueType;

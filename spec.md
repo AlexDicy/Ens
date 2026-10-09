@@ -241,6 +241,8 @@ Construction assigns it at most once: a second assignment on any path through a 
 A const field without a default value must be assigned on every path through every constructor, whatever its type, a class that declares one but no constructor is rejected, and every aggregate literal must name it.
 A const field with a default value keeps the default when construction does not assign it, so a constructor path may assign it once or not at all, and an aggregate literal may leave it out.
 Everything else is an error: assigning from a method, a destructor, or a free function, assigning through any reference other than `this`, assigning an inherited const field from a subclass constructor, and `++`, `--`, or a compound assignment anywhere.
+Writing a field of a const field of a struct type is an error too, because a struct's fields are part of its value.
+That holds at any depth, for `=`, a compound assignment, `++`, and `--`, and in a constructor as anywhere else, so a constructor gives such a field its whole value in its one assignment.
 A const field may be nullable, and it cannot also be `weak`, because a weak field resets to null when its target is destroyed while a const field never changes.
 
 A field carries visibility modifiers, `const`, `static` (which requires `const`), `lazy` (which requires `const` too), and in a class also `weak`; no other modifier applies to one.
@@ -274,6 +276,7 @@ A lazy const is read through the type name, as in `Streams.input`, and it is typ
 The value's destructor never runs, because the program holds the value to the end.
 On a generic type a lazy const's type and its initializer cannot mention the type's parameters, so every instantiation shares one value.
 Assigning to a lazy const, or applying `++` or `--` to one, is an error.
+So is writing a field of a struct-typed lazy const, at any depth and in any of those forms, because a struct's fields are part of its value.
 A cycle between two lazy const initializers is a compile error where the initializers read each other directly; one that closes through a function call stops the program on the read that closes it, naming the value.
 
 A static of a generic type takes the type's arguments in one of three ways.
@@ -1281,6 +1284,7 @@ float viaOperator = 1.0 + 2.0;  // error: the operands are doubles, and their su
 ---
 
 `let` and a typed declaration both introduce a mutable binding. `const` introduces an immutable one: it must be initialized, and assigning to it again, or passing it as `out`, is a compile error. Like `let`, a `const` may infer its type or state it explicitly.
+Writing a field of a `const` local of a struct type, at any depth, is an error too.
 
 A local variable need not be initialized where it is declared, but it must be definitely assigned before it is read: on every path that reaches a use of the variable, an assignment to it must come first.
 A local has no implicit zero value, so this holds for every type, nullable or not: `int total; total = sum(xs); use(total)` is fine, while reading `total` before that assignment is a compile error.
