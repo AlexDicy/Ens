@@ -35,6 +35,7 @@ import StructType from model.types;
 import phases.bodies.operators;
 import phases.bodies.memberaccess;
 import phases.bodies.lambdas;
+import phases.bodies.mutation;
 import BodyChecker from phases.bodies;
 import LocalName from phases.bodies;
 import MemberPosition from phases.bodies.memberaccess;
@@ -122,6 +123,9 @@ public reportUnchangeable(BodyChecker checker, Expression changed, Type changedT
             checker.reporter().report(refusal, span);
             return WriteRefusal.Unwritable;
         }
+        if (mutation.refuseUnmarkedWrite(checker, changed, span)) {
+            return WriteRefusal.Unwritable;
+        }
     }
     return WriteRefusal.None;
 }
@@ -132,36 +136,34 @@ public reportUnchangeable(BodyChecker checker, Expression changed, Type changedT
 // local or a 'const' field. Null where the chain reaches a class reference, an array element or
 // anything else with storage of its own first.
 constantStructRefusal(BodyChecker checker, Expression target, string opening) -> string? {
-    Expression current = wording.unwrapParentheses(target);
-    while (current is MemberExpressionNode) {
-        Expression holder = wording.unwrapParentheses(current.object());
-        let holderType = checker.result().typeOf(holder.green());
-        if (holderType == null || !types.isStructLike(holderType)) {
-            return null;
-        }
-        switch (holder) {
-            is IdentifierExpressionNode identifier -> {
-                let binding = checker.result().bindingOf(identifier.green());
-                if (binding == null || !binding.isConst()) {
-                    return null;
-                }
+    Expression written = wording.unwrapParentheses(target);
+    if (!(written is MemberExpressionNode)) {
+        return null;
+    }
+    let root = mutation.placeRoot(checker, written.object());
+    if (root == null) {
+        return null;
+    }
+    let binding = root.binding();
+    let field = root.field();
+    let member = root.member();
+    switch (root.kind()) {
+        ConstantLocal -> {
+            if (binding != null) {
                 return constantLocalStructRefusal(checker, opening, binding);
-            },
-            is MemberExpressionNode member -> {
-                let typeLevel = checker.result().staticConstFieldOf(member.green());
-                if (typeLevel != null) {
-                    return lazyStructRefusal(checker, opening, member, typeLevel);
-                }
-                let field = nullguidance.accessedField(checker, member);
-                if (field != null && field.isConst()) {
-                    return constantFieldStructRefusal(checker, opening, member, field);
-                }
-                current = member;
-            },
-            default -> {
-                return null;
-            },
-        }
+            }
+        },
+        LazyConstant -> {
+            if (field != null && member != null) {
+                return lazyStructRefusal(checker, opening, member, field);
+            }
+        },
+        ConstantField -> {
+            if (field != null && member != null) {
+                return constantFieldStructRefusal(checker, opening, member, field);
+            }
+        },
+        default -> { },
     }
     return null;
 }
@@ -338,7 +340,7 @@ public safeSlotType(BodyChecker checker, Expression target) -> Type? {
 // A member write through a class reference mutates the heap object, so any object works; a
 // struct member write needs an addressable struct, so the object must itself be an lvalue.
 // Parentheses name the place they hold, so the test reads through them wherever they stand.
-isLValue(BodyChecker checker, Expression node) -> bool {
+public isLValue(BodyChecker checker, Expression node) -> bool {
     switch (wording.unwrapParentheses(node)) {
         is IdentifierExpressionNode ignored -> {
             return true;
@@ -490,6 +492,8 @@ public analyzeAssignment(BodyChecker checker, AssignmentExpressionNode node) -> 
             checker.reporter().report(constant, node.span());
             refused = true;
             nullLevels = 0;
+        } else if (mutation.refuseUnmarkedWrite(checker, writtenTarget, node.span())) {
+            refused = true;
         }
     }
     // What the store actually lands: the right side for '=', the operator's result for 'OP='.
@@ -772,7 +776,7 @@ declaredTargetType(BodyChecker checker, Expression target, Type analyzed) -> Typ
 }
 
 // "'Path.separator'", the way a static const reads in a diagnostic, in quotes.
-quotedStaticConst(Field field, TypeNames names) -> string {
+public quotedStaticConst(Field field, TypeNames names) -> string {
     let owner = types.authorityOf(field.definingType());
     if (owner == null) {
         return "'{field.name()}'";

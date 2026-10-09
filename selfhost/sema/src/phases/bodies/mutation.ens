@@ -1,0 +1,306 @@
+// Where a change to a struct value lands, and the 'mutating' rules that follow from it: a struct
+// method that changes 'this' must be 'mutating', and a 'mutating' method is called only on a value
+// that may change.
+import Expression from @ens.frontend.syntax.generated.nodes;
+import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ThisExpressionNode from @ens.frontend.syntax.generated.nodes;
+import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import Span from @ens.frontend.support.source;
+import LocalBinding from model.scopes;
+import model.convert;
+import model.hierarchy;
+import model.typemembers;
+import Field from model.typemembers;
+import Method from model.typemembers;
+import model.types;
+import Type from model.types;
+import TypeParamType from model.types;
+import StructType from model.types;
+import phases.bodies.assignments;
+import phases.bodies.definiteassignment;
+import phases.bodies.lambdas;
+import phases.bodies.nullguidance;
+import phases.bodies.wording;
+import BodyChecker from phases.bodies;
+
+// The kind of value a chain of struct fields starts from, where a change to any of them lands.
+public enum PlaceRootKind {
+    ConstantLocal,
+    LazyConstant,
+    ConstantField,
+    Receiver,
+    Local,
+}
+
+// The value a change to a struct value lands in: a local, 'this', a lazy const or a 'const'
+// field, which is the value itself where it is 'direct' and a value holding it otherwise.
+public final class PlaceRoot {
+    PlaceRootKind rootKind;
+    LocalBinding? rootBinding;
+    Field? rootField;
+    MemberExpressionNode? rootMember;
+    bool rootIsDirect;
+
+    protected constructor(this.rootKind, this.rootBinding, this.rootField, this.rootMember,
+                          this.rootIsDirect);
+
+    public kind() -> PlaceRootKind {
+        return this.rootKind;
+    }
+
+    public binding() -> LocalBinding? {
+        return this.rootBinding;
+    }
+
+    public field() -> Field? {
+        return this.rootField;
+    }
+
+    public member() -> MemberExpressionNode? {
+        return this.rootMember;
+    }
+
+    public isDirect() -> bool {
+        return this.rootIsDirect;
+    }
+}
+
+// The root of the struct value 'holder' names, following struct fields back to where they start.
+// Null where the value is a class reference, an array element or the result of a call, since each
+// of those has storage of its own.
+public placeRoot(BodyChecker checker, Expression holder) -> PlaceRoot? {
+    Expression current = wording.unwrapParentheses(holder);
+    bool direct = true;
+    while (true) {
+        let currentType = checker.result().typeOf(current.green());
+        if (currentType == null || !changesWithItsValue(convert.coreOf(currentType))) {
+            return null;
+        }
+        switch (current) {
+            is IdentifierExpressionNode identifier -> {
+                let binding = checker.result().bindingOf(identifier.green());
+                if (binding == null) {
+                    return null;
+                }
+                if (binding.isConst()) {
+                    return new PlaceRoot(PlaceRootKind.ConstantLocal, binding, null, null, direct);
+                }
+                return new PlaceRoot(PlaceRootKind.Local, binding, null, null, direct);
+            },
+            is ThisExpressionNode ignored -> {
+                return new PlaceRoot(PlaceRootKind.Receiver, null, null, null, direct);
+            },
+            is MemberExpressionNode member -> {
+                let typeLevel = checker.result().staticConstFieldOf(member.green());
+                if (typeLevel != null) {
+                    return new PlaceRoot(PlaceRootKind.LazyConstant, null, typeLevel, member, direct);
+                }
+                let field = nullguidance.accessedField(checker, member);
+                if (field != null && field.isConst()) {
+                    return new PlaceRoot(PlaceRootKind.ConstantField, null, field, member, direct);
+                }
+                current = wording.unwrapParentheses(member.object());
+                direct = false;
+            },
+            default -> {
+                return null;
+            },
+        }
+    }
+    return null;
+}
+
+// Whether a change to a field of a value of 'type' changes the value itself: a struct, or a type
+// parameter, which a struct can be passed as.
+changesWithItsValue(Type type) -> bool {
+    return types.isStructLike(type) || type is TypeParamType;
+}
+
+// Whether 'method' of the struct 'receiver' implements a 'mutating' requirement of an interface the
+// struct implements, where the conformance check already reports its missing marker.
+public implementsMutatingRequirement(Type receiver, Method method) -> bool {
+    let authority = types.authorityOf(receiver);
+    if (!(authority is StructType)) {
+        return false;
+    }
+    for (let implemented in authority.interfaces()) {
+        for (let level in hierarchy.interfaceLadderOf(implemented)) {
+            let required = typemembers.methodsOf(level);
+            if (required == null) {
+                continue;
+            }
+            for (let requirement in required) {
+                if (requirement.isMutating() && requirement.name() == method.name()
+                        && typemembers.sameParameterTypes(requirement.signature(), method.signature())) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+// Refuses a change to 'this' in a struct method that is not 'mutating', once for each method, with
+// a note saying 'change' at 'at'. True when the body may not make the change.
+public refuseUnmarkedChange(BodyChecker checker, Span at, string change) -> bool {
+    let method = checker.frame().unmarkedMethod();
+    if (method == null) {
+        return false;
+    }
+    if (checker.frame().firstUnmarkedChange()) {
+        string name = method.name();
+        string owner = checker.names().quoted(method.definingType());
+        let authority = types.authorityOf(method.definingType());
+        if (authority != null) {
+            owner = checker.names().quotedName(authority);
+        }
+        checker.reporter().report("Method '{name}' of struct {owner} changes the struct it is called "
+            + "on, so it must be marked 'mutating'. Write 'mutating' before '{name}'.",
+            method.signature().nameSpan(), at, change);
+    }
+    return true;
+}
+
+// refuseUnmarkedChange for a write to the member chain 'target' that lands in 'this'.
+public refuseUnmarkedWrite(BodyChecker checker, Expression target, Span at) -> bool {
+    Expression written = wording.unwrapParentheses(target);
+    if (!(written is MemberExpressionNode)) {
+        return false;
+    }
+    let root = placeRoot(checker, written.object());
+    if (root == null || root.kind() != PlaceRootKind.Receiver) {
+        return false;
+    }
+    return refuseUnmarkedChange(checker, at, "'{wording.oneLineSpelling(written)}' is written here");
+}
+
+// Refuses a call to the 'mutating' method 'method' on 'receiver' where the change could not land:
+// a constant, a struct a lambda captured, 'this' in a method that is not 'mutating', or a value
+// with no storage of its own. A class object or an interface value changes through its reference
+// instead, so a call on one is never refused.
+public checkMutatingCall(BodyChecker checker, Expression receiver, Method method, Span at) {
+    if (!method.isMutating()) {
+        return;
+    }
+    let receiverType = checker.result().typeOf(receiver.green());
+    if (receiverType == null || !changesWithItsValue(convert.coreOf(receiverType))) {
+        return;
+    }
+    string name = method.name();
+    string spelled = wording.oneLineSpelling(wording.unwrapParentheses(receiver));
+    string opening = "Cannot call '{name}' on '{spelled}'";
+    string gloss = "'{name}' is 'mutating', which marks a method that changes the struct it is called on.";
+    let root = placeRoot(checker, receiver);
+    if (root == null) {
+        if (!assignments.isLValue(checker, receiver)) {
+            string local = nullguidance.freeLocalName(checker, "", "value");
+            checker.reporter().report("{opening}, because '{spelled}' is not a variable, a field or an "
+                + "array element. '{name}' is 'mutating', which marks a method that changes the struct "
+                + "it is called on, so the change would be lost. Store the value in a local first, as "
+                + "in 'let {local} = {spelled};', and call '{name}' on the local.", at);
+        }
+        return;
+    }
+    switch (root.kind()) {
+        ConstantLocal -> {
+            let binding = root.binding();
+            if (binding != null) {
+                checker.reporter().report(constantLocalCallRefusal(checker, opening, gloss, binding,
+                    root.isDirect(), spelled), at);
+            }
+        },
+        ConstantField -> {
+            let field = root.field();
+            let member = root.member();
+            if (field != null && member != null) {
+                checker.reporter().report(constantFieldCallRefusal(checker, opening, gloss, member, field,
+                    root.isDirect()), at);
+            }
+        },
+        LazyConstant -> {
+            let field = root.field();
+            let member = root.member();
+            if (field != null && member != null) {
+                checker.reporter().report(lazyCallRefusal(checker, opening, gloss, member, field,
+                    root.isDirect(), method, spelled), at);
+            }
+        },
+        Receiver -> {
+            refuseUnmarkedChange(checker, at, "'{name}' is 'mutating' and is called on '{spelled}' here");
+        },
+        Local -> {
+            let binding = root.binding();
+            if (binding != null && lambdas.isCapturedBinding(checker, binding)) {
+                checker.reporter().report("{opening} inside a lambda. {gloss} A lambda works on copies of "
+                    + "what it captures, so the '{binding.name()}' outside it would not change. Return "
+                    + "the value the lambda computes and store it where the lambda is called, or keep "
+                    + "the value in a field of an object the lambda uses.", at);
+            }
+        },
+    }
+}
+
+constantLocalCallRefusal(BodyChecker checker, string opening, string gloss, LocalBinding binding,
+                         bool direct, string spelled) -> string {
+    string name = binding.name();
+    string fix = "Remove 'const' from the declaration of '{name}'";
+    if (definiteassignment.bindingsContain(checker.untypedConstants(), binding)) {
+        fix = "Replace 'const' with 'let' in the declaration of '{name}'";
+    }
+    if (direct) {
+        return "{opening}, because '{spelled}' is declared 'const'. {gloss} {fix} if it needs to change.";
+    }
+    return "{opening}, because it is part of '{name}', which is declared 'const'. {gloss} A struct's "
+        + "fields are part of its value. {fix} if it needs to change.";
+}
+
+constantFieldCallRefusal(BodyChecker checker, string opening, string gloss, MemberExpressionNode member,
+                         Field field, bool direct) -> string {
+    string name = field.name();
+    string fix = "Remove 'const' from the field if it needs to change.";
+    bool throughThis = wording.unwrapParentheses(member.object()) is ThisExpressionNode;
+    if (checker.frame().inConstructor() && throughThis) {
+        fix = "Give '{name}' its whole value in its one assignment, as in 'this.{name} = ...;', or "
+            + "remove 'const' from the field if it needs to change.";
+    }
+    if (direct) {
+        return "{opening}, because field '{name}' is 'const'. {gloss} {fix}";
+    }
+    return "{opening}, because it is part of field '{name}', which is 'const'. {gloss} A struct's "
+        + "fields are part of its value. {fix}";
+}
+
+// The refusal of 'method' called on 'spelled', which is the lazy const 'member' or part of it. The
+// call the fix makes writes the copy's name where 'spelled' writes the lazy const.
+lazyCallRefusal(BodyChecker checker, string opening, string gloss, MemberExpressionNode member,
+                Field field, bool direct, Method method, string spelled) -> string {
+    string quotedConstant = assignments.quotedStaticConst(field, checker.names());
+    string local = nullguidance.freeLocalName(checker, "", field.name());
+    string constant = wording.oneLineSpelling(member);
+    string copy = "'let {local} = {constant};'";
+    string reason = "{quotedConstant} is a lazy const";
+    string parts = "";
+    if (!direct) {
+        reason = "it is part of the lazy const {quotedConstant}";
+        parts = " A struct's fields are part of its value.";
+        if (spelled.startsWith(constant)) {
+            string path = spelled.substring(constant.length);
+            string call = "{local}{path}.{method.name()}{callArguments(method)};";
+            if (method.signature().declaresThrows()) {
+                call = "try {call}";
+            }
+            copy = "{copy} and then '{call}'";
+        }
+    }
+    return "{opening}, because {reason}. {gloss}{parts} A lazy const keeps the value its initializer "
+        + "gives it. Change the initializer, or copy the value into a variable and call '{method.name()}' "
+        + "on the copy, as in {copy}.";
+}
+
+// How a call to 'method' writes its arguments in an example: '()' when it takes none, '(...)' else.
+callArguments(Method method) -> string {
+    if (method.signature().parameters().length == 0) {
+        return "()";
+    }
+    return "(...)";
+}

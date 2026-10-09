@@ -127,6 +127,14 @@ Storing a struct in an interface-typed variable, field, array element, or parame
 A call on a bound type parameter therefore reaches the struct's own method directly, with no allocation and no dispatch.
 A struct that implements `Iterable<T>` can be walked by a for-each loop for the same reason, since the loop calls `makeIterator()` on the struct itself.
 
+A struct method that changes the struct it is called on is marked `mutating`, written with the other modifiers before its name, as in `mutating bump() { this.count += 1; }`.
+A method changes the struct when it writes a field of `this` at any depth, with `=`, a compound assignment, `++`, or `--`, or when it calls a `mutating` method on `this` or on a struct field of `this`.
+Writing an element of an array that a field holds is not a change to the struct, because an array is a reference.
+Such a method without the marker is an error, while marking a method that changes nothing is allowed.
+A `mutating` method is called only on a value that may change, so a call on a `const` local, a `const` field, a `lazy const`, a struct a lambda captured, `this` in a method that is not `mutating`, or a struct a call returns is an error.
+An interface method may be marked `mutating`, a struct that implements it marks its method exactly when the interface does, and a call through a generic bound follows the interface's marker.
+A class implementing that interface writes no marker, because a class method changes its object through a reference.
+
 Overloading is allowed, best match arguments first, then visibility.
 Two declarations of the same name must differ in parameter count or parameter types.
 A call picks the overload whose parameter types match the arguments exactly; when there is no exact match, an overload reachable through implicit widening is chosen.
@@ -243,10 +251,11 @@ A const field with a default value keeps the default when construction does not 
 Everything else is an error: assigning from a method, a destructor, or a free function, assigning through any reference other than `this`, assigning an inherited const field from a subclass constructor, and `++`, `--`, or a compound assignment anywhere.
 Writing a field of a const field of a struct type is an error too, because a struct's fields are part of its value.
 That holds at any depth, for `=`, a compound assignment, `++`, and `--`, and in a constructor as anywhere else, so a constructor gives such a field its whole value in its one assignment.
+Calling a `mutating` method on such a field, or on a struct field of it, is an error for the same reason.
 A const field may be nullable, and it cannot also be `weak`, because a weak field resets to null when its target is destroyed while a const field never changes.
 
 A field carries visibility modifiers, `const`, `static` (which requires `const`), `lazy` (which requires `const` too), and in a class also `weak`; no other modifier applies to one.
-A method carries visibility, the overriding markers (`abstract`, `override`, `final`), `noreturn`, and `static`, while a constructor carries visibility alone, and a function declared at the top level carries visibility and `noreturn` alone, because nothing inherits it.
+A method carries visibility, the overriding markers (`abstract`, `override`, `final`), `noreturn`, and `static`, and a struct or interface method also `mutating`, while a constructor carries visibility alone, and a function declared at the top level carries visibility and `noreturn` alone, because nothing inherits it.
 A destructor carries no modifier at all, because no code ever calls it.
 `sealed` belongs to a class, so it does not apply to a field or a callable; `const` belongs to a field or a variable inside a function, so it does not apply to a callable.
 Writing a modifier where it does not belong is an error that names where it does.
@@ -277,6 +286,7 @@ The value's destructor never runs, because the program holds the value to the en
 On a generic type a lazy const's type and its initializer cannot mention the type's parameters, so every instantiation shares one value.
 Assigning to a lazy const, or applying `++` or `--` to one, is an error.
 So is writing a field of a struct-typed lazy const, at any depth and in any of those forms, because a struct's fields are part of its value.
+So is calling a `mutating` method on one.
 A cycle between two lazy const initializers is a compile error where the initializers read each other directly; one that closes through a function call stops the program on the read that closes it, naming the value.
 
 A static of a generic type takes the type's arguments in one of three ways.
@@ -1286,6 +1296,7 @@ float viaOperator = 1.0 + 2.0;  // error: the operands are doubles, and their su
 
 `let` and a typed declaration both introduce a mutable binding. `const` introduces an immutable one: it must be initialized, and assigning to it again, or passing it as `out`, is a compile error. Like `let`, a `const` may infer its type or state it explicitly.
 Writing a field of a `const` local of a struct type, at any depth, is an error too.
+So is calling a `mutating` method on one.
 
 A local variable need not be initialized where it is declared, but it must be definitely assigned before it is read: on every path that reaches a use of the variable, an assignment to it must come first.
 A local has no implicit zero value, so this holds for every type, nullable or not: `int total; total = sum(xs); use(total)` is fine, while reading `total` before that assignment is a compile error.

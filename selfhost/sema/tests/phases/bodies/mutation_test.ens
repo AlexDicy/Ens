@@ -1,0 +1,137 @@
+// The 'mutating' rules in method bodies: a struct method that changes 'this' must be 'mutating', and a
+// 'mutating' method is refused on every value whose change would be refused or lost.
+import @std.testing;
+import sema_support;
+
+test "a struct method that changes 'this' is reported once, at the method, with a note at the change" {
+    let analysis = try sema_support.analyzeOne(program());
+    let reported = analysis.bodyDiagnostics();
+    string file = "/proj/src/main.ens";
+    try sema_support.assertDiagnostic(reported, 0, file,
+        "Method 'reset' of struct 'Counter' changes the struct it is called on, so it must be marked "
+        + "'mutating'. Write 'mutating' before 'reset'.");
+    try testing.assertEqual((try sema_support.relatedOf(reported[0])).note(),
+        "'this.value' is written here");
+    try sema_support.assertDiagnostic(reported, 1, file,
+        "Method 'bumpThis' of struct 'Counter' changes the struct it is called on, so it must be "
+        + "marked 'mutating'. Write 'mutating' before 'bumpThis'.");
+    try testing.assertEqual((try sema_support.relatedOf(reported[1])).note(),
+        "'bump' is 'mutating' and is called on 'this' here");
+}
+
+// A mutable local and an array element take the change, so only the constants, the returned value
+// and the captured local are refused.
+test "a 'mutating' call is refused on a value whose change would be refused or lost" {
+    let analysis = try sema_support.analyzeOne(program());
+    let reported = analysis.bodyDiagnostics();
+    string file = "/proj/src/main.ens";
+    string gloss = "'bump' is 'mutating', which marks a method that changes the struct it is called on.";
+    try sema_support.assertDiagnostic(reported, 2, file,
+        "Cannot call 'bump' on 'kept', because 'kept' is declared 'const'. {gloss} Remove 'const' "
+        + "from the declaration of 'kept' if it needs to change.");
+    try sema_support.assertDiagnostic(reported, 3, file,
+        "Cannot call 'bump' on 'typed', because 'typed' is declared 'const'. {gloss} Remove 'const' "
+        + "from the declaration of 'typed' if it needs to change.");
+    try sema_support.assertDiagnostic(reported, 4, file,
+        "Cannot call 'bump' on 'untyped', because 'untyped' is declared 'const'. {gloss} Replace "
+        + "'const' with 'let' in the declaration of 'untyped' if it needs to change.");
+    try sema_support.assertDiagnostic(reported, 5, file,
+        "Cannot call 'bump' on 'outer.inner', because it is part of 'outer', which is declared "
+        + "'const'. {gloss} A struct's fields are part of its value. Remove 'const' from the "
+        + "declaration of 'outer' if it needs to change.");
+    try sema_support.assertDiagnostic(reported, 6, file,
+        "Cannot call 'bump' on 'Settings.counter', because 'Settings.counter' is a lazy const. "
+        + "{gloss} A lazy const keeps the value its initializer gives it. Change the initializer, or "
+        + "copy the value into a variable and call 'bump' on the copy, as in "
+        + "'let counter = Settings.counter;'.");
+    string lazyReason = "because it is part of the lazy const 'Settings.outer'.";
+    string lazyRule = "A struct's fields are part of its value. A lazy const keeps the value its "
+        + "initializer gives it. Change the initializer, or copy the value into a variable and call";
+    try sema_support.assertDiagnostic(reported, 7, file,
+        "Cannot call 'bump' on 'Settings.outer.inner', {lazyReason} {gloss} {lazyRule} 'bump' on the "
+        + "copy, as in 'let outer2 = Settings.outer;' and then 'outer2.inner.bump();'.");
+    try sema_support.assertDiagnostic(reported, 8, file,
+        "Cannot call 'add' on 'Settings.outer.inner', {lazyReason} 'add' is 'mutating', which marks a "
+        + "method that changes the struct it is called on. {lazyRule} 'add' on the copy, as in "
+        + "'let outer2 = Settings.outer;' and then 'try outer2.inner.add(...);'.");
+    try sema_support.assertDiagnostic(reported, 9, file,
+        "Cannot call 'bump' on 'fresh()', because 'fresh()' is not a variable, a field or an array "
+        + "element. 'bump' is 'mutating', which marks a method that changes the struct it is called "
+        + "on, so the change would be lost. Store the value in a local first, as in "
+        + "'let value = fresh();', and call 'bump' on the local.");
+    try sema_support.assertDiagnostic(reported, 10, file,
+        "Cannot call 'bump' on 'captured' inside a lambda. {gloss} A lambda works on copies of what "
+        + "it captures, so the 'captured' outside it would not change. Return the value the lambda "
+        + "computes and store it where the lambda is called, or keep the value in a field of an "
+        + "object the lambda uses.");
+    try testing.assertEqual(reported.length, 11L);
+}
+
+program() -> string {
+    return "public interface Bumpable \{\n"
+        + "    mutating bump();\n"
+        + "\}\n"
+        + "class Failure extends Error \{\n"
+        + "    protected constructor(string message) \{\n"
+        + "        super(message);\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public struct Counter implements Bumpable \{\n"
+        + "    public int value;\n"
+        + "    public constructor(this.value);\n"
+        + "    public override mutating bump() \{\n"
+        + "        this.value += 1;\n"
+        + "    \}\n"
+        + "    public mutating add(int amount) throws \{\n"
+        + "        if (amount < 0) \{\n"
+        + "            throw new Failure(\"negative\");\n"
+        + "        \}\n"
+        + "        this.value += amount;\n"
+        + "    \}\n"
+        + "    public reset() \{\n"
+        + "        this.value = 0;\n"
+        + "        this.value = 1;\n"
+        + "    \}\n"
+        + "    public bumpThis() \{\n"
+        + "        this.bump();\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public struct Outer \{\n"
+        + "    public Counter inner;\n"
+        + "\}\n"
+        + "public class Settings \{\n"
+        + "    public lazy const Counter counter = Counter(0);\n"
+        + "    public lazy const Outer outer = \{inner: Counter(0)\};\n"
+        + "\}\n"
+        + "fresh() -> Counter \{\n"
+        + "    return Counter(0);\n"
+        + "\}\n"
+        + "held<T: Bumpable>(T value) \{\n"
+        + "    const T kept = value;\n"
+        + "    kept.bump();\n"
+        + "\}\n"
+        + "calls() throws \{\n"
+        + "    const Counter typed = Counter(0);\n"
+        + "    typed.bump();\n"
+        + "    const untyped = fresh();\n"
+        + "    untyped.bump();\n"
+        + "    const Outer outer = \{inner: Counter(0)\};\n"
+        + "    outer.inner.bump();\n"
+        + "    Settings.counter.bump();\n"
+        + "    Settings.outer.inner.bump();\n"
+        + "    try Settings.outer.inner.add(1);\n"
+        + "    fresh().bump();\n"
+        + "    Counter captured = Counter(0);\n"
+        + "    () -> void later = () -> \{\n"
+        + "        captured.bump();\n"
+        + "    \};\n"
+        + "    later();\n"
+        + "    Counter mutable = Counter(0);\n"
+        + "    mutable.bump();\n"
+        + "    Counter[] all = [Counter(0)];\n"
+        + "    all[0].bump();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n";
+}
