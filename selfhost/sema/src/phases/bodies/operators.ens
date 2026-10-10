@@ -510,13 +510,152 @@ analyzeEquality(BodyChecker checker, Span span, string operatorText, Expression 
     return checker.store().primitive(PrimitiveKind.Bool);
 }
 
+// Why two numbers of the kinds 'left' and 'right' cannot be compared, as a clause, and the fix after
+// it: a 'char' beside a floating-point number is no quantity, a floating-point type is not exact for
+// a wide integer beside it, and a signed and an unsigned integer each have values the other lacks.
+numericMismatch(string operatorText, Expression leftNode, Expression rightNode, PrimitiveType left,
+                PrimitiveType right) -> string[] {
+    string conversion = bothSidesConversion(operatorText, leftNode, rightNode, left, right);
+    bool leftFloating = isFloatingKind(left.kind());
+    bool rightFloating = isFloatingKind(right.kind());
+    bool character = (left.kind() == PrimitiveKind.Char && rightFloating)
+        || (right.kind() == PrimitiveKind.Char && leftFloating);
+    if (character) {
+        Expression codePoint = leftNode;
+        if (right.kind() == PrimitiveKind.Char) {
+            codePoint = rightNode;
+        }
+        let spelled = wording.shortSpelling(codePoint);
+        string compare = " Compare it with a character instead.";
+        if (spelled != null) {
+            compare = " Compare it with a character instead, as in '{spelled} {operatorText} 'a''.";
+        }
+        string number = bothSidesConversion(operatorText, leftNode, rightNode, left, right,
+            "Or, to compare its number, convert");
+        return ["a 'char' is a code point, a character's number in Unicode, not a quantity",
+            "{compare}{number}"];
+    }
+    if (leftFloating || rightFloating) {
+        PrimitiveType floating = left;
+        PrimitiveType integer = right;
+        Expression integerNode = rightNode;
+        if (!leftFloating) {
+            floating = right;
+            integer = left;
+            integerNode = leftNode;
+        }
+        string floatName = primitiveName(floating.kind());
+        string integerName = primitiveName(integer.kind());
+        if (conversion.length == 0) {
+            conversion = closeConversion(operatorText, leftNode, rightNode, integerNode, floatName,
+                " if comparing them as '{floatName}' values is close enough");
+        }
+        return ["a '{floatName}' cannot represent every '{integerName}' exactly, so a large value would "
+            + "compare wrongly", conversion];
+    }
+    PrimitiveType signed = left;
+    PrimitiveType unsigned = right;
+    Expression signedNode = leftNode;
+    if (literalfixes.isUnsignedKind(left.kind())) {
+        signed = right;
+        unsigned = left;
+        signedNode = rightNode;
+    }
+    string signedName = primitiveName(signed.kind());
+    string unsignedName = primitiveName(unsigned.kind());
+    if (conversion.length == 0) {
+        string condition = " if it is never negative";
+        let spelledSigned = wording.shortSpelling(signedNode);
+        if (spelledSigned != null) {
+            condition = " if '{spelledSigned}' is never negative";
+        }
+        conversion = closeConversion(operatorText, leftNode, rightNode, signedNode, unsignedName, condition);
+    }
+    return ["neither type has every value of the other: {typenames.typeArticle(signedName)} '{signedName}' "
+        + "can be negative, and a '{unsignedName}' can be larger than any '{signedName}'", conversion];
+}
+
+// The fix after an ordering of two numbers with no common type: the conversion to a type that has
+// both exactly, or else the reason no such type exists and the fix that is right under a condition.
+orderingConversion(string operatorText, Expression leftNode, Expression rightNode, Type first, Type second)
+        -> string {
+    string conversion = bothSidesConversion(operatorText, leftNode, rightNode, first, second);
+    Type left = convert.coreOf(first);
+    Type right = convert.coreOf(second);
+    if (conversion.length > 0 || !(left is PrimitiveType) || !(right is PrimitiveType)) {
+        return conversion;
+    }
+    string[] mismatch = numericMismatch(operatorText, leftNode, rightNode, left, right);
+    string why = mismatch[0];
+    return " {why.substring(0, 1).toUpperAscii()}{why.substring(1)}."
+        + "{nullChecksFirst(leftNode, rightNode, first, second)}{mismatch[1]}";
+}
+
+// The null checks a converting fix needs first, one for each side of type 'first' or 'second' that
+// can be null, since 'as' converts only a value that is there.
+nullChecksFirst(Expression leftNode, Expression rightNode, Type first, Type second) -> string {
+    if (first is OptionalType && second is OptionalType) {
+        let leftSpelled = wording.shortSpelling(leftNode);
+        let rightSpelled = wording.shortSpelling(rightNode);
+        if (leftSpelled == null || rightSpelled == null) {
+            return " Check both values for null first.";
+        }
+        return " Check '{leftSpelled}' and '{rightSpelled}' for null first "
+            + "('if ({leftSpelled} != null && {rightSpelled} != null)').";
+    }
+    if (first is OptionalType) {
+        return nullCheckFirst(leftNode);
+    }
+    if (second is OptionalType) {
+        return nullCheckFirst(rightNode);
+    }
+    return "";
+}
+
+nullCheckFirst(Expression side) -> string {
+    let spelled = wording.shortSpelling(side);
+    if (spelled == null) {
+        return " Check the value for null first.";
+    }
+    return " Check '{spelled}' for null first ('if ({spelled} != null)').";
+}
+
+// The fix that converts the side 'converted' of a comparison to 'target' and keeps the other side,
+// worth writing only under 'condition'.
+closeConversion(string operatorText, Expression leftNode, Expression rightNode, Expression converted,
+                string target, string condition) -> string {
+    let leftSpelled = wording.shortSpelling(leftNode);
+    let rightSpelled = wording.shortSpelling(rightNode);
+    if (leftSpelled == null || rightSpelled == null) {
+        return " Convert one side to '{target}' with 'as'{condition}.";
+    }
+    Expression leftValue = wording.unwrapParentheses(leftNode);
+    Expression rightValue = wording.unwrapParentheses(rightNode);
+    string leftText = wording.oneLineSpelling(leftValue);
+    string rightText = wording.oneLineSpelling(rightValue);
+    if (converted == leftNode) {
+        leftText = wording.converted(leftValue, target);
+    } else {
+        rightText = wording.converted(rightValue, target);
+    }
+    return " Write '{leftText} {operatorText} {rightText}'{condition}.";
+}
+
 // The refusal of 'operatorText' between two sides whose types are never equal. Against 'null',
 // the side that can never be null is named with the result the comparison always has.
 comparisonRefusal(BodyChecker checker, string operatorText, Expression leftNode, Expression rightNode,
                   Type left, Type right) -> string {
     if (!(left is NullType) && !(right is NullType)) {
-        return "Cannot compare {checker.names().quoted(left)} with {checker.names().quoted(right)}, because "
-            + "a value of one of these types is never equal to a value of the other.";
+        string opening = "Cannot compare {checker.names().quoted(left)} with {checker.names().quoted(right)}";
+        Type leftCore = convert.coreOf(left);
+        Type rightCore = convert.coreOf(right);
+        if (leftCore is PrimitiveType && rightCore is PrimitiveType && convert.isNumericType(leftCore)
+                && convert.isNumericType(rightCore)) {
+            string[] mismatch = numericMismatch(operatorText, leftNode, rightNode, leftCore, rightCore);
+            return "{opening}, because {mismatch[0]}.{nullChecksFirst(leftNode, rightNode, left, right)}"
+                + mismatch[1];
+        }
+        return "{opening}, because a value of one of these types is never equal to a value of the other.";
     }
     Type other = left;
     Expression valueNode = leftNode;
@@ -618,7 +757,7 @@ analyzeComparison(BodyChecker checker, Span span, SyntaxKind operator, string op
     if (convert.numericCommonType(first, second) == null) {
         checker.reporter().report("'{operatorText}' needs the same number type on both sides, "
             + "{sidesClause(leftNode, rightNode, first, second, true, true, checker.names())}."
-            + bothSidesConversion(operatorText, leftNode, rightNode, first, second), span);
+            + orderingConversion(operatorText, leftNode, rightNode, first, second), span);
     }
     return checker.store().primitive(PrimitiveKind.Bool);
 }
@@ -949,9 +1088,9 @@ sidesClause(Expression leftNode, Expression rightNode, Type left, Type right, bo
 
 // The sentence, opening with a space, that converts two sides of different number types to the
 // narrowest type with every value of each, so no value changes. Empty when no type has them all, and
-// for a compound assignment, whose result goes back into its left side.
-bothSidesConversion(string operatorText, Expression leftNode, Expression rightNode, Type left, Type right)
-        -> string {
+// for a compound assignment, whose result goes back into its left side. 'opening' starts the sentence.
+bothSidesConversion(string operatorText, Expression leftNode, Expression rightNode, Type left, Type right,
+                    string opening = "Convert") -> string {
     Type leftCore = convert.coreOf(left);
     Type rightCore = convert.coreOf(right);
     if (isCompoundOperator(operatorText) || !(leftCore is PrimitiveType) || !(rightCore is PrimitiveType)) {
@@ -968,7 +1107,7 @@ bothSidesConversion(string operatorText, Expression leftNode, Expression rightNo
     bool convertsLeft = primitiveName(leftCore.kind()) != target;
     bool convertsRight = primitiveName(rightCore.kind()) != target;
     if (leftSpelled == null || rightSpelled == null) {
-        return " Convert both sides to '{target}' with 'as'.";
+        return " {opening} both sides to '{target}' with 'as'.";
     }
     string leftText = wording.oneLineSpelling(leftValue);
     string rightText = wording.oneLineSpelling(rightValue);
@@ -980,13 +1119,13 @@ bothSidesConversion(string operatorText, Expression leftNode, Expression rightNo
     }
     string example = "{leftText} {operatorText} {rightText}";
     if (convertsLeft && convertsRight) {
-        return " Convert both sides to '{target}', as in '{example}'.";
+        return " {opening} both sides to '{target}', as in '{example}'.";
     }
     string side = leftSpelled;
     if (convertsRight) {
         side = rightSpelled;
     }
-    return " Convert '{side}' to '{target}', as in '{example}'.";
+    return " {opening} '{side}' to '{target}', as in '{example}'.";
 }
 
 // Whether 'operatorText' writes its result back into its left side, as '+=' does.
