@@ -81,12 +81,14 @@ parsePackagePath(Parser parser, string missingMessage) {
 parsePackageItem(Parser parser) {
     if (parser.atContextual("version")) {
         parseManifestValueItem(parser, SyntaxKind.VersionKeyword, SyntaxKind.VersionDeclaration,
+            SyntaxKind.ErrorPackageItem,
             "Expected the package's version in quotes. For example, write 'version \"1.3.0\";'.",
             "Expected ';' after the version declaration.");
         return;
     }
     if (parser.atContextual("ens")) {
         parseManifestValueItem(parser, SyntaxKind.EnsKeyword, SyntaxKind.EnsDeclaration,
+            SyntaxKind.ErrorPackageItem,
             "Expected the version of Ens the package is written for, in quotes. For example, "
             + "write 'ens \"1.2\";'.",
             "Expected ';' after the 'ens' declaration.");
@@ -104,42 +106,166 @@ parsePackageItem(Parser parser) {
         + "'dependency' or 'native' line inside the package declaration.");
 }
 
+// A 'keyword "value";' line, as in 'ens "0.1";'.
 parseManifestValueItem(Parser parser, SyntaxKind keywordKind, SyntaxKind nodeKind,
-                       string valueMessage, string semicolonMessage) {
+                       SyntaxKind errorKind, string valueMessage, string semicolonMessage) {
     let marker = parser.start();
     parser.bumpAs(keywordKind);
-    parser.expect(SyntaxKind.StringLiteral, valueMessage);
-    parser.expect(SyntaxKind.Semicolon, semicolonMessage);
+    bool written = expectManifestValue(parser, valueMessage);
+    finishManifestLine(parser, marker, nodeKind, errorKind, written, semicolonMessage);
+}
+
+// Consumes the quoted value at the cursor, or reports it missing. Where something else is written
+// in its place, as in 'ens 0.1;', the problem is reported at that token and false is returned.
+expectManifestValue(Parser parser, string message) -> bool {
+    if (parser.at(SyntaxKind.StringLiteral)) {
+        parser.bump();
+        return true;
+    }
+    if (parser.at(SyntaxKind.Semicolon) || parser.at(SyntaxKind.CloseBrace) || parser.atEnd()) {
+        parser.missing(SyntaxKind.StringLiteral, message);
+        return true;
+    }
+    parser.missingUnreported(SyntaxKind.StringLiteral);
+    parser.reportAtCurrent(message);
+    return false;
+}
+
+// Ends a manifest line at its ';'. A line whose value was replaced by something else has its one
+// problem reported already, and so does a line with more after its value than its ';', as in
+// 'ens "0.1" "0.2";'. Either way the rest of that line, through its ';', is taken without another
+// report. A line that simply ends without its ';' leaves the next line to be read as written.
+finishManifestLine(Parser parser, long marker, SyntaxKind nodeKind, SyntaxKind errorKind,
+                   bool valueWritten, string semicolonMessage) {
+    if (valueWritten && parser.at(SyntaxKind.Semicolon)) {
+        parser.bump();
+        parser.complete(marker, nodeKind);
+        return;
+    }
+    if (valueWritten) {
+        parser.missing(SyntaxKind.Semicolon, semicolonMessage);
+    } else {
+        parser.missingUnreported(SyntaxKind.Semicolon);
+    }
     parser.complete(marker, nodeKind);
+    if (!parser.at(SyntaxKind.CloseBrace) && !parser.atEnd() && !atLineStart(parser)) {
+        skipLineRest(parser, errorKind);
+    }
+}
+
+// True when the token at the cursor is the first on its line. The line break before it is the end
+// of the previous token's trailing trivia, or in its own leading trivia after a blank line.
+atLineStart(Parser parser) -> bool {
+    let tokens = parser.tokens();
+    long position = parser.position();
+    if (position == 0) {
+        return true;
+    }
+    for (let piece in tokens[position - 1].trailing) {
+        if (piece.kind == SyntaxKind.Newline) {
+            return true;
+        }
+    }
+    for (let piece in tokens[position].leading) {
+        if (piece.kind == SyntaxKind.Newline) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Takes the rest of a line whose problem is already reported into a node of the block's error
+// kind: through its ';', up to a '}' or the next line, with a braced region taken whole.
+skipLineRest(Parser parser, SyntaxKind errorKind) {
+    let marker = parser.start();
+    let skipped = parser.start();
+    bool first = true;
+    while (!parser.atEnd()) {
+        let kind = parser.currentKind();
+        if (kind == SyntaxKind.CloseBrace || (!first && atLineStart(parser))) {
+            break;
+        }
+        if (kind == SyntaxKind.Semicolon) {
+            parser.bump();
+            break;
+        }
+        if (kind == SyntaxKind.OpenBrace) {
+            parser.bumpBalancedBraces();
+            break;
+        }
+        parser.bump();
+        first = false;
+    }
+    parser.complete(skipped, SyntaxKind.List);
+    parser.complete(marker, errorKind);
 }
 
 parseDependencyDeclaration(Parser parser) {
     let marker = parser.start();
     parser.bumpAs(SyntaxKind.DependencyKeyword);
+    long nameStart = parser.tokens()[parser.position()].offset;
     parsePackagePath(parser, "Expected the name of the package to depend on. For example, write "
         + "'dependency acme.json;'.");
+    string name = "";
+    if (parser.lastContentEnd() > nameStart) {
+        name = parser.text().substring(nameStart, parser.lastContentEnd());
+    }
+    bool written = true;
     if (parser.at(SyntaxKind.StringLiteral)) {
         parser.bump();
-    } else {
+    } else if (atDependencyVersionEnd(parser)) {
         parser.nullSlot();
+    } else if (name.length == 0) {
+        // The missing name is this line's problem, already reported.
+        parser.nullSlot();
+        written = false;
+    } else {
+        string version = "2.0";
+        switch (parser.currentKind()) {
+            IntLiteral, LongLiteral, FloatLiteral, DoubleLiteral -> {
+                version = parser.currentText();
+            },
+            default -> {},
+        }
+        parser.reportAtCurrent("Expected the version of '{name}' in quotes. For example, write "
+            + "'dependency {name} \"{version}\";'.");
+        parser.nullSlot();
+        written = false;
     }
-    if (parser.atContextual("from")) {
+    if (written && parser.atContextual("from")) {
         let source = parser.start();
         parser.bumpAs(SyntaxKind.FromKeyword);
-        parser.expect(SyntaxKind.StringLiteral, "Expected the package's git URL in quotes after "
+        written = expectManifestValue(parser, "Expected the package's git URL in quotes after "
             + "'from'. For example, write 'dependency acme.json \"2.0\" from "
             + "\"https://github.com/acme/json.git\";'.");
         parser.complete(source, SyntaxKind.FromClause);
     } else {
         parser.nullSlot();
     }
-    parser.expect(SyntaxKind.Semicolon, "Expected ';' after the dependency declaration.");
-    parser.complete(marker, SyntaxKind.DependencyDeclaration);
+    finishManifestLine(parser, marker, SyntaxKind.DependencyDeclaration, SyntaxKind.ErrorPackageItem,
+        written, "Expected ';' after the dependency declaration.");
+}
+
+// True where a dependency written without a version goes on: at its 'from', its ';', or the end
+// of the line or the block.
+atDependencyVersionEnd(Parser parser) -> bool {
+    return parser.atContextual("from") || parser.at(SyntaxKind.Semicolon)
+        || parser.at(SyntaxKind.CloseBrace) || parser.atEnd() || atLineStart(parser);
 }
 
 parseNativeDeclaration(Parser parser) {
     let marker = parser.start();
     parser.bumpAs(SyntaxKind.NativeKeyword);
+    if (parser.at(SyntaxKind.StringLiteral)) {
+        parser.missingUnreported(SyntaxKind.Identifier);
+        parser.reportAtCurrent("A native library's name is written without quotes, as in "
+            + "'native zlib;'. Remove the quotes around '{parser.currentText()}'.");
+        parser.nullSlot();
+        parser.nullSlot();
+        finishManifestLine(parser, marker, SyntaxKind.NativeDeclaration, SyntaxKind.ErrorPackageItem,
+            false, "");
+        return;
+    }
     parser.expect(SyntaxKind.Identifier, "Expected the native library's name. For example, "
         + "write 'native zlib;'.");
     if (parser.atContextual("system")) {
@@ -150,13 +276,13 @@ parseNativeDeclaration(Parser parser) {
     if (parser.at(SyntaxKind.OpenBrace)) {
         parseNativeBindingList(parser);
         parser.nullSlot();
-    } else {
-        parser.nullSlot();
-        parser.expect(SyntaxKind.Semicolon, "Expected ';' after the native library's name, or a "
-            + "'\{ ... \}' block naming its library for each platform. For example, write "
-            + "'native zlib;'.");
+        parser.complete(marker, SyntaxKind.NativeDeclaration);
+        return;
     }
-    parser.complete(marker, SyntaxKind.NativeDeclaration);
+    parser.nullSlot();
+    finishManifestLine(parser, marker, SyntaxKind.NativeDeclaration, SyntaxKind.ErrorPackageItem, true,
+        "Expected ';' after the native library's name, or a '\{ ... \}' block naming its library for "
+        + "each platform. For example, write 'native zlib;'.");
 }
 
 parseNativeBindingList(Parser parser) {
@@ -214,10 +340,10 @@ parseWorkspaceItem(Parser parser) {
     if (parser.atContextual("member")) {
         let marker = parser.start();
         parser.bumpAs(SyntaxKind.MemberKeyword);
-        parser.expect(SyntaxKind.StringLiteral, "Expected the member's folder in quotes. For "
+        bool written = expectManifestValue(parser, "Expected the member's folder in quotes. For "
             + "example, write 'member \"frontend\";'.");
-        parser.expect(SyntaxKind.Semicolon, "Expected ';' after the member declaration.");
-        parser.complete(marker, SyntaxKind.MemberDeclaration);
+        finishManifestLine(parser, marker, SyntaxKind.MemberDeclaration,
+            SyntaxKind.ErrorWorkspaceItem, written, "Expected ';' after the member declaration.");
         return;
     }
     parseManifestItemError(parser, SyntaxKind.ErrorWorkspaceItem, "Expected a 'member' line "
@@ -230,10 +356,10 @@ parseOverridesItem(Parser parser) {
         parser.bump();
         parsePackagePath(parser, "Expected the name of the package to override after "
             + "'override'. For example, write 'override alex.library \"../library\";'.");
-        parser.expect(SyntaxKind.StringLiteral, "Expected the folder to take the package from, "
-            + "in quotes. For example, write 'override alex.library \"../library\";'.");
-        parser.expect(SyntaxKind.Semicolon, "Expected ';' after the override declaration.");
-        parser.complete(marker, SyntaxKind.OverrideDeclaration);
+        bool written = expectManifestValue(parser, "Expected the folder to take the package "
+            + "from, in quotes. For example, write 'override alex.library \"../library\";'.");
+        finishManifestLine(parser, marker, SyntaxKind.OverrideDeclaration,
+            SyntaxKind.ErrorOverridesItem, written, "Expected ';' after the override declaration.");
         return;
     }
     parseManifestItemError(parser, SyntaxKind.ErrorOverridesItem, "Expected an 'override' line "
@@ -241,10 +367,15 @@ parseOverridesItem(Parser parser) {
         + "'override alex.library \"../library\";'.");
 }
 
-// The junk is wrapped in the block's error kind. A ';' ends it and is consumed into it, a
-// braced region is skipped whole, and a '}' ends it unconsumed so the block can close.
+// The junk is reported once and wrapped in the block's error kind.
 parseManifestItemError(Parser parser, SyntaxKind errorKind, string message) {
     parser.reportAtCurrent(message);
+    skipManifestItem(parser, errorKind);
+}
+
+// Takes tokens into a node of the block's error kind. A ';' ends them and is consumed into it, a
+// braced region is skipped whole, and a '}' ends them unconsumed so the block can close.
+skipManifestItem(Parser parser, SyntaxKind errorKind) {
     let marker = parser.start();
     let skipped = parser.start();
     while (!parser.atEnd()) {
