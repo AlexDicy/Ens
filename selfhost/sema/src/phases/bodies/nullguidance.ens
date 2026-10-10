@@ -28,6 +28,9 @@ import GreenElement from @ens.frontend.syntax.green;
 import GreenNode from @ens.frontend.syntax.green;
 import support.diagnostics;
 import model.convert;
+import phases.bodies.literalfixes;
+import phases.bodies.literaltyping;
+import LiteralOrigin from phases.bodies.literaltargets;
 import phases.bodies.wording;
 import phases.bodies.narrowing;
 import model.hierarchy;
@@ -44,6 +47,7 @@ import ErrorType from model.types;
 import NullType from model.types;
 import OptionalType from model.types;
 import ArrayType from model.types;
+import DeclaredType from model.types;
 import ClassType from model.types;
 import List from @std.collections.list;
 import phases.bodies.assignments;
@@ -638,19 +642,137 @@ charNarrowingHint(BodyChecker checker, Type target, Type source, Expression? val
 }
 
 // assignabilityHint with the mismatched value in hand, which a value that fits once its null is
-// gone extends with the null guidance for the place it is read from.
-public valueAssignabilityHint(BodyChecker checker, Type target, Type source, Expression? value) -> string {
+// gone extends with the null guidance for the place it is read from. A value that does not fit for
+// another reason gets the conversion that keeps it, or the change of the declaration at 'origin' that
+// takes it, where either applies.
+public valueAssignabilityHint(BodyChecker checker, Type target, Type source, Expression? value,
+                              LiteralOrigin? origin = null) -> string {
     string narrowing = charNarrowingHint(checker, target, source, value);
     if (narrowing.length > 0) {
         return narrowing;
     }
     string hint = assignabilityHint(target, source, checker.names());
     long levels = nullLevelsAbove(target, source);
-    if (value == null || target is ErrorType || hint.length > 0 || levels == 0) {
+    if (target is ErrorType || hint.length > 0) {
         return hint;
     }
-    return withGuidance(checker, " The value may be null here.",
-        nullGuidance(checker, value, source, levels));
+    if (levels > 0 && value != null) {
+        return withGuidance(checker, " The value may be null here.",
+            nullGuidance(checker, value, source, levels));
+    }
+    if (levels > 0) {
+        return "";
+    }
+    return mismatchFix(checker, target, source, value, origin);
+}
+
+// The fix for a value of type 'source' where 'target' is expected: the conversion that keeps the value,
+// under the condition it needs, and the change that declares the place at 'origin' with the value's own
+// type. Empty where neither applies.
+mismatchFix(BodyChecker checker, Type target, Type source, Expression? value,
+            LiteralOrigin? origin) -> string {
+    if (source is ErrorType || source is NullType || types.isVoidType(source)) {
+        return "";
+    }
+    string conversion = valueConversion(checker, target, source, value);
+    string declaration = "";
+    Type wanted = source;
+    for (long i = 0; i < wording.optionalLevels(target); i++) {
+        wanted = checker.store().optionalOf(wanted);
+    }
+    if (origin != null && checker.names().canSpell(wanted) && !mentionsTypeParameters(wanted)
+            && !mentionsTypeParameters(target)) {
+        declaration = literalfixes.declarationChange(origin, checker.names().of(wanted));
+    }
+    if (conversion.length > 0 && declaration.length > 0) {
+        return " {conversion}, or {declaration}.";
+    }
+    if (conversion.length > 0) {
+        return " {conversion}.";
+    }
+    if (declaration.length > 0) {
+        return " {declaration.substring(0, 1).toUpperAscii()}{declaration.substring(1)} instead.";
+    }
+    return "";
+}
+
+// Whether 'type' names a type parameter, directly or as a generic type at its own type parameters, as
+// 'this' is inside a generic body. Such a type means something else in another declaration.
+mentionsTypeParameters(Type type) -> bool {
+    switch (type) {
+        is OptionalType optional -> {
+            return mentionsTypeParameters(optional.inner());
+        },
+        is ArrayType array -> {
+            return mentionsTypeParameters(array.element());
+        },
+        is DeclaredType declared -> {
+            return declared.isGeneric();
+        },
+        default -> {
+            return convert.containsTypeParam(type);
+        },
+    }
+}
+
+// The conversion 'converted' of the integer literal 'value' to the integer kind 'kind', which keeps it
+// exactly where its value is one of the kind's, and empty where it is not.
+literalConversion(string converted, Expression value, PrimitiveKind kind) -> string {
+    let literal = literaltyping.integerLiteralOf(value, true);
+    if (literal == null) {
+        return "";
+    }
+    let magnitude = literalvalues.integerMagnitude(literal.value().text());
+    if (magnitude == null
+            || !literalvalues.magnitudeFits(literaltyping.isNegativeLiteral(value), magnitude, kind)) {
+        return "";
+    }
+    return converted;
+}
+
+// The conversion of a number of type 'source' to the number type 'target' has without its '?', under
+// the condition that keeps the value: an integer inside the target's range, or any number where the
+// nearest floating-point value is close enough. Between two signed types the condition names the whole
+// range, because a negative value is kept as well. Empty for a floating-point number that would lose its
+// fraction, for a 'char', and for anything that is not a number.
+valueConversion(BodyChecker checker, Type target, Type source, Expression? value) -> string {
+    Type core = convert.coreOf(target);
+    if (!(source is PrimitiveType) || !(core is PrimitiveType) || !convert.isNumericType(source)
+            || !convert.isNumericType(core) || source.kind() == PrimitiveKind.Char
+            || core.kind() == PrimitiveKind.Char) {
+        return "";
+    }
+    string name = checker.names().of(core);
+    string? spelled = null;
+    string converted = "Convert the value with 'as {name}'";
+    if (value != null) {
+        spelled = wording.shortSpelling(value);
+        if (spelled != null) {
+            converted = "Write '{wording.converted(wording.unwrapParentheses(value), name)}'";
+        } else if (!wording.isSingleTerm(wording.unwrapParentheses(value))) {
+            converted = "Put the value in parentheses and write 'as {name}' after them";
+        }
+    }
+    if (convert.isIntegerType(source) && convert.isIntegerType(core) && value != null
+            && literaltyping.integerLiteralOf(value, true) != null) {
+        return literalConversion(converted, value, core.kind());
+    }
+    if (convert.isIntegerType(source) && convert.isIntegerType(core)) {
+        bool signed = !literalfixes.isUnsignedKind(source.kind())
+            && !literalfixes.isUnsignedKind(core.kind());
+        if (signed) {
+            string subject = "the value";
+            if (spelled != null) {
+                subject = "'{spelled}'";
+            }
+            return "{converted} if {subject} is {literalvalues.integerRange(core.kind())}";
+        }
+        return converted + literalfixes.keepsValueCondition(spelled, source.kind(), core.kind(), "the value");
+    }
+    if (convert.isFloatType(core)) {
+        return "{converted} if the '{name}' nearest to its value is close enough";
+    }
+    return "";
 }
 
 // The advice for the operands, said once when both take the same fix. Null when none has advice.
