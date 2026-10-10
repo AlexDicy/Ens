@@ -8,6 +8,7 @@ import support.source;
 import SyntaxKind from syntax.generated.kind;
 import Diagnostic from support.diagnostics;
 import LexedToken from lex.token;
+import RawToken from lex.token;
 import lex.lexer;
 import LexResult from lex.lexer;
 import GreenNode from syntax.green;
@@ -147,6 +148,15 @@ mergeDiagnostics(Diagnostic[] first, Diagnostic[] second) -> Diagnostic[] {
         }
     }
     return merged.toArray();
+}
+
+hasInvalidPiece(RawToken[] pieces) -> bool {
+    for (let piece in pieces) {
+        if (piece.kind == SyntaxKind.Invalid) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // True when the same limit was already reached at the same place, which is what one construct's
@@ -502,16 +512,71 @@ public final class Parser {
 
     // Records a diagnostic over the rest of the current token.
     public reportAtCurrent(string message) {
+        if (this.followsLexerError()) {
+            return;
+        }
         let token = this.lexedTokens[this.cursor];
         let start = token.offset + this.splitOffset;
         this.report(message, source.makeSpan(start, token.end() - start));
+    }
+
+    // True where a problem at the cursor would follow from one the lexer reported: a character no
+    // token begins with just before it, a string or character left open by the token before it,
+    // or a comment left open that runs to the end of the file.
+    followsLexerError() -> bool {
+        let token = this.lexedTokens[this.cursor];
+        if (hasInvalidPiece(token.leading)) {
+            return true;
+        }
+        if (this.cursor == 0) {
+            return false;
+        }
+        let previous = this.lexedTokens[this.cursor - 1];
+        if (hasInvalidPiece(previous.trailing) || this.leftOpen(previous)) {
+            return true;
+        }
+        return token.kind == SyntaxKind.EndOfFile
+            && (this.endsInOpenComment(token.leading) || this.endsInOpenComment(previous.trailing));
+    }
+
+    // True for a string or character literal, or the last piece of an interpolated string, that the
+    // lexer reported as never closed on its line.
+    leftOpen(LexedToken token) -> bool {
+        byte quote = '"';
+        if (token.kind == SyntaxKind.CharLiteral) {
+            quote = '\'';
+        } else if (token.kind != SyntaxKind.StringLiteral
+                && token.kind != SyntaxKind.InterpolatedStringEnd) {
+            return false;
+        }
+        long end = token.end();
+        if (token.length < 2 || this.input.byteAt(end - 1) != quote) {
+            return true;
+        }
+        long backslashes = 0;
+        while (end - 2 - backslashes > token.offset && this.input.byteAt(end - 2 - backslashes) == '\\') {
+            backslashes++;
+        }
+        return backslashes % 2 == 1;
+    }
+
+    endsInOpenComment(RawToken[] pieces) -> bool {
+        if (pieces.length == 0) {
+            return false;
+        }
+        let last = pieces[pieces.length - 1];
+        if (last.kind != SyntaxKind.BlockComment) {
+            return false;
+        }
+        long end = last.end();
+        return last.length < 4 || this.input.byteAt(end - 1) != '/' || this.input.byteAt(end - 2) != '*';
     }
 
     // A zero-length Missing token at the end of the previous token's content, with a diagnostic
     // anchored there, recorded as a guess unless the token was a separator carrying no meaning.
     public missing(SyntaxKind expected, string message) {
         this.missingUnreported(expected);
-        if (this.closedAtHeader == this.cursor) {
+        if (this.closedAtHeader == this.cursor || this.followsLexerError()) {
             return;
         }
         this.report(message, source.makeSpan(this.contentEnd, 0));

@@ -283,9 +283,23 @@ class Lexer {
         this.emit(SyntaxKind.BlockComment, startPosition);
     }
 
+    // A character no token begins with, written between two characters of a word as in 'in§t', is
+    // reported and kept in the word, so the word is still the one name it was meant to be.
     lexIdentifierOrKeyword(long startPosition) {
-        while (!this.atEnd() && isIdentifierContinue(this.peek(0))) {
-            this.advance();
+        while (!this.atEnd()) {
+            if (isIdentifierContinue(this.peek(0))) {
+                this.advance();
+                continue;
+            }
+            long runEnd = this.refusedRunEnd(this.position);
+            if (runEnd == this.position || !isIdentifierContinue(this.byteAt(runEnd))) {
+                break;
+            }
+            long refusedStart = this.position;
+            while (this.position < runEnd) {
+                this.advance();
+            }
+            this.reportRefused(refusedStart);
         }
         let text = this.sourceText.substring(startPosition, this.position);
         let keyword = kind.keywordFromText(text);
@@ -717,40 +731,83 @@ class Lexer {
         this.emit(operatorKind, startPosition);
     }
 
-    // The Invalid token spans the whole offending character, a full UTF-8 codepoint when the lead
-    // byte is one. Lexing carries on so one bad byte does not derail the rest.
+    // The Invalid piece spans the whole run of offending characters, each a full UTF-8 codepoint when
+    // its lead byte is one. Lexing carries on so one bad byte does not derail the rest.
     lexInvalidCharacter(long startPosition, byte lead) {
-        this.advance();
-        let trailing = utf8SequenceLength(lead) - 1;
-        long consumed = 0;
-        while (consumed < trailing && !this.atEnd() && isContinuationByte(this.peek(0))) {
+        long runEnd = this.refusedRunEnd(startPosition);
+        while (this.position < runEnd) {
             this.advance();
-            consumed++;
         }
+        this.reportRefused(startPosition);
+        this.emit(SyntaxKind.Invalid, startPosition);
+    }
+
+    // Where a run of characters no token begins with, starting at 'index', ends: a run is one piece
+    // with one report, written together the way a single stray character is.
+    refusedRunEnd(long index) -> long {
+        long end = index;
+        while (true) {
+            long length = this.refusedLength(end);
+            if (length == 0) {
+                return end;
+            }
+            end = end + length;
+        }
+    }
+
+    // The byte at 'index', or 0 past the end.
+    byteAt(long index) -> byte {
+        if (index < this.sourceLength) {
+            return this.lexerSource.byteAt(index);
+        }
+        return 0;
+    }
+
+    // How many bytes the character at 'index' spans when no token begins with it, or 0.
+    refusedLength(long index) -> long {
+        if (index >= this.sourceLength) {
+            return 0;
+        }
+        let c = this.lexerSource.byteAt(index);
+        bool begins = c == ' ' || c == '\t' || c == '\f' || c == 0x0B || c == '\n' || c == '\r'
+            || isDigit(c) || isIdentifierStart(c) || c == '"' || c == '\'' || singleCharacterKind(c) != null;
+        if (begins) {
+            return 0;
+        }
+        long length = 1;
+        long trailing = utf8SequenceLength(c) - 1;
+        while (length <= trailing && index + length < this.sourceLength
+                && isContinuationByte(this.lexerSource.byteAt(index + length))) {
+            length++;
+        }
+        return length;
+    }
+
+    reportRefused(long startPosition) {
         let sequence = this.sourceText.substring(startPosition, this.position);
         this.report("'{sequence}' cannot appear in code outside a string or a comment. Remove it, "
             + "or move it into a string.", startPosition, this.position);
-        this.emit(SyntaxKind.Invalid, startPosition);
     }
 }
 
 // A token's trailing trivia runs from just after it up to and including the first newline or the
 // end of file, and the rest becomes the next token's leading. The EndOfFile token, always last,
-// owns the file's remaining tail as leading.
+// owns the file's remaining tail as leading. A character no token begins with is reported already
+// and kept as trivia, so the parser reads the code around it as written.
 attachTrivia(RawToken[] pieces) -> LexedToken[] {
     let tokens = new List<LexedToken>();
     let count = pieces.length;
     long index = 0;
     while (index < count) {
         let leadingStart = index;
-        while (index < count && kind.isTrivia(pieces[index].kind)) {
+        while (index < count && isTriviaPiece(pieces[index].kind)) {
             index++;
         }
         let tokenIndex = index;
         let tokenPiece = pieces[index];
         index++;
         let trailingStart = index;
-        while (index < count && kind.isTrivia(pieces[index].kind)) {
+        while (index < count && isTriviaPiece(pieces[index].kind)) {
             let triviaKind = pieces[index].kind;
             index++;
             if (triviaKind == SyntaxKind.Newline) {
@@ -770,6 +827,10 @@ attachTrivia(RawToken[] pieces) -> LexedToken[] {
         }
     }
     return tokens.toArray();
+}
+
+isTriviaPiece(SyntaxKind pieceKind) -> bool {
+    return kind.isTrivia(pieceKind) || pieceKind == SyntaxKind.Invalid;
 }
 
 sliceRawTokens(RawToken[] pieces, long startIndex, long endIndex) -> RawToken[] {
