@@ -3,9 +3,8 @@
 
 Primitive types: `bool (1)`, `byte (1)`, `short (2)`, `ushort (2)`, `int (4)`, `uint (4)`, `long (8)`, `ulong (8)`, `float (4)`, `double (8)`, `char (4)`. `byte` is unsigned (0..255); `short`/`int`/`long` are signed; `ushort`/`uint`/`ulong` are their unsigned counterparts.
 `char` is an unsigned 32-bit Unicode scalar value (0..0x10FFFF); it counts as an integer type, and converts to text as the character it denotes.
-Being a code point rather than a quantity, a `char` converts to `int`, `uint`, `long` and `ulong` on its own, since each of them has room for every code point, but never `float` or `double`: arithmetic on a code point in integers is meaningful, while a code point as a floating-point number is a mistake rather than an intent.
+Being a code point rather than a quantity, a `char` reaches the integer types on its own but never `float` or `double`: arithmetic on a code point in integers is meaningful, while a code point as a floating-point number is a mistake rather than an intent.
 Write `c as double` where the number behind the character is what is wanted.
-`byte`, `short` and `ushort` have room for only some code points, so a `char` converts to them only through `as`, as in `c as byte`.
 
 Visibility has three tiers, `private` < `public` < `export`, with `protected` alongside them.
 Everything is private by default.
@@ -1232,15 +1231,7 @@ Errno? e = code as? Errno;             // the matching member, or null
 Errno chosen = 13 as? Errno ?? Errno.EPERM;
 ```
 
-An integer converts to a `char` with `as?`, which evaluates to `char?`: the character whose code point the integer is, or `null` when the integer is negative, past 0x10FFFF, or a surrogate from 0xD800 through 0xDFFF.
-A `byte` or a `char` is always a code point, so it converts with `as`, and `as?` from either is an error.
-
-```ens
-char? c = code as? char;              // the character, or null
-char shown = code as? char ?? '?';
-```
-
-The target must be a class or an interface (or, for `as?` only, a numeric enum or `char`); testing against a struct, another primitive, a plain enum, an array, or a string is a compile error, and so is a nullable target like `as? Circle?`, whose result would already be nullable.
+The target must be a class or an interface (or, for `as?` only, a numeric enum); testing against a struct, a primitive, a plain enum, an array, or a string is a compile error, and so is a nullable target like `as? Circle?`, whose result would already be nullable.
 The scrutinee must be a class, an interface, or a nullable form of either, and the target must be related to it: a test that could never succeed (unrelated classes) and a test the static type already satisfies (always true) are both compile errors.
 A nullable scrutinee tested against a type it already satisfies is the exception: for `Base? x`, the test `x is Base` is a combined null-plus-type check and is allowed.
 An interface target over a class scrutinee is an error only in the impossible case, a `final` class that does not implement it (any other class could have an implementing subclass), or the always-true case where the static class already implements it.
@@ -2080,6 +2071,8 @@ The count is a floor and never a ceiling, so nothing bounds how long a loaded ma
 Every value has a `hash()` method returning a `long`. Value types (primitives, enums, strings, structs) and arrays hash by their contents, so equal values hash equally; classes hash by identity, matching how `==` compares them.
 An optional hashes as its payload does while it is present and as one fixed value once it is absent, so every absent value hashes equally whatever its type.
 A class or a struct can declare its own `hash() -> long` to control its hashing, paired with `equals(T other) -> bool`, a method taking a single parameter of the declaring type `T` itself, to control equality.
+A generic type writes itself with its own type parameters, so a `class Box<E>` declares `equals(Box<E> other) -> bool`.
+A subclass that overrides an inherited `equals` keeps the base class's parameter type.
 A method named `hash` must have exactly that signature, and neither `hash` nor `equals` can be `throws`, because the language takes a value's hash and compares two values where there is no room for a `try`; `equals` must return `bool`.
 When a class declares such an `equals`, `==` and `!=` on that class compare by content, running an identity and null check first and then `equals`, rather than by reference identity; when a struct declares one, `==` and `!=` call it instead of comparing the fields.
 Both `hash` and `equals` are written with `override`, since they replace behavior the language provides: a class's identity hash and equality, a struct's content hash and memberwise equality.
