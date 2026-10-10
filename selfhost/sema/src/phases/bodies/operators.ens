@@ -66,11 +66,15 @@ public analyzeBinary(BodyChecker checker, BinaryExpressionNode node) -> Type {
     }
     Type? target = null;
     LiteralOrigin? origin = null;
+    LiteralOrigin? slot = null;
     if (checker.targets().binaryNode() == node.green()) {
         if (literalfixes.isArithmeticOperator(operator) || operator == SyntaxKind.Ampersand
                 || operator == SyntaxKind.Pipe || operator == SyntaxKind.Caret) {
             target = checker.targets().binaryTarget();
             origin = checker.targets().binaryOrigin();
+        } else if (operator == SyntaxKind.LessLess || operator == SyntaxKind.GreaterGreater
+                || operator == SyntaxKind.GreaterGreaterGreater) {
+            slot = checker.targets().binaryOrigin();
         }
         checker.targets().clearBinaryStash();
     }
@@ -85,16 +89,17 @@ public analyzeBinary(BodyChecker checker, BinaryExpressionNode node) -> Type {
     }
     checker.targets().enterOperands(node, target, origin);
     Type result = analyzeBinaryOperands(checker, node.span(), operator, node.operator().text(),
-        node.left(), node.right(), left, right, null);
+        node.left(), node.right(), left, right, null, slot);
     checker.targets().leaveOperands();
     return result;
 }
 
 // The result of 'left OP right' under the operator's own rules. A compound assignment passes its
-// target as 'written', which is checked without its '?'.
+// target as 'written', which is checked without its '?'. 'slot' is where the type the result goes
+// into is declared, for a fix that changes the result's type.
 public analyzeBinaryOperands(BodyChecker checker, Span span, SyntaxKind operator, string operatorText,
                              Expression leftNode, Expression rightNode, Type left,
-                             Type right, WriteTarget? written) -> Type {
+                             Type right, WriteTarget? written, LiteralOrigin? slot = null) -> Type {
     switch (operator) {
         Plus, Minus, Star, Slash, Percent -> {
             return analyzeArithmetic(checker, span, operator, operatorText, leftNode, rightNode,
@@ -112,7 +117,7 @@ public analyzeBinaryOperands(BodyChecker checker, Span span, SyntaxKind operator
         },
         LessLess, GreaterGreater, GreaterGreaterGreater -> {
             return analyzeShift(checker, span, operator, operatorText, leftNode, rightNode, left,
-                right, written);
+                right, written, slot);
         },
         default -> {
             checker.reporter().report("Internal: unsupported binary operator '{operatorText}'.", span);
@@ -794,7 +799,7 @@ analyzeBitwise(BodyChecker checker, Span span, SyntaxKind operator, string opera
 
 // The shifted value alone decides the result type, so only the distance adapts.
 analyzeShift(BodyChecker checker, Span span, SyntaxKind operator, string operatorText, Expression leftNode,
-             Expression rightNode, Type left, Type right, WriteTarget? written) -> Type {
+             Expression rightNode, Type left, Type right, WriteTarget? written, LiteralOrigin? slot) -> Type {
     Type checkedLeft = checkedSide(left, written);
     JoinText? why = null;
     if (literalfixes.overflowWidening(checker, rightNode, checkedLeft) != null) {
@@ -836,20 +841,108 @@ analyzeShift(BodyChecker checker, Span span, SyntaxKind operator, string operato
     if (checkedLeft != distance) {
         string shifted = checker.names().of(shownSide(checkedLeft, left, written));
         string wanted = checker.names().of(checkedLeft);
-        string fix = "Convert the distance with 'as'.";
-        if (wording.shortSpelling(rightNode) != null) {
-            fix = "Write '{wording.converted(wording.unwrapParentheses(rightNode), wanted)}'.";
+        string fix = "";
+        if (distance is PrimitiveType && checkedLeft is PrimitiveType) {
+            fix = distanceFix(checker, operatorText, leftNode, rightNode, checkedLeft.kind(), distance.kind(),
+                written != null, slot);
         }
         string quotedShifted = checker.names().quoted(shownSide(checkedLeft, left, written));
         string quotedWanted = checker.names().quoted(checkedLeft);
         checker.reporter().report("'{operatorText}' shifts {typenames.typeArticle(shifted)} {quotedShifted} "
             + "here, so the shift distance must be {typenames.typeArticle(wanted)} {quotedWanted} too, but "
-            + "{wording.sideNamed(rightNode, "the distance")} has type {checker.names().quoted(distance)}. "
-            + "{fix}",
+            + "{wording.sideNamed(rightNode, "the distance")} has type {checker.names().quoted(distance)}."
+            + fix,
             span);
         return checker.store().errorType();
     }
     return checkedLeft;
+}
+
+// The sentence, opening with a space, that fixes a shift of a 'shifted' value by a 'distance' distance:
+// the distance converted to the shifted type, under the condition that keeps its value. A 'char' is
+// shifted as its code point in an integer type instead, because an integer does not convert to a
+// 'char'. That result goes into no 'char', so a compound shift of a 'char' gets no fix, and a 'char'
+// declared at 'slot' gets the change of its declaration as well, or no fix where none is written.
+distanceFix(BodyChecker checker, string operatorText, Expression leftNode, Expression rightNode,
+            PrimitiveKind shifted, PrimitiveKind distance, bool compound, LiteralOrigin? slot) -> string {
+    let spelled = wording.shortSpelling(rightNode);
+    Expression rightValue = wording.unwrapParentheses(rightNode);
+    if (shifted != PrimitiveKind.Char) {
+        string condition = distanceCondition(spelled, distance, shifted);
+        if (spelled == null) {
+            return " Convert the distance with 'as'{condition}.";
+        }
+        return " Write '{wording.converted(rightValue, primitiveName(shifted))}'{condition}.";
+    }
+    if (compound || spelled == null || wording.shortSpelling(leftNode) == null) {
+        return "";
+    }
+    PrimitiveKind holding = PrimitiveKind.Int;
+    string rightText = wording.converted(rightValue, "int");
+    if (literalvalues.integerMaximum(distance) >= literalvalues.integerMaximum(PrimitiveKind.Char)) {
+        holding = distance;
+        rightText = wording.oneLineSpelling(rightValue);
+    }
+    string holdingName = primitiveName(holding);
+    string leftText = wording.converted(wording.unwrapParentheses(leftNode), holdingName);
+    string fix = " Write '{leftText} {operatorText} {rightText}' to shift its code point as "
+        + "{typenames.typeArticle(holdingName)} '{holdingName}'";
+    Type holdingType = checker.store().primitive(holding);
+    if (slot == null || convert.isAssignableStrict(slot.declared(), holdingType)) {
+        return "{fix}.";
+    }
+    if (slot.declared() is OptionalType) {
+        holdingType = checker.store().optionalOf(holdingType);
+    }
+    string change = slotChange(slot, checker.names().of(holdingType));
+    if (change.length == 0) {
+        return "";
+    }
+    return "{fix}, and {change}.";
+}
+
+// The change that makes the declaration at 'slot' take the type 'wanted', in the words the literal
+// fixes use, or empty where no one edit changes it.
+slotChange(LiteralOrigin slot, string wanted) -> string {
+    string quoted = "{typenames.typeArticle(wanted)} '{wanted}'";
+    switch (slot.kind()) {
+        Declared -> {
+            if (slot.quotedFieldOwner().length > 0) {
+                return "declare field '{slot.name()}' of {slot.quotedFieldOwner()} as {quoted}";
+            }
+            return "declare '{slot.name()}' as {quoted}";
+        },
+        Returned -> {
+            return "change the return type of '{slot.name()}' to '{wanted}'";
+        },
+        default -> {
+            return "";
+        },
+    }
+}
+
+// The condition under which converting a shift distance of kind 'distance' to 'shifted' keeps its value,
+// opening with a space, or empty where every value of 'distance' is one of 'shifted'. 'spelled' is the
+// distance as written, or null where it is too long to repeat.
+distanceCondition(string? spelled, PrimitiveKind distance, PrimitiveKind shifted) -> string {
+    ulong largest = literalvalues.integerMaximum(shifted);
+    bool tooLarge = literalvalues.integerMaximum(distance) > largest;
+    bool negative = !literalfixes.isUnsignedKind(distance)
+        && (tooLarge || literalfixes.isUnsignedKind(shifted));
+    string subject = "it";
+    if (spelled != null) {
+        subject = "'{spelled}'";
+    }
+    if (tooLarge && negative) {
+        return " if {subject} is never negative and at most {largest}";
+    }
+    if (tooLarge) {
+        return " if {subject} is at most {largest}";
+    }
+    if (negative) {
+        return " if {subject} is never negative";
+    }
+    return "";
 }
 
 public analyzePrefix(BodyChecker checker, PrefixExpressionNode node) -> Type {
