@@ -43,6 +43,8 @@ import phases.bodies.valuejoins;
 import phases.bodies.literaltyping;
 import phases.bodies.nullguidance;
 import phases.bodies.wording;
+import phases.bodies.argumentshapes;
+import ArgumentShape from phases.calls;
 import model.typemembers;
 import Parameter from model.typemembers;
 import Signature from model.typemembers;
@@ -102,6 +104,7 @@ public analyzeTry(BodyChecker checker, TryExpressionNode node) -> Type {
 // parameter, so its refusal can name it.
 public buildCallShape(BodyChecker checker, ArgumentListNode arguments, bool single) -> BuiltShape {
     let shape = new CallShape();
+    shape.setLocalNamer((base) -> nullguidance.freeLocalName(checker, "", base));
     let positionalValues = new List<Expression?>();
     let namedValues = new List<Expression?>();
     for (long i = 0; i < arguments.argumentsCount(); i++) {
@@ -116,8 +119,13 @@ public buildCallShape(BodyChecker checker, ArgumentListNode arguments, bool sing
                         break;
                     }
                 }
-                bool waits = single && carriesOverflowingFloat(named.value());
-                if (needsTargetType(named.value()) || waits) {
+                let shaped = shapedArgumentOf(checker, name, named.value(), single);
+                if (shaped != null) {
+                    if (shaped.holdsError()) {
+                        shape.markErrorArgument();
+                    }
+                    shape.named().push(shaped);
+                } else if (single && carriesOverflowingFloat(named.value())) {
                     shape.named().push(targetTypedArgument(checker, name, named.value()));
                 } else {
                     bool outerAwaiting = checker.targets().awaitingParameter();
@@ -159,7 +167,13 @@ public buildCallShape(BodyChecker checker, ArgumentListNode arguments, bool sing
                         value.span());
                     shape.markMalformed();
                 }
-                if (needsTargetType(value) || (single && carriesOverflowingFloat(value))) {
+                let shaped = shapedArgumentOf(checker, "", value, single);
+                if (shaped != null) {
+                    if (shaped.holdsError()) {
+                        shape.markErrorArgument();
+                    }
+                    shape.positional().push(shaped);
+                } else if (single && carriesOverflowingFloat(value)) {
                     shape.positional().push(targetTypedArgument(checker, "", value));
                 } else {
                     bool outerAwaiting = checker.targets().awaitingParameter();
@@ -184,6 +198,47 @@ public buildCallShape(BodyChecker checker, ArgumentListNode arguments, bool sing
         values.push(namedValues.get(i));
     }
     return new BuiltShape(shape, values);
+}
+
+// The argument 'value' shaped by what is written, with its parts analyzed as the call's other arguments
+// are, or null where it has a type of its own.
+shapedArgumentOf(BodyChecker checker, string name, Expression value, bool single) -> ArgumentValue? {
+    bool outerAwaiting = checker.targets().awaitingParameter();
+    checker.targets().setAwaitingParameter(!single);
+    let shaped = argumentshapes.shapedArgument(checker, name, value);
+    checker.targets().setAwaitingParameter(outerAwaiting);
+    return shaped;
+}
+
+// Resolves the call over 'candidates'. Where none is chosen, a method or function name among the
+// arguments is refused on its own, because resolution reports nothing for a call that passes one.
+public resolveBuiltCall(BodyChecker checker, List<CallCandidate> candidates, BuiltShape built, Span span,
+                        string displayName, string kindWord) -> CallResolution {
+    let resolution = calls.resolveCall(candidates, built.shape(), checker.reporter(), span, displayName,
+        kindWord, checker.names());
+    if (resolution.failed()) {
+        for (long i = 0; i < built.values.length(); i++) {
+            let value = built.values.get(i);
+            if (value != null) {
+                refuseHeldNames(checker, built.shape().argumentAt(i), value);
+            }
+        }
+    }
+    return resolution;
+}
+
+// Analyzes each method or function name 'argument' holds with no function type to fit, which refuses it.
+refuseHeldNames(BodyChecker checker, ArgumentValue argument, Expression value) {
+    if (argument.shape() == ArgumentShape.Name) {
+        checker.analyzeExpression(value);
+        return;
+    }
+    let array = wording.unwrapParentheses(value);
+    if (argument.shape() == ArgumentShape.ArrayLiteral && array is ArrayLiteralExpressionNode) {
+        for (long i = 0; i < array.elementsCount(); i++) {
+            refuseHeldNames(checker, argument.elements()[i], array.elements(i));
+        }
+    }
 }
 
 // An argument whose type only the parameter it is passed to determines, left unanalyzed until the
@@ -669,8 +724,7 @@ dispatchFunctionCall(BodyChecker checker, CallExpressionNode node, IdentifierExp
         for (long i = 0; i < entries.length(); i++) {
             candidates.push(new CallCandidate(entries.get(i).signature(), null, true));
         }
-        let resolved = calls.resolveCall(candidates, built.shape(), checker.reporter(),
-            node.span(), name, "Function", checker.names());
+        let resolved = resolveBuiltCall(checker, candidates, built, node.span(), name, "Function");
         if (resolved.failed()) {
             return checker.store().errorType();
         }
@@ -706,8 +760,8 @@ public analyzeNamespaceFunctionCall(BodyChecker checker, CallExpressionNode node
                 types.isVisibleFrom(entry.visibility(), targetPath, targetPackagePrefix,
                     checker.modulePath(), checker.packagePrefix())));
         }
-        let resolved = calls.resolveCall(candidates, built.shape(), checker.reporter(),
-            node.span(), memberName, "Function", checker.names());
+        let resolved = resolveBuiltCall(checker, candidates, built,
+            node.span(), memberName, "Function");
         if (resolved.failed()) {
             return checker.store().errorType();
         }

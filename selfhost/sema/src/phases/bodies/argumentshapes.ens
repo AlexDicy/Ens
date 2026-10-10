@@ -1,0 +1,188 @@
+// The arguments of a call that name no type of their own: a lambda, the name of a method or function,
+// an array literal and a struct literal. Each fits a candidate's parameters by what is written, and
+// is typed from the parameter of the candidate chosen.
+import Expression from @ens.frontend.syntax.generated.nodes;
+import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
+import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import GenericNameExpressionNode from @ens.frontend.syntax.generated.nodes;
+import LambdaExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ArrayLiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
+import StructLiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
+import phases.calls;
+import ArgumentValue from phases.calls;
+import ArgumentShape from phases.calls;
+import model.typemembers;
+import Method from model.typemembers;
+import Signature from model.typemembers;
+import Type from model.types;
+import ErrorType from model.types;
+import NullType from model.types;
+import OptionalType from model.types;
+import ArrayType from model.types;
+import FunctionType from model.types;
+import StringType from model.types;
+import ExternalType from model.types;
+import EnumType from model.types;
+import List from @std.collections.list;
+import phases.bodies.functioncalls;
+import phases.bodies.memberaccess;
+import phases.bodies.staticmembers;
+import phases.bodies.wording;
+import BodyChecker from phases.bodies;
+import FunctionName from phases.bodies;
+import NamespaceName from phases.bodies;
+import TypeName from phases.bodies;
+
+// The argument 'value', named 'name' or positional with an empty name, where what is written decides
+// the parameters it fits, or null where it has a type of its own. The parts of it that have a type of
+// their own are analyzed now.
+public shapedArgument(BodyChecker checker, string name, Expression value) -> ArgumentValue? {
+    let argument = new ArgumentValue(name, checker.store().errorType(), false, false, 0, false, value.span());
+    Expression written = wording.unwrapParentheses(value);
+    switch (written) {
+        is LambdaExpressionNode lambda -> {
+            argument.markLambda(lambda.parametersCount());
+        },
+        is ArrayLiteralExpressionNode array -> {
+            let elements = new List<ArgumentValue>();
+            for (long i = 0; i < array.elementsCount(); i++) {
+                elements.push(elementValue(checker, array.elements(i)));
+            }
+            argument.markArrayLiteral(elements.toArray(), aloneType(checker, elements));
+        },
+        is StructLiteralExpressionNode ignored -> {
+            argument.markStructLiteral();
+        },
+        default -> {
+            let counts = namedParameterCounts(checker, written);
+            if (counts == null) {
+                return null;
+            }
+            argument.markName(counts);
+        },
+    }
+    argument.setSpelling(wording.shortSpelling(value));
+    return argument;
+}
+
+// An element of an array literal argument, shaped as an argument is, or else analyzed for its own type.
+elementValue(BodyChecker checker, Expression element) -> ArgumentValue {
+    let shaped = shapedArgument(checker, "", element);
+    if (shaped != null) {
+        return shaped;
+    }
+    Type analyzed = checker.analyzeBeforeChoosing(element);
+    return functioncalls.argumentValueOf(checker, "", element, analyzed);
+}
+
+// The type an array literal of 'elements' has when it is written alone: an array of its first element's
+// type, which every other element fits. Null where the first element has no type of its own or is
+// 'null', and where another element does not fit that type.
+aloneType(BodyChecker checker, List<ArgumentValue> elements) -> Type? {
+    if (elements.length() == 0) {
+        return null;
+    }
+    let first = elements.get(0);
+    Type? element = first.aloneType();
+    if (first.shape() == ArgumentShape.Typed && !first.needsTarget()) {
+        element = first.type();
+    }
+    if (element == null || element is ErrorType || element is NullType) {
+        return null;
+    }
+    for (let value in elements) {
+        if (calls.conversionRank(value, element) == 0) {
+            return null;
+        }
+    }
+    return checker.store().arrayOf(element);
+}
+
+// The parameter counts the methods or functions 'value' names can be called with, or null where it
+// names no method or function. The receiver a method is read from is analyzed now.
+namedParameterCounts(BodyChecker checker, Expression value) -> long[]? {
+    switch (value) {
+        is IdentifierExpressionNode identifier -> {
+            string name = identifier.name().text();
+            if (name.length == 0) {
+                return null;
+            }
+            let resolution = checker.resolveName(name);
+            if (!(resolution is FunctionName)) {
+                return null;
+            }
+            let signatures = new List<Signature>();
+            for (let entry in resolution.entries()) {
+                signatures.push(entry.signature());
+            }
+            return parameterCounts(signatures);
+        },
+        is MemberExpressionNode member -> {
+            return memberParameterCounts(checker, member);
+        },
+        default -> {
+            return null;
+        },
+    }
+}
+
+// The parameter counts of the methods or the module's functions a member read names, in the order
+// a member read resolves its head: a module, an enum, a type, and then a value.
+memberParameterCounts(BodyChecker checker, MemberExpressionNode member) -> long[]? {
+    let object = member.object();
+    string name = member.member().text();
+    if (object is IdentifierExpressionNode) {
+        string head = object.name().text();
+        let resolution = checker.resolveName(head);
+        if (resolution is NamespaceName) {
+            return parameterCounts(memberaccess.reachableFunctionSignatures(checker,
+                resolution.targetModulePath(), name));
+        }
+        if (resolution is TypeName && resolution.target() is EnumType) {
+            return null;
+        }
+        let type = staticmembers.staticHeadNamed(checker, head);
+        if (type != null) {
+            return methodParameterCounts(staticmembers.staticMethodsRead(checker, type, name));
+        }
+    }
+    if (object is GenericNameExpressionNode) {
+        return null;
+    }
+    Type objectType = checker.analyzeBeforeChoosing(object);
+    if (objectType is ErrorType || objectType is OptionalType) {
+        return null;
+    }
+    Type core = memberaccess.memberReceiverCore(checker, objectType, name);
+    bool stringLength = core is StringType && name == "length";
+    if (core is ArrayType || core is FunctionType || core is ExternalType || stringLength
+            || !memberaccess.isRecordLike(core)) {
+        return null;
+    }
+    return methodParameterCounts(memberaccess.methodsRead(checker, core, name));
+}
+
+methodParameterCounts(List<Method> methods) -> long[]? {
+    let signatures = new List<Signature>();
+    for (let method in methods) {
+        signatures.push(method.signature());
+    }
+    return parameterCounts(signatures);
+}
+
+// Every argument count one of 'signatures' can be called with, or null where there is no signature.
+parameterCounts(List<Signature> signatures) -> long[]? {
+    if (signatures.length() == 0) {
+        return null;
+    }
+    let counts = new List<long>();
+    for (let signature in signatures) {
+        long total = signature.parameters().length;
+        for (long count = typemembers.requiredParameterCount(signature); count <= total; count++) {
+            if (!counts.contains(count)) {
+                counts.push(count);
+            }
+        }
+    }
+    return counts.toArray();
+}

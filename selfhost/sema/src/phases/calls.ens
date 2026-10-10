@@ -16,9 +16,21 @@ import TypeNames from model.typenames;
 import QuotedCode from model.typenames;
 import Type from model.types;
 import ErrorType from model.types;
+import ArrayType from model.types;
+import FunctionType from model.types;
 import PrimitiveType from model.types;
 import PrimitiveKind from model.types;
 import List from @std.collections.list;
+
+// What an argument fits a parameter by: its type, or for an argument that names no type of its own,
+// what is written. A struct literal fits every parameter until a candidate is chosen.
+public enum ArgumentShape {
+    Typed,
+    Lambda,
+    Name,
+    ArrayLiteral,
+    StructLiteral,
+}
 
 // One analyzed call argument. The literal facts carry what conversionRank reads about
 // untyped integer and char literals: their value, so fitting a narrower parameter still counts.
@@ -35,6 +47,14 @@ public class ArgumentValue {
     bool floatLiteral;
     double floatLiteralMagnitude;
 
+    ArgumentShape argumentShape;
+    // The parameter counts a lambda or a name fits, and the elements of an array literal with the type
+    // the literal has when it is written alone.
+    long[] parameterCounts;
+    ArgumentValue[] elementValues;
+    Type? typeAlone;
+    string? writtenSpelling;
+
     public constructor(string name, Type type, bool isIntegerLiteral, bool isNegative,
                 ulong magnitude, bool isCharacterLiteral, Span span) {
         this.argumentName = name;
@@ -47,17 +67,110 @@ public class ArgumentValue {
         this.argumentSpan = span;
         this.floatLiteral = false;
         this.floatLiteralMagnitude = 0.0;
+        this.argumentShape = ArgumentShape.Typed;
+        this.parameterCounts = [];
+        this.elementValues = [];
+        this.typeAlone = null;
+        this.writtenSpelling = null;
     }
 
-    // True for a literal that names no type of its own, an empty array literal or a '{...}'
-    // literal, so only the parameter it is passed to determines its type. Ranking reads nothing from
-    // such an argument; it is typed once a candidate is chosen.
+    // True for an argument typed once a candidate is chosen: one that names no type of its own, and
+    // with a single candidate, one holding a literal too large for 'float'.
     public needsTarget() -> bool {
         return this.targetTyped;
     }
 
     public markNeedsTarget() {
         this.targetTyped = true;
+    }
+
+    public shape() -> ArgumentShape {
+        return this.argumentShape;
+    }
+
+    // A lambda that declares 'count' parameters.
+    public markLambda(long count) {
+        this.markShape(ArgumentShape.Lambda);
+        this.parameterCounts = [count];
+    }
+
+    // The name of methods or functions, one of which takes each of 'counts' arguments.
+    public markName(long[] counts) {
+        this.markShape(ArgumentShape.Name);
+        this.parameterCounts = counts;
+    }
+
+    // An array literal of 'elements', with the type 'alone' it has when it is written alone, or null
+    // where its elements give it none.
+    public markArrayLiteral(ArgumentValue[] elements, Type? alone) {
+        this.markShape(ArgumentShape.ArrayLiteral);
+        this.elementValues = elements;
+        this.typeAlone = alone;
+    }
+
+    public markStructLiteral() {
+        this.markShape(ArgumentShape.StructLiteral);
+    }
+
+    markShape(ArgumentShape shape) {
+        this.targetTyped = true;
+        this.argumentShape = shape;
+    }
+
+    public elements() -> ArgumentValue[] {
+        return this.elementValues;
+    }
+
+    public aloneType() -> Type? {
+        return this.typeAlone;
+    }
+
+    protected takesParameterCount(long count) -> bool {
+        for (let taken in this.parameterCounts) {
+            if (taken == count) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    protected declaredParameterCount() -> long {
+        return this.parameterCounts[0];
+    }
+
+    // The argument as the call writes it, or null where it is too long to repeat in a message.
+    public spelling() -> string? {
+        return this.writtenSpelling;
+    }
+
+    public setSpelling(string? spelled) {
+        this.writtenSpelling = spelled;
+    }
+
+    // Whether this is the name of a method or function, or an array literal holding one.
+    public holdsName() -> bool {
+        if (this.argumentShape == ArgumentShape.Name) {
+            return true;
+        }
+        for (let element in this.elementValues) {
+            if (element.holdsName()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Whether this, or an element of this array literal, has a type that a refusal took away.
+    public holdsError() -> bool {
+        if (!this.targetTyped) {
+            return this.argumentType is ErrorType;
+        }
+        for (let element in this.elementValues) {
+            if (element.holdsError()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // The named-argument name, or "" for a positional argument.
@@ -112,12 +225,45 @@ public class CallShape {
     List<ArgumentValue> namedArguments;
     bool shapeMalformed;
     bool erroredArgument;
+    // How a fix names a local it declares: the name it would use, numbered where that is taken.
+    (string) -> string localNamer;
 
     public constructor() {
         this.positionalArguments = new List<ArgumentValue>();
         this.namedArguments = new List<ArgumentValue>();
         this.shapeMalformed = false;
         this.erroredArgument = false;
+        this.localNamer = (base) -> base;
+    }
+
+    public setLocalNamer((string) -> string namer) {
+        this.localNamer = namer;
+    }
+
+    protected localName(string base) -> string {
+        return this.localNamer(base);
+    }
+
+    // Whether an argument is the name of a method or function, which is refused on its own where no
+    // candidate is chosen.
+    protected holdsName() -> bool {
+        for (long i = 0; i < this.argumentCount(); i++) {
+            if (this.argumentAt(i).holdsName()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Whether an argument is an array literal with a type of its own, which fits by its elements only
+    // where no candidate takes that type.
+    protected holdsTypedArrayLiteral() -> bool {
+        for (long i = 0; i < this.argumentCount(); i++) {
+            if (this.argumentAt(i).aloneType() != null) {
+                return true;
+            }
+        }
+        return false;
     }
 
     public positional() -> List<ArgumentValue> {
@@ -419,8 +565,15 @@ namedInCall(CallShape shape, string name) -> bool {
 }
 
 // How well an argument fits a parameter: 3 exact, 2 implicit conversion, 1 viable only because
-// an untyped literal's value fits the parameter's own numeric family, 0 not at all.
-public conversionRank(ArgumentValue argument, Type parameterType) -> long {
+// an untyped literal's value fits the parameter's own numeric family, 0 not at all. With 'byElements',
+// an array literal fits by its elements even where it has a type of its own.
+public conversionRank(ArgumentValue argument, Type parameterType, bool byElements = false) -> long {
+    switch (argument.shape()) {
+        Lambda, Name, ArrayLiteral -> {
+            return shapeRank(argument, parameterType, byElements);
+        },
+        default -> { },
+    }
     Type argumentType = argument.type();
     if (argumentType is ErrorType || parameterType is ErrorType) {
         return 3;
@@ -465,6 +618,43 @@ public conversionRank(ArgumentValue argument, Type parameterType) -> long {
     return 0;
 }
 
+// How well a lambda, a name or an array literal fits a parameter by what is written. A nullable
+// parameter fits it as a conversion, as it fits a value. An array literal with a type of its own fits
+// by that type, and by its elements only with 'byElements', at the rank of its least fitting element.
+shapeRank(ArgumentValue argument, Type parameterType, bool byElements) -> long {
+    if (parameterType is ErrorType) {
+        return 3;
+    }
+    Type core = convert.coreOf(parameterType);
+    long fit = 3;
+    if (core != parameterType) {
+        fit = 2;
+    }
+    if (argument.shape() != ArgumentShape.ArrayLiteral) {
+        if (core is FunctionType && argument.takesParameterCount(core.parameterTypes().length)) {
+            return fit;
+        }
+        return 0;
+    }
+    if (!(core is ArrayType)) {
+        return 0;
+    }
+    let alone = argument.aloneType();
+    if (alone != null && !byElements) {
+        if (alone == core) {
+            return fit;
+        }
+        return 0;
+    }
+    for (let element in argument.elements()) {
+        long rank = conversionRank(element, core.element(), true);
+        if (rank < fit) {
+            fit = rank;
+        }
+    }
+    return fit;
+}
+
 class ViableCandidate {
     protected CallCandidate candidate;
     protected long[] mapping;
@@ -477,47 +667,32 @@ class ViableCandidate {
 // Picks the best candidate: filter by argument shape and viability, rank argument matches
 // (exact beats conversion beats literal fitting), prefer accessible candidates, keep the
 // Pareto-undominated set with fewer defaulted parameters as the tiebreak, and report the
-// no-match and ambiguity diagnostics here.
+// no-match and ambiguity diagnostics here. A call passing the name of a method or function reports
+// neither, because that name is refused on its own.
 public resolveCall(List<CallCandidate> candidates, CallShape shape, Reporter reporter,
                    Span span, string displayName, string kindWord,
                    TypeNames names) -> CallResolution {
     if (shape.isMalformed()) {
         return new CallResolution(true, null, []);
     }
-    let viable = new List<ViableCandidate>();
-    string singleFailure = "";
-    long sourceCount = shape.argumentCount();
-    for (long c = 0; c < candidates.length(); c++) {
-        let candidate = candidates.get(c);
-        let outcome = mapArguments(candidate.signature(), shape, kindWord, displayName);
-        if (!outcome.ok) {
-            if (candidates.length() == 1) {
-                singleFailure = outcome.failure;
-            }
-            continue;
-        }
-        let ranks = new List<long>();
-        bool usable = true;
-        for (long i = 0; i < sourceCount; i++) {
-            let argument = shape.argumentAt(i);
-            Type parameterType = candidate.signature().parameters()[outcome.mapping[i]].type();
-            long rank = conversionRank(argument, parameterType);
-            if (rank == 0 && candidates.length() > 1 && !shape.hasErrorArgument()) {
-                usable = false;
-                break;
-            }
-            ranks.push(rank);
-        }
-        if (!usable) {
-            continue;
-        }
-        viable.push(new ViableCandidate(candidate, outcome.mapping, ranks.toArray(),
-            outcome.defaulted));
+    let viable = viableCandidates(candidates, shape, kindWord, displayName, false);
+    if (viable.length() == 0 && shape.holdsTypedArrayLiteral()) {
+        viable = viableCandidates(candidates, shape, kindWord, displayName, true);
     }
 
     if (viable.length() == 0) {
-        if (candidates.length() == 1 && singleFailure.length > 0) {
+        if (shape.holdsName()) {
+            return new CallResolution(true, null, []);
+        }
+        string singleFailure = "";
+        if (candidates.length() == 1) {
+            singleFailure = mapArguments(candidates.get(0).signature(), shape, kindWord, displayName).failure;
+        }
+        let sole = soleCountRefusal(candidates, shape, displayName, kindWord, names);
+        if (singleFailure.length > 0) {
             reporter.report(singleFailure, span);
+        } else if (sole != null) {
+            reporter.report(sole, span);
         } else {
             reporter.report(noMatchMessage(candidates, shape, displayName, kindWord, names), span);
         }
@@ -554,12 +729,42 @@ public resolveCall(List<CallCandidate> candidates, CallShape shape, Reporter rep
         best.push(pool.get(0));
     }
     if (best.length() > 1 && !shape.hasErrorArgument()) {
-        reporter.report(ambiguityMessage(best, shape, displayName, kindWord, names), span);
+        if (!shape.holdsName()) {
+            reporter.report(ambiguityMessage(best, shape, displayName, kindWord, names), span);
+        }
         return new CallResolution(true, null, []);
     }
 
     let winner = best.get(0);
     return new CallResolution(false, winner.candidate, winner.mapping);
+}
+
+// The candidates the call's arguments can be passed to, each with how well every argument fits.
+// With 'byElements', an array literal fits by its elements even where it has a type of its own.
+viableCandidates(List<CallCandidate> candidates, CallShape shape, string kindWord, string displayName,
+                 bool byElements) -> List<ViableCandidate> {
+    let viable = new List<ViableCandidate>();
+    for (let candidate in candidates) {
+        let outcome = mapArguments(candidate.signature(), shape, kindWord, displayName);
+        if (!outcome.ok) {
+            continue;
+        }
+        let ranks = new List<long>();
+        bool usable = true;
+        for (long i = 0; i < shape.argumentCount(); i++) {
+            Type parameterType = candidate.signature().parameters()[outcome.mapping[i]].type();
+            long rank = conversionRank(shape.argumentAt(i), parameterType, byElements);
+            if (rank == 0 && candidates.length() > 1 && !shape.hasErrorArgument()) {
+                usable = false;
+                break;
+            }
+            ranks.push(rank);
+        }
+        if (usable) {
+            viable.push(new ViableCandidate(candidate, outcome.mapping, ranks.toArray(), outcome.defaulted));
+        }
+    }
+    return viable;
 }
 
 betterThan(ViableCandidate left, ViableCandidate right) -> bool {
@@ -597,23 +802,141 @@ noMatchMessage(List<CallCandidate> candidates, CallShape shape, string displayNa
         return "{declared} can be called with no arguments. {listing} Add the arguments of one "
             + "of them.";
     }
-    let argumentTypes = new List<string>();
+    let typed = new List<string>();
+    let described = new List<string>();
+    bool untyped = false;
     for (long i = 0; i < count; i++) {
-        argumentTypes.push(names.quoted(shape.argumentAt(i).type()));
+        let argument = shape.argumentAt(i);
+        string text = argumentText(argument, names);
+        typed.push(text);
+        if (argument.shape() == ArgumentShape.Typed) {
+            text = "a value of type {text}";
+        } else {
+            untyped = true;
+        }
+        described.push(text);
     }
-    string typesText = diagnostics.andJoined(argumentTypes.toArray());
     if (count == 1) {
-        string type = names.quoted(shape.argumentAt(0).type());
-        return "{declared} takes a value of type {type}. {listing} Change the argument to match one of them.";
+        return "{declared} takes {described.get(0)}. {listing} Change the argument to match one of them.";
     }
-    return "{declared} takes the arguments {typesText}. {listing} Change the arguments to match "
-        + "one of them.";
+    if (untyped) {
+        return "{declared} takes {diagnostics.andJoined(described.toArray())}. {listing} Change the "
+            + "arguments to match one of them.";
+    }
+    return "{declared} takes the arguments {diagnostics.andJoined(typed.toArray())}. {listing} Change "
+        + "the arguments to match one of them.";
+}
+
+// The refusal of a call that only one of several candidates takes as many arguments as, against that
+// candidate: the first argument it does not take, and what it takes there. Null where no candidate or
+// several take that many.
+soleCountRefusal(List<CallCandidate> candidates, CallShape shape, string displayName, string kindWord,
+                 TypeNames names) -> string? {
+    long count = shape.argumentCount();
+    CallCandidate? sole = null;
+    for (let candidate in candidates) {
+        if (acceptsArgumentCount(candidate.signature(), count)) {
+            if (sole != null) {
+                return null;
+            }
+            sole = candidate;
+        }
+    }
+    if (sole == null || candidates.length() < 2) {
+        return null;
+    }
+    let outcome = mapArguments(sole.signature(), shape, kindWord, displayName);
+    if (!outcome.ok) {
+        return null;
+    }
+    for (long i = 0; i < count; i++) {
+        let argument = shape.argumentAt(i);
+        Type wanted = sole.signature().parameters()[outcome.mapping[i]].type();
+        if (conversionRank(argument, wanted, true) > 0) {
+            continue;
+        }
+        string label = "{i + 1}";
+        if (argument.name().length > 0) {
+            label = "'{argument.name()}'";
+        }
+        string callee = "'{displayName}'";
+        string noun = "'{displayName}'";
+        if (kindWord == "Constructor" || kindWord == "Base constructor") {
+            callee = "the constructor of '{displayName}'";
+            noun = "constructor of '{displayName}'";
+        }
+        string passed = "has type {argumentText(argument, names)}";
+        if (argument.shape() != ArgumentShape.Typed && argument.aloneType() == null) {
+            passed = "is {argumentText(argument, names)}";
+        }
+        string taken = "{typenames.typeArticle(names.of(wanted))} {names.quoted(wanted)}";
+        string signature = quotedSignature(sole.signature(), names);
+        return "Argument {label} of {callee} {passed}, but {signature}, the only "
+            + "{noun} that takes {takenCount(count, count, "argument")}, takes {taken} there"
+            + "{shapeMismatch(argument, wanted)}.";
+    }
+    return null;
+}
+
+// Why a lambda or an array literal does not fit the parameter type 'wanted', opening with a comma, or
+// empty for any other argument.
+shapeMismatch(ArgumentValue argument, Type wanted) -> string {
+    Type core = convert.coreOf(wanted);
+    switch (argument.shape()) {
+        Lambda -> {
+            if (core is FunctionType) {
+                long taken = core.parameterTypes().length;
+                return ", which takes {takenCount(taken, taken, "parameter")}";
+            }
+            return ", which is not a function type";
+        },
+        ArrayLiteral -> {
+            if (!(core is ArrayType)) {
+                return ", which is not an array type";
+            }
+            return "";
+        },
+        default -> {
+            return "";
+        },
+    }
+}
+
+// An argument as a refusal lists what a call passes: its type, or what is written where it names no
+// type of its own.
+argumentText(ArgumentValue argument, TypeNames names) -> string {
+    switch (argument.shape()) {
+        Lambda -> {
+            long count = argument.declaredParameterCount();
+            return "a lambda with {takenCount(count, count, "parameter")}";
+        },
+        Name -> {
+            return "the name of a method or function";
+        },
+        ArrayLiteral -> {
+            let alone = argument.aloneType();
+            if (alone != null) {
+                return names.quoted(alone);
+            }
+            if (argument.elements().length == 0) {
+                return "an empty '[]'";
+            }
+            return "an array literal";
+        },
+        StructLiteral -> {
+            return "a struct literal";
+        },
+        Typed -> {
+            return names.quoted(argument.type());
+        },
+    }
 }
 
 // The refusal of a call that several declarations accept equally well. The fix converts every
 // argument whose parameter type differs among them to the type the first of them takes, which
-// makes that one match best. When the passed arguments agree, the fix passes the first defaulted
-// argument whose type differs among them.
+// makes that one match best, or declares them as locals of that type where one of them names no type
+// of its own. When the passed arguments agree, the fix passes the first defaulted argument whose type
+// differs among them.
 ambiguityMessage(List<ViableCandidate> best, CallShape shape, string displayName, string kindWord,
                  TypeNames names) -> string {
     let shown = new List<CallCandidate>();
@@ -624,9 +947,8 @@ ambiguityMessage(List<ViableCandidate> best, CallShape shape, string displayName
         + "clear which one to call.";
     let first = best.get(0);
     Parameter[] wanted = first.candidate.signature().parameters();
-    let written = new List<string>();
-    let described = new List<string>();
-    bool renderable = true;
+    let differing = new List<long>();
+    bool untyped = false;
     for (long i = 0; i < shape.argumentCount(); i++) {
         Type target = wanted[first.mapping[i]].type();
         bool differs = false;
@@ -637,9 +959,20 @@ ambiguityMessage(List<ViableCandidate> best, CallShape shape, string displayName
             }
         }
         let argument = shape.argumentAt(i);
-        if (!differs || argument.type() == target) {
-            continue;
+        if (differs && argument.type() != target) {
+            differing.push(i);
+            untyped = untyped || argument.needsTarget();
         }
+    }
+    if (untyped) {
+        return "{problem} {localsFix(differing, first, shape, names)}";
+    }
+    let written = new List<string>();
+    let described = new List<string>();
+    bool renderable = true;
+    for (let i in differing) {
+        let argument = shape.argumentAt(i);
+        Type target = wanted[first.mapping[i]].type();
         string? text = literalText(argument);
         if (text == null) {
             renderable = false;
@@ -661,6 +994,46 @@ ambiguityMessage(List<ViableCandidate> best, CallShape shape, string displayName
             + "{diagnostics.andJoined(written.toArray())}, so the call matches one of them exactly.";
     }
     return "{problem} {defaultedArgumentFix(best, shape, displayName, kindWord, names)}";
+}
+
+// The fix for a call whose arguments that differ among the candidates include one that names no type
+// of its own, which 'as' cannot convert: declare each of them as a local of the type the first
+// candidate takes, and pass the locals.
+localsFix(List<long> differing, ViableCandidate first, CallShape shape, TypeNames names) -> string {
+    Parameter[] wanted = first.candidate.signature().parameters();
+    if (differing.length() > 1) {
+        let declared = new List<string>();
+        for (let i in differing) {
+            Type type = wanted[first.mapping[i]].type();
+            declared.push("argument {i + 1} as a local of type {names.quoted(type)}");
+        }
+        return "Declare {diagnostics.andJoined(declared.toArray())} first, and pass the locals.";
+    }
+    long index = differing.get(0);
+    let argument = shape.argumentAt(index);
+    let parameter = wanted[first.mapping[index]];
+    Type type = parameter.type();
+    string noun = switch (argument.shape()) {
+        Lambda -> "the lambda",
+        ArrayLiteral -> "the array",
+        StructLiteral -> "the struct",
+        default -> "argument {index + 1}",
+    };
+    string? spelled = argument.spelling();
+    if (spelled == null) {
+        return "Declare {noun} as a local of type {names.quoted(type)} first, and pass the local.";
+    }
+    string base = parameter.name();
+    if (base.length == 0) {
+        base = "value";
+    }
+    string local = shape.localName(base);
+    string tail = " {local} = {spelled};";
+    string declaration = names.quotedCode(["", tail], [type]);
+    if (type is FunctionType && type.thrownTypes().length > 0) {
+        declaration = names.quotedCode(["(", "){tail}"], [type]);
+    }
+    return "Declare {noun} as a local first, as in {declaration}, and pass '{local}'.";
 }
 
 // The fix for candidates that differ only in a parameter the call leaves to its default: pass

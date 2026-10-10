@@ -7,6 +7,7 @@ import phases.calls;
 import ArgumentValue from phases.calls;
 import CallShape from phases.calls;
 import CallCandidate from phases.calls;
+import ArgumentShape from phases.calls;
 import model.convert;
 import model.literalvalues;
 import Scope from model.scopes;
@@ -262,6 +263,84 @@ test "fewer defaulted parameters break rank ties" {
     let chosen = resolved.chosen();
     try testing.assertTrue(chosen != null && chosen.signature() == oneParameter,
         "the candidate defaulting fewer parameters wins");
+}
+
+// A lambda and a name fit a function type by parameter count, and an array literal fits an array type by
+// the type it has alone, or by its least fitting element. A nullable parameter fits each as a conversion.
+test "a lambda, a name and an array literal fit a parameter by what is written" {
+    let store = new TypeStore();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let longType = store.primitive(PrimitiveKind.Long);
+    let byteType = store.primitive(PrimitiveKind.Byte);
+    let unary = store.functionOf([intType], intType, []);
+    let binary = store.functionOf([intType, intType], intType, []);
+    let intArray = store.arrayOf(intType);
+    let longArray = store.arrayOf(longType);
+    Span nowhere = source.makeSpan(0, 0);
+    let lambda = new ArgumentValue("", store.errorType(), false, false, 0, false, nowhere);
+    lambda.markLambda(1);
+    try testing.assertTrue(lambda.shape() == ArgumentShape.Lambda && lambda.needsTarget(),
+        "a lambda is typed once a candidate is chosen");
+    try testing.assertEqual(calls.conversionRank(lambda, unary), 3L);
+    try testing.assertEqual(calls.conversionRank(lambda, binary), 0L);
+    try testing.assertEqual(calls.conversionRank(lambda, store.optionalOf(unary)), 2L);
+    try testing.assertEqual(calls.conversionRank(lambda, intType), 0L);
+    let name = new ArgumentValue("", store.errorType(), false, false, 0, false, nowhere);
+    name.markName([1, 2]);
+    try testing.assertEqual(calls.conversionRank(name, binary), 3L);
+    try testing.assertTrue(name.holdsName(), "a name is refused on its own where no candidate is chosen");
+    let one = new ArgumentValue("", intType, true, false, 1, false, nowhere);
+    let literal = new ArgumentValue("", store.errorType(), false, false, 0, false, nowhere);
+    literal.markArrayLiteral([one, one], intArray);
+    try testing.assertEqual(calls.conversionRank(literal, intArray), 3L);
+    try testing.assertEqual(calls.conversionRank(literal, longArray), 0L);
+    try testing.assertEqual(calls.conversionRank(literal, longArray, true), 2L);
+    try testing.assertEqual(calls.conversionRank(literal, store.arrayOf(byteType), true), 1L);
+    let empty = new ArgumentValue("", store.errorType(), false, false, 0, false, nowhere);
+    empty.markArrayLiteral([], null);
+    try testing.assertEqual(calls.conversionRank(empty, longArray), 3L);
+    try testing.assertEqual(calls.conversionRank(empty, intType), 0L);
+}
+
+// Two function types of the same parameter count tie for a lambda, which 'as' cannot convert, so the fix
+// declares it as a local. A name in a call that resolves to nothing reports nothing here.
+test "a tie a lambda leaves is fixed with a local, and a call passing a name reports nothing itself" {
+    let store = new TypeStore();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let longType = store.primitive(PrimitiveKind.Long);
+    Span nowhere = source.makeSpan(0, 0);
+    let toInt = new Signature("tie", [new Parameter("step", store.functionOf([intType], intType, []), false,
+        false, false, nowhere)], intType, false, false, [], [], [], null, nowhere);
+    let toLong = new Signature("tie", [new Parameter("step", store.functionOf([intType], longType, []), false,
+        false, false, nowhere)], intType, false, false, [], [], [], null, nowhere);
+    let candidates = new List<CallCandidate>();
+    candidates.push(new CallCandidate(toInt, null, true));
+    candidates.push(new CallCandidate(toLong, null, true));
+
+    let sink = new List<FileDiagnostic>();
+    let reporter = new Reporter("/t.ens", sink);
+    let shape = new CallShape();
+    shape.setLocalNamer((base) -> base + "2");
+    let lambda = new ArgumentValue("", store.errorType(), false, false, 0, false, nowhere);
+    lambda.markLambda(1);
+    lambda.setSpelling("(x) -> x + 1");
+    shape.positional().push(lambda);
+    let resolved = calls.resolveCall(candidates, shape, reporter, nowhere, "tie", "Function",
+        sema_support.namesOfNoFile(store));
+    try testing.assertTrue(resolved.failed(), "a same-shape tie does not resolve");
+    try sema_support.assertDiagnostic(sink.toArray(), 0, "/t.ens", "This call matches 'tie((int) -> int)' "
+        + "and 'tie((int) -> long)' equally well, so it is not clear which one to call. Declare the lambda "
+        + "as a local first, as in '(int) -> int step2 = (x) -> x + 1;', and pass 'step2'.");
+
+    let quiet = new List<FileDiagnostic>();
+    let named = new CallShape();
+    let name = new ArgumentValue("", store.errorType(), false, false, 0, false, nowhere);
+    name.markName([1]);
+    named.positional().push(name);
+    let unresolved = calls.resolveCall(candidates, named, new Reporter("/t.ens", quiet), nowhere, "tie",
+        "Function", sema_support.namesOfNoFile(store));
+    try testing.assertTrue(unresolved.failed(), "a name that ties does not resolve");
+    try testing.assertEqual(quiet.length(), 0L);
 }
 
 test "unmatchable calls report the single-candidate failure" {
