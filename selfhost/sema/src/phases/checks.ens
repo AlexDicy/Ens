@@ -45,16 +45,144 @@ import PrimitiveBinding from model.types;
 import TypeParamType from model.types;
 import Visibility from model.types;
 import List from @std.collections.list;
+import Map from @std.collections.map;
 import Set from @std.collections.set;
 import StringBuilder from @std.text.stringbuilder;
 
 public checkProgram(List<ModuleContext> contexts) -> FileDiagnostic[] {
     let collected = new List<FileDiagnostic>();
+    let references = new ProgramReferences(contexts);
     for (long i = 0; i < contexts.length(); i++) {
-        let checker = new ModuleChecks(contexts.get(i), collected);
+        let checker = new ModuleChecks(contexts.get(i), collected, references);
         checker.run();
     }
     return diagnostics.sorted(collected);
+}
+
+// What the declarations of a program reach from other modules and from other types, which a fix that
+// lowers a declaration's visibility would break: by module path, the names other modules import from
+// it, whether another module imports it whole, which reaches its functions, and whether another module
+// imports from it at all; and by type, the types that extend or implement it.
+final class ProgramReferences {
+    Map<string, Set<string>> namedImports;
+    Set<string> wholeImports;
+    Map<DeclaredType, List<DeclaredType>> derivedTypes;
+
+    protected constructor(List<ModuleContext> contexts) {
+        this.namedImports = new Map<string, Set<string>>();
+        this.wholeImports = new Set<string>();
+        this.derivedTypes = new Map<DeclaredType, List<DeclaredType>>();
+        for (let context in contexts) {
+            this.noteDerivedTypes(context);
+            let records = context.declarations().imports();
+            let targets = context.module().importTargets();
+            for (long i = 0; i < records.length && i < targets.length; i++) {
+                let target = targets[i];
+                if (target == null || target == context.module().canonicalPath()) {
+                    continue;
+                }
+                if (!records[i].isNamed()) {
+                    this.wholeImports.add(target);
+                    continue;
+                }
+                let names = this.namedImports.get(target);
+                if (names == null) {
+                    names = new Set<string>();
+                    this.namedImports.set(target, names);
+                }
+                names.add(records[i].name());
+            }
+        }
+    }
+
+    // Records each type the module declares under the types it extends or implements.
+    noteDerivedTypes(ModuleContext context) {
+        let store = context.resolver().typeStore();
+        string modulePath = context.module().canonicalPath();
+        for (let declaration in context.declarations().types()) {
+            let declared = store.findDeclared(modulePath, declaration.name());
+            switch (declared) {
+                is ClassType classType -> {
+                    this.noteDerived(classType.base(), classType);
+                    for (let implemented in classType.interfaces()) {
+                        this.noteDerived(implemented, classType);
+                    }
+                },
+                is InterfaceType interfaceType -> {
+                    this.noteDerived(interfaceType.base(), interfaceType);
+                },
+                is StructType structType -> {
+                    for (let implemented in structType.interfaces()) {
+                        this.noteDerived(implemented, structType);
+                    }
+                },
+                default -> { },
+            }
+        }
+    }
+
+    noteDerived(Type? base, DeclaredType derived) {
+        if (base == null) {
+            return;
+        }
+        let authority = types.authorityOf(base);
+        if (authority == null) {
+            return;
+        }
+        let found = this.derivedTypes.get(authority);
+        if (found == null) {
+            found = new List<DeclaredType>();
+            this.derivedTypes.set(authority, found);
+        }
+        found.push(derived);
+    }
+
+    // Whether a module other than the one at 'modulePath' imports its type 'name' by name, the only way
+    // another module names a type.
+    protected typeImportedElsewhere(string modulePath, string name) -> bool {
+        let names = this.namedImports.get(modulePath);
+        return names != null && names.contains(name);
+    }
+
+    // Whether a module other than the one at 'modulePath' imports it whole, the only way another module
+    // reaches its functions.
+    protected importedWholeElsewhere(string modulePath) -> bool {
+        return this.wholeImports.contains(modulePath);
+    }
+
+    // Whether a module other than the one at 'modulePath' imports anything from it.
+    protected importedElsewhere(string modulePath) -> bool {
+        return this.wholeImports.contains(modulePath) || this.namedImports.get(modulePath) != null;
+    }
+
+    // The types that extend or implement 'declared' directly.
+    protected derivedFrom(DeclaredType declared) -> List<DeclaredType> {
+        return this.derivedTypes.get(declared) ?? new List<DeclaredType>();
+    }
+}
+
+// What a fix that lowers a declaration's visibility changes: the type 'declared' itself, a member of
+// the type 'owner', which is 'overriding' where it overrides or provides a method of a base or an
+// interface, or the function 'function' of the module being checked.
+final class Lowering {
+    protected DeclaredType? declared;
+    protected DeclaredType? owner;
+    protected bool overriding;
+    protected string function;
+
+    protected constructor(this.declared, this.owner, this.overriding, this.function);
+}
+
+typeLowering(DeclaredType declared) -> Lowering {
+    return new Lowering(declared, null, false, "");
+}
+
+memberLowering(DeclaredType owner, bool overriding = false) -> Lowering {
+    return new Lowering(null, owner, overriding, "");
+}
+
+functionLowering(string name) -> Lowering {
+    return new Lowering(null, null, false, name);
 }
 
 class FoundIdentifier {
@@ -73,6 +201,7 @@ class CycleStep {
 
 class ModuleChecks {
     ModuleContext context;
+    ProgramReferences references;
     Reporter reporter;
     TypeNames names;
     string modulePath;
@@ -83,8 +212,10 @@ class ModuleChecks {
     List<InterfaceDeclarationNode> interfaceNodes;
     List<PrimitiveDeclarationNode> primitiveNodes;
 
-    protected constructor(ModuleContext context, List<FileDiagnostic> collected) {
+    protected constructor(ModuleContext context, List<FileDiagnostic> collected,
+                          ProgramReferences references) {
         this.context = context;
+        this.references = references;
         this.reporter = new Reporter(context.module().filePath(), collected);
         this.names = context.names();
         this.modulePath = context.module().canonicalPath();
@@ -836,7 +967,8 @@ class ModuleChecks {
                 continue;
             }
             this.checkCallableLeaks(entry.signature(), entry.visibility(),
-                "Function '{entry.signature().name()}'", "'{entry.signature().name()}'");
+                "Function '{entry.signature().name()}'", "'{entry.signature().name()}'",
+                functionLowering(entry.signature().name()));
         }
         for (long i = 0; i < this.structNodes.length(); i++) {
             let node = this.structNodes.get(i);
@@ -846,8 +978,8 @@ class ModuleChecks {
             }
             string declPhrase = "Struct {this.names.quotedName(structType)}";
             this.checkBoundLeaks(structType.typeParameterTypes(), structType.visibility(),
-                declPhrase, "{this.names.quotedName(structType)}", node.name().span(), null,
-                structType);
+                declPhrase, "{this.names.quotedName(structType)}", node.name().span(),
+                typeLowering(structType));
             this.checkMemberLeaks("struct", structType, structType.fields(), 0,
                 structType.methods(), fileReach());
             this.checkMemberLeaks("struct", structType, structType.staticFields(), 0,
@@ -863,8 +995,8 @@ class ModuleChecks {
             this.checkClassBaseLeaks(classType, node, declPhrase);
             this.checkImplementedInterfaceLeaks(classType, node, declPhrase);
             this.checkBoundLeaks(classType.typeParameterTypes(), classType.visibility(),
-                declPhrase, "{this.names.quotedName(classType)}", node.name().span(), null,
-                classType);
+                declPhrase, "{this.names.quotedName(classType)}", node.name().span(),
+                typeLowering(classType));
             let reach = subclassReach(classType);
             this.checkMemberLeaks("class", classType, classType.fields(),
                 classType.baseFieldCount(), classType.methods(), reach);
@@ -893,12 +1025,14 @@ class ModuleChecks {
             string declPhrase = "Interface {interfaceName}";
             this.checkInterfaceBaseLeaks(interfaceType, node, declPhrase);
             this.checkBoundLeaks(interfaceType.typeParameterTypes(),
-                interfaceType.visibility(), declPhrase, "{interfaceName}", node.name().span());
+                interfaceType.visibility(), declPhrase, "{interfaceName}", node.name().span(),
+                typeLowering(interfaceType));
             let methods = interfaceType.methods();
             for (long m = 0; m < methods.length(); m++) {
                 let method = methods.get(m);
                 this.checkCallableLeaks(method.signature(), method.visibility(),
-                    "Method '{method.name()}' of interface {interfaceName}", "{interfaceName}");
+                    "Method '{method.name()}' of interface {interfaceName}", "{interfaceName}",
+                    typeLowering(interfaceType));
             }
         }
     }
@@ -921,15 +1055,16 @@ class ModuleChecks {
         if (baseAuthority != null && types.visibilityTier(baseAuthority.visibility())
                     < types.visibilityTier(classType.visibility())) {
             string needed = types.visibilityWord(classType.visibility());
+            string lowering = this.loweringClause(target, classType.visibility(), baseAuthority,
+                typeLowering(classType));
             this.reporter.report("{declPhrase} is '{needed}', but its base class "
                 + "{this.names.quotedName(baseAuthority)} is {notNameablePhrase(baseAuthority)}. Mark "
-                + "{this.names.quotedName(baseAuthority)} '{needed}', or "
-                + "{loweringFix(target, classType.visibility(), baseAuthority, classType)}.", at);
+                + "{this.names.quotedName(baseAuthority)} '{needed}'{lowering}.", at);
         }
         if (base is InstantiationType) {
             for (let argument in base.arguments()) {
                 this.checkMentionedType(argument, classType.visibility(), declPhrase, target,
-                    "base class type argument", at, null, classType);
+                    "base class type argument", at, typeLowering(classType));
             }
         }
     }
@@ -952,15 +1087,16 @@ class ModuleChecks {
         if (baseAuthority != null && types.visibilityTier(baseAuthority.visibility())
                     < types.visibilityTier(interfaceType.visibility())) {
             string needed = types.visibilityWord(interfaceType.visibility());
+            string lowering = this.loweringClause(target, interfaceType.visibility(), baseAuthority,
+                typeLowering(interfaceType));
             this.reporter.report("{declPhrase} is '{needed}', but the interface it extends, "
                 + "{this.names.quotedName(baseAuthority)}, is {notNameablePhrase(baseAuthority)}. "
-                + "Mark {this.names.quotedName(baseAuthority)} '{needed}', or "
-                + "{loweringFix(target, interfaceType.visibility(), baseAuthority, null)}.", at);
+                + "Mark {this.names.quotedName(baseAuthority)} '{needed}'{lowering}.", at);
         }
         if (base is InstantiationType) {
             for (let argument in base.arguments()) {
                 this.checkMentionedType(argument, interfaceType.visibility(), declPhrase, target,
-                    "extended interface type argument", at);
+                    "extended interface type argument", at, typeLowering(interfaceType));
             }
         }
     }
@@ -979,7 +1115,7 @@ class ModuleChecks {
             if (resolved != null) {
                 this.checkMentionedType(resolved, classType.visibility(), declPhrase,
                     "{this.names.quotedName(classType)}", "implemented interface", reference.span(),
-                    null, classType);
+                    typeLowering(classType));
             }
         }
     }
@@ -1006,7 +1142,7 @@ class ModuleChecks {
             }
             this.checkMentionedType(field.type(), effective,
                 "Field '{field.name()}' of {owner}", "'{field.name()}'", "type", field.nameSpan(),
-                protectedOwner);
+                memberLowering(ownerType), protectedOwner);
         }
         for (long i = 0; i < methods.length(); i++) {
             let method = methods.get(i);
@@ -1023,56 +1159,57 @@ class ModuleChecks {
                 target = "the constructor";
             }
             this.checkCallableLeaks(method.signature(), effective,
-                memberWord + " of " + owner, target, protectedOwner);
+                memberWord + " of " + owner, target, memberLowering(ownerType, method.isOverride()),
+                protectedOwner);
             for (let constraint in method.constraints()) {
                 for (let bound in constraint.bounds()) {
                     this.checkMentionedType(bound, effective, memberWord + " of " + owner, target,
-                        "type-parameter bound", method.signature().nameSpan(), protectedOwner);
+                        "type-parameter bound", method.signature().nameSpan(),
+                        memberLowering(ownerType, method.isOverride()), protectedOwner);
                 }
             }
         }
     }
 
     // 'target' names the declaration whose visibility mark a fix changes.
+    // 'lowering' is what a fix that lowers the declaration 'target' names changes.
     checkCallableLeaks(Signature signature, Visibility declVisibility, string declPhrase,
-                       string target, ProtectedOwner? protectedOwner = null) {
+                       string target, Lowering lowering, ProtectedOwner? protectedOwner = null) {
         if (types.visibilityTier(declVisibility) == 0) {
             return;
         }
         for (let parameter in signature.parameters()) {
             this.checkMentionedType(parameter.type(), declVisibility, declPhrase, target,
-                "parameter type", parameter.span(), protectedOwner);
+                "parameter type", parameter.span(), lowering, protectedOwner);
         }
         this.checkMentionedType(signature.returnType(), declVisibility, declPhrase, target,
-            "return type", signature.nameSpan(), protectedOwner);
+            "return type", signature.nameSpan(), lowering, protectedOwner);
         Type[] thrown = signature.throwsTypes();
         Span[] thrownSpans = signature.throwsTypeSpans();
         for (long i = 0; i < thrown.length; i++) {
             this.checkMentionedType(thrown[i], declVisibility, declPhrase, target, "thrown type",
-                thrownSpans[i], protectedOwner);
+                thrownSpans[i], lowering, protectedOwner);
         }
         this.checkBoundLeaks(signature.typeParameters(), declVisibility, declPhrase, target,
-            signature.nameSpan(), protectedOwner);
+            signature.nameSpan(), lowering, protectedOwner);
     }
 
-    // 'lowered' is the type 'target' names, when it names a class or a struct.
     checkBoundLeaks(TypeParamType[] parameters, Visibility declVisibility, string declPhrase,
-                    string target, Span at, ProtectedOwner? protectedOwner = null,
-                    DeclaredType? lowered = null) {
+                    string target, Span at, Lowering lowering, ProtectedOwner? protectedOwner = null) {
         if (types.visibilityTier(declVisibility) == 0) {
             return;
         }
         for (let parameter in parameters) {
             for (let bound in parameter.bounds()) {
                 this.checkMentionedType(bound, declVisibility, declPhrase, target,
-                    "type-parameter bound", at, protectedOwner, lowered);
+                    "type-parameter bound", at, lowering, protectedOwner);
             }
         }
     }
 
     checkMentionedType(Type mentioned, Visibility declVisibility, string declPhrase,
-                       string target, string role, Span at, ProtectedOwner? protectedOwner = null,
-                       DeclaredType? lowered = null) {
+                       string target, string role, Span at, Lowering lowering,
+                       ProtectedOwner? protectedOwner = null) {
         let worst = leastVisibleMention(mentioned);
         if (worst == null || types.visibilityTier(worst.visibility())
                 >= types.visibilityTier(declVisibility)) {
@@ -1098,17 +1235,60 @@ class ModuleChecks {
                     at);
                 return;
             }
+            string lowered = "";
             string closing = "";
+            if (this.lowerable(typeLowering(ownerType), ownerType.visibility(), worst)) {
+                lowered = " Or {loweringFix("{ownerName}", declVisibility, worst, ownerType)}.";
+            }
             if (ownerType is ClassType && closable(ownerType)) {
                 closing = " Or mark {ownerName} 'final'.";
             }
             this.reporter.report("{declPhrase} is protected, and {ownerName} is '{needed}', "
-                + "so {subclass} can {verb} it, but {uses}. Mark {worstName} '{needed}'. Or "
-                + "{loweringFix("{ownerName}", declVisibility, worst, ownerType)}.{closing}", at);
+                + "so {subclass} can {verb} it, but {uses}. Mark {worstName} '{needed}'."
+                + "{lowered}{closing}", at);
             return;
         }
         this.reporter.report("{declPhrase} is '{needed}', but {uses}. Mark {worstName} "
-            + "'{needed}', or {loweringFix(target, declVisibility, worst, lowered)}.", at);
+            + "'{needed}'{this.loweringClause(target, declVisibility, worst, lowering)}.", at);
+    }
+
+    // The fix after the first that lowers 'target' to the visibility of 'worst', opening with ", or",
+    // or empty where lowering it breaks other code.
+    loweringClause(string target, Visibility declared, DeclaredType worst, Lowering lowering) -> string {
+        if (!this.lowerable(lowering, declared, worst)) {
+            return "";
+        }
+        return ", or {loweringFix(target, declared, worst, lowering.declared)}";
+    }
+
+    // Whether lowering a declaration of visibility 'declared' to the visibility of 'worst' leaves every
+    // other declaration valid. An 'export' declaration may be named outside the build. A type must not
+    // be imported by name into another module or be extended or implemented by a more visible type; a
+    // member must override nothing and belong to a type nothing extends, in a module no other module
+    // imports from; and a function must be in a module no other module imports whole.
+    lowerable(Lowering lowering, Visibility declared, DeclaredType worst) -> bool {
+        if (declared == Visibility.Export) {
+            return false;
+        }
+        Visibility lowered = loweredVisibility(worst);
+        let declaredType = lowering.declared;
+        let owner = lowering.owner;
+        if (declaredType != null) {
+            if (this.references.typeImportedElsewhere(declaredType.modulePath(), declaredType.name())) {
+                return false;
+            }
+            for (let derived in this.references.derivedFrom(declaredType)) {
+                if (types.visibilityTier(derived.visibility()) > types.visibilityTier(lowered)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        if (owner != null) {
+            return !lowering.overriding && !this.references.importedElsewhere(owner.modulePath())
+                && this.references.derivedFrom(owner).length() == 0;
+        }
+        return !this.references.importedWholeElsewhere(this.modulePath);
     }
 
     // The leak of a protected member of a sealed class, which mentions 'worst', through the open
@@ -1229,6 +1409,15 @@ fileReach() -> SubclassReach {
 // no other package can name, nothing outside this build can.
 closable(ClassType declared) -> bool {
     return declared.visibility() != Visibility.Export && declared.directSubclasses().length() == 0;
+}
+
+// The visibility a lowering fix gives a declaration that uses 'worst': none, which is private, where
+// 'worst' is private, and 'public' otherwise.
+loweredVisibility(DeclaredType worst) -> Visibility {
+    if (worst.visibility() == Visibility.Private) {
+        return Visibility.Private;
+    }
+    return Visibility.Public;
 }
 
 // Whether every class of 'classes' is closable.
