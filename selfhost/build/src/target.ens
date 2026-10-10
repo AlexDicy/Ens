@@ -9,6 +9,10 @@ import FileLoader from @ens.sema.support.loader;
 import ManifestSurvey from @ens.sema.program.workspace;
 import @ens.sema.program.workspace;
 import @ens.host.paths;
+import FileDiagnostic from @ens.sema.support.diagnostics;
+import SourceCatalog from diagnostics;
+import diagnostics;
+import report;
 
 export enum TargetKind {
     // One '.ens' file, compiled as a program whose main module is that file.
@@ -121,8 +125,11 @@ export final class BuildTarget {
 export final class TargetResolution {
     BuildTarget? found;
     string problem;
+    string[] manifestProblems;
 
-    protected constructor(this.found, this.problem);
+    protected constructor(this.found, this.problem, string[] manifestProblems = []) {
+        this.manifestProblems = manifestProblems;
+    }
 
     export target() -> BuildTarget? {
         return this.found;
@@ -130,6 +137,11 @@ export final class TargetResolution {
 
     export failure() -> string {
         return this.problem;
+    }
+
+    // Problems in the target's manifest that already name the file and position they are about.
+    export diagnostics() -> string[] {
+        return this.manifestProblems;
     }
 }
 
@@ -296,6 +308,11 @@ resolveFolder(FileLoader loader, Path folder) -> TargetResolution {
     if (declared.length > 0) {
         name = artifactStem(declared);
     }
+    FileDiagnostic[] problems = survey.diagnostics();
+    if (problems.length > 0) {
+        return failedInManifests(loader, problems,
+            "{name}: {report.problemCount(problems.length)} in its ens.package");
+    }
     let kind = TargetKind.Folder;
     if (survey.isPackage()) {
         kind = TargetKind.Package;
@@ -316,7 +333,15 @@ buildRootAbove(FileLoader loader, Path folder) -> Path {
 }
 
 resolveWorkspace(FileLoader loader, Path folder, ManifestSurvey survey) -> TargetResolution {
+    string name = folderStem(folder);
+    FileDiagnostic[] problems = survey.diagnostics();
+    if (problems.length > 0) {
+        return failedInManifests(loader, problems, "{name}: {report.problemCount(problems.length)} "
+            + "in its ens.package, so none of its members was read");
+    }
     let members = new List<WorkspaceMember>();
+    let memberProblems = new List<FileDiagnostic>();
+    long troubledMembers = 0;
     for (let listed in survey.members()) {
         Path memberFolder = folder.join(listed).normalize();
         let memberSurvey = workspace.surveyManifest(loader, memberFolder);
@@ -324,6 +349,13 @@ resolveWorkspace(FileLoader loader, Path folder, ManifestSurvey survey) -> Targe
             return failed("the workspace at '{folder}' lists the member '{listed}', but "
                 + "'{listed}' has no ens.package manifest. Add one that declares the member's "
                 + "package, or remove the member from the workspace");
+        }
+        if (memberSurvey.diagnostics().length > 0 && !memberSurvey.declaresNothing()) {
+            for (let problem in memberSurvey.diagnostics()) {
+                memberProblems.push(problem);
+            }
+            troubledMembers++;
+            continue;
         }
         if (!memberSurvey.isPackage()) {
             return failed("the workspace at '{folder}' lists the member '{listed}', but its "
@@ -333,17 +365,32 @@ resolveWorkspace(FileLoader loader, Path folder, ManifestSurvey survey) -> Targe
         members.push(new WorkspaceMember(memberSurvey.packageName(), memberFolder,
             memberSurvey.dependencies(), memberSurvey.ensVersion()));
     }
+    if (troubledMembers > 0) {
+        string where = "a member's ens.package";
+        if (troubledMembers > 1) {
+            where = "{troubledMembers} members' ens.package files";
+        }
+        return failedInManifests(loader, memberProblems.toArray(),
+            "{name}: {report.problemCount(memberProblems.length())} in {where}, so none of its "
+            + "members was read");
+    }
     WorkspaceMember[] listed = members.toArray();
     let agreement = versionAgreement(listed);
     if (agreement.failure().length > 0) {
         return failed(agreement.failure());
     }
     return new TargetResolution(new BuildTarget(TargetKind.Workspace, folder, folder, Path(""), "",
-        folderStem(folder), "", listed, agreement.version(), folder), "");
+        name, "", listed, agreement.version(), folder), "");
 }
 
 failed(string problem) -> TargetResolution {
     return new TargetResolution(null, problem);
+}
+
+// A target whose manifests have problems, which stop the command before any source is read.
+failedInManifests(FileLoader loader, FileDiagnostic[] problems, string summary) -> TargetResolution {
+    return new TargetResolution(null, summary,
+        diagnostics.formatAll(problems, new SourceCatalog(loader)));
 }
 
 noMembers() -> WorkspaceMember[] {

@@ -1295,6 +1295,50 @@ task("test")
                 "split.lib",
                 "'0.1'", "'0.2'")
 
+            -- a workspace whose own manifest has problems reports each of them and reads no member
+            local misdeclared = path.join(root, "misdeclared")
+            os.mkdir(path.join(misdeclared, "app", "src"))
+            io.writefile(path.join(misdeclared, "ens.package"),
+                'workspace {\n    member "app"\n    version "1.0";\n}\n')
+            io.writefile(path.join(misdeclared, "app", "ens.package"),
+                'package misdeclared.app {\n    ens "0.1";\n}\n')
+            io.writefile(path.join(misdeclared, "app", "src", "main.ens"),
+                'main() -> int {\n    return 0;\n}\n')
+            for _, command in ipairs({"build", "check"}) do
+                run({command, misdeclared}, nil, 1,
+                    "ens.package:2:17: error: Expected ';' after the member declaration.",
+                    "ens.package:3:5: error: Expected a 'member' line inside the workspace "
+                    .. "declaration. For example, write 'member \"frontend\";'.",
+                    "ens: misdeclared: 2 problems in its ens.package, so none of its members was read",
+                    "!misdeclared.app")
+            end
+
+            -- a package whose manifest has problems reports each of them and reads no source
+            local unfinished = path.join(root, "unfinished")
+            os.mkdir(path.join(unfinished, "src"))
+            io.writefile(path.join(unfinished, "ens.package"),
+                'package demo.unfinished {\n    ens "0.1"\n}\n')
+            io.writefile(path.join(unfinished, "src", "main.ens"),
+                'main() -> int {\n    return missing();\n}\n')
+            for _, command in ipairs({"build", "check"}) do
+                run({command, unfinished}, nil, 1,
+                    "ens.package:2:14: error: Expected ';' after the 'ens' declaration.",
+                    "ens: unfinished: 1 problem in its ens.package", "!missing")
+            end
+
+            -- an empty manifest declares nothing, which is its one problem
+            local empty = path.join(root, "empty")
+            os.mkdir(path.join(empty, "src"))
+            io.writefile(path.join(empty, "ens.package"), '')
+            io.writefile(path.join(empty, "src", "main.ens"),
+                'main() -> int {\n    return missing();\n}\n')
+            for _, command in ipairs({"build", "check"}) do
+                run({command, empty}, nil, 1, "ens.package:1:1: error: This manifest declares "
+                    .. "nothing. Declare the package, as in 'package app { ens \"0.1\"; }', or a "
+                    .. "workspace, as in 'workspace { member \"app\"; }'.",
+                    "ens: empty: 1 problem in its ens.package", "!missing")
+            end
+
             -- a source folder reached through a symbolic link is compiled, which is how a checkout
             -- that shares one folder between two packages builds at all. The link is made with the
             -- system's own command, and Windows makes a junction, which needs no privilege a test
@@ -1626,6 +1670,55 @@ task("test")
             os.rm(beta_tests)
             run({"test", suites}, nil, 0, "There are no tests in",
                 "1/1 tests passed across 1 member")
+
+            -- a workspace whose own manifest has problems reports each of them and reads no member
+            local misdeclared = path.join(root, "misdeclared")
+            os.mkdir(misdeclared)
+            io.writefile(path.join(misdeclared, "ens.package"),
+                'workspace {\n    member "app"\n    version "1.0";\n}\n')
+            writePackage(path.join(misdeclared, "app"),
+                'package misdeclared.app {\n    ens "0.1";\n}\n', {
+                ["src/main.ens"] = 'main() -> int {\n    print("the misdeclared program");\n'
+                    .. '    return 0;\n}\n',
+                ["tests/main_test.ens"] = 'import @std.testing;\n\n'
+                    .. 'test "misdeclared holds" {\n    try testing.assertEqual(1, 1);\n}\n',
+            })
+            for _, command in ipairs({"run", "test"}) do
+                run({command, misdeclared}, nil, 1,
+                    "ens.package:2:17: error: Expected ';' after the member declaration.",
+                    "ens.package:3:5: error: Expected a 'member' line inside the workspace "
+                    .. "declaration. For example, write 'member \"frontend\";'.",
+                    "ens: misdeclared: 2 problems in its ens.package, so none of its members was read",
+                    "!the misdeclared program", "!misdeclared holds")
+            end
+
+            -- a package whose manifest has problems reports each of them and reads no source, even
+            -- when it has no tests for 'ens test' to run
+            local unfinished = path.join(root, "unfinished")
+            writePackage(unfinished, 'package demo.unfinished {\n    ens "0.1"\n}\n', {
+                ["src/main.ens"] = 'main() -> int {\n    print("the unfinished program");\n'
+                    .. '    return 0;\n}\n',
+            })
+            for _, command in ipairs({"run", "test"}) do
+                run({command, unfinished}, nil, 1,
+                    "ens.package:2:14: error: Expected ';' after the 'ens' declaration.",
+                    "ens: unfinished: 1 problem in its ens.package", "!the unfinished program",
+                    "!There are no tests")
+            end
+
+            -- an empty manifest declares nothing, which is its one problem
+            local empty = path.join(root, "empty")
+            writePackage(empty, '', {
+                ["src/main.ens"] = 'main() -> int {\n    print("the empty program");\n'
+                    .. '    return 0;\n}\n',
+            })
+            for _, command in ipairs({"run", "test"}) do
+                run({command, empty}, nil, 1, "ens.package:1:1: error: This manifest declares "
+                    .. "nothing. Declare the package, as in 'package app { ens \"0.1\"; }', or a "
+                    .. "workspace, as in 'workspace { member \"app\"; }'.",
+                    "ens: empty: 1 problem in its ens.package", "!the empty program",
+                    "!There are no tests")
+            end
 
             if #failures == 0 then
                 return {name = name, ok = true}
