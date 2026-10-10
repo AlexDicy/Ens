@@ -120,18 +120,19 @@ skipDeepBlockBody(Parser parser) {
 
 // For a required Block slot with no '{' present. An empty Block with missing braces keeps the
 // typed accessors total. It is zero-width and consumes nothing, so the pair of braces is one
-// guess reaching no further than the statement being built. A '{' after closing brackets that
-// close nothing, as in 'if (ready)) {', is still the body, kept with the brackets in a Block
-// with missing braces.
-public parseBlockOrMissing(Parser parser, string message) {
-    long strays = strayClosersBeforeBrace(parser);
-    if (strays > 0) {
+// guess reaching no further than the statement being built. A '{' after tokens that cannot go
+// there, as in 'if (ready)) {' or 'if (ready) && set {', is still the body named by 'body', kept
+// with those tokens in a Block with missing braces. 'condition' is true when the parentheses
+// before the body hold one expression, which those tokens may have been meant to extend.
+public parseBlockOrMissing(Parser parser, string message, string body, bool condition) {
+    long junk = junkBeforeBrace(parser);
+    if (junk > 0) {
         let marker = parser.start();
         parser.missingInPlace();
         let statements = parser.start();
         let error = parser.start();
         let skipped = parser.start();
-        takeStrayClosers(parser, strays);
+        takeJunkBeforeBrace(parser, junk, body, condition);
         parser.complete(skipped, SyntaxKind.List);
         parser.complete(error, SyntaxKind.ErrorStatement);
         parseBlock(parser);
@@ -153,46 +154,87 @@ public parseBlockOrMissing(Parser parser, string message) {
     parser.complete(marker, SyntaxKind.Block);
 }
 
-// How many ')' and ']' at the cursor come right before a '{', or 0 when no '{' follows them.
-public strayClosersBeforeBrace(Parser parser) -> long {
+// How many tokens at the cursor come before the '{' of a body, or 0 when a ';' or '}' comes
+// first. A '{' inside brackets those tokens opened, such as a lambda's, is not the body's, and
+// neither is a '{' after a token a value follows, as in 'Point p = {x: 1};'.
+public junkBeforeBrace(Parser parser) -> long {
+    long depth = 0;
     long count = 0;
-    while (parser.peekKind(count) == SyntaxKind.CloseParenthesis
-            || parser.peekKind(count) == SyntaxKind.CloseBracket) {
+    while (true) {
+        switch (parser.peekKind(count)) {
+            OpenBrace -> {
+                if (depth <= 0) {
+                    if (count > 0 && expressions.takesValueAfter(parser.peekKind(count - 1))) {
+                        return 0;
+                    }
+                    return count;
+                }
+            },
+            Semicolon, CloseBrace, EndOfFile -> {
+                return 0;
+            },
+            OpenParenthesis, OpenBracket -> {
+                depth++;
+            },
+            CloseParenthesis, CloseBracket -> {
+                depth--;
+            },
+            default -> {},
+        }
         count++;
     }
-    if (parser.peekKind(count) != SyntaxKind.OpenBrace) {
-        return 0;
-    }
-    return count;
 }
 
-// Consumes the 'count' closing brackets at the cursor and reports them once.
-public takeStrayClosers(Parser parser, long count) {
+// Consumes the 'count' tokens at the cursor, which come before the '{' of 'body', and reports
+// them once.
+public takeJunkBeforeBrace(Parser parser, long count, string body, bool condition) {
     let tokens = parser.tokens();
     let first = tokens[parser.position()];
     let last = tokens[parser.position() + count - 1];
     string written = parser.text().substring(first.offset, last.end());
-    string message = "These closing brackets '{written}' have no matching opening brackets. "
-        + "Remove them.";
-    if (count == 1) {
-        string opener = "(";
-        if (first.kind == SyntaxKind.CloseBracket) {
-            opener = "[";
-        }
-        message = "This '{written}' has no matching '{opener}'. Remove it.";
-    }
-    parser.report(message, source.makeSpan(first.offset, last.end() - first.offset));
+    parser.report(junkMessage(parser, count, written, body, condition),
+        source.makeSpan(first.offset, last.end() - first.offset));
     for (long i = 0; i < count; i++) {
         parser.bump();
     }
 }
 
+// Closing brackets alone close nothing, and any other tokens cannot be written there at all. Tokens
+// that begin with an operator extending a condition, as '&& set' does, may belong inside it.
+junkMessage(Parser parser, long count, string written, string body, bool condition) -> string {
+    let tokens = parser.tokens();
+    long start = parser.position();
+    bool closersOnly = true;
+    for (long i = start; i < start + count; i++) {
+        let kind = tokens[i].kind;
+        if (kind != SyntaxKind.CloseParenthesis && kind != SyntaxKind.CloseBracket) {
+            closersOnly = false;
+        }
+    }
+    if (closersOnly && count == 1 && tokens[start].kind == SyntaxKind.CloseBracket) {
+        return "This ']' has no matching '['. Remove it.";
+    }
+    if (closersOnly && count == 1) {
+        return "This ')' has no matching '('. Remove it.";
+    }
+    if (closersOnly) {
+        return "These closing brackets '{written}' have no matching opening brackets. Remove them.";
+    }
+    string advice = "Remove it.";
+    if (condition && expressions.extendsExpression(tokens[start].kind)) {
+        advice = "Remove it, or move it inside the parentheses before it.";
+    }
+    return "'{written}' cannot be written before the '\{' that begins {body}. {advice}";
+}
+
 // Recovery inside blocks: wraps the junk in an ErrorStatement; a ';' ends the junk and is
-// consumed into it, and a '}' ends it unconsumed so the enclosing block can close.
+// consumed into it, and a '}' or '{' ends it unconsumed, so the enclosing block can close and a
+// block after the junk is parsed with its own '}'.
 parseStatementError(Parser parser, string message) {
     parser.reportAtCurrent(message);
     let marker = parser.start();
     let skipped = parser.start();
+    bool first = true;
     while (!parser.atEnd()) {
         let kind = parser.currentKind();
         if (kind == SyntaxKind.CloseBrace) {
@@ -202,7 +244,11 @@ parseStatementError(Parser parser, string message) {
             parser.bump();
             break;
         }
+        if (kind == SyntaxKind.OpenBrace && !first) {
+            break;
+        }
         parser.bump();
+        first = false;
     }
     parser.complete(skipped, SyntaxKind.List);
     parser.complete(marker, SyntaxKind.ErrorStatement);
@@ -332,14 +378,15 @@ parseIfStatement(Parser parser) {
     parseCondition(parser, "Expected '(' before the condition of 'if'. Write the condition in "
         + "parentheses, as in 'if (ready) \{ ... \}'.", "Expected ')' after the condition of 'if'.");
     parseBlockOrMissing(parser, "Expected '\{' to begin the body of 'if'. The branches of 'if' "
-        + "are always blocks, as in 'if (ready) \{ start(); \}'.");
+        + "are always blocks, as in 'if (ready) \{ start(); \}'.", "the body of 'if'", true);
     if (parser.at(SyntaxKind.ElseKeyword)) {
         let elseMarker = parser.start();
         parser.bump();
         if (parser.at(SyntaxKind.IfKeyword)) {
             parseElseIf(parser, parser.roomRefusalCount() > refusalsBefore);
         } else {
-            parseBlockOrMissing(parser, "Expected '\{' or another 'if' after 'else'.");
+            parseBlockOrMissing(parser, "Expected '\{' or another 'if' after 'else'.",
+                "the block after 'else'", false);
         }
         parser.complete(elseMarker, SyntaxKind.ElseClause);
     } else {
@@ -422,7 +469,8 @@ parseWhileStatement(Parser parser) {
     parseCondition(parser, "Expected '(' before the condition of 'while'. Write the condition in "
         + "parentheses, as in 'while (running) \{ ... \}'.",
         "Expected ')' after the condition of 'while'.");
-    parseBlockOrMissing(parser, "Expected '\{' to begin the loop body.");
+    parseBlockOrMissing(parser, "Expected '\{' to begin the loop body.", "the body of 'while'",
+        true);
     parser.complete(marker, SyntaxKind.WhileStatement);
 }
 
@@ -470,7 +518,7 @@ parseForStatement(Parser parser) {
         expressions.parseExpression(parser);
         parser.expect(SyntaxKind.CloseParenthesis, "Expected ')' after the values the loop walks "
             + "through, as in 'for (let item in items)'.");
-        parseBlockOrMissing(parser, "Expected '\{' to begin the loop body.");
+        parseBlockOrMissing(parser, "Expected '\{' to begin the loop body.", "the loop body", false);
         parser.complete(marker, SyntaxKind.ForEachStatement);
         return;
     }
@@ -500,7 +548,7 @@ parseForStatement(Parser parser) {
     }
     parser.expect(SyntaxKind.CloseParenthesis, "Expected ')' after the three parts of 'for', as "
         + "in 'for (int i = 0; i < 10; i++)'.");
-    parseBlockOrMissing(parser, "Expected '\{' to begin the loop body.");
+    parseBlockOrMissing(parser, "Expected '\{' to begin the loop body.", "the loop body", false);
     parser.complete(marker, SyntaxKind.ForStatement);
 }
 
@@ -594,19 +642,19 @@ parseSwitchParts(Parser parser) {
         + "'switch (color) \{ ... \}'.");
     expressions.parseExpression(parser);
     parser.expect(SyntaxKind.CloseParenthesis, "Expected ')' after the switch value.");
-    long strays = strayClosersBeforeBrace(parser);
-    if (strays > 0) {
+    long junk = junkBeforeBrace(parser);
+    if (junk > 0) {
         parser.missingInPlace();
     } else {
         parser.expect(SyntaxKind.OpenBrace, "Expected '\{' to begin the switch's arms.");
     }
     let arms = parser.start();
     bool needSeparator = false;
-    if (strays > 0) {
-        // Closing brackets that close nothing, and the '{' after them, are one error arm.
+    if (junk > 0) {
+        // The tokens that cannot go before the '{', and the '{' itself, are one error arm.
         let error = parser.start();
         let skipped = parser.start();
-        takeStrayClosers(parser, strays);
+        takeJunkBeforeBrace(parser, junk, "the switch's arms", true);
         parser.bump();
         parser.complete(skipped, SyntaxKind.List);
         parser.complete(error, SyntaxKind.ErrorSwitchArm);
