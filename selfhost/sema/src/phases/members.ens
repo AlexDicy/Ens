@@ -2,6 +2,7 @@
 // same readers serve structs, classes, interfaces, and free functions; the caller states what
 // the surrounding declaration allows.
 import FunctionDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import MemberListNode from @ens.frontend.syntax.generated.nodes;
 import FieldDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import SyntaxKind from @ens.frontend.syntax.generated.kind;
 import SyntaxToken from @ens.frontend.syntax.node;
@@ -1392,15 +1393,17 @@ public hashSignatureConforms(Signature signature) -> bool {
 // collections rely on, and it may not fail, because the language takes a value's hash where
 // no caller could write a 'try'.
 public checkHashSignature(Reporter reporter, FunctionDeclarationNode declaration,
-                          Signature signature, bool isConstructor, DeclaredType owner, TypeNames names) {
+                          Signature signature, bool isConstructor, DeclaredType owner, TypeNames names,
+                          bool marksOverride, MemberListNode? body) {
     if (isConstructor || signature.name() != "hash") {
         return;
     }
+    string rename = pairedRenameAdvice(body, declaration, "hash", "equals", marksOverride);
     let throwsClause = declaration.throwsClause();
     if (throwsClause != null) {
         reporter.report("A method named 'hash' cannot be marked 'throws': a hash is taken "
             + "where no 'try' can be written, such as on a Map or Set key. Remove 'throws', or "
-            + "rename the method.", throwsClause.throwsKeyword().span());
+            + "{rename}.", throwsClause.throwsKeyword().span());
     }
     bool returnsLong = false;
     let returned = signature.returnType();
@@ -1429,7 +1432,55 @@ public checkHashSignature(Reporter reporter, FunctionDeclarationNode declaration
         required = "'hash() -> long'";
     }
     reporter.report("Method 'hash' of {ownerPhrase(owner, names)} {problem}. A Map or Set calls 'hash()' "
-        + "to find a key. {reason}. Write {required}, or rename the method.", signature.nameSpan());
+        + "to find a key. {reason}. Write {required}, or {rename}.", signature.nameSpan());
+}
+
+renameAdvice(bool marksOverride) -> string {
+    if (marksOverride) {
+        return "rename the method and remove 'override'";
+    }
+    return "rename the method";
+}
+
+// The rename fix for 'hash' or 'equals'. Where the body of a class or a struct declares the other
+// one too, renaming one alone leaves the other unpaired, so the fix renames both and removes each
+// 'override' they carry. An interface has no pairing, so it passes no body.
+pairedRenameAdvice(MemberListNode? body, FunctionDeclarationNode declaration, string name,
+                   string partnerName, bool marksOverride) -> string {
+    if (body == null) {
+        return renameAdvice(marksOverride);
+    }
+    let partner = siblingMethod(body, declaration, partnerName);
+    if (partner == null) {
+        return renameAdvice(marksOverride);
+    }
+    bool partnerMarksOverride = functionModifiers(partner).declaresOverride;
+    string both = "rename both 'hash' and 'equals'";
+    if (marksOverride && partnerMarksOverride) {
+        return both + " and remove 'override' from each";
+    }
+    if (marksOverride) {
+        return both + " and remove 'override' from '{name}'";
+    }
+    if (partnerMarksOverride) {
+        return both + " and remove 'override' from '{partnerName}'";
+    }
+    return both;
+}
+
+// The method named 'name' declared in 'body' other than 'declaration', or null.
+siblingMethod(MemberListNode body, FunctionDeclarationNode declaration, string name)
+        -> FunctionDeclarationNode? {
+    for (long i = 0; i < body.membersCount(); i++) {
+        let member = body.members(i);
+        if (member is FunctionDeclarationNode && member.green() != declaration.green()) {
+            let nameToken = member.name();
+            if (nameToken != null && nameToken.text() == name) {
+                return member;
+            }
+        }
+    }
+    return null;
 }
 
 public toStringSignatureConforms(Signature signature) -> bool {
@@ -1448,7 +1499,7 @@ public isTextFormMethod(Signature signature) -> bool {
 }
 
 public checkToStringSignature(Reporter reporter, FunctionDeclarationNode declaration,
-                              Signature signature, bool isConstructor) {
+                              Signature signature, bool isConstructor, bool marksOverride) {
     if (isConstructor || !isTextFormMethod(signature)) {
         return;
     }
@@ -1456,11 +1507,15 @@ public checkToStringSignature(Reporter reporter, FunctionDeclarationNode declara
     if (throwsClause != null) {
         reporter.report("A method named 'toString' cannot be marked 'throws': a text form is "
             + "taken where no 'try' can be written, such as inside a '\{...\}' in a string. "
-            + "Remove 'throws', or rename the method.", throwsClause.throwsKeyword().span());
+            + "Remove 'throws', or {renameAdvice(marksOverride)}.", throwsClause.throwsKeyword().span());
     }
     if (!(signature.returnType() is StringType)) {
+        string ordinary = "a parameter";
+        if (marksOverride) {
+            ordinary = "remove 'override' and give it a parameter";
+        }
         reporter.report("A method named 'toString' must have the signature 'toString() -> "
-            + "string'. Give it a 'string' result, or a parameter to make it an ordinary "
+            + "string'. Give it a 'string' result, or {ordinary} to make it an ordinary "
             + "method.", signature.nameSpan());
     }
 }
@@ -1552,21 +1607,22 @@ public equalsIntent(Signature signature, Type owner) -> bool {
 
 public checkEqualsSignature(Reporter reporter, FunctionDeclarationNode declaration,
                             Signature signature, Type owner, bool isConstructor,
-                            TypeNames names) {
+                            TypeNames names, bool marksOverride, MemberListNode body) {
     if (isConstructor || signature.name() != "equals" || !equalsIntent(signature, owner)) {
         return;
     }
+    string rename = pairedRenameAdvice(body, declaration, "equals", "hash", marksOverride);
     let throwsClause = declaration.throwsClause();
     if (throwsClause != null) {
         reporter.report("A method named 'equals' cannot be marked 'throws': '==' calls it where "
-            + "no 'try' can be written. Remove 'throws', or rename the method.",
+            + "no 'try' can be written. Remove 'throws', or {rename}.",
             throwsClause.throwsKeyword().span());
     }
     if (!equalsSignatureConforms(signature, owner)) {
         string shown = names.quoted(owner);
         reporter.report("Method 'equals' takes a value of type {shown}, so '==' uses it to "
             + "compare two {shown} values, and it must return 'bool'. Change its return type to "
-            + "'bool', or rename the method.", signature.nameSpan());
+            + "'bool', or {rename}.", signature.nameSpan());
     }
 }
 
