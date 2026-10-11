@@ -25,6 +25,8 @@ import phases.bodies.valuejoins;
 import phases.bodies.literaltyping;
 import phases.bodies.nullguidance;
 import phases.bodies.wording;
+import support.diagnostics;
+import List from @std.collections.list;
 import phases.bodies.narrowing;
 import model.typenames;
 import TypeNames from model.typenames;
@@ -943,7 +945,7 @@ public analyzePrefix(BodyChecker checker, PrefixExpressionNode node) -> Type {
                     convert.isIntegerType(convert.coreOf(operand)), null);
                 checker.reporter().report(nullguidance.withGuidance(checker, "'~' flips the bits of an "
                     + "integer, but {wording.sideNamed(node.operand(), "the operand")} has type "
-                    + "{checker.names().quoted(operand)}.",
+                    + "{checker.names().quoted(operand)}.{flipFix(node.operand(), operand)}",
                     guidance), node.span());
                 return checker.store().errorType();
             }
@@ -1083,6 +1085,103 @@ shownSide(Type adapted, Type left, WriteTarget? written) -> Type {
     return adapted;
 }
 
+// The fix for '~' on 'operand' of type 'type': '!' negates a 'bool', and a floating-point number
+// converts to an integer first. Empty for any other type, and for a nullable one, whose own guidance
+// follows.
+flipFix(Expression operand, Type type) -> string {
+    if (convert.isBoolType(type)) {
+        return " Write '!{termSpelling(operand)}' to negate a 'bool'.";
+    }
+    string? converted = integerConversion(operand, type, "long");
+    if (converted == null) {
+        return "";
+    }
+    return " Write '~({converted})' to flip the bits of its whole number part.";
+}
+
+// The fix for '&', '|' or '^' on 'left' and 'right': two 'bool' values have an operator of their own,
+// and a side that is a floating-point number converts to the other side's integer type, or to 'long'
+// where neither side is an integer. Empty where a side converts to none, or is nullable, whose own
+// guidance follows.
+bitwiseFix(SyntaxKind operator, Expression leftNode, Expression rightNode, Type left, Type right,
+           TypeNames names) -> string {
+    if (convert.isBoolType(left) && convert.isBoolType(right)) {
+        switch (operator) {
+            Ampersand -> {
+                return " Write '&&' to require that both 'bool' values are true.";
+            },
+            Pipe -> {
+                return " Write '||' to require that either 'bool' value is true.";
+            },
+            default -> {
+                return " Write '!=' to require that exactly one of the 'bool' values is true.";
+            },
+        }
+    }
+    let sides = new List<Expression>();
+    let types = new List<Type>();
+    string target = "long";
+    if (convert.isIntegerType(left)) {
+        target = names.of(left);
+    } else {
+        sides.push(leftNode);
+        types.push(left);
+    }
+    if (convert.isIntegerType(right)) {
+        target = names.of(right);
+    } else {
+        sides.push(rightNode);
+        types.push(right);
+    }
+    return conversionFix(sides.toArray(), types.toArray(), target);
+}
+
+// The sentence that converts each of 'sides' to 'target', or empty where one of them converts to none.
+conversionFix(Expression[] sides, Type[] sideTypes, string target) -> string {
+    let converted = new List<string>();
+    for (long i = 0; i < sides.length; i++) {
+        string? written = integerConversion(sides[i], sideTypes[i], target);
+        if (written == null) {
+            return "";
+        }
+        converted.push("'{written}'");
+    }
+    if (converted.length() == 0) {
+        return "";
+    }
+    if (converted.length() == 1) {
+        return " Write {converted.get(0)} to use its whole number part.";
+    }
+    return " Write {diagnostics.andJoined(converted.toArray())} to use their whole number parts.";
+}
+
+// 'value' written as the integer type 'target': a floating-point number drops its fraction. Null for
+// any other type, and for a nullable one.
+integerConversion(Expression value, Type type, string target) -> string? {
+    if (convert.isFloatType(type)) {
+        return "{termSpelling(value)} as {target}";
+    }
+    return null;
+}
+
+// The integer type a shifted floating-point value converts to: the distance's own type, which the
+// shifted value must match, or 'long' where the distance is no integer either.
+shiftTarget(Type distance, TypeNames names) -> string {
+    if (convert.isIntegerType(distance)) {
+        return names.of(distance);
+    }
+    return "long";
+}
+
+// 'value' as code, in parentheses unless it is a single term.
+termSpelling(Expression value) -> string {
+    string spelled = wording.oneLineSpelling(value);
+    if (!wording.isSingleTerm(value)) {
+        return "({spelled})";
+    }
+    return spelled;
+}
+
 // The refusal of an operator's sides 'leftNode' and 'rightNode', naming the ones the operator does
 // not take. A shift names only the shifted value.
 public sidesRefusal(SyntaxKind operator, string operatorText, Expression leftNode, Expression rightNode,
@@ -1097,11 +1196,13 @@ public sidesRefusal(SyntaxKind operator, string operatorText, Expression leftNod
         Ampersand, Pipe, Caret -> {
             string sides = sidesClause(leftNode, rightNode, left, right, !convert.isIntegerType(left),
                 !convert.isIntegerType(right), names);
-            return "'{operatorText}' needs integers on both sides, {sides}.";
+            return "'{operatorText}' needs integers on both sides, {sides}."
+                + bitwiseFix(operator, leftNode, rightNode, left, right, names);
         },
         LessLess, GreaterGreater, GreaterGreaterGreater -> {
             return "'{operatorText}' shifts an integer, but "
-                + "{wording.sideNamed(leftNode, "the value it shifts")} has type {names.quoted(left)}.";
+                + "{wording.sideNamed(leftNode, "the value it shifts")} has type {names.quoted(left)}."
+                + conversionFix([leftNode], [left], shiftTarget(right, names));
         },
         default -> {
             string sides = sidesClause(leftNode, rightNode, left, right, !convert.isNumericType(left),
