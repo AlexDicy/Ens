@@ -1,20 +1,18 @@
 // The linker bridge: one C entry point over lld's three object-file drivers, since lld itself
 // exposes only a C++ interface. It carries no policy - the caller hands over a finished argument
 // vector and the flavor to run it under, and everything the linker printed comes back as one
-// allocated text the caller releases through ens_lld_free.
+// allocated text the caller releases through ens_lld_free. ens_lld_shutdown stops lld's thread
+// pool once, after the last link, while the process can still wait for its threads.
 
 #include "lld/Common/CommonLinkerContext.h"
 #include "lld/Common/Driver.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/Support/CrashRecoveryContext.h"
-#include "llvm/Support/Parallel.h"
+#include "llvm/Support/ManagedStatic.h"
 #include "llvm/Support/raw_ostream.h"
 
-#include <chrono>
-#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
-#include <mutex>
 #include <string>
 #include <vector>
 
@@ -105,33 +103,6 @@ bool runDriver(int flavor, llvm::ArrayRef<const char*> arguments, llvm::raw_ostr
     return linked;
 }
 
-constexpr std::chrono::seconds kStartTimeout{5};
-
-// Returns once every thread of lld's pool is running, since on Windows exiting while one is still
-// being created can crash the process or hang its exit. The wait ends early when no thread starts
-// for five seconds, and the entry point below still prevents the hang then.
-void waitForLinkerThreads() {
-    llvm::parallel::TaskGroup group;
-    if (!group.isParallel()) return;
-    const std::size_t count = llvm::parallel::getThreadCount();
-    std::mutex mutex;
-    std::condition_variable allStarted;
-    std::size_t started = 0;
-    auto lastStart = std::chrono::steady_clock::now();
-    for (std::size_t i = 0; i < count; ++i) {
-        group.spawn([&] {
-            std::unique_lock<std::mutex> lock(mutex);
-            lastStart = std::chrono::steady_clock::now();
-            if (++started == count) allStarted.notify_all();
-            const auto everyStarted = [&] { return started == count; };
-            while (!allStarted.wait_until(lock, lastStart + kStartTimeout, everyStarted)) {
-                if (std::chrono::steady_clock::now() >= lastStart + kStartTimeout) return;
-            }
-        });
-    }
-    group.sync();
-}
-
 }  // namespace
 
 extern "C" {
@@ -166,7 +137,6 @@ ENS_LLD_EXPORT int ens_lld_link(int flavor, const char* argumentBlock, long long
     std::string printed;
     llvm::raw_string_ostream stream(printed);
     const bool linked = runDriver(flavor, argv, stream, stream);
-    waitForLinkerThreads();
     stream.flush();
 
     if (output != nullptr && !printed.empty()) *output = copied(printed);
@@ -178,22 +148,18 @@ ENS_LLD_EXPORT void ens_lld_free(char* output) {
     std::free(output);
 }
 
-}  // extern "C"
-
-#if defined(_WIN32)
-
-#include <windows.h>
-
-extern "C" BOOL WINAPI _DllMainCRTStartup(HINSTANCE instance, DWORD reason, LPVOID reserved);
-
-// Windows ends every other thread before it calls this entry point for process exit, so a static
-// destructor waiting on lld's pool would never return. Teardown is skipped then and runs only when
-// the library is unloaded from a process that keeps running.
-extern "C" BOOL WINAPI ens_lld_entry(HINSTANCE instance, DWORD reason, LPVOID reserved) {
-    if (reason == DLL_PROCESS_DETACH && reserved != nullptr) return TRUE;
-    return _DllMainCRTStartup(instance, reason, reserved);
+// Stops the thread pool lld's parallel steps run on, which outlives the links that started it. It is
+// called after the last link, because a stopped pool is never started again, so a link
+// after it would wait for workers that are gone. LLVM's own account of the stop, from
+// llvm/lib/Support/Parallel.cpp: "The ManagedStatic enables the ThreadPoolExecutor to be stopped
+// via llvm_shutdown() which allows a "clean" fast exit, e.g. via _exit(). This stops the thread
+// pool and waits for any worker thread creation to complete but does not wait for the threads to
+// finish. The wait for worker thread creation to complete is important as it prevents intermittent
+// crashes on Windows due to a race condition between thread creation and process exit." Stopping it
+// here, while every thread is still alive, is what lets the pool's destructor at process exit return
+// at once instead of waiting on threads Windows has already ended.
+ENS_LLD_EXPORT void ens_lld_shutdown() {
+    llvm::llvm_shutdown();
 }
 
-#pragma comment(linker, "/entry:ens_lld_entry")
-
-#endif
+}  // extern "C"
