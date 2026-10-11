@@ -241,9 +241,10 @@ Open work is tracked as GitHub issues on `AlexDicy/Ens`, never in a file in the 
 - Each issue carries one area label (`frontend`, `sema`, `codegen`, `std`, `driver`, `lsp`, `infra`), chosen by the folder that changes, and one kind label (`soundness`, `bug`, `diagnostic-text`, `cleanup`, `feature`, `test-coverage`), the first that matches in that order.
   A `diagnostic-text` issue also carries a `diagnostic-rule:N` for each Diagnostics rule its text breaks.
   `design-ruling-needed` marks an issue that waits for a decision from Alex, and nobody works on it until Alex comments the ruling and removes the label.
-- A finding outside the change under review is filed, not fixed and not written down anywhere else.
+- A finding outside the change under review is fixed next in the session when it is in reach, as its own commit, and needs no issue.
+  It is filed only when it needs a ruling from Alex or cannot be done in the session, and the issue says which; it is never written down anywhere else.
   Search open and closed issues for a fragment of the text first (`gh issue list --state all --search "..."`), and comment on a match instead of filing a second one.
-  A finding the same session fixes next needs no issue: the fix lands as its own commit, and an issue would only be opened to be closed.
+  A text that reports a symptom whose fix is known is a workaround, not a change to land.
 - A commit subject that fixes an issue says `fixes #N` wherever it reads naturally, as in `Report a struct value cycle once, fixes #N`.
   GitHub closes the issue when the commit is pushed, so agents never close one.
 - Before committing, rerun the repros of the open issues that quote a text the change edits.
