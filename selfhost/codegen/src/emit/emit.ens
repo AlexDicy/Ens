@@ -18,6 +18,9 @@ import @ens.llvm.instructions;
 import @ens.llvm.memory;
 import @ens.llvm.globals;
 import @ens.llvm.analysis;
+import @ens.llvm.passes;
+import Context from @ens.llvm.core;
+import Module from @ens.llvm.core;
 import TargetMachine from @ens.llvm.target;
 import @ens.llvm.target;
 import List from @std.collections.list;
@@ -65,14 +68,16 @@ public emitModule(string moduleName, List<EirFunction> functions, EntryPoint? en
         return internalFailure("could not resolve the target '{triple}'");
     }
     let machine = resolved.createTargetMachine(triple, settings.llvmOptimizationLevel());
-    string outcome = emitInto(emitter, machine, functions, entry, definedDescriptors, objectPath);
+    string outcome = emitInto(emitter, machine, functions, entry, definedDescriptors, objectPath,
+        settings.llvmPassPipeline());
     machine.dispose();
     emitter.dispose();
     return outcome;
 }
 
 emitInto(ModuleEmitter emitter, TargetMachine machine, List<EirFunction> functions,
-         EntryPoint? entry, List<DescriptorPlan> definedDescriptors, string objectPath) -> string {
+         EntryPoint? entry, List<DescriptorPlan> definedDescriptors, string objectPath,
+         string? pipeline) -> string {
     let layout = machine.createDataLayout();
     emitter.recordDataLayout(layout);
     target.setModuleDataLayout(emitter.module, layout);
@@ -106,6 +111,14 @@ emitInto(ModuleEmitter emitter, TargetMachine machine, List<EirFunction> functio
     if (verdict.length > 0) {
         return internalFailure("module '{emitter.name()}' failed LLVM verification: {verdict}");
     }
+    if (pipeline != null) {
+        keepEveryFrame(emitter.context, emitter.module);
+        string refused = passes.runPasses(emitter.module, pipeline, machine);
+        if (refused.length > 0) {
+            return internalFailure("LLVM's pipeline '{pipeline}' did not run over module "
+                + "'{emitter.name()}': {refused}");
+        }
+    }
     string written = machine.emitObjectFile(emitter.module, objectPath);
     if (written.length > 0) {
         return written.substring(0, 1).toUpperAscii() + written.substring(1) + ". Check that the "
@@ -126,6 +139,24 @@ forceUnwindTables(ModuleEmitter emitter) {
     while (current != null) {
         if (!globals.isDeclaration(current)) {
             globals.addFunctionAttributeValued(emitter.context, current, "uwtable", 2);
+        }
+        current = globals.nextFunction(current);
+    }
+}
+
+// A trace names one frame for each call the program made, so LLVM's pipeline must neither inline
+// a function into its caller, which joins two frames into one, nor end a function by jumping to its
+// last callee, which removes the caller's frame. 'noinline' also keeps -O3 from specializing a copy
+// of a function, which no symbol entry names. A function marked 'alwaysinline' is still inlined, so
+// it must make no call a trace names.
+public keepEveryFrame(Context context, Module module) {
+    let current = globals.firstFunction(module);
+    while (current != null) {
+        if (!globals.isDeclaration(current)) {
+            if (!globals.hasFunctionAttribute(current, "alwaysinline")) {
+                globals.addFunctionAttribute(context, current, "noinline");
+            }
+            globals.addStringFunctionAttribute(context, current, "disable-tail-calls", "true");
         }
         current = globals.nextFunction(current);
     }

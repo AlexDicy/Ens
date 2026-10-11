@@ -1,8 +1,15 @@
-// What emission refuses to write. An object holding no code makes the Mach-O linker leave the first
-// function of the object after it without unwind information, which empties every stack trace
-// captured there, so a module with nothing to define must never reach emission at all.
+// What emission refuses to write, and what LLVM's pipeline may do to what it writes. An object
+// holding no code makes the Mach-O linker leave the first function of the object after it without
+// unwind information, which empties every stack trace captured there, so a module with nothing to
+// define must never reach emission at all.
 import @std.testing;
 import Path from @std.fs;
+import @ens.llvm.analysis;
+import @ens.llvm.globals;
+import @ens.llvm.instructions;
+import @ens.llvm.passes;
+import @ens.llvm.target;
+import EmissionHost from support;
 import EirFunction from eir.model;
 import DescriptorPlan from layout.descriptors;
 import DescriptorPlans from layout.descriptors;
@@ -21,4 +28,47 @@ test "a module defining no function is refused instead of written" {
         "the refusal must say what an object with no code costs: {failure}");
     try testing.assertFalse(object.exists(),
         "a refused module must leave no object file behind");
+}
+
+test "LLVM's pipeline inlines the retain and keeps every other call a call of its own" {
+    let host = new EmissionHost("emit_frames");
+    let pointer = host.context.pointerType();
+    let callType = host.context.voidType().functionType([pointer]);
+    let sink = host.module.addFunction("sink", callType);
+    let callee = host.module.addFunction("callee", callType);
+    let calleeBuilder = host.context.createBuilder();
+    calleeBuilder.positionAtEnd(host.context.appendBasicBlock(callee, "entry"));
+    instructions.buildCall(calleeBuilder, callType, sink, [globals.getParam(callee, 0)], "");
+    instructions.buildRetVoid(calleeBuilder);
+    calleeBuilder.dispose();
+
+    let object = host.runtime.call(host.runtime.alloc(), [host.runtime.int64(24),
+        host.runtime.nullPointer(), host.runtime.nullPointer()], "");
+    host.runtime.call(host.runtime.retain(), [object], "");
+    instructions.buildCall(host.builder, callType, callee, [object], "");
+    instructions.buildRetVoid(host.builder);
+    try testing.assertEqual(analysis.verify(host.module), "");
+
+    string triple = target.hostTargetTriple();
+    let resolved = target.targetFromTriple(triple);
+    try testing.assertTrue(resolved != null, "the host target '{triple}' did not resolve");
+    if (resolved == null) {
+        return;
+    }
+    let machine = resolved.createTargetMachine(triple, 2);
+    emit.keepEveryFrame(host.context, host.module);
+    string refused = passes.runPasses(host.module, "default<O2>", machine);
+    machine.dispose();
+    try testing.assertEqual(refused, "");
+    string text = analysis.moduleText(host.module);
+    try testing.assertTrue(text.indexOf("call void @ens_retain") < 0,
+        "the retain was not inlined: {text}");
+    try testing.assertTrue(text.indexOf("atomicrmw add") >= 0,
+        "the inlined retain lost its count: {text}");
+    try testing.assertTrue(text.indexOf("call void @callee(") >= 0, "the callee was inlined: {text}");
+    try testing.assertTrue(text.indexOf("call void @sink(") >= 0,
+        "the callee lost its own call: {text}");
+    try testing.assertTrue(text.indexOf("tail call") < 0, "a call became a tail call: {text}");
+    host.builder.dispose();
+    host.context.dispose();
 }
