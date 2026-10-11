@@ -13,6 +13,9 @@ import ErrorSwitchArmNode from @ens.frontend.syntax.generated.nodes;
 import ArmBody from @ens.frontend.syntax.generated.nodes;
 import LiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
 import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ThisExpressionNode from @ens.frontend.syntax.generated.nodes;
+import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SyntaxNode from @ens.frontend.syntax.node;
 import SyntaxKind from @ens.frontend.syntax.generated.kind;
 import Span from @ens.frontend.support.source;
 import LocalBinding from model.scopes;
@@ -50,29 +53,115 @@ import Set from @std.collections.set;
 import BodyChecker from phases.bodies;
 import support.syntax;
 
-// The end of the refusal of an 'is' arm that matches every value of the switch, from the comma or
-// full stop after that clause. A first arm makes the switch unnecessary, which 'takenClause' states
-// where the refusal does not already, and a later one can be a 'default' arm, since an earlier 'is'
-// arm stays.
-everyValueFix(Type scrutineeType, Expression scrutinee, ArmBody body, bool first,
-              string takenClause) -> string {
+// The end of the refusal of an 'is' arm for 'armType' that matches every value of the switch, from
+// the comma or full stop after that clause. A first arm makes the switch unnecessary, which
+// 'takenClause' states where the refusal does not already, and a later one can be a 'default' arm,
+// since an earlier 'is' arm stays. 'bound' is the name the arm binds, or null. The switched value is
+// written for that name only where each use reads a member of it, since passing the value on could
+// choose a different overload than the name of the arm's type does; anywhere else a local of that
+// type holds it.
+everyValueFix(BodyChecker checker, Type scrutineeType, Type armType, Expression scrutinee,
+              ArmBody body, bool first, string takenClause, string? bound) -> string {
+    bool usesBound = bound != null && body is SyntaxNode && wording.usesName(body.green(), bound);
+    string? place = null;
+    string? local = null;
+    if (bound != null && usesBound) {
+        place = placeSpelling(scrutinee);
+        if (place != null && body is SyntaxNode && !wording.usesNameOnlyAsObject(body.green(), bound)) {
+            place = null;
+        }
+        let spelledScrutinee = wording.shortSpelling(scrutinee);
+        if (place == null && spelledScrutinee != null) {
+            local = checker.names().quotedCode(["", " {bound} = {spelledScrutinee};"], [armType]);
+        }
+    }
+    string word = armBodyWord(body);
+    string verb = body is Expression ? "it uses" : "they use";
     if (!first) {
-        return ". Use a 'default' arm instead.";
+        if (bound == null || !usesBound) {
+            return ". Use a 'default' arm instead.";
+        }
+        if (place != null) {
+            return ". Use a 'default' arm instead, and write '{place}' where {verb} '{bound}'.";
+        }
+        if (local != null && placeSpelling(scrutinee) != null) {
+            return ". Use a 'default' arm instead, and write {local} before the switch.";
+        }
+        if (local != null) {
+            return ". Use a 'default' arm instead. Write {local} before the switch, and switch on "
+                + "'{bound}'.";
+        }
+        return ". Use a 'default' arm instead, and before the switch, store the switched value in a "
+            + "local named '{bound}'.";
     }
     if (scrutineeType is OptionalType) {
         return " that is not null. Check {wording.sideNamed(scrutinee, "the value")} for null with 'if' "
             + "instead of switching on it.";
     }
+    if (bound != null && usesBound && place == null) {
+        if (local == null) {
+            return "{takenClause}. Store the switched value in a local named '{bound}', and write the "
+                + "{word} of this arm after it instead of the switch.";
+        }
+        if (body is Expression) {
+            string kept = wording.oneLineSpelling(body);
+            if (kept.length <= wording.quotedCodeLimit()) {
+                return "{takenClause}. Store the switched value in a local, as in {local}, and write "
+                    + "'{kept}' after it instead of the switch.";
+            }
+        }
+        return "{takenClause}. Store the switched value in a local, as in {local}, and write the {word} "
+            + "of this arm after it instead of the switch.";
+    }
+    string uses = "";
+    if (bound != null && place != null) {
+        uses = ", and write '{place}' where {verb} '{bound}'";
+    }
     switch (body) {
         is Expression value -> {
             string spelled = wording.oneLineSpelling(value);
+            if (bound != null && place != null) {
+                spelled = wording.spellingWithName(value, bound, place);
+            }
             if (spelled.length <= wording.quotedCodeLimit()) {
                 return "{takenClause}. Write '{spelled}' instead of the switch.";
             }
-            return "{takenClause}. Write the value of this arm instead of the switch.";
+            return "{takenClause}. Write the value of this arm instead of the switch{uses}.";
         },
         default -> {
-            return "{takenClause}. Write the statements of this arm instead of the switch.";
+            return "{takenClause}. Write the statements of this arm instead of the switch{uses}.";
+        },
+    }
+}
+
+// What an arm body is called in a fix: its value, or its statements.
+armBodyWord(ArmBody body) -> string {
+    return body is Expression ? "value" : "statements";
+}
+
+// The scrutinee as code that names the same value each time it is written, a name, 'this' or a field
+// of one, or null for anything else.
+placeSpelling(Expression scrutinee) -> string? {
+    Expression written = syntax.unwrapParentheses(scrutinee);
+    if (!isPlainPlace(written)) {
+        return null;
+    }
+    return wording.shortSpelling(written);
+}
+
+isPlainPlace(Expression written) -> bool {
+    switch (written) {
+        is IdentifierExpressionNode ignored -> {
+            return true;
+        },
+        is ThisExpressionNode ignored -> {
+            return true;
+        },
+        is MemberExpressionNode member -> {
+            return isPlainPlace(syntax.unwrapParentheses(member.object()));
+        },
+        default -> {
+            return false;
         },
     }
 }
@@ -144,6 +233,7 @@ public checkSwitchArms(BodyChecker checker, Expression scrutinee, List<SwitchArm
     let seenStringLabels = new Set<string>();
     let armTargets = new List<Type>();
     bool everyValueArm = false;
+    string? everyValueTest = null;
     let valueExpressions = new List<Expression>();
     bool sawValueBlock = false;
     let switchEntry = checker.assignment().snapshot();
@@ -190,10 +280,22 @@ public checkSwitchArms(BodyChecker checker, Expression scrutinee, List<SwitchArm
                             arm.target().span());
                     }
                 } else if (!(armType is ErrorType)) {
-                    armTarget = checkTypeArmTarget(checker, scrutineeType, inner, armType,
-                        arm.target().span(), scrutinee, arm.body(), armTargets.length() == 0);
-                    if (armTarget == null && matchesEveryValue(inner, armType)) {
-                        everyValueArm = true;
+                    if (everyValueTest != null && matchesEveryValue(inner, armType)) {
+                        checker.reporter().report("This {quotedShortTypeTest(armType, checker.names())} "
+                            + "arm never runs, because the earlier {everyValueTest} arm already matches "
+                            + "every value of this switch. Remove it.", arm.target().span());
+                    } else {
+                        string? bound = null;
+                        let bindingName = arm.binding();
+                        if (bindingName != null) {
+                            bound = bindingName.text();
+                        }
+                        armTarget = checkTypeArmTarget(checker, scrutineeType, inner, armType,
+                            arm.target().span(), scrutinee, arm.body(), armTargets.length() == 0, bound);
+                        if (armTarget == null && matchesEveryValue(inner, armType)) {
+                            everyValueArm = true;
+                            everyValueTest = quotedShortTypeTest(armType, checker.names());
+                        }
                     }
                 }
                 if (armTarget != null) {
@@ -592,9 +694,9 @@ checkStringLabel(BodyChecker checker, Expression label, Set<string> seen) {
 // The class or interface an 'is' arm matches, or null when the arm is rejected: the
 // target must be able to match some values of the scrutinee without matching all of them.
 // 'first' marks an arm with no accepted 'is' arm before it, which the refusal of an arm that
-// matches every value writes the switch without.
+// matches every value writes the switch without, and 'bound' is the name the arm binds, or null.
 checkTypeArmTarget(BodyChecker checker, Type scrutineeType, Type inner, Type armType, Span span,
-                   Expression scrutinee, ArmBody body, bool first) -> Type? {
+                   Expression scrutinee, ArmBody body, bool first, string? bound) -> Type? {
     if (armType is OptionalType) {
         string test = checker.names().quotedCode(["is ", ""], [convert.coreOf(armType)]);
         checker.reporter().report("The type of an 'is' arm cannot be nullable, because 'is' never matches "
@@ -615,14 +717,14 @@ checkTypeArmTarget(BodyChecker checker, Type scrutineeType, Type inner, Type arm
     if (armType == inner) {
         checker.reporter().report("{checker.names().quotedCode(["is ", ""], [armType])} matches every "
             + "value of this switch over {checker.names().quoted(scrutineeType)}"
-            + everyValueFix(scrutineeType, scrutinee, body, first, ", so the switch always takes this arm"),
-            span);
+            + everyValueFix(checker, scrutineeType, armType, scrutinee, body, first,
+                ", so the switch always takes this arm", bound), span);
         return null;
     }
     if (hierarchy.isSubclassOrConforms(inner, armType)) {
         checker.reporter().report("A value of type {checker.names().quoted(inner)} is always a "
             + "{checker.names().quoted(armType)}, so this arm matches every value"
-            + everyValueFix(scrutineeType, scrutinee, body, first, ""), span);
+            + everyValueFix(checker, scrutineeType, armType, scrutinee, body, first, "", bound), span);
         return null;
     }
     if (types.isInterfaceLike(inner)) {
