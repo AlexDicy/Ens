@@ -2382,6 +2382,17 @@ task("test")
                 "uses git submodules, and a package has to contain all of its own files. Declare "
                     .. "what the submodule contains as a dependency of")
 
+            -- a repository that is not there is reported with git's reason and what to check
+            local using_ghost = path.join(root, "usingghost")
+            os.mkdir(path.join(using_ghost, "src"))
+            write_package(using_ghost, "demo.ghostapp",
+                {'dependency ghost.lib "1.0" from "' .. url_of(path.join(repos, "ghost")) .. '";'})
+            io.writefile(path.join(using_ghost, "src", "main.ens"),
+                'main() -> int {\n    return 0;\n}\n')
+            run({"build", "."}, {curdir = using_ghost, envs = withCache(cache)}, 1,
+                "could not list the tags of package 'ghost.lib' at '",
+                ". Check that the URL is right and that the repository exists", "!exists..")
+
             -- a tag that moved is caught against the lock, naming both digests
             local using_retag = path.join(root, "usingretag")
             os.mkdir(path.join(using_retag, "src"))
