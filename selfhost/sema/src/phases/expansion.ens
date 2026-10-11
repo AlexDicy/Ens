@@ -8,6 +8,7 @@ import QuotedCode from model.typenames;
 import TypeNames from model.typenames;
 import TypeNameDirectory from model.typenames;
 import Type from model.types;
+import TypeStore from model.types;
 import DeclaredType from model.types;
 import InstantiationType from model.types;
 import InstantiationOverflow from model.types;
@@ -15,7 +16,10 @@ import TypeParamType from model.types;
 import OptionalType from model.types;
 import ArrayType from model.types;
 import FunctionType from model.types;
+import phases.obligations;
 import InstantiationMention from phases.obligations;
+import ObligationRegistry from phases.obligations;
+import Origin from phases.obligations;
 import List from @std.collections.list;
 import Map from @std.collections.map;
 import Set from @std.collections.set;
@@ -284,4 +288,298 @@ boundedSpelling(InstantiationType written, GreenNode declaration, TypeNames name
     }
     code.write(">");
     return code.quotedFor(names);
+}
+
+// One place a generic is used with type arguments that name type parameters of the generic it is
+// written in: a call of a generic function, or an instantiation of a generic type.
+final class GenericUse {
+    GreenNode target;
+    string targetName;
+    Type[] targetParameters;
+    Type[] arguments;
+    Origin origin;
+    bool isCall;
+    DeclaredType? template;
+
+    protected constructor(this.target, this.targetName, this.targetParameters, this.arguments,
+                          this.origin, this.isCall, this.template);
+}
+
+// The name the reporting file writes for what 'use' calls or instantiates.
+usedName(GenericUse use, TypeNames names) -> string {
+    let template = use.template;
+    if (template != null) {
+        return names.plainNameOf(template);
+    }
+    return use.targetName;
+}
+
+// A type parameter of the generic 'use' is written in, leading to parameter 'index' of the generic
+// it uses. It grows when the argument wraps the parameter instead of passing it on as it is.
+final class UseEdge {
+    TypeParamType from;
+    GreenNode toOwner;
+    long toIndex;
+    bool grows;
+    GenericUse use;
+
+    protected constructor(this.from, this.toOwner, this.toIndex, this.grows, this.use);
+}
+
+// Generics whose uses inside their own bodies need ever larger instantiations of each other, which
+// no type nesting reports because no field or signature holds them: refused once at each use that
+// makes an argument grow, except a use the type nesting already refused.
+public endlessUseDiagnostics(TypeStore store, ObligationRegistry registry,
+                             List<InstantiationMention> mentions, FileDiagnostic[] alreadyReported,
+                             TypeNameDirectory names) -> FileDiagnostic[] {
+    let uses = genericUses(registry, mentions);
+    let edges = new List<UseEdge>();
+    for (let use in uses) {
+        for (long i = 0; i < use.arguments.length; i++) {
+            let inside = new List<Type>();
+            collectAllParameters(use.arguments[i], inside);
+            for (let parameter in inside) {
+                if (parameter is TypeParamType) {
+                    edges.push(new UseEdge(parameter, use.target, i, use.arguments[i] != parameter, use));
+                }
+            }
+        }
+    }
+    let reported = new Set<string>();
+    for (let diagnostic in alreadyReported) {
+        reported.add("{diagnostic.file()}#{diagnostic.span().start}");
+    }
+    let found = new List<FileDiagnostic>();
+    for (let edge in edges) {
+        if (!edge.grows) {
+            continue;
+        }
+        let key = "{edge.use.origin.file()}#{edge.use.origin.span().start}";
+        if (reported.contains(key)) {
+            continue;
+        }
+        let back = pathBack(edges, edge);
+        if (back == null) {
+            continue;
+        }
+        reported.add(key);
+        found.push(endlessUse(store, registry, mentions, edge, back, names));
+    }
+    return found.toArray();
+}
+
+genericUses(ObligationRegistry registry, List<InstantiationMention> mentions) -> List<GenericUse> {
+    let uses = new List<GenericUse>();
+    for (let call in registry.openCallSites()) {
+        let signature = call.calledSignature();
+        let declaration = signature.declaration();
+        if (declaration == null) {
+            continue;
+        }
+        let parameters = new List<Type>();
+        for (let parameter in signature.typeParameters()) {
+            parameters.push(parameter);
+        }
+        uses.push(new GenericUse(declaration, signature.name(), parameters.toArray(),
+            call.typeArguments(), call.writtenAt(), true, null));
+    }
+    for (let mention in mentions) {
+        let instantiation = mention.instantiation();
+        bool open = false;
+        for (let argument in instantiation.arguments()) {
+            let inside = new List<Type>();
+            collectAllParameters(argument, inside);
+            if (inside.length() > 0) {
+                open = true;
+            }
+        }
+        if (!open) {
+            continue;
+        }
+        let template = instantiation.template();
+        let parameters = new List<Type>();
+        for (let parameter in template.typeParameterTypes()) {
+            parameters.push(parameter);
+        }
+        uses.push(new GenericUse(template.declaration(), template.name(), parameters.toArray(),
+            instantiation.arguments(), mention.origin(), false, template));
+    }
+    return uses;
+}
+
+// The edges from where 'edge' leads back to the type parameter it starts from, each leading to the
+// next, or null where none lead back, so 'edge' is on no cycle.
+pathBack(List<UseEdge> edges, UseEdge edge) -> List<UseEdge>? {
+    if (startsAt(edge, edge.toOwner, edge.toIndex)) {
+        return new List<UseEdge>();
+    }
+    let pending = new List<UseEdge>();
+    let parents = new List<long>();
+    let seen = new Set<string>();
+    for (let next in edges) {
+        if (startsAt(next, edge.toOwner, edge.toIndex) && seen.add(edgeKey(next))) {
+            pending.push(next);
+            parents.push(-1);
+        }
+    }
+    for (long at = 0; at < pending.length(); at++) {
+        let current = pending.get(at);
+        if (current.toOwner == edge.from.owner() && current.toIndex == edge.from.index()) {
+            let path = new List<UseEdge>();
+            long walk = at;
+            while (walk >= 0) {
+                path.insert(0, pending.get(walk));
+                walk = parents.get(walk);
+            }
+            return path;
+        }
+        for (let next in edges) {
+            if (startsAt(next, current.toOwner, current.toIndex) && seen.add(edgeKey(next))) {
+                pending.push(next);
+                parents.push(at);
+            }
+        }
+    }
+    return null;
+}
+
+startsAt(UseEdge edge, GreenNode owner, long index) -> bool {
+    return edge.from.owner() == owner && edge.from.index() == index;
+}
+
+edgeKey(UseEdge edge) -> string {
+    return "{edge.use.origin.file()}#{edge.use.origin.span().start}#{edge.toIndex}#{edge.from.index()}";
+}
+
+endlessUse(TypeStore store, ObligationRegistry registry, List<InstantiationMention> mentions,
+           UseEdge edge, List<UseEdge> back, TypeNameDirectory directory) -> FileDiagnostic {
+    let origin = edge.use.origin;
+    let names = directory.namesFor(origin.file());
+    GreenNode owner = edge.from.owner();
+    let cycle = new List<UseEdge>();
+    cycle.push(edge);
+    cycle.pushAll(back);
+    let into = cycle.get(cycle.length() - 1).use;
+    Type[] start = concreteArguments(registry, mentions, owner) ?? into.targetParameters;
+    Type[] used = substituted(store, edge.use.arguments, owner, start);
+    let next = edge;
+    if (back.length() > 0) {
+        next = back.get(0);
+    }
+    Type[] nextUsed = substituted(store, next.use.arguments, edge.use.target, used);
+    string example = "{obligations.quotedCall(usedName(into, names), start, names)} {verb(edge.use)} "
+        + "{obligations.quotedCall(usedName(edge.use, names), used, names)}, which {verb(next.use)} "
+        + "{obligations.quotedCall(usedName(next.use, names), nextUsed, names)}";
+    bool allCalls = true;
+    for (let step in cycle) {
+        if (!step.use.isCall) {
+            allCalls = false;
+        }
+    }
+    string them = "all of them";
+    string grow = "They grow";
+    if (allCalls) {
+        them = "all of these calls";
+        grow = "The calls grow";
+    }
+    let grown = new List<Type>();
+    long wrapping = 0;
+    for (let argument in edge.use.arguments) {
+        if (!isParameterOf(argument, owner) && mentionsParameterOf(argument, owner)) {
+            collectParameters(argument, owner, grown);
+            wrapping++;
+        }
+    }
+    let quotedParameters = new List<string>();
+    for (let parameter in grown) {
+        quotedParameters.push(names.quoted(parameter));
+    }
+    string inside = "inside another type";
+    if (wrapping > 1) {
+        inside = "inside other types";
+    }
+    string where = "where its type parameter {quotedParameters.get(0)} is {inside}";
+    if (quotedParameters.length() > 1) {
+        where = "where its type parameters {diagnostics.andJoined(quotedParameters.toArray())} are "
+            + inside;
+    }
+    string message = "{example}, and so on without end, so no program can contain {them}. "
+        + "{grow} because '{usedName(into, names)}' {verb(edge.use)} {origin.display()}, {where}.";
+    return new FileDiagnostic(origin.file(), message, origin.span());
+}
+
+substituted(TypeStore store, Type[] types, GreenNode owner, Type[] arguments) -> Type[] {
+    let result = new List<Type>();
+    for (let type in types) {
+        result.push(store.substitute(type, owner, arguments));
+    }
+    return result.toArray();
+}
+
+verb(GenericUse use) -> string {
+    if (use.isCall) {
+        return "calls";
+    }
+    return "uses";
+}
+
+// The type arguments a call or a written instantiation gives 'owner' with no type parameter in
+// them, so an example starts at a type or a call the program writes. Null where none does.
+concreteArguments(ObligationRegistry registry, List<InstantiationMention> mentions, GreenNode owner)
+        -> Type[]? {
+    for (let call in registry.concreteCallSites()) {
+        if (call.calledSignature().declaration() == owner) {
+            return call.typeArguments();
+        }
+    }
+    for (let mention in mentions) {
+        let instantiation = mention.instantiation();
+        if (instantiation.template().declaration() != owner) {
+            continue;
+        }
+        bool open = false;
+        for (let argument in instantiation.arguments()) {
+            let inside = new List<Type>();
+            collectAllParameters(argument, inside);
+            if (inside.length() > 0) {
+                open = true;
+            }
+        }
+        if (!open) {
+            return instantiation.arguments();
+        }
+    }
+    return null;
+}
+
+// Every type parameter inside 'type', of any generic, each once.
+collectAllParameters(Type type, List<Type> found) {
+    switch (type) {
+        is TypeParamType ignored -> {
+            if (!found.contains(type)) {
+                found.push(type);
+            }
+        },
+        is OptionalType optional -> {
+            collectAllParameters(optional.inner(), found);
+        },
+        is ArrayType array -> {
+            collectAllParameters(array.element(), found);
+        },
+        is FunctionType function -> {
+            for (let parameter in function.parameterTypes()) {
+                collectAllParameters(parameter, found);
+            }
+            collectAllParameters(function.returnType(), found);
+            for (let thrown in function.thrownTypes()) {
+                collectAllParameters(thrown, found);
+            }
+        },
+        is InstantiationType instantiation -> {
+            for (let argument in instantiation.arguments()) {
+                collectAllParameters(argument, found);
+            }
+        },
+        default -> { },
+    }
 }
