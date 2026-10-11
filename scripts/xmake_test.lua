@@ -28,6 +28,11 @@
 -- is relative to the folder of the file the directive is written in, and semacheck and
 -- codegencheck honor it too.
 --     // @stdlib ../stdlib
+-- @platform limits a fixture to the hosts it names, any of 'linux', 'macos' and 'windows', for a
+-- fixture that exercises one system's own behavior. On every other host the fixture is neither
+-- built nor run, codegencheck leaves it out the same way, and both list it as skipped for this
+-- platform.
+--     // @platform linux
 -- tests run in parallel; set ENS_TEST_JOBS to override the worker count (default: cpu count).
 -- pass test names to run a subset, e.g. `xmake test arc_basic class_constructor`; runs all if omitted.
 task("test")
@@ -435,6 +440,41 @@ task("test")
         -- a captured stream with its trailing newlines trimmed, the form the directives compare.
         local function captured(logpath)
             return ((io.readfile(logpath) or ""):gsub("[\r\n]+$", ""))
+        end
+
+        -- the name a @platform directive gives the host running the suite.
+        local function hostPlatform()
+            if is_host("windows") then return "windows" end
+            if is_host("macosx") then return "macos" end
+            return "linux"
+        end
+
+        -- the hosts the @platform lines of a fixture's directive file name, and apart from them
+        -- every name that is no host's.
+        local function fixturePlatforms(file)
+            local named, unknown = {}, {}
+            for line in (io.readfile(file) or ""):gmatch("[^\r\n]+") do
+                local listed = line:match("^%s*//%s*@platform%s+(.*)$")
+                if listed then
+                    for platform in listed:gmatch("%S+") do
+                        if platform == "linux" or platform == "macos" or platform == "windows" then
+                            table.insert(named, platform)
+                        else
+                            table.insert(unknown, platform)
+                        end
+                    end
+                end
+            end
+            return named, unknown
+        end
+
+        -- whether a fixture naming these hosts runs on this one; naming none runs everywhere.
+        local function runsHere(named)
+            if #named == 0 then return true end
+            for _, platform in ipairs(named) do
+                if platform == hostPlatform() then return true end
+            end
+            return false
         end
 
         -- find the native libraries an Ens build links against - the local LLVM the compiler was
@@ -881,10 +921,19 @@ task("test")
                 "skiplist " .. skiplist,
                 "optimization " .. job.optimization,
             }
+            -- a fixture for another host is named apart, so it is neither run nor counted as a
+            -- fixture that should have been.
+            local function listFixture(label, directive)
+                if runsHere((fixturePlatforms(directive))) then
+                    table.insert(lines, "fixture " .. label .. " " .. directive)
+                else
+                    table.insert(lines, "elsewhere " .. label)
+                end
+            end
             local singles = os.files(path.join(tests_dir, "*.ens"))
             table.sort(singles)
             for _, f in ipairs(singles) do
-                table.insert(lines, "fixture tests/" .. path.filename(f) .. " " .. f)
+                listFixture("tests/" .. path.filename(f), f)
             end
             local folders = os.dirs(path.join(tests_dir, "*"))
             table.sort(folders)
@@ -898,7 +947,7 @@ task("test")
                     directive = src_main_ens
                 end
                 if directive then
-                    table.insert(lines, "fixture tests/" .. path.basename(sub) .. " " .. directive)
+                    listFixture("tests/" .. path.basename(sub), directive)
                 end
             end
             io.writefile(manifest, table.concat(lines, "\n") .. "\n")
@@ -3067,6 +3116,17 @@ task("test")
             local ens_test_args     = job.ens_test_args   -- @ens-test: run `ens test` on the folder instead
             local stdlib_root       = nil   -- @stdlib: a std/ package to compile against instead of libs/
             local content = (ens_file and io.readfile(ens_file)) or ""
+            if ens_file then
+                local named, unknown = fixturePlatforms(ens_file)
+                if #unknown > 0 then
+                    return {name = name, ok = false, short = "@platform names no host",
+                        full = string.format("%s: '@platform %s' names no host; write 'linux', "
+                            .. "'macos' or 'windows'", name, unknown[1])}
+                end
+                if not runsHere(named) then
+                    return {name = name, ok = true, note = "skipped for this platform"}
+                end
+            end
             for line in content:gmatch("[^\r\n]+") do
                 local stdlib_str = line:match("^%s*//%s*@stdlib%s+(%S+)")
                 if stdlib_str then

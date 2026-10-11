@@ -1,0 +1,151 @@
+// @platform linux
+// @exit 0
+// @stdout pidfd_open is refused
+// @stdout a captured run keeps both streams whole
+// @stdout a timed wait reports a running child and then its status
+// @stdout a quiet child is polled in turns
+// The poll a Linux kernel without pidfd_open takes, which checks the child every 5 milliseconds
+// instead of waiting on it. A seccomp filter makes pidfd_open fail with ENOSYS for this process
+// before it starts any child, so every poll below takes that path.
+import Path from @std.fs;
+import FileSystemError from @std.fs.error;
+import ProcessError from @std.process;
+import @std.process;
+import @std.text.parse;
+import List from @std.collections.list;
+
+external from libc {
+    prctl(int option, long second, long third, long fourth, long fifth) -> int;
+    syscall(long number, long first, long second) -> long;
+    malloc(long size) -> long;
+    memcpy(long destination, byte[] source, long count) -> long;
+    getpid() -> int;
+}
+
+// The prctl options and the seccomp actions the filter is installed with.
+final class Seccomp {
+    protected static const int noNewPrivileges = 38;
+    protected static const int setSeccomp = 22;
+    protected static const long filterMode = 2;
+    protected static const long allow = 0x7FFF0000;
+    protected static const long failWithNoSystemCall = 0x00050000 + 38;
+    protected static const long pidfdOpen = 434;
+}
+
+main() -> int {
+    if (!refusePidfdOpen()) {
+        print("the seccomp filter was not installed");
+        return 1;
+    }
+    long opened = syscall(Seccomp.pidfdOpen, getpid() as long, 0);
+    if (opened != -1) {
+        print("pidfd_open opened descriptor {opened}");
+        return 1;
+    }
+    print("pidfd_open is refused");
+    print(try capturedRun());
+    print(try timedWait());
+    print(try quietChild());
+    return 0;
+} catch (ProcessError failed) {
+    print(failed.message);
+    return 1;
+} catch (FileSystemError failed) {
+    print(failed.message);
+    return 1;
+}
+
+// Installs a filter that fails pidfd_open with ENOSYS and allows every other call. A filter is a
+// list of 8-byte instructions, and prctl takes it through a 16-byte struct holding its length and
+// where it is, so both are copied into memory whose address this program can name.
+refusePidfdOpen() -> bool {
+    let instructions = new List<byte>();
+    // Load the call's number, which is the first word of the data a filter reads.
+    appendInstruction(instructions, 0x20, 0, 0, 0);
+    // pidfd_open goes on to the next instruction, and every other call skips over it.
+    appendInstruction(instructions, 0x15, 0, 1, Seccomp.pidfdOpen);
+    appendInstruction(instructions, 0x06, 0, 0, Seccomp.failWithNoSystemCall);
+    appendInstruction(instructions, 0x06, 0, 0, Seccomp.allow);
+    byte[] filter = instructions.toArray();
+    long filterAddress = malloc(filter.length);
+    memcpy(filterAddress, filter, filter.length);
+    let program = new List<byte>();
+    appendLittleEndian(program, filter.length / 8, 2);
+    appendLittleEndian(program, 0, 6);
+    appendLittleEndian(program, filterAddress, 8);
+    byte[] programBytes = program.toArray();
+    long programAddress = malloc(programBytes.length);
+    memcpy(programAddress, programBytes, programBytes.length);
+    if (prctl(Seccomp.noNewPrivileges, 1, 0, 0, 0) != 0) {
+        return false;
+    }
+    return prctl(Seccomp.setSeccomp, Seccomp.filterMode, programAddress, 0, 0) == 0;
+}
+
+// One filter instruction: a 16-bit code, the two jump offsets, and a 32-bit operand.
+appendInstruction(List<byte> into, long code, long whenTrue, long whenFalse, long operand) {
+    appendLittleEndian(into, code, 2);
+    appendLittleEndian(into, whenTrue, 1);
+    appendLittleEndian(into, whenFalse, 1);
+    appendLittleEndian(into, operand, 4);
+}
+
+appendLittleEndian(List<byte> into, long value, long width) {
+    for (long i = 0; i < width; i++) {
+        into.push(((value >> (i * 8)) & 0xFF) as byte);
+    }
+}
+
+// Each stream gets more lines than a pipe holds, so a poll that missed either stream would leave
+// the child waiting on a full pipe and the run would never end.
+capturedRun() -> string throws ProcessError {
+    let result = try process.runShell("i=0; while [ $i -lt 3000 ]; do echo out-$i; "
+        + "echo err-$i >&2; i=$((i+1)); done", captureOutput: true);
+    long outputLines = result.stdout.trim().lines().length;
+    long errorLines = result.stderr.trim().lines().length;
+    if (outputLines != 3000 || errorLines != 3000) {
+        return "a captured run kept {outputLines} output lines and {errorLines} error lines";
+    }
+    return "a captured run keeps both streams whole";
+}
+
+timedWait() -> string throws ProcessError {
+    let child = try process.spawn(Path("/bin/sh"), ["-c", "sleep 1; exit 7"]);
+    let early = try child.wait(100);
+    if (early != null) {
+        return "a child that sleeps for a second ended within 100 milliseconds";
+    }
+    let ended = try child.wait();
+    if (ended.code != 7) {
+        return "a timed wait's child ended with {ended.code}";
+    }
+    return "a timed wait reports a running child and then its status";
+}
+
+// A poll that waits on the child gives the processor up a handful of times in a second, and one
+// that checks every 5 milliseconds about two hundred.
+quietChild() -> string throws ProcessError, FileSystemError {
+    let child = try process.spawn(Path("/bin/sh"), ["-c", "sleep 3"]);
+    long before = try voluntarySwitches();
+    let early = try child.wait(1000);
+    long turns = try voluntarySwitches() - before;
+    try child.kill();
+    let ended = try child.wait();
+    if (early != null) {
+        return "a child that sleeps for three seconds ended within one";
+    }
+    if (turns < 50) {
+        return "a second of polling a quiet child gave the processor up only {turns} times";
+    }
+    return "a quiet child is polled in turns";
+}
+
+// How many times this process has given the processor up of its own accord.
+voluntarySwitches() -> long throws FileSystemError {
+    for (let line in (try Path("/proc/self/status").readText()).lines()) {
+        if (line.startsWith("voluntary_ctxt_switches:")) {
+            return parse.parseLong(line.substring("voluntary_ctxt_switches:".length).trim()) ?? 0;
+        }
+    }
+    return 0;
+}
