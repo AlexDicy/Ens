@@ -5,7 +5,8 @@
 --     // @stdout-contains Hello
 --     // @stderr panic: boom
 --     // @stderr-contains panic:
--- @stdout and @stderr give one exact line each and accumulate: every directive of the kind,
+-- @stdout and @stderr give one exact line each, taken as written after the one space that follows the
+-- directive so a line that starts with spaces is pinned with them, and accumulate: every directive of the kind,
 -- joined with newlines, must equal the whole stream (trailing newlines trimmed). @stdout-contains
 -- and @stderr-contains each name a substring the stream must contain. Both streams are captured
 -- separately, so what the runtime reports on stderr - a panic, an unhandled exception - is
@@ -3032,7 +3033,7 @@ task("test")
                 if exit_str then expected_exit = tonumber(exit_str) end
                 local contains_str = line:match("^%s*//%s*@stdout%-contains%s+(.*)$")
                 if contains_str then table.insert(expected_contains, contains_str) end
-                local stdout_str = line:match("^%s*//%s*@stdout%s+(.*)$")
+                local stdout_str = line:match("^%s*//%s*@stdout (.*)$")
                 if stdout_str then
                     if expected_stdout == nil then expected_stdout = {} end
                     table.insert(expected_stdout, stdout_str)
@@ -3041,7 +3042,7 @@ task("test")
                 if err_contains_str then
                     table.insert(expected_stderr_contains, err_contains_str)
                 end
-                local stderr_str = line:match("^%s*//%s*@stderr%s+(.*)$")
+                local stderr_str = line:match("^%s*//%s*@stderr (.*)$")
                 if stderr_str then
                     if expected_stderr == nil then expected_stderr = {} end
                     table.insert(expected_stderr, stderr_str)
