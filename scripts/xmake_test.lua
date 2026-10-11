@@ -1309,6 +1309,11 @@ task("test")
             local std_folder = path.join(os.projectdir(), "libs", "std")
             run({"check", std_folder, "--stdlib", path.join(os.projectdir(), "libs")}, nil, 0,
                 "std: ", "nothing to report", "!(from std.")
+            -- Windows reads the names of one folder written in two cases as that one folder
+            if is_host("windows") then
+                run({"check", std_folder, "--stdlib", path.join(os.projectdir(), "LIBS")}, nil, 0,
+                    "std: ", "nothing to report", "!names a different folder")
+            end
             run({"check", std_folder, "--stdlib", root}, nil, 2, "is the package 'std', which is "
                 .. "the standard library, so this command uses it as the standard library. "
                 .. "'--stdlib' names a different folder, '",
