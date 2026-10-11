@@ -1,0 +1,287 @@
+// Generics whose instantiations nest without end. Each one is refused once, at the type written
+// inside the generic that makes the type arguments grow, however many instantiations lead to it.
+import GreenNode from @ens.frontend.syntax.green;
+import FileDiagnostic from support.diagnostics;
+import support.diagnostics;
+import model.convert;
+import QuotedCode from model.typenames;
+import TypeNames from model.typenames;
+import TypeNameDirectory from model.typenames;
+import Type from model.types;
+import DeclaredType from model.types;
+import InstantiationType from model.types;
+import InstantiationOverflow from model.types;
+import TypeParamType from model.types;
+import OptionalType from model.types;
+import ArrayType from model.types;
+import FunctionType from model.types;
+import InstantiationMention from phases.obligations;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+import Set from @std.collections.set;
+
+// The mention a refusal is reported at, with the chain and the step in it that the refusal
+// spells as its example.
+final class GrowingReference {
+    InstantiationMention mention;
+    InstantiationType[] chain;
+    long step;
+
+    protected constructor(this.mention, this.chain, this.step);
+}
+
+public endlessNestingDiagnostics(InstantiationOverflow[] overflows, List<InstantiationMention> mentions,
+                                 TypeNameDirectory names) -> FileDiagnostic[] {
+    let references = new Map<string, GrowingReference>();
+    let order = new List<string>();
+    let unexplained = new List<InstantiationOverflow>();
+    for (let overflow in overflows) {
+        InstantiationType[] chain = overflow.chain();
+        let cycle = cycleTemplates(chain);
+        bool explained = false;
+        for (let mention in mentions) {
+            long step = growingStep(chain, cycle, mention.instantiation());
+            if (step < 0) {
+                continue;
+            }
+            explained = true;
+            string key = "{mention.origin().file()}#{mention.origin().span().start}";
+            let known = references.get(key);
+            if (known == null) {
+                references.set(key, new GrowingReference(mention, chain, step));
+                order.push(key);
+            } else if (convert.containsTypeParam(known.chain[known.step])
+                    && !convert.containsTypeParam(chain[step])) {
+                references.set(key, new GrowingReference(mention, chain, step));
+            }
+        }
+        if (!explained) {
+            unexplained.push(overflow);
+        }
+    }
+    let found = new List<FileDiagnostic>();
+    for (let key in order) {
+        let reference = references.get(key);
+        if (reference != null) {
+            found.push(endlessNesting(reference, names));
+        }
+    }
+    let fallbacks = new Set<string>();
+    for (let overflow in unexplained) {
+        let diagnostic = overflow.diagnostic(names);
+        if (fallbacks.add("{diagnostic.file()}#{diagnostic.span().start}#{diagnostic.message()}")) {
+            found.push(diagnostic);
+        }
+    }
+    return found.toArray();
+}
+
+endlessNesting(GrowingReference reference, TypeNameDirectory directory) -> FileDiagnostic {
+    let origin = reference.mention.origin();
+    let names = directory.namesFor(origin.file());
+    let written = reference.mention.instantiation();
+    InstantiationType[] chain = reference.chain;
+    long step = reference.step;
+    let owner = chain[step].template();
+    GreenNode declaration = owner.declaration();
+    let grown = new List<Type>();
+    long wrapping = 0;
+    for (let argument in written.arguments()) {
+        if (!isParameterOf(argument, declaration) && mentionsParameterOf(argument, declaration)) {
+            collectParameters(argument, declaration, grown);
+            wrapping++;
+        }
+    }
+    let quotedParameters = new List<string>();
+    for (let parameter in grown) {
+        quotedParameters.push(names.quoted(parameter));
+    }
+    string inside = "inside another type";
+    if (wrapping > 1) {
+        inside = "inside other types";
+    }
+    string where = "where its type parameter {quotedParameters.get(0)} is {inside}";
+    if (quotedParameters.length() > 1) {
+        where = "where its type parameters {diagnostics.andJoined(quotedParameters.toArray())} are "
+            + inside;
+    }
+    string message = "{names.quoted(chain[step])} uses {names.quoted(chain[step + 1])}, which uses "
+        + "{names.quoted(chain[step + 2])}, and so on without end, so no program can contain a value "
+        + "of these types. The types grow because {names.quotedName(owner)} uses {origin.display()}, "
+        + "{where}.";
+    let fix = boundedSpelling(written, declaration, names);
+    if (fix != null) {
+        message = message + " Change {origin.display()} to {fix}.";
+    }
+    return new FileDiagnostic(origin.file(), message, origin.span());
+}
+
+// The templates the end of the chain repeats, which the chain cycles through without end. The
+// instantiations before them only lead into the cycle.
+cycleTemplates(InstantiationType[] chain) -> Set<DeclaredType> {
+    let cycle = new Set<DeclaredType>();
+    long last = chain.length - 1;
+    let repeated = chain[last].template();
+    long start = last - 1;
+    while (start > 0 && chain[start].template() != repeated) {
+        start--;
+    }
+    for (long i = start; i <= last; i++) {
+        cycle.add(chain[i].template());
+    }
+    return cycle;
+}
+
+// The first step of the chain inside the cycle that 'written' produces, where substituting the
+// arguments of the instantiation being filled into 'written' gives the next instantiation, and
+// 'written' makes an argument grow. -1 where 'written' produces no such step.
+growingStep(InstantiationType[] chain, Set<DeclaredType> cycle, InstantiationType written) -> long {
+    for (long step = 0; step + 2 < chain.length; step++) {
+        let filling = chain[step];
+        let next = chain[step + 1];
+        let owner = filling.template();
+        if (written.template() != next.template() || !cycle.contains(owner)
+                || !cycle.contains(next.template())) {
+            continue;
+        }
+        GreenNode declaration = owner.declaration();
+        if (grows(written, declaration) && produces(written, next, declaration, filling.arguments())) {
+            return step;
+        }
+    }
+    return -1;
+}
+
+// Whether an argument of 'written' wraps a type parameter of the generic it is written in.
+grows(InstantiationType written, GreenNode declaration) -> bool {
+    for (let argument in written.arguments()) {
+        if (!isParameterOf(argument, declaration) && mentionsParameterOf(argument, declaration)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Whether 'written', with each type parameter of 'declaration' replaced by its argument, is
+// 'produced'. Interned types are equal only when they are the same object.
+produces(Type written, Type produced, GreenNode declaration, Type[] arguments) -> bool {
+    switch (written) {
+        is TypeParamType parameter -> {
+            if (parameter.owner() == declaration && parameter.index() < arguments.length) {
+                return arguments[parameter.index()] == produced;
+            }
+            return written == produced;
+        },
+        is OptionalType optional -> {
+            if (produced is OptionalType) {
+                return produces(optional.inner(), produced.inner(), declaration, arguments);
+            }
+            return false;
+        },
+        is ArrayType array -> {
+            if (produced is ArrayType) {
+                return produces(array.element(), produced.element(), declaration, arguments);
+            }
+            return false;
+        },
+        is FunctionType function -> {
+            if (!(produced is FunctionType)) {
+                return false;
+            }
+            return producesAll(function.parameterTypes(), produced.parameterTypes(), declaration, arguments)
+                && producesAll(function.thrownTypes(), produced.thrownTypes(), declaration, arguments)
+                && produces(function.returnType(), produced.returnType(), declaration, arguments);
+        },
+        is InstantiationType instantiation -> {
+            if (!(produced is InstantiationType) || instantiation.template() != produced.template()) {
+                return false;
+            }
+            return producesAll(instantiation.arguments(), produced.arguments(), declaration, arguments);
+        },
+        default -> {
+            return written == produced;
+        },
+    }
+}
+
+producesAll(Type[] written, Type[] produced, GreenNode declaration, Type[] arguments) -> bool {
+    if (written.length != produced.length) {
+        return false;
+    }
+    for (long i = 0; i < written.length; i++) {
+        if (!produces(written[i], produced[i], declaration, arguments)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+isParameterOf(Type type, GreenNode declaration) -> bool {
+    if (type is TypeParamType) {
+        return type.owner() == declaration;
+    }
+    return false;
+}
+
+mentionsParameterOf(Type type, GreenNode declaration) -> bool {
+    let found = new List<Type>();
+    collectParameters(type, declaration, found);
+    return found.length() > 0;
+}
+
+// The type parameters of 'declaration' inside 'type', each once, in the order they are written.
+collectParameters(Type type, GreenNode declaration, List<Type> found) {
+    switch (type) {
+        is TypeParamType parameter -> {
+            if (parameter.owner() == declaration && !found.contains(type)) {
+                found.push(type);
+            }
+        },
+        is OptionalType optional -> {
+            collectParameters(optional.inner(), declaration, found);
+        },
+        is ArrayType array -> {
+            collectParameters(array.element(), declaration, found);
+        },
+        is FunctionType function -> {
+            for (let parameter in function.parameterTypes()) {
+                collectParameters(parameter, declaration, found);
+            }
+            collectParameters(function.returnType(), declaration, found);
+            for (let thrown in function.thrownTypes()) {
+                collectParameters(thrown, declaration, found);
+            }
+        },
+        is InstantiationType instantiation -> {
+            for (let argument in instantiation.arguments()) {
+                collectParameters(argument, declaration, found);
+            }
+        },
+        default -> { },
+    }
+}
+
+// 'written' with each argument that wraps one type parameter replaced by that parameter, in
+// quotes, which nests no deeper than the instantiation it is written in. Null where an argument
+// wraps more than one, since no single parameter can replace it.
+boundedSpelling(InstantiationType written, GreenNode declaration, TypeNames names) -> string? {
+    let code = new QuotedCode();
+    code.write("{names.plainNameOf(written.template())}<");
+    Type[] arguments = written.arguments();
+    for (long i = 0; i < arguments.length; i++) {
+        if (i > 0) {
+            code.write(", ");
+        }
+        let inside = new List<Type>();
+        collectParameters(arguments[i], declaration, inside);
+        if (isParameterOf(arguments[i], declaration) || inside.length() == 0) {
+            code.writeType(arguments[i]);
+        } else if (inside.length() == 1) {
+            code.writeType(inside.get(0));
+        } else {
+            return null;
+        }
+    }
+    code.write(">");
+    return code.quotedFor(names);
+}
