@@ -1370,6 +1370,17 @@ task("test")
                 run_program(path.join(root, "linked.exe"), 0, "through the link")
             end
 
+            -- the link reads none of the variables meant for Microsoft's link.exe
+            if is_host("windows") then
+                local linking = {}
+                for key, value in pairs(env) do linking[key] = value end
+                linking.LINK = "/threads:0"
+                linking._LINK_ = "/threads:0"
+                run({"build", hello, "--output", path.join(root, "unaffected.exe")},
+                    {envs = linking}, 0, ": Built '")
+                run_program(path.join(root, "unaffected.exe"), 0, "Hello, world!")
+            end
+
             -- the hidden syntax tools
             run({"cst-dump", hello}, nil, 0, "SourceFile")
             run({"cst-analyze", hello}, nil, 0)
