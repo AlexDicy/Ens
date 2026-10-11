@@ -952,6 +952,15 @@ export class TypeStore {
     Map<InstantiationKey, InstantiationType> instantiations;
     List<InstantiationType> pendingFills;
     List<InstantiationType> instantiationChain;
+    // For each entry of instantiationChain, the member of its template being substituted, and the
+    // members a chain has nested through without end. After a chain reaches the depth limit, only
+    // its root goes on to fill new instantiations, so each other member it grows through starts
+    // its own chain from the root. Chains from a root naming type parameters and chains from one
+    // naming none are kept apart, so a type a program writes still grows a chain of its own.
+    List<string> fillingMembers;
+    Set<string> endlessMembers;
+    bool unwindingToRoot;
+    string chainKind;
     List<InstantiationOverflow> instantiationOverflows;
     // The packages whose sources the user cannot edit, by package prefix.
     Set<string> uneditablePackages;
@@ -971,6 +980,10 @@ export class TypeStore {
         this.instantiations = new Map<InstantiationKey, InstantiationType>();
         this.pendingFills = new List<InstantiationType>();
         this.instantiationChain = new List<InstantiationType>();
+        this.fillingMembers = new List<string>();
+        this.endlessMembers = new Set<string>();
+        this.unwindingToRoot = false;
+        this.chainKind = "";
         this.instantiationOverflows = new List<InstantiationOverflow>();
         this.uneditablePackages = new Set<string>();
     }
@@ -1068,7 +1081,9 @@ export class TypeStore {
 
     // Interns the instantiation, registering the shell before filling so a self-referential
     // member (e.g. 'Node<T>? next') resolves back to this same instance. The members fill
-    // immediately when the template's members are complete, and queue otherwise.
+    // immediately when the template's members are complete, and queue otherwise. One asked for
+    // by a member that already nested without end stays unfilled, so a template growing through
+    // two members does not expand every branch to the depth limit.
     export instantiationOf(DeclaredType template, Type[] arguments) -> InstantiationType {
         let key = new InstantiationKey(template, arguments);
         let existing = this.instantiations.get(key);
@@ -1077,8 +1092,14 @@ export class TypeStore {
         }
         let created = new InstantiationType(template, arguments);
         this.instantiations.set(key, created);
+        if (this.unwindingToRoot && this.instantiationChain.length() > 1) {
+            return created;
+        }
         if (this.instantiationChain.length() >= Limits.instantiationDepth) {
             this.recordInstantiationOverflow();
+            return created;
+        }
+        if (this.fillingMembers.length() > 0 && this.endlessMembers.contains(this.fillingMembers.last())) {
             return created;
         }
         if (template.membersComplete()) {
@@ -1103,6 +1124,15 @@ export class TypeStore {
 
     recordInstantiationOverflow() {
         this.instantiationOverflows.push(new InstantiationOverflow(this.instantiationChain.toArray()));
+        for (let member in this.fillingMembers) {
+            this.endlessMembers.add(member);
+        }
+        this.unwindingToRoot = true;
+    }
+
+    fillingMember(DeclaredType template, string label) {
+        this.fillingMembers.set(this.fillingMembers.length() - 1,
+            "{this.chainKind}#{template.filePath()}#{template.name()}#{label}");
     }
 
     // Fills one queued instantiation early, for a base link the layout phase needs now.
@@ -1179,6 +1209,13 @@ export class TypeStore {
 
     fill(InstantiationType instantiation) {
         this.instantiationChain.push(instantiation);
+        this.fillingMembers.push("");
+        if (this.instantiationChain.length() == 1) {
+            this.chainKind = "concrete";
+            if (namesTypeParameter(instantiation)) {
+                this.chainKind = "open";
+            }
+        }
         let template = instantiation.template();
         Type[] arguments = instantiation.arguments();
         GreenNode owner = template.declaration();
@@ -1186,38 +1223,46 @@ export class TypeStore {
             is ClassType classTemplate -> {
                 let base = classTemplate.base();
                 if (base != null) {
+                    this.fillingMember(template, "base");
                     instantiation.setBase(this.substitute(base, owner, arguments));
                 }
+                this.fillingMember(template, "interfaces");
                 instantiation.setInterfaces(this.substituteAll(classTemplate.interfaces(), owner, arguments));
                 this.fillFields(instantiation, classTemplate.fields(), owner, arguments,
                     classTemplate.baseFieldCount());
                 instantiation.setBaseFieldCount(classTemplate.baseFieldCount());
                 this.fillMethods(instantiation, classTemplate.methods(), owner, arguments,
-                    instantiation.methods());
+                    instantiation.methods(), "method");
                 this.fillMethods(instantiation, classTemplate.staticMethods(), owner, arguments,
-                    instantiation.staticMethods());
+                    instantiation.staticMethods(), "static method");
             },
             is StructType structTemplate -> {
+                this.fillingMember(template, "interfaces");
                 instantiation.setInterfaces(
                     this.substituteAll(structTemplate.interfaces(), owner, arguments));
                 this.fillFields(instantiation, structTemplate.fields(), owner, arguments, 0);
                 this.fillMethods(instantiation, structTemplate.methods(), owner, arguments,
-                    instantiation.methods());
+                    instantiation.methods(), "method");
                 this.fillMethods(instantiation, structTemplate.staticMethods(), owner, arguments,
-                    instantiation.staticMethods());
+                    instantiation.staticMethods(), "static method");
             },
             is InterfaceType interfaceTemplate -> {
                 let base = interfaceTemplate.base();
                 if (base != null) {
+                    this.fillingMember(template, "base");
                     instantiation.setBase(this.substitute(base, owner, arguments));
                 }
                 this.fillMethods(instantiation, interfaceTemplate.methods(), owner, arguments,
-                    instantiation.methods());
+                    instantiation.methods(), "method");
             },
             default -> { },
         }
         instantiation.setFilled();
+        this.fillingMembers.pop();
         this.instantiationChain.pop();
+        if (this.instantiationChain.length() <= 1) {
+            this.unwindingToRoot = false;
+        }
     }
 
     // The first inheritedCount template fields were declared by a base, so their defining type
@@ -1227,6 +1272,7 @@ export class TypeStore {
                        GreenNode owner, Type[] arguments, long inheritedCount) {
         for (long i = 0; i < templateFields.length(); i++) {
             let field = templateFields.get(i);
+            this.fillingMember(instantiation.template(), "field {i}");
             Type definingType = instantiation;
             if (i < inheritedCount) {
                 definingType = this.substitute(field.definingType(), owner, arguments);
@@ -1239,9 +1285,10 @@ export class TypeStore {
     }
 
     fillMethods(InstantiationType instantiation, List<Method> templateMethods,
-                        GreenNode owner, Type[] arguments, List<Method> filled) {
+                        GreenNode owner, Type[] arguments, List<Method> filled, string label) {
         for (long i = 0; i < templateMethods.length(); i++) {
             let method = templateMethods.get(i);
+            this.fillingMember(instantiation.template(), "{label} {i}");
             let signature = this.substituteSignature(method.signature(), owner, arguments);
             filled.push(new Method(signature, method.visibility(),
                 method.isConstructor(), method.isDestructor(), method.isOverride(),
@@ -1390,6 +1437,44 @@ final class Limits {
     // The instantiation nesting a well-formed program stays far below. A chain that reaches it is
     // a polymorphically recursive template that would never terminate.
     protected static const long instantiationDepth = 200;
+}
+
+namesTypeParameter(Type type) -> bool {
+    switch (type) {
+        is TypeParamType ignored -> {
+            return true;
+        },
+        is OptionalType optional -> {
+            return namesTypeParameter(optional.inner());
+        },
+        is ArrayType array -> {
+            return namesTypeParameter(array.element());
+        },
+        is FunctionType functionType -> {
+            for (let parameter in functionType.parameterTypes()) {
+                if (namesTypeParameter(parameter)) {
+                    return true;
+                }
+            }
+            for (let thrown in functionType.thrownTypes()) {
+                if (namesTypeParameter(thrown)) {
+                    return true;
+                }
+            }
+            return namesTypeParameter(functionType.returnType());
+        },
+        is InstantiationType instantiation -> {
+            for (let argument in instantiation.arguments()) {
+                if (namesTypeParameter(argument)) {
+                    return true;
+                }
+            }
+            return false;
+        },
+        default -> {
+            return false;
+        },
+    }
 }
 
 // The span of the field whose type re-enters the template, so the diagnostic points at the
