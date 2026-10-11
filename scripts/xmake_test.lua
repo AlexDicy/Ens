@@ -1269,6 +1269,24 @@ task("test")
             run({"check", path.join(tests_dir, "undefined_function.ens")}, nil, 1,
                 "Undefined function")
 
+            -- the standard library named as the target is checked once, as the library itself
+            local std_folder = path.join(os.projectdir(), "libs", "std")
+            run({"check", std_folder, "--stdlib", path.join(os.projectdir(), "libs")}, nil, 0,
+                "std: ", "nothing to report", "!(from std.")
+            run({"check", std_folder, "--stdlib", root}, nil, 2, "is a standard library: a "
+                .. "package named 'std' whose 'src' holds 'core.ens' and 'io/print.ens'. This "
+                .. "command uses it as the standard library, but '--stdlib' names a different "
+                .. "folder, '",
+                "Remove '--stdlib', or write '--stdlib ")
+
+            -- a package of the user's own named 'std' is an ordinary package
+            local user_std = path.join(root, "userstd", "std")
+            os.mkdir(path.join(user_std, "src"))
+            io.writefile(path.join(user_std, "ens.package"), 'package std {\n    ens "0.1";\n}\n')
+            io.writefile(path.join(user_std, "src", "tools.ens"),
+                'export answer() -> int {\n    return 1;\n}\n')
+            run({"check", user_std}, nil, 0, "std: ", "nothing to report", "!is a standard library")
+
             -- a workspace root builds every member, the library before the application that
             -- depends on it even though the manifest lists the application first
             local workspace = path.join(tests_dir, "cli_workspace")
