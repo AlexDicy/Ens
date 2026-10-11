@@ -64,6 +64,9 @@ enum class ManifestForm { None, Package, Workspace, Overrides };
 struct Manifest {
     ManifestForm form = ManifestForm::None;
     std::string packageName;
+    // Where the package's name is written, so a problem with the name is reported at it.
+    int packageNameLine = 0;
+    int packageNameColumn = 0;
     bool hasVersion = false;
     std::string version;
     bool hasEnsVersion = false;

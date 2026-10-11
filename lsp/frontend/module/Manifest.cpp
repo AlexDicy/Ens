@@ -96,6 +96,8 @@ private:
         if (at(SyntaxKind::KwPackage)) {
             manifest.form = ManifestForm::Package;
             advance();
+            manifest.packageNameLine = current().line;
+            manifest.packageNameColumn = current().column;
             if (auto name = parsePackagePath("Expected the package name after 'package', for "
                                              "example 'package acme.tools'.")) {
                 manifest.packageName = *name;

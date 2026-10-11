@@ -690,6 +690,7 @@ package alex.jsonkit {
 }
 ```
 
+A package is named by its `package` declaration, and the name `std` is reserved for the standard library, so no other manifest may declare it.
 A package's sources live in its `src/` folder, with its tests in a sibling `tests/` folder.
 A package whose `src/main.ens` defines `main()` is an application and builds to an executable; a package without one is a library.
 Every package declares `ens`, the language version it is written for as major.minor; `version`, the package's own version in dotted numerals, is optional.

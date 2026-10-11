@@ -167,6 +167,11 @@ fs::path findStdlibRoot() {
     return fs::path();
 }
 
+fs::path standardLibraryFolder(const fs::path& stdlibRoot) {
+    if (stdlibRoot.empty()) return {};
+    return stdlibRoot / "std";
+}
+
 // Build a module from its in-memory override if present, else read it from disk.
 static std::unique_ptr<Module> loadOrOverride(const fs::path& base, const fs::path& rel,
                                               const std::u16string& mp,
@@ -448,7 +453,7 @@ bool buildModuleGraph(const fs::path& sourceRoot,
                       std::unordered_map<std::u16string, Module*>& byPath,
                       const SourceOverrides* overrides,
                       const fs::path& testsRoot) {
-    WorkspaceRegistry registry;
+    WorkspaceRegistry registry(standardLibraryFolder(stdlibRoot));
     Workspace& root = registry.defineRoot(sourceRoot, sourceRoot, testsRoot,
                                           /*withDependencies=*/false);
     return buildModuleGraph(root, registry, stdlibRoot, seedRelatives, modulesOut, byPath, overrides);
@@ -462,7 +467,7 @@ Module* analyzeStandaloneSource(const std::u16string& modulePath, const std::str
     // The implicit imports are best-effort here: without a standard library the buffer still
     // analyzes, only the names it would have provided stay unknown.
     if (!stdlibRoot.empty()) {
-        WorkspaceRegistry registry;
+        WorkspaceRegistry registry(standardLibraryFolder(stdlibRoot));
         Workspace* stdlib = registry.getOrLoad(stdlibRoot / "std", u"std");
         std::vector<std::u16string> alwaysLoaded;
         for (std::u16string_view implicitPath : kImplicitImportPaths) {

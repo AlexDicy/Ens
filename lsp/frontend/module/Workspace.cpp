@@ -25,6 +25,13 @@ std::string positionOf(const std::string& manifestPath, int line, int column) {
     return manifestPath + ":" + std::to_string(line) + ":" + std::to_string(column) + ": ";
 }
 
+// Whether `sources` holds the modules every program reads without an import, which is what makes
+// a root package named `std` the standard library itself.
+bool holdsPrelude(const fs::path& sources) {
+    std::error_code ec;
+    return fs::exists(sources / "core.ens", ec) && fs::exists(sources / "io" / "print.ens", ec);
+}
+
 }  // namespace
 
 std::optional<PackageMatch> matchPackage(
@@ -221,7 +228,24 @@ const WorkspaceRegistry::MemberIndex* WorkspaceRegistry::enclosingMemberIndex(
     return nullptr;
 }
 
-void WorkspaceRegistry::applyPackageManifest(Workspace& ws, const Manifest& manifest) {
+WorkspaceRegistry::WorkspaceRegistry(const fs::path& standardLibrary)
+    : standardLibraryKey_(standardLibrary.empty() ? std::string()
+                                                  : canonicalFolderKey(standardLibrary)) {}
+
+std::string reservedPackageNameMessage() {
+    return "The package name 'std' is reserved for the standard library, which programs import "
+           "as '@std'. Rename this package, as in 'package acme.tools'.";
+}
+
+void WorkspaceRegistry::applyPackageManifest(Workspace& ws, const Manifest& manifest,
+                                             bool isRoot) {
+    bool isLibrary = canonicalFolderKey(ws.root) == standardLibraryKey_ ||
+                     (isRoot && holdsPrelude(ws.srcRoot));
+    if (manifest.packageName == "std" && !isLibrary) {
+        errors_.push_back(positionOf(ws.manifestPath, manifest.packageNameLine,
+                                     manifest.packageNameColumn) +
+                          reservedPackageNameMessage());
+    }
     ws.hasPackageManifest = true;
     ws.packageName = toU16(manifest.packageName);
     ws.natives = manifest.natives;
@@ -365,7 +389,7 @@ Workspace& WorkspaceRegistry::defineRoot(const fs::path& folder, const fs::path&
 
     switch (manifest.form) {
         case ManifestForm::Package:
-            applyPackageManifest(ws, manifest);
+            applyPackageManifest(ws, manifest, /*isRoot=*/true);
             break;
         case ManifestForm::Workspace:
             // A workspace declares members without being a package itself: modules under its
@@ -414,7 +438,7 @@ Workspace* WorkspaceRegistry::getOrLoad(const fs::path& folder, const std::u16st
     }
     const Manifest& manifest = manifestFor(manifestFile);
     if (manifest.form == ManifestForm::Package) {
-        applyPackageManifest(ws, manifest);
+        applyPackageManifest(ws, manifest, /*isRoot=*/false);
     } else {
         errors_.push_back(ws.manifestPath + ": Expected a package declaration; a package "
                           "consumed as a dependency cannot hold a workspace or overrides "

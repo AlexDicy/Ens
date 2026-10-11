@@ -126,4 +126,8 @@ bool analyzeModuleGraph(std::vector<std::unique_ptr<Module>>& modules,
                         std::unordered_map<std::u16string, Module*>& byPath,
                         TypeContext& sharedCtx);
 
+// The folder of the standard library's package under `stdlibRoot`, or an empty path when there is
+// no standard library.
+fs::path standardLibraryFolder(const fs::path& stdlibRoot);
+
 }  // namespace ens::modules

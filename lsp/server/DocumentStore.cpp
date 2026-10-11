@@ -48,7 +48,8 @@ void Document::analyze() {
 
     ens::modules::SourceOverrides overrides = store_.collectOverrides();
     std::deque<fs::path> seeds{ rel };
-    ens::modules::WorkspaceRegistry registry;
+    ens::modules::WorkspaceRegistry registry(
+        ens::modules::standardLibraryFolder(store_.stdlibRoot()));
     ens::modules::Workspace& root = registry.defineRoot(
         rw.depsFolder, rw.srcRoot, rw.testsRoot, rw.withDependencies);
     bool ok = ens::modules::buildModuleGraph(root, registry, store_.stdlibRoot(),
@@ -224,7 +225,7 @@ WorkspaceModules DocumentStore::buildWorkspaceModules(const fs::path& forFile) c
 
     workspace.typeCtx = std::make_unique<TypeContext>();
     ens::modules::SourceOverrides overrides = collectOverrides();
-    ens::modules::WorkspaceRegistry registry;
+    ens::modules::WorkspaceRegistry registry(ens::modules::standardLibraryFolder(stdlibRoot_));
     ens::modules::Workspace& root =
         registry.defineRoot(depsFolder, srcRoot, testsRoot, withDependencies);
     bool ok = ens::modules::buildModuleGraph(root, registry, stdlibRoot_, seeds,

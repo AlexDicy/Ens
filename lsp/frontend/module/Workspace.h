@@ -86,6 +86,10 @@ struct CollectedNative {
 // `errors()` rather than aborting the load.
 class WorkspaceRegistry {
 public:
+    // A registry for a compilation whose standard library is the package in `standardLibrary`,
+    // the one folder whose manifest may declare the package `std`. Empty when there is none.
+    explicit WorkspaceRegistry(const fs::path& standardLibrary = {});
+
     // Define the compilation's root workspace. `srcRoot`/`testsRoot` may differ from
     // `folder/src` and `folder/tests` when the driver was given an explicit source or tests
     // folder. With `withManifest`, `folder/ens.package` and the sibling `ens.overrides` are
@@ -127,7 +131,9 @@ private:
     const Manifest& manifestFor(const fs::path& manifestFile);
     const MemberIndex& memberIndexFor(const fs::path& folder);
     const MemberIndex* enclosingMemberIndex(const fs::path& packageFolder);
-    void applyPackageManifest(Workspace& ws, const Manifest& manifest);
+    // `isRoot` marks the compilation's root package, which is the standard library itself when it
+    // is named `std` and holds the prelude, whatever library the compilation was given.
+    void applyPackageManifest(Workspace& ws, const Manifest& manifest, bool isRoot);
     void resolveDependencies(Workspace& ws, const Manifest& manifest);
     void loadRootOverrides(const fs::path& rootFolder);
     void noticeOverrideUse(const std::string& name, const fs::path& folder);
@@ -141,6 +147,11 @@ private:
     std::unordered_set<std::string> noticedOverrides_;
     std::vector<std::string> errors_;
     std::vector<std::string> notices_;
+    std::string standardLibraryKey_;
 };
+
+// What a manifest that declares a package named `std` reports, unless it is the standard
+// library's own.
+std::string reservedPackageNameMessage();
 
 }  // namespace ens::modules
