@@ -17,6 +17,7 @@ import target;
 import Reporter from report;
 import report;
 import Unit from program;
+import EntryReading from program;
 import program;
 import BuildOutcome from build;
 import build;
@@ -75,12 +76,15 @@ final class Application {
 }
 
 // Which of the target's programs to run. A file, a folder and a package each hold at most one, so
-// the only choice is at a workspace root: exactly one of its members must be an application.
+// the only choice is at a workspace root: exactly one of its members must be an application. A main
+// module with a syntax error and no main() found may still be the application, so it is built and
+// the build reports the error. In a workspace, that holds for the one such member when no member
+// declares main().
 application(FileLoader loader, BuildTarget resolved, Path workingFolder) -> Application {
     if (resolved.kind() == TargetKind.Workspace) {
         return workspaceApplication(loader, resolved, workingFolder);
     }
-    if (!program.definesEntryFile(loader, mainModuleOf(resolved))) {
+    if (program.readEntryFile(loader, mainModuleOf(resolved)) == EntryReading.Absent) {
         return refused("'{resolved.root()}' cannot be run, because its main module does not "
             + "define main(). The main module is the file named on the command line, or "
             + "'main.ens' in the folder or package named. Add a main() function there");
@@ -91,11 +95,34 @@ application(FileLoader loader, BuildTarget resolved, Path workingFolder) -> Appl
 workspaceApplication(FileLoader loader, BuildTarget resolved, Path workingFolder) -> Application {
     let found = new List<WorkspaceMember>();
     let named = new List<string>();
+    let uncertain = new List<WorkspaceMember>();
     for (let member in target.memberOrder(resolved.members()).members()) {
-        if (program.definesEntryFile(loader, member.folder().join("src/main.ens"))) {
-            found.push(member);
-            named.push(member.packageName());
+        switch (program.readEntryFile(loader, member.folder().join("src/main.ens"))) {
+            Declared -> {
+                found.push(member);
+                named.push(member.packageName());
+            },
+            Uncertain -> {
+                uncertain.push(member);
+            },
+            Absent -> { },
         }
+    }
+    if (found.length() == 0 && uncertain.length() == 1) {
+        found.push(uncertain.get(0));
+        named.push(uncertain.get(0).packageName());
+    }
+    if (found.length() == 0 && uncertain.length() > 1) {
+        let names = new List<string>();
+        for (long i = 0; i < uncertain.length(); i++) {
+            names.push(uncertain.get(i).packageName());
+        }
+        string example = "";
+        if (workingFolder.normalize() == resolved.root().normalize()) {
+            example = memberFolderText(resolved.root(), uncertain.get(0).folder());
+        }
+        return refused(uncertainProgramsMessage(resolved.root().toString(), names.toArray(),
+            example));
     }
     if (found.length() == 0) {
         return refused("the workspace at '{resolved.root()}' has no program to run: no member's "
@@ -114,6 +141,23 @@ workspaceApplication(FileLoader loader, BuildTarget resolved, Path workingFolder
     let only = found.get(0);
     return new Application(program.memberUnit(only, resolved.root()),
         target.artifactStem(only.packageName()), "");
+}
+
+// Why a workspace where no member declares main() has no one program to run, when the syntax errors
+// in more than one member's 'src/main.ens' may each hide it. 'example' is the folder of a member to
+// name, or empty text when the command was not run in the workspace root.
+export uncertainProgramsMessage(string root, string[] members, string example) -> string {
+    string which = "either";
+    if (members.length > 2) {
+        which = "any of them";
+    }
+    string message = "the 'src/main.ens' of " + report.quotedNames(members) + " in the workspace "
+        + "at '{root}' have syntax errors, so {which} may be the program to run. Name the folder "
+        + "of the member to run";
+    if (example.length > 0) {
+        message = message + ", as in 'ens run {example}'";
+    }
+    return message + ", and the build reports its errors";
 }
 
 // A member's folder as a command run in the workspace root names it.

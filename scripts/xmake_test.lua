@@ -1495,6 +1495,15 @@ task("test")
             run({"run", broken}, nil, 1, "' was not built, so it was not run")
             assertTempEmpty("a failed ens run")
 
+            -- a syntax error that may hide main() is the build's to report, not a missing main()
+            local hidden = path.join(root, "hidden")
+            writePackage(hidden, 'package demo.hidden {\n    ens "0.1";\n}\n', {
+                ["src/main.ens"] = 'attempt() {\n    if (true) {\n\n  main() -> int {\n'
+                    .. '    return 0;\n}\n',
+            })
+            run({"run", hidden}, nil, 1, "Expected '}' to close the block that starts on line 2.",
+                "' was not built, so it was not run", "!does not define main()")
+
             -- '--target' asks for a machine this command cannot run what it builds on
             run({"run", echo, "--target", "aarch64-unknown-linux-gnu"}, nil, 2,
                 "runs what it builds", "Remove '--target'")
@@ -1520,6 +1529,38 @@ task("test")
             })
             run({"run", none}, nil, 2, "' has no program to run: no member's 'src/main.ens' defines "
                 .. "main(). Add main() to the 'src/main.ens' of the member to run")
+
+            -- the one member whose syntax error may hide main() is built, and the build reports it
+            local unsure = path.join(root, "unsure")
+            os.mkdir(unsure)
+            io.writefile(path.join(unsure, "ens.package"),
+                'workspace {\n    member "app";\n    member "lib";\n}\n')
+            writePackage(path.join(unsure, "app"), 'package unsure.app {\n    ens "0.1";\n}\n', {
+                ["src/main.ens"] = 'attempt() {\n    if (true) {\n\n  main() -> int {\n'
+                    .. '    return 0;\n}\n',
+            })
+            writePackage(path.join(unsure, "lib"), 'package unsure.lib {\n    ens "0.1";\n}\n', {
+                ["src/greet.ens"] = 'export greet() -> string {\n    return "hi";\n}\n',
+            })
+            run({"run", unsure}, nil, 1, "Expected '}' to close the block that starts on line 2.",
+                "'unsure.app' was not built, so it was not run", "!has no program to run")
+
+            -- two members whose syntax errors may each hide main() are not told apart
+            local twounsure = path.join(root, "twounsure")
+            os.mkdir(twounsure)
+            io.writefile(path.join(twounsure, "ens.package"),
+                'workspace {\n    member "app";\n    member "tool";\n}\n')
+            for _, member in ipairs({"app", "tool"}) do
+                writePackage(path.join(twounsure, member),
+                    'package twounsure.' .. member .. ' {\n    ens "0.1";\n}\n', {
+                    ["src/main.ens"] = 'attempt() {\n    if (true) {\n\n  main() -> int {\n'
+                        .. '    return 0;\n}\n',
+                })
+            end
+            run({"run", "."}, {curdir = twounsure}, 2, "the 'src/main.ens' of 'twounsure.app' and "
+                .. "'twounsure.tool' in the workspace at '", "' have syntax errors, so either may be "
+                .. "the program to run. Name the folder of the member to run, as in 'ens run app', "
+                .. "and the build reports its errors", "!has no program to run")
 
             -- a workspace root whose program depends on a sibling member: the sibling's text is
             -- what comes out, everything after '--' reaches the program, the program's own code
