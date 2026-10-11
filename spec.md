@@ -794,6 +794,7 @@ A module the program reaches nothing in gets no object file of its own.
 A build keeps the object files it produced under the build root, in `.ens/<target triple>/O<level>/`.
 The build root is the folder holding the manifest that governs the sources, so where the objects go does not move when `--output` names an executable somewhere else; sources that no manifest governs keep theirs beside themselves.
 Every target triple and every optimization level has a folder of its own, so an object built for one configuration is never read by a build of another.
+Each kept object file's name carries a digest of its bytes, and a build removes the earlier versions of the objects it keeps.
 The `.ens` folder carries a `.gitignore` that ignores everything under it, and a build leaves what it put there in place.
 `ens run` and `ens test` are the exception: each builds in a folder of its own under the system's temporary directory and removes that folder afterwards, object files included, so neither leaves anything anywhere.
 
@@ -1934,7 +1935,8 @@ Both return an `Iterable<Entry>`, which a `for`-in loop walks, and an `Entry` fr
 
 `createDirectories()` creates the directory and every missing directory above it, leaving a path that is already a directory alone.
 `createDirectoryExclusive()` creates them the same way and returns whether this call is the one that created the directory itself, so two programs racing for the same name get different results and the one that gets `true` may treat the directory as its own.
-`moveTo(destination)` moves what is at the path in one step and returns whether this call is the one that moved it, which is `false` when something was already at the destination; both paths have to be on the same volume, because a move across volumes would have to copy.
+`moveTo(destination, replace = false)` moves what is at the path in one step and returns whether this call is the one that moved it, which is `false` when something was already at the destination; both paths have to be on the same volume, because a move across volumes would have to copy.
+With `replace` set to `true` it moves over a file already at the destination in the same one step, so it returns `true` or raises a `FileSystemError`, as it does on Windows while another program has that file open.
 `copyTo(destination)` copies the file at the path, replacing whatever was at the destination, and the copy carries the source's permissions and never its set-user-id, set-group-id or sticky bits, because a copy hands over permissions and not privileges.
 `removeFile()` removes one file and raises a `FileSystemError` for a directory, and `removeDirectory()` removes one directory, which has to be empty already, so removing what a directory contains always takes a call of its own.
 `removeRecursively()` is that call: it removes everything under the path, then the path itself, and stops at the first thing it could not remove.

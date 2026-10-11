@@ -43,6 +43,7 @@ task("test")
         import("core.base.option")
         import("core.base.global")
         import("core.base.json")
+        import("core.base.process")
         import("core.tool.toolchain")
         import("net.http")
         import("async.runjobs")
@@ -976,11 +977,21 @@ task("test")
                     full = string.format("%s: %s", name, failed)}
             end
 
-            -- the fixpoint: the two stages' objects, module by module in name order.
+            -- the fixpoint: the two stages' objects, module by module in name order. A build keeps
+            -- an object under its emitted name with the digest of its bytes before the extension, so
+            -- the two stages are matched by the emitted name and their bytes then compared.
+            local function emittedName(kept)
+                local front, digest, extension = kept:match("^(.*)%.(%x+)(%.[^.]+)$")
+                if front and #digest == 16 then return front .. extension end
+                return kept
+            end
+            local kept_names = {}
             local function objectNames(folder)
                 local names = {}
                 for _, f in ipairs(os.files(path.join(folder, "*" .. obj_suffix))) do
-                    table.insert(names, path.filename(f))
+                    local emitted = emittedName(path.filename(f))
+                    kept_names[folder .. "|" .. emitted] = path.filename(f)
+                    table.insert(names, emitted)
                 end
                 table.sort(names)
                 return names
@@ -1013,8 +1024,8 @@ task("test")
             end
             local total_bytes = 0
             for _, n in ipairs(names2) do
-                local bytes2 = readBytes(path.join(stage2_dir, n))
-                local bytes3 = readBytes(path.join(stage3_dir, n))
+                local bytes2 = readBytes(path.join(stage2_dir, kept_names[stage2_dir .. "|" .. n]))
+                local bytes3 = readBytes(path.join(stage3_dir, kept_names[stage3_dir .. "|" .. n]))
                 total_bytes = total_bytes + #bytes2
                 if bytes2 ~= bytes3 then
                     return {name = name, ok = false,
@@ -1173,10 +1184,9 @@ task("test")
                 table.insert(failures, "a build left no object files under the build root")
             end
 
-            -- each object is assembled in a folder of the build's own and moved into place once it
-            -- is whole, so nothing can read one half-written. That the move is indivisible cannot be
-            -- asserted without racing two builds; what is asserted is that the staging folder is
-            -- always taken away, and that a build whose objects are already there replaces them.
+            -- each object is assembled in a folder of the build's own and kept under a name that
+            -- carries the digest of its bytes, so no build reads or replaces another's. What is
+            -- asserted is that the staging folder is always taken away.
             local function expectNoStaging(base, after)
                 local left = os.dirs(path.join(base, "staging-*"))
                 if #left > 0 then
@@ -1189,11 +1199,36 @@ task("test")
             expectNoStaging(path.join(objects, ".ens", triple, "O2"), "a build over its own objects")
             run_program(path.join(root, "objects.exe"), 0, "objects")
 
-            -- an edited source reaches the object at its path rather than the previous one staying
+            -- an edited source is linked from its own new object
             io.writefile(path.join(objects, "src", "main.ens"),
                 'main() -> int {\n    print("objects again");\n    return 0;\n}\n')
             run({"build", objects, "--output", path.join(root, "objects.exe")}, nil, 0, ": Built '")
             run_program(path.join(root, "objects.exe"), 0, "objects again")
+            -- the edited object is kept under a name of its own, and its earlier version is cleared
+            local mains = os.files(path.join(objects, ".ens", triple, "O2", "objects.main.*"
+                .. obj_suffix))
+            if #mains ~= 1 then
+                table.insert(failures, string.format("the objects folder holds %d versions of "
+                    .. "'objects.main'", #mains))
+            end
+
+            -- Windows refuses to replace a program that is running, and the build names the
+            -- program and what to do
+            if is_host("windows") then
+                local sleeper = path.join(root, "sleeper.ens")
+                local sleeper_exe = path.join(root, "sleeper.exe")
+                io.writefile(sleeper, 'import Thread from @std.thread;\n\nmain() -> int {\n'
+                    .. '    Thread.sleep(20000);\n    return 0;\n}\n')
+                run({"build", sleeper, "--output", sleeper_exe}, nil, 0, ": Built '")
+                local running = process.openv(sleeper_exe, {})
+                run({"build", sleeper, "--output", sleeper_exe}, nil, 1, "could not replace '",
+                    "sleeper.exe': another program has it open, such as a running copy of the "
+                    .. "program, or the file is read-only. Close that program or clear the "
+                    .. "read-only setting, and build again", "!.ens-link")
+                running:kill()
+                running:wait(-1)
+                running:close()
+            end
 
             -- and nowhere else: not beside the executable, and not in the folder it was run from
             for _, elsewhere in ipairs({root, work}) do

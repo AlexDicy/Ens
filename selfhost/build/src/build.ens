@@ -2,12 +2,17 @@
 // linked. A unit whose main module defines main() produces a program, and one that does not is a
 // library compiled just as thoroughly. Building a unit is a function of its inputs alone.
 import Path from @std.fs;
+import ErrorKind from @std.fs.error;
 import FileSystemError from @std.fs.error;
+import Thread from @std.thread;
+import Platform from @std.environment;
+import @std.environment;
 import List from @std.collections.list;
 import FileDiagnostic from @ens.sema.support.diagnostics;
 import FileLoader from @ens.sema.support.loader;
 import ProgramAnalysis from @ens.sema.pipeline;
 import @ens.host.scratch;
+import Retry from @ens.host.scratch;
 import @ens.codegen.driver;
 import @ens.codegen.settings;
 import LinkRequest from @ens.link.request;
@@ -28,6 +33,7 @@ import Loaded from program;
 import Unit from program;
 import program;
 import natives;
+import objects;
 import prebuilt;
 import platform;
 
@@ -239,39 +245,117 @@ export finishUnit(BuildOptions options, Packaging packaging, Loaded loaded, stri
     }
 
     let emitted = emitObjects(options, analysis, objectsFolder, output.stem() + ".");
-    string[] notices = withLeftover(loaded.notices(), emitted.leftBehind);
     if (emitted.failure.length > 0) {
-        return failed([emitted.failure], loaded.moduleCount(), notices);
+        return failed([emitted.failure], loaded.moduleCount(),
+            withLeftover(loaded.notices(), emitted.leftBehind));
     }
     if (emitted.diagnostics.length > 0) {
         return failedWithDiagnostics(diagnostics.formatAll(emitted.diagnostics, loaded.catalog()),
-            loaded.moduleCount(), notices);
+            loaded.moduleCount(), withLeftover(loaded.notices(), emitted.leftBehind));
     }
-    if (emitted.objects.length == 0) {
-        return failed(["Internal: code generation wrote no object files for a program that "
-            + "defines main()"], loaded.moduleCount(), notices);
+    let attempt = linkStaged(packaging, loaded, emitted, output, options, toolchain);
+    string[] notices = withLeftover(withLeftovers(loaded.notices(),
+        keepObjects(emitted, objectsFolder)), attempt.leftBehind);
+    if (attempt.failure.length > 0) {
+        return failed(attempt.failure, loaded.moduleCount(), notices);
     }
+    return new UnitReport(BuildOutcome.BuiltExecutable, output, attempt.noise, nothing(),
+        loaded.moduleCount(), emitted.objects.length, emitted.account, notices);
+}
 
+// What linking a unit's staged objects came to: why it failed, or what the linker printed on a link
+// that succeeded.
+final class LinkAttempt {
+    protected string[] failure;
+    protected string[] noise;
+    // Why the folder the program was linked in is still there, or empty text.
+    protected string leftBehind;
+
+    protected constructor(this.failure, this.noise, this.leftBehind);
+}
+
+// Links the program out of the objects in the build's own staging folder, which no other build reads
+// or writes, into a folder of its own beside the program, and then moves it over the program in one
+// step. Another build of the same program therefore never meets a half-written or missing one.
+linkStaged(Packaging packaging, Loaded loaded, Emitted emitted, Path output, BuildOptions options,
+           Toolchain toolchain) -> LinkAttempt {
+    string[] none = [];
+    if (emitted.objects.length == 0) {
+        return new LinkAttempt(["Internal: code generation wrote no object files for a program "
+            + "that defines main()"], none, "");
+    }
     let plan = natives.librariesFor(loaded.natives(),
         platform.platformName(options.targetTriple()));
     if (plan.failure().length > 0) {
-        return failed([plan.failure()], loaded.moduleCount(), notices);
+        return new LinkAttempt([plan.failure()], none, "");
     }
     let prebuiltFiles = prebuilt.filesFor(plan, packaging);
     if (prebuiltFiles.failure().length > 0) {
-        return failed([prebuiltFiles.failure()], loaded.moduleCount(), notices);
+        return new LinkAttempt([prebuiltFiles.failure()], none, "");
     }
-
+    let room = scratch.createUnder(output.parent() ?? Path("."), FolderPrefixes.linking);
+    if (room.failure().length > 0) {
+        return new LinkAttempt([room.failure()], none, "");
+    }
+    Path linking = room.folder().join(output.fileName());
     let linked = linker.link(new LinkRequest(emitted.objects, plan.libraries(),
-        prebuiltFiles.files(), output.toString(), options.targetTriple()), toolchain);
+        prebuiltFiles.files(), linking.toString(), options.targetTriple()), toolchain);
+    string[] failure = none;
     if (linked.problem().length > 0) {
-        return failed([linked.problem()], loaded.moduleCount(), notices);
+        failure = [linked.problem()];
+    } else if (!linked.linked()) {
+        failure = linkFailureLines(output, linked.output());
+    } else {
+        failure = placed(linking, output);
     }
-    if (!linked.linked()) {
-        return failed(linkFailureLines(output, linked.output()), loaded.moduleCount(), notices);
+    string leftBehind = scratch.discard(room.folder());
+    if (failure.length > 0) {
+        return new LinkAttempt(failure, none, leftBehind);
     }
-    return new UnitReport(BuildOutcome.BuiltExecutable, output, linkerNoise(linked.output()),
-        nothing(), loaded.moduleCount(), emitted.objects.length, emitted.account, notices);
+    return new LinkAttempt(none, linkerNoise(linked.output()), leftBehind);
+}
+
+// Moves the linked program over the one at 'output' in one step. Empty when that worked, or why it
+// did not. Windows refuses to replace a file another program has open, so a refusal of that kind is
+// waited out over the same schedule a scratch folder's removal is.
+placed(Path linking, Path output) -> string[] {
+    string[] none = [];
+    FileSystemError? refused = moved(linking, output);
+    if (refused == null) {
+        return none;
+    }
+    FileSystemError last = refused;
+    for (let wait in Retry.schedule()) {
+        if (!scratch.waitingCanClear(last.kind, environment.platform())) {
+            break;
+        }
+        Thread.sleep(wait);
+        FileSystemError? again = moved(linking, output);
+        if (again == null) {
+            return none;
+        }
+        last = again;
+    }
+    return [replaceText(output, last, environment.platform())];
+}
+
+// The message for a program that could not be moved over the one at 'output'. On Windows a refused
+// permission is a file another program has open or one marked read-only, which waiting did not
+// clear.
+public replaceText(Path output, FileSystemError last, Platform platform) -> string {
+    if (platform == Platform.Windows && last.kind == ErrorKind.PermissionDenied) {
+        return "could not replace '{output}': another program has it open, such as a running copy "
+            + "of the program, or the file is read-only. Close that program or clear the read-only "
+            + "setting, and build again";
+    }
+    return "could not replace '{output}': {last.reason}";
+}
+
+moved(Path linking, Path output) -> FileSystemError? {
+    try linking.moveTo(output, true);
+    return null;
+} catch (FileSystemError refused) {
+    return refused;
 }
 
 // A library is compiled the whole way, object files included, and produces no executable: the point
@@ -285,14 +369,15 @@ buildLibrary(BuildOptions options, ProgramAnalysis analysis, Loaded loaded,
         return failed([prepared], loaded.moduleCount(), loaded.notices());
     }
     let emitted = emitObjects(options, analysis, objectsFolder, artifactStem + ".");
-    string[] notices = withLeftover(loaded.notices(), emitted.leftBehind);
     if (emitted.failure.length > 0) {
-        return failed([emitted.failure], loaded.moduleCount(), notices);
+        return failed([emitted.failure], loaded.moduleCount(),
+            withLeftover(loaded.notices(), emitted.leftBehind));
     }
     if (emitted.diagnostics.length > 0) {
         return failedWithDiagnostics(diagnostics.formatAll(emitted.diagnostics, loaded.catalog()),
-            loaded.moduleCount(), notices);
+            loaded.moduleCount(), withLeftover(loaded.notices(), emitted.leftBehind));
     }
+    string[] notices = withLeftovers(loaded.notices(), keepObjects(emitted, objectsFolder));
     return new UnitReport(BuildOutcome.ValidatedLibrary, Path(""), nothing(), nothing(),
         loaded.moduleCount(), emitted.objects.length, emitted.account, notices);
 }
@@ -307,6 +392,8 @@ export discoverToolchain(BuildOptions options) -> Toolchain {
 // The name the folder one build's objects pass through on their way into place starts with.
 final class FolderPrefixes {
     protected static const string staging = "staging";
+    // The folder beside the program it is linked in, dotted so a listing passes over it.
+    protected static const string linking = ".ens-link";
 }
 
 // What code generation left behind: the object files where they belong, whatever it diagnosed about
@@ -319,15 +406,16 @@ final class Emitted {
     protected string failure;
     // Why the staging folder is still there, or empty text when it was removed.
     protected string leftBehind;
+    // The build's own folder the objects are in until they are kept, or empty once it is gone.
+    protected Path staging;
 
     protected constructor(this.objects, this.diagnostics, this.account, this.failure,
-                this.leftBehind);
+                this.leftBehind, this.staging);
 }
 
-// Generates the program's object files. Every one is written into a folder of this build's own and
-// moved to where it belongs once it is whole, so what is at an object's path is never a
-// half-written object. The staging folder is inside the target folder, so the move is a rename
-// within one volume.
+// Generates the program's object files into a folder of this build's own, each named there after its
+// bytes. What is in that folder is never read or written by another build, so the link reads the
+// objects there, and 'keepObjects' then puts them where the build keeps them.
 emitObjects(BuildOptions options, ProgramAnalysis analysis, Path objectsFolder,
             string filePrefix) -> Emitted {
     let staging = scratch.createUnder(objectsFolder, FolderPrefixes.staging);
@@ -339,52 +427,79 @@ emitObjects(BuildOptions options, ProgramAnalysis analysis, Path objectsFolder,
     string[] nothing = [];
     if (!emitted.succeeded()) {
         return new Emitted(nothing, emitted.diagnostics(), emitted.explanation(), "",
-            scratch.discard(staging.folder()));
+            scratch.discard(staging.folder()), Path(""));
     }
-    let placed = placeObjects(objectsFolder, emitted.objects());
-    string leftBehind = scratch.discard(staging.folder());
+    let named = nameObjects(emitted.objects());
     FileDiagnostic[] clean = [];
-    if (placed.failure.length > 0) {
-        return new Emitted(nothing, clean, nothing, placed.failure, leftBehind);
+    if (named.failure.length > 0) {
+        return new Emitted(nothing, clean, nothing, named.failure,
+            scratch.discard(staging.folder()), Path(""));
     }
-    return new Emitted(placed.files, clean, emitted.explanation(), "", leftBehind);
+    return new Emitted(named.files, clean, emitted.explanation(), "", "", staging.folder());
 }
 
-// The object files of one emission, once each is where it belongs.
-final class PlacedObjects {
+// The object files of one emission, each under the name its bytes give it.
+final class NamedObjects {
     protected string[] files;
     protected string failure;
 
     protected constructor(this.files, this.failure);
 }
 
-placeObjects(Path objectsFolder, List<string> staged) -> PlacedObjects {
-    let placed = new List<string>();
+// Renames every staged object, inside the staging folder, to the name its bytes give it.
+nameObjects(List<string> staged) -> NamedObjects {
+    let named = new List<string>();
     for (long i = 0; i < staged.length(); i++) {
-        string from = staged.get(i);
-        Path to = objectsFolder.join(Path(from).fileName());
-        string problem = placeObject(Path(from), to);
-        if (problem.length > 0) {
-            string[] nothing = [];
-            return new PlacedObjects(nothing, problem);
-        }
-        placed.push(to.toString());
+        Path emitted = Path(staged.get(i));
+        Path folder = emitted.parent() ?? Path("");
+        Path renamed = folder.join(objects.contentName(emitted.fileName(), try emitted.readBytes()));
+        try emitted.moveTo(renamed);
+        named.push(renamed.toString());
     }
-    return new PlacedObjects(placed.toArray(), "");
+    return new NamedObjects(named.toArray(), "");
+} catch (FileSystemError refused) {
+    string[] nothing = [];
+    return new NamedObjects(nothing, refused.message);
 }
 
-// Puts one finished object at its own path. What an earlier build left there goes first, because a
-// move fails rather than replaces when a name is taken; across the two steps the path holds either
-// that whole earlier object or this whole new one, and never a part of either.
-placeObject(Path from, Path to) -> string {
-    if (to.exists()) {
-        try to.removeFile();
+// Moves the emission's objects from its staging folder to where the build keeps them, clears the
+// other versions of those objects, and removes the staging folder. Returns what could not be done,
+// one line each.
+keepObjects(Emitted emitted, Path objectsFolder) -> string[] {
+    let kept = new List<string>();
+    let problems = new List<string>();
+    for (let staged in emitted.objects) {
+        Path from = Path(staged);
+        try objects.keepObject(from, objectsFolder, from.fileName());
+        kept.push(from.fileName());
     }
-    if (try from.moveTo(to)) {
-        return "";
+    let present = new List<string>();
+    for (let entry in try objectsFolder.entries()) {
+        present.push(entry.name);
     }
-    return "the object file '{to}' was replaced while this build was writing it, so another build "
-        + "of these sources is running. Run one build of these sources at a time";
+    for (let stale in objects.staleNames(present.toArray(), kept.toArray())) {
+        string refused = removedOrWhy(objectsFolder.join(stale));
+        if (refused.length > 0) {
+            problems.push(refused);
+        }
+    }
+    string leftBehind = scratch.discard(emitted.staging);
+    if (leftBehind.length > 0) {
+        problems.push(leftBehind);
+    }
+    return problems.toArray();
+} catch (FileSystemError refused) {
+    string leftBehind = scratch.discard(emitted.staging);
+    if (leftBehind.length > 0) {
+        return [refused.message, leftBehind];
+    }
+    return [refused.message];
+}
+
+// Removes an object the build no longer keeps, or says why it is still there.
+removedOrWhy(Path stale) -> string {
+    try stale.removeFile();
+    return "";
 } catch (FileSystemError refused) {
     return refused.message;
 }
@@ -392,7 +507,7 @@ placeObject(Path from, Path to) -> string {
 failedEmission(string problem) -> Emitted {
     string[] nothing = [];
     FileDiagnostic[] clean = [];
-    return new Emitted(nothing, clean, nothing, problem, "");
+    return new Emitted(nothing, clean, nothing, problem, "", Path(""));
 }
 
 // The notices of a unit, with the staging folder its emission could not remove among them, so a
@@ -407,6 +522,15 @@ export withLeftover(string[] notices, string leftBehind) -> string[] {
     }
     all.push("ens: " + leftBehind);
     return all.toArray();
+}
+
+// The notices of a unit with each of the problems keeping its objects ran into among them.
+withLeftovers(string[] notices, string[] leftovers) -> string[] {
+    string[] all = notices;
+    for (let leftover in leftovers) {
+        all = withLeftover(all, leftover);
+    }
+    return all;
 }
 
 // The folder Ens keeps what a build root produces under. The name is dotted and tool-owned, so it
