@@ -14,6 +14,7 @@ import model.convert;
 import model.literalvalues;
 import model.typemembers;
 import Field from model.typemembers;
+import Method from model.typemembers;
 import TypeNames from model.typenames;
 import model.types;
 import Type from model.types;
@@ -35,6 +36,7 @@ import phases.bodies.nullguidance;
 import phases.bodies.valuejoins;
 import phases.bodies.wording;
 import List from @std.collections.list;
+import StringBuilder from @std.text.stringbuilder;
 import phases.bodies.memberaccess;
 import phases.bodies.identifiers;
 import BodyChecker from phases.bodies;
@@ -748,6 +750,12 @@ public analyzeStructLiteralAdapt(BodyChecker checker, StructLiteralExpressionNod
         return structType;
     }
     string quotedStruct = quotedStructName(structType, checker.names());
+    let settable = new List<Field>();
+    for (let field in fields) {
+        if (memberaccess.isAccessAllowed(checker, field.visibility(), field.definingType())) {
+            settable.push(field);
+        }
+    }
     let provided = new List<bool>();
     for (long i = 0; i < fields.length(); i++) {
         provided.push(false);
@@ -758,7 +766,7 @@ public analyzeStructLiteralAdapt(BodyChecker checker, StructLiteralExpressionNod
         long index = fieldIndexNamed(fields, fieldName);
         if (index < 0) {
             checker.reporter().report("Struct {quotedStruct} has no field named '{fieldName}'."
-                + fieldsListed(fields), entry.name().span());
+                + fieldsListed(settable, settable.length() < fields.length()), entry.name().span());
             checker.analyzeExpression(entry.value());
             continue;
         }
@@ -788,19 +796,166 @@ public analyzeStructLiteralAdapt(BodyChecker checker, StructLiteralExpressionNod
                 entry.value().span());
         }
     }
+    let missing = new List<Field>();
+    let unsettable = new List<Field>();
     for (long i = 0; i < fields.length(); i++) {
-        if (provided.get(i)) {
-            continue;
-        }
         let field = fields.get(i);
-        if (field.hasDefault()) {
+        if (provided.get(i) || field.hasDefault()) {
             continue;
         }
+        if (settable.contains(field)) {
+            missing.push(field);
+        } else {
+            unsettable.push(field);
+        }
+    }
+    if (unsettable.length() > 0) {
+        checker.reporter().report(unbuildableRefusal(checker, structType, quotedStruct, unsettable, node),
+            node.span());
+        return structType;
+    }
+    for (let field in missing) {
         checker.reporter().report("Struct literal for {quotedStruct} does not set the field "
             + "'{field.name()}'. Add '{field.name()}: ...', or give the field a default "
             + "value.", node.span());
     }
     return structType;
+}
+
+// The refusal of the literal 'node' of a struct whose fields 'unsettable' have no default and cannot
+// be set here, so no literal written here can build one.
+unbuildableRefusal(BodyChecker checker, Type structType, string quotedStruct, List<Field> unsettable,
+                   StructLiteralExpressionNode node) -> string {
+    let refusal = new StringBuilder();
+    refusal.append("Struct {quotedStruct} cannot be built with a literal here.");
+    let reaches = new List<string>();
+    for (let field in unsettable) {
+        string reach = setterReach(checker, field);
+        if (!reaches.contains(reach)) {
+            reaches.push(reach);
+        }
+    }
+    for (let reach in reaches) {
+        let named = new List<string>();
+        for (let field in unsettable) {
+            if (setterReach(checker, field) == reach) {
+                named.push(field.name());
+            }
+        }
+        if (named.length() == 1) {
+            refusal.append(" Its field '{named.get(0)}' has no default value, and {reach} can set it.");
+        } else {
+            refusal.append(" Its fields {wording.quotedList(named)} have no default value, and {reach} "
+                + "can set them.");
+        }
+    }
+    let callable = reachableConstructor(checker, structType, node);
+    if (callable != null) {
+        if (checker.names().canSpell(structType)) {
+            refusal.append(" Call its constructor instead, as in "
+                + "'{checker.names().of(structType)}{constructorArguments(callable, node)}'.");
+        } else {
+            refusal.append(" Call the constructor of {quotedStruct} instead.");
+        }
+        return refusal.toString();
+    }
+    let authority = types.authorityOf(structType);
+    if (authority != null && authority.isEditable()) {
+        string marker = "export";
+        string article = "an";
+        if (authority.packagePrefix() == checker.packagePrefix()) {
+            marker = "public";
+            article = "a";
+        }
+        let names = new List<string>();
+        for (let field in unsettable) {
+            names.push(field.name());
+        }
+        if (names.length() == 1) {
+            refusal.append(" Give '{names.get(0)}' a default value, mark it '{marker}', or add {article} "
+                + "'{marker}' constructor to {quotedStruct}.");
+        } else {
+            refusal.append(" Give {wording.quotedList(names)} default values, mark them '{marker}', or "
+                + "add {article} '{marker}' constructor to {quotedStruct}.");
+        }
+    }
+    return refusal.toString();
+}
+
+// The constructor of 'structType' this code can call whose parameters are named after the most of
+// the fields the literal 'node' sets, or null where it can call none.
+reachableConstructor(BodyChecker checker, Type structType, StructLiteralExpressionNode node) -> Method? {
+    Method? chosen = null;
+    long chosenCover = -1;
+    for (let candidate in typemembers.constructorsOf(structType)) {
+        if (!checker.resolver().memberExists(candidate)
+                || !memberaccess.isAccessAllowed(checker, candidate.visibility(), candidate.definingType())) {
+            continue;
+        }
+        long cover = 0;
+        for (let parameter in candidate.signature().parameters()) {
+            if (literalValueNamed(node, parameter.name()) != null) {
+                cover++;
+            }
+        }
+        if (cover > chosenCover) {
+            chosen = candidate;
+            chosenCover = cover;
+        }
+    }
+    return chosen;
+}
+
+// The argument list of a call to the constructor 'callable', each parameter named and given the
+// value the literal 'node' sets the field of that name to, '...' where the literal sets none and the
+// parameter has no default, and left out where it has one.
+constructorArguments(Method callable, StructLiteralExpressionNode node) -> string {
+    let arguments = new List<string>();
+    for (let parameter in callable.signature().parameters()) {
+        let value = literalValueNamed(node, parameter.name());
+        if (value == null && parameter.hasDefault()) {
+            continue;
+        }
+        string spelled = "...";
+        if (value != null) {
+            spelled = wording.shortSpelling(value) ?? "...";
+        }
+        arguments.push("{parameter.name()}: {spelled}");
+    }
+    return "({string.joined(arguments.toArray(), ", ")})";
+}
+
+// The value the literal 'node' sets the field 'name' to, or null where it sets none.
+literalValueNamed(StructLiteralExpressionNode node, string name) -> Expression? {
+    for (long i = 0; i < node.fieldsCount(); i++) {
+        if (node.fields(i).name().text() == name) {
+            return node.fields(i).value();
+        }
+    }
+    return null;
+}
+
+// The code that may set 'field', named for the refusal of a literal written anywhere else.
+setterReach(BodyChecker checker, Field field) -> string {
+    let owner = types.authorityOf(field.definingType());
+    string quotedOwner = checker.names().quoted(field.definingType());
+    if (owner != null) {
+        quotedOwner = checker.names().quotedName(owner);
+    }
+    switch (field.visibility()) {
+        Public -> {
+            if (owner != null && owner.packagePrefix().length > 0) {
+                return "only code in package '{owner.packagePrefix()}'";
+            }
+            return "only code in the package that declares {quotedOwner}";
+        },
+        Protected -> {
+            return "only code in the file that declares {quotedOwner}";
+        },
+        default -> {
+            return "only code inside {quotedOwner}";
+        },
+    }
 }
 
 // The refusal of a '{...}' literal toward 'target', which is not a struct, with the 'new' that
@@ -839,14 +994,21 @@ quotedStructName(Type structType, TypeNames names) -> string {
     return names.quoted(structType);
 }
 
-// The sentence, opening with a space, that lists the names of 'fields', or empty when there are none.
-fieldsListed(List<Field> fields) -> string {
-    if (fields.length() == 0) {
+// The sentence, opening with a space, that lists the names of the 'settable' fields, or empty when
+// there are none. 'partial' is true when the struct has fields that cannot be set here.
+fieldsListed(List<Field> settable, bool partial) -> string {
+    if (settable.length() == 0) {
         return "";
     }
     let listed = new List<string>();
-    for (long i = 0; i < fields.length(); i++) {
-        listed.push(fields.get(i).name());
+    for (let field in settable) {
+        listed.push(field.name());
+    }
+    if (partial) {
+        if (listed.length() == 1) {
+            return " The only field that can be set here is '{listed.get(0)}'.";
+        }
+        return " The fields that can be set here are {wording.quotedList(listed)}.";
     }
     if (listed.length() == 1) {
         return " Its only field is '{listed.get(0)}'.";
