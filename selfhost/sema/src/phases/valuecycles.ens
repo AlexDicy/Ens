@@ -1,0 +1,264 @@
+// The by-value field graph between structs, where a struct whose fields lead back to itself can
+// have no layout. Each struct counts as its template, so 'Wrap<Loop>' and 'Wrap<T>' are one node.
+import model.typemembers;
+import Field from model.typemembers;
+import model.types;
+import Type from model.types;
+import DeclaredType from model.types;
+import StructType from model.types;
+import OptionalType from model.types;
+import InstantiationType from model.types;
+import List from @std.collections.list;
+import Set from @std.collections.set;
+
+// One by-value field: 'field' of 'owner', as the type it is read on, leading from struct 'from'
+// to struct 'to'.
+public final class ValueEdge {
+    DeclaredType edgeFrom;
+    DeclaredType edgeTo;
+    Type edgeOwner;
+    Field edgeField;
+
+    protected constructor(this.edgeFrom, this.edgeTo, this.edgeOwner, this.edgeField);
+
+    public from() -> DeclaredType {
+        return this.edgeFrom;
+    }
+
+    public to() -> DeclaredType {
+        return this.edgeTo;
+    }
+
+    public owner() -> Type {
+        return this.edgeOwner;
+    }
+
+    public field() -> Field {
+        return this.edgeField;
+    }
+}
+
+// The structs that reach a struct and are reached from it through by-value fields, with the
+// fields between them, in the order the walk from the struct finds them.
+public final class ValueComponent {
+    List<DeclaredType> componentStructs;
+    List<ValueEdge> componentEdges;
+
+    protected constructor(this.componentStructs, this.componentEdges);
+
+    public structs() -> List<DeclaredType> {
+        return this.componentStructs;
+    }
+
+    public edges() -> List<ValueEdge> {
+        return this.componentEdges;
+    }
+
+    // Whether the component is one cycle that passes each of its structs once.
+    public isSimpleCycle() -> bool {
+        return this.componentEdges.length() == this.componentStructs.length();
+    }
+
+    // Whether the component is reported from 'start': no struct before it, by file path and then by
+    // where it is declared, finds a component containing 'start' from its own fields. A generic
+    // struct whose cycle only closes through one of its instantiations finds none from itself.
+    public startsAt(DeclaredType start) -> bool {
+        for (let other in this.componentStructs) {
+            if (other == start || !precedes(other, start) || !(other is StructType)) {
+                continue;
+            }
+            let theirs = componentOf(other);
+            if (theirs != null && theirs.structs().contains(start)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Structs that no cycle of the component avoids all of, so making them classes breaks every
+    // cycle: one struct where one is on every cycle, the first struct of each remaining cycle
+    // otherwise.
+    public breakingStructs() -> List<DeclaredType> {
+        let ordered = sortedStructs(this.componentStructs);
+        for (let candidate in ordered) {
+            let removed = new List<DeclaredType>();
+            removed.push(candidate);
+            if (!this.hasCycleWithout(removed)) {
+                return removed;
+            }
+        }
+        let removed = new List<DeclaredType>();
+        while (this.hasCycleWithout(removed)) {
+            for (let candidate in ordered) {
+                if (!removed.contains(candidate) && this.onCycleWithout(candidate, removed)) {
+                    removed.push(candidate);
+                    break;
+                }
+            }
+        }
+        return removed;
+    }
+
+    hasCycleWithout(List<DeclaredType> removed) -> bool {
+        for (let start in this.componentStructs) {
+            if (!removed.contains(start) && this.onCycleWithout(start, removed)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Whether 'start' reaches itself again through edges between structs not in 'removed'.
+    onCycleWithout(DeclaredType start, List<DeclaredType> removed) -> bool {
+        let seen = new Set<DeclaredType>();
+        let pending = new List<DeclaredType>();
+        pending.push(start);
+        while (pending.length() > 0) {
+            let current = pending.pop();
+            for (let edge in this.componentEdges) {
+                if (edge.from() != current || removed.contains(edge.to())) {
+                    continue;
+                }
+                if (edge.to() == start) {
+                    return true;
+                }
+                if (seen.add(edge.to())) {
+                    pending.push(edge.to());
+                }
+            }
+        }
+        return false;
+    }
+}
+
+// The component of 'origin' in the by-value graph, or null where no by-value field path leads
+// from 'origin' back to it.
+public componentOf(StructType origin) -> ValueComponent? {
+    let edges = reachableEdges(origin);
+    let members = new List<DeclaredType>();
+    members.push(origin);
+    bool grew = true;
+    while (grew) {
+        grew = false;
+        for (let edge in edges) {
+            if (members.contains(edge.to()) && !members.contains(edge.from())) {
+                members.push(edge.from());
+                grew = true;
+            }
+        }
+    }
+    let closing = new List<ValueEdge>();
+    for (let edge in edges) {
+        if (members.contains(edge.from()) && members.contains(edge.to())) {
+            closing.push(edge);
+        }
+    }
+    bool returns = false;
+    for (let edge in closing) {
+        if (edge.to() == origin) {
+            returns = true;
+        }
+    }
+    if (!returns) {
+        return null;
+    }
+    let ordered = new List<DeclaredType>();
+    for (let edge in closing) {
+        if (!ordered.contains(edge.from())) {
+            ordered.push(edge.from());
+        }
+    }
+    return new ValueComponent(ordered, closing);
+}
+
+// Every by-value field reachable from 'origin', each once, read on every instantiation the walk
+// reaches.
+reachableEdges(StructType origin) -> List<ValueEdge> {
+    let edges = new List<ValueEdge>();
+    let explored = new Set<Type>();
+    let pending = new List<Type>();
+    Type start = origin;
+    explored.add(start);
+    pending.push(start);
+    long next = 0;
+    while (next < pending.length()) {
+        let current = pending.get(next);
+        next++;
+        let from = types.authorityOf(current);
+        let fields = typemembers.fieldsOf(current);
+        if (from == null || fields == null) {
+            continue;
+        }
+        for (long i = 0; i < fields.length(); i++) {
+            let field = fields.get(i);
+            let target = byValueStruct(field.type());
+            if (target == null) {
+                continue;
+            }
+            let to = types.authorityOf(target);
+            if (to == null) {
+                continue;
+            }
+            if (!containsEdge(edges, from, to, field.name())) {
+                edges.push(new ValueEdge(from, to, current, field));
+            }
+            if (explored.add(target)) {
+                pending.push(target);
+            }
+        }
+    }
+    return edges;
+}
+
+containsEdge(List<ValueEdge> edges, DeclaredType from, DeclaredType to, string fieldName) -> bool {
+    for (let edge in edges) {
+        if (edge.from() == from && edge.to() == to && edge.field().name() == fieldName) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The struct a field stores by value, under any number of '?', or null for any other type.
+public byValueStruct(Type fieldType) -> Type? {
+    Type core = fieldType;
+    while (core is OptionalType) {
+        core = core.inner();
+    }
+    if (core is StructType) {
+        return core;
+    }
+    if (core is InstantiationType && core.template() is StructType) {
+        return core;
+    }
+    return null;
+}
+
+sortedStructs(List<DeclaredType> structs) -> List<DeclaredType> {
+    let sorted = new List<DeclaredType>();
+    for (let candidate in structs) {
+        long at = 0;
+        while (at < sorted.length() && precedes(sorted.get(at), candidate)) {
+            at++;
+        }
+        sorted.insert(at, candidate);
+    }
+    return sorted;
+}
+
+// Whether 'first' comes before 'second' by file path, then by the position of its first field,
+// which within one file is the order the structs are declared in.
+precedes(DeclaredType first, DeclaredType second) -> bool {
+    if (first.filePath() != second.filePath()) {
+        return first.filePath().compareTo(second.filePath()) < 0;
+    }
+    return declaredAt(first) < declaredAt(second);
+}
+
+declaredAt(DeclaredType declared) -> long {
+    let fields = typemembers.fieldsOf(declared);
+    if (fields == null || fields.length() == 0) {
+        return 0;
+    }
+    return fields.get(0).nameSpan().start;
+}

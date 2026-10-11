@@ -20,6 +20,8 @@ import RelatedLocation from support.diagnostics;
 import support.diagnostics;
 import ModuleContext from context;
 import phases.layout;
+import phases.valuecycles;
+import ValueComponent from phases.valuecycles;
 import phases.members;
 import model.convert;
 import model.hierarchy;
@@ -587,46 +589,107 @@ class ModuleChecks {
 
     // ---- Struct by-value containment cycles ----
 
+    // Every struct a by-value field path leads back to is in one component with the structs on
+    // those paths, and the component is reported once, from its first struct.
     checkStructCycles() {
         for (long i = 0; i < this.structNodes.length(); i++) {
             let found = this.structFor(this.structNodes.get(i));
             if (found == null) {
                 continue;
             }
-            let path = new List<CycleStep>();
-            let explored = new Set<Type>();
-            if (!findPathBackTo(found, found, path, explored)) {
+            let component = valuecycles.componentOf(found);
+            if (component == null || !component.startsAt(found)) {
                 continue;
             }
-            string quotedFound = this.names.quotedName(found);
-            let steps = new List<string>();
-            for (long s = 0; s < path.length(); s++) {
-                let step = path.get(s);
-                steps.push("field '{step.field.name()}' of {this.names.quoted(step.owner)} has type "
-                    + "{this.names.quoted(step.field.type())}");
+            if (component.isSimpleCycle()) {
+                this.reportStructCycle(found);
+            } else {
+                this.reportStructComponent(component);
             }
-            let builder = new StringBuilder();
-            builder.append("Struct {quotedFound} contains itself: {diagnostics.andJoined(steps.toArray())}");
-            string exampleName = found.name();
-            string quotedExample = quotedFound;
-            string located = "";
-            let example = byValueStruct(path.get(0).field.type());
-            if (example != null) {
-                let authority = types.authorityOf(example);
-                if (authority != null) {
-                    exampleName = authority.name();
-                    quotedExample = this.names.quotedName(authority);
-                    if (authority.modulePath() != this.modulePath) {
-                        located = " where module '{this.names.importPathOf(authority)}' declares it";
-                    }
+        }
+    }
+
+    reportStructCycle(StructType found) {
+        let path = new List<CycleStep>();
+        let explored = new Set<Type>();
+        if (!findPathBackTo(found, found, path, explored)) {
+            return;
+        }
+        string quotedFound = this.names.quotedName(found);
+        let steps = new List<string>();
+        for (long s = 0; s < path.length(); s++) {
+            let step = path.get(s);
+            steps.push("field '{step.field.name()}' of {this.names.quoted(step.owner)} has type "
+                + "{this.names.quoted(step.field.type())}");
+        }
+        let builder = new StringBuilder();
+        builder.append("Struct {quotedFound} contains itself: {diagnostics.andJoined(steps.toArray())}");
+        string exampleName = found.name();
+        string quotedExample = quotedFound;
+        string located = "";
+        let example = valuecycles.byValueStruct(path.get(0).field.type());
+        if (example != null) {
+            let authority = types.authorityOf(example);
+            if (authority != null) {
+                exampleName = authority.name();
+                quotedExample = this.names.quotedName(authority);
+                if (authority.modulePath() != this.modulePath) {
+                    located = " where module '{this.names.importPathOf(authority)}' declares it";
                 }
             }
-            builder.append(". A struct keeps its fields inside itself, so every {quotedFound} would "
-                + "contain another {quotedFound} without end. Make {quotedExample} a class, as in "
-                + "'class {exampleName} \{ ... \}'{located}, because a class field only refers to "
-                + "another object.");
-            this.reporter.report(builder.toString(), path.get(0).field.nameSpan());
         }
+        builder.append(". A struct keeps its fields inside itself, so every {quotedFound} would "
+            + "contain another {quotedFound} without end. Make {quotedExample} a class, as in "
+            + "'class {exampleName} \{ ... \}'{located}, because a class field only refers to "
+            + "another object.");
+        this.reporter.report(builder.toString(), path.get(0).field.nameSpan());
+    }
+
+    // A component with more than one cycle through its structs names every struct and every
+    // field between them, and the structs whose change to a class breaks all the cycles at once.
+    reportStructComponent(ValueComponent component) {
+        let structs = component.structs();
+        let quotedStructs = new List<string>();
+        for (let member in structs) {
+            quotedStructs.push(this.names.quotedName(member));
+        }
+        string lead = "Structs {diagnostics.andJoined(quotedStructs.toArray())} contain each other";
+        string endless = "each of these structs would contain another of them without end";
+        if (structs.length() == 1) {
+            lead = "Struct {quotedStructs.get(0)} contains itself";
+            endless = "every {quotedStructs.get(0)} would contain another {quotedStructs.get(0)} without end";
+        }
+        let steps = new List<string>();
+        let notes = new List<RelatedLocation>();
+        for (let edge in component.edges()) {
+            string step = "field '{edge.field().name()}' of {this.names.quoted(edge.owner())} has type "
+                + "{this.names.quoted(edge.field().type())}";
+            steps.push(step);
+            notes.push(new RelatedLocation(edge.from().filePath(), edge.field().nameSpan(), step));
+        }
+        let breaking = component.breakingStructs();
+        let quotedBreaking = new List<string>();
+        for (let member in breaking) {
+            quotedBreaking.push(this.names.quotedName(member));
+        }
+        let example = breaking.get(0);
+        string located = "";
+        if (example.modulePath() != this.modulePath) {
+            located = " where module '{this.names.importPathOf(example)}' declares it";
+        }
+        string classes = "a class";
+        if (breaking.length() > 1) {
+            classes = "classes";
+        }
+        string fix = "Make {diagnostics.andJoined(quotedBreaking.toArray())} {classes}, as in 'class "
+            + "{example.name()} \{ ... \}'{located}, because a class field only refers to another object.";
+        string why = "A struct keeps its fields inside itself, so {endless}.";
+        Span at = component.edges().get(0).field().nameSpan();
+        if (steps.length() <= 3) {
+            this.reporter.report("{lead}: {diagnostics.andJoined(steps.toArray())}. {why} {fix}", at);
+            return;
+        }
+        this.reporter.report("{lead} through the fields listed below. {why} {fix}", at, notes.toArray());
     }
 
     // ---- Field default ordering ----
@@ -1697,20 +1760,6 @@ notNameablePhrase(DeclaredType worst) -> string {
 
 // The struct a field stores inline: a plain struct, or an instantiation of a generic struct
 // with its own substituted fields.
-byValueStruct(Type fieldType) -> Type? {
-    Type core = fieldType;
-    while (core is OptionalType) {
-        core = core.inner();
-    }
-    if (core is StructType) {
-        return core;
-    }
-    if (core is InstantiationType && core.template() is StructType) {
-        return core;
-    }
-    return null;
-}
-
 // Depth-first search for a by-value field path from origin back to itself. An instantiation
 // counts as its template, so 'Wrap<T>' inside 'struct Wrap<T>' closes the cycle. explored
 // bounds the walk on graphs with shared members.
@@ -1721,7 +1770,7 @@ findPathBackTo(StructType origin, Type current, List<CycleStep> path, Set<Type> 
     }
     for (long i = 0; i < fields.length(); i++) {
         let field = fields.get(i);
-        let next = byValueStruct(field.type());
+        let next = valuecycles.byValueStruct(field.type());
         if (next == null) {
             continue;
         }
