@@ -3224,10 +3224,29 @@ task("test")
                     return {name = name, ok = false, short = "no LLVM environment",
                         full = string.format("%s: %s", name, env_error)}
                 end
-                local run_rc = execSplit(host_exe, argv, stdout_file, stderr_file, {envs = env})
+                -- a package's own tests run in an empty folder of their own, which has to stay
+                -- empty: whatever a test writes goes in a scratch folder it removes, never in the
+                -- folder it ran in
+                local run_options = {envs = env}
+                local run_folder = nil
+                if not ens_file then
+                    run_folder = path.join(out_dir, name .. ".cwd")
+                    os.tryrm(run_folder)
+                    os.mkdir(run_folder)
+                    run_options.curdir = run_folder
+                end
+                local run_rc = execSplit(host_exe, argv, stdout_file, stderr_file, run_options)
                 local actual_stdout = captured(stdout_file)
                 local actual_stderr = captured(stderr_file)
                 local why = compareRun(run_rc, actual_stdout, actual_stderr)
+                if run_folder then
+                    local left = os.filedirs(path.join(run_folder, "*"))
+                    if #left > 0 then
+                        table.insert(why, string.format("the tests left %s in the folder they "
+                            .. "ran in", path.filename(left[1])))
+                    end
+                    os.tryrm(run_folder)
+                end
                 if #why == 0 then
                     return {name = name, ok = true,
                         note = actual_stdout:match("(%d+/%d+ tests passed)")}
