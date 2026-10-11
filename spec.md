@@ -1928,6 +1928,7 @@ Writing a file that was opened for reading is refused by the operating system an
 A file that is dropped without being closed is closed anyway, with any failure kept to itself, so a file that was written and matters is closed with `close`.
 `tryLock()` takes the file's lock without waiting and returns whether the file holds it afterwards, which is `true` at once for a file that already holds its lock, and `false` when another open file holds the lock or when the file was removed after it was opened, since a lock on a file no path names keeps nothing out.
 The lock lasts until the file is closed, which also happens when the program ends however it ends, and it keeps out only another `tryLock`, so reading and writing the file are not affected.
+Reading, writing, flushing or locking a file after `close` is a mistake in the program, and it panics.
 
 `entries()` returns what is directly inside the directory, in ascending byte order of name, with the entries naming the directory itself and its parent left out.
 The directory is read to its end before anything is returned, so a walk visits the same names in the same order however the file system enumerates them.
