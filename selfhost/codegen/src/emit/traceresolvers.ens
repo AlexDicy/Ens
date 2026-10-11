@@ -10,7 +10,8 @@ import emit.traceruntime;
 import emit.traceshapes;
 
 // ptr ens_resolve_addr(i64 addr): the symbol entry with the greatest function start at or below
-// the address, or null when no registered function covers it.
+// the address, or null when no registered function covers it. An address past the start of a
+// function no entry records, such as a runtime routine, belongs to that function, so it is null too.
 public defineResolveAddress(Runtime runtime) {
     let resolver = runtime.libc("ens_resolve_addr",
         runtime.pointerType.functionType([runtime.int64Type]));
@@ -23,10 +24,12 @@ public defineResolveAddress(Runtime runtime) {
 
     let best = memory.buildAlloca(builder, runtime.pointerType, "best");
     let bestStart = memory.buildAlloca(builder, runtime.int64Type, "best.start");
+    let innerStart = memory.buildAlloca(builder, runtime.int64Type, "inner.start");
     let chunkCursor = memory.buildAlloca(builder, runtime.pointerType, "chunk");
     let index = memory.buildAlloca(builder, runtime.int64Type, "i");
     memory.buildStore(builder, runtime.nullPointer(), best);
     memory.buildStore(builder, runtime.int64(0), bestStart);
+    memory.buildStore(builder, runtime.int64(0), innerStart);
     memory.buildStore(builder, memory.buildLoad(builder, runtime.pointerType,
         traceruntime.head(runtime), "head"), chunkCursor);
 
@@ -36,6 +39,11 @@ public defineResolveAddress(Runtime runtime) {
     let entryBody = traceruntime.block(runtime, resolver, "entry.body");
     let keep = traceruntime.block(runtime, resolver, "entry.keep");
     let entryNext = traceruntime.block(runtime, resolver, "entry.next");
+    let innerFirst = traceruntime.block(runtime, resolver, "inner.first");
+    let innerTest = traceruntime.block(runtime, resolver, "inner.test");
+    let innerBody = traceruntime.block(runtime, resolver, "inner.body");
+    let innerKeep = traceruntime.block(runtime, resolver, "inner.keep");
+    let innerNext = traceruntime.block(runtime, resolver, "inner.next");
     let chunkNext = traceruntime.block(runtime, resolver, "chunk.next");
     let done = traceruntime.block(runtime, resolver, "done");
     instructions.buildBr(builder, chunkTest);
@@ -55,7 +63,7 @@ public defineResolveAddress(Runtime runtime) {
     builder.positionAtEnd(entryTest);
     let position = memory.buildLoad(builder, runtime.int64Type, index, "i.cur");
     instructions.buildCondBr(builder,
-        instructions.buildICmpSLT(builder, position, count, ""), entryBody, chunkNext);
+        instructions.buildICmpSLT(builder, position, count, ""), entryBody, innerFirst);
 
     builder.positionAtEnd(entryBody);
     let entry = memory.buildGEP(builder, entryType, entries, [position], "entry");
@@ -79,13 +87,51 @@ public defineResolveAddress(Runtime runtime) {
         index);
     instructions.buildBr(builder, entryTest);
 
+    // The greatest start at or below the address among the functions no entry records.
+    builder.positionAtEnd(innerFirst);
+    let inners = memory.buildLoad(builder, runtime.pointerType,
+        memory.buildStructGEP(builder, chunkShape, chunk, 5, ""), "inners");
+    let innerCount = memory.buildLoad(builder, runtime.int64Type,
+        memory.buildStructGEP(builder, chunkShape, chunk, 6, ""), "inner.count");
+    memory.buildStore(builder, runtime.int64(0), index);
+    instructions.buildBr(builder, innerTest);
+
+    builder.positionAtEnd(innerTest);
+    let innerPosition = memory.buildLoad(builder, runtime.int64Type, index, "j.cur");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLT(builder, innerPosition, innerCount, ""), innerBody, chunkNext);
+
+    builder.positionAtEnd(innerBody);
+    let inner = instructions.buildPtrToInt(builder,
+        memory.buildLoad(builder, runtime.pointerType,
+            memory.buildGEP(builder, runtime.pointerType, inners, [innerPosition], ""), "inner"),
+        runtime.int64Type, "inner.at");
+    let innerBelow = instructions.buildICmpULE(builder, inner, address, "");
+    let innerAbove = instructions.buildICmpUGT(builder, inner,
+        memory.buildLoad(builder, runtime.int64Type, innerStart, ""), "");
+    instructions.buildCondBr(builder, instructions.buildAnd(builder, innerBelow, innerAbove, ""),
+        innerKeep, innerNext);
+
+    builder.positionAtEnd(innerKeep);
+    memory.buildStore(builder, inner, innerStart);
+    instructions.buildBr(builder, innerNext);
+
+    builder.positionAtEnd(innerNext);
+    memory.buildStore(builder, instructions.buildAdd(builder, innerPosition, runtime.int64(1),
+        ""), index);
+    instructions.buildBr(builder, innerTest);
+
     builder.positionAtEnd(chunkNext);
     memory.buildStore(builder, memory.buildLoad(builder, runtime.pointerType,
         memory.buildStructGEP(builder, chunkShape, chunk, 0, ""), "next"), chunkCursor);
     instructions.buildBr(builder, chunkTest);
 
     builder.positionAtEnd(done);
-    instructions.buildRet(builder, memory.buildLoad(builder, runtime.pointerType, best, ""));
+    let insideInner = instructions.buildICmpUGT(builder,
+        memory.buildLoad(builder, runtime.int64Type, innerStart, ""),
+        memory.buildLoad(builder, runtime.int64Type, bestStart, ""), "inside.inner");
+    instructions.buildRet(builder, instructions.buildSelect(builder, insideInner,
+        runtime.nullPointer(), memory.buildLoad(builder, runtime.pointerType, best, ""), ""));
     traceruntime.finishBody(runtime, saved);
 }
 
