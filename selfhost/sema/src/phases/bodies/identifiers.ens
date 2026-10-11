@@ -14,6 +14,9 @@ import phases.bodies.staticmembers;
 import phases.bodies.memberaccess;
 import phases.bodies.functionvalues;
 import NamePosition from phases.bodies.memberaccess;
+import MissingMember from phases.bodies.memberaccess;
+import FieldMember from phases.bodies.memberaccess;
+import StaticCallText from phases.bodies.memberaccess;
 import LambdaFit from phases.bodies.functionvalues;
 import model.narrow;
 import model.hierarchy;
@@ -28,6 +31,7 @@ import StructType from model.types;
 import InterfaceType from model.types;
 import EnumType from model.types;
 import TypeParamType from model.types;
+import DeclaredType from model.types;
 import List from @std.collections.list;
 import StringBuilder from @std.text.stringbuilder;
 import BodyChecker from phases.bodies;
@@ -76,10 +80,15 @@ public analyzeIdentifier(BodyChecker checker, IdentifierExpressionNode node) -> 
         if (isRefusedImport(checker, name)) {
             return checker.store().errorType();
         }
-        let ownerName = staticSuggestionOwner(checker, name);
-        if (ownerName != null) {
-            checker.reporter().report(staticWithoutType(checker, name, ownerName, false, wanted),
+        let declaring = staticSuggestionOwner(checker, name);
+        if (declaring != null) {
+            checker.reporter().report(staticWithoutType(checker, name, declaring, null, wanted),
                 node.name().span());
+            return checker.store().errorType();
+        }
+        let member = instanceMemberWithoutObject(checker, name, null, wanted);
+        if (member != null) {
+            checker.reporter().report(member, node.name().span());
             return checker.store().errorType();
         }
         checker.reporter().report("Undefined name '{name}'. Check the spelling, or declare it "
@@ -539,22 +548,73 @@ moduleFunctionExample(BodyChecker checker, string name, string targetPath) -> st
     return null;
 }
 
-// The enclosing type's name when it declares a static under the given name, for the
-// uniform-access suggestion; null otherwise.
-public staticSuggestionOwner(BodyChecker checker, string name) -> string? {
+// The type that declares a static under the given name for code inside the enclosing type: that
+// type itself or one of its bases. Null outside every type and where none of them declares one.
+public staticSuggestionOwner(BodyChecker checker, string name) -> Type? {
+    Type? current = checker.frame().enclosingOwner();
+    while (current != null) {
+        if (members.findField(typemembers.staticFieldsOf(current), name) != null
+                || members.findMethodNamed(typemembers.staticMethodsOf(current), name) != null) {
+            if (types.authorityOf(current) == null) {
+                return null;
+            }
+            return current;
+        }
+        current = hierarchy.baseOf(current);
+    }
+    return null;
+}
+
+// The refusal of the field or method 'name' of the enclosing type written without the object it
+// belongs to, or null where the enclosing type has no such member. 'arguments' is the argument list
+// a call writes, as in '(1, "x")', and null where the code does not call it. 'wanted' is the function
+// type expected where it is written.
+public instanceMemberWithoutObject(BodyChecker checker, string name, string? arguments,
+                                   FunctionType? wanted) -> string? {
     let owner = checker.frame().enclosingOwner();
     if (owner == null) {
         return null;
     }
-    if (members.findField(typemembers.staticFieldsOf(owner), name) == null
-            && members.findMethodNamed(typemembers.staticMethodsOf(owner), name) == null) {
-        return null;
-    }
     let authority = types.authorityOf(owner);
-    if (authority == null) {
+    let member = memberaccess.lookupMember(checker, owner, name);
+    if (authority == null || member is MissingMember) {
         return null;
     }
-    return authority.name();
+    string quotedOwner = checker.names().quotedName(authority);
+    string kind = member is FieldMember ? "field" : "method";
+    let methods = memberaccess.availableMethods(checker, owner, name);
+    let field = typemembers.inheritedOrOwnField(owner, name);
+    bool callsField = arguments != null && field != null && field.type() is FunctionType;
+    string written = "this.{name}";
+    if (!(member is FieldMember) && arguments != null) {
+        written = "{new StaticCallText(methods).prefix()}this.{name}{arguments}";
+    } else if (!(member is FieldMember)) {
+        written = memberaccess.methodCallText(written, methods);
+    } else if (callsField) {
+        written = "this.{name}{arguments}";
+    }
+    if (checker.frame().thisType() == null) {
+        return objectlessMemberRefusal(checker, name, kind, authority, written);
+    }
+    if (member is FieldMember) {
+        if (arguments != null && !callsField) {
+            return "'{name}' is a field of {quotedOwner}, and a field is read, not called. Write "
+                + "'this.{name}'.";
+        }
+        return "'{name}' is a field of {quotedOwner}, and a field is always read through 'this' or "
+            + "another object, even inside {quotedOwner}. Write '{written}'.";
+    }
+    string refusal = "'{name}' is a method of {quotedOwner}, and a method is always called through "
+        + "'this' or another object, even inside {quotedOwner}.";
+    if (wanted != null) {
+        let fix = functionvalues.lambdaFix(checker, "method", name, functionvalues.signaturesOf(methods),
+            wanted, "this");
+        if (fix.fit() != LambdaFit.Called) {
+            string spelling = "'{fix.before()}this.{name}{fix.after()}'";
+            return "{refusal} {functionvalues.nameNotValueText(fix, spelling)}";
+        }
+    }
+    return "{refusal} Write '{written}'.";
 }
 
 // How a refusal names a function value called by 'calleeName', which is empty for one with no name.
@@ -565,26 +625,65 @@ public functionValueName(BodyChecker checker, string calleeName) -> string {
     return "'{calleeName}'";
 }
 
-// The refusal of the static 'name' of the enclosing type 'ownerName', written without the type
-// name in front. 'called' is true when the code calls it, and 'wanted' is the function type
-// expected where it is written.
-public staticWithoutType(BodyChecker checker, string name, string ownerName, bool called,
+// The refusal of the 'kind' 'name' of 'owner' written where no object is in reach: a static method,
+// a lazy const's initializer, a field default or a parameter default. 'written' is the member as
+// code inside a method writes it. Null anywhere else.
+objectlessMemberRefusal(BodyChecker checker, string name, string kind, DeclaredType owner,
+                        string written) -> string? {
+    string quotedOwner = checker.names().quotedName(owner);
+    string opening = "'{name}' is a {kind} of {quotedOwner}, so it belongs to an object";
+    if (checker.frame().inStaticMethod()) {
+        return "{opening}, and a static method is not called on an object. Take the object as a "
+            + "parameter, or remove 'static' and write '{written}'.";
+    }
+    string? defaulted = checker.frame().fieldDefaultName();
+    if (defaulted != null) {
+        return "{opening}, and the default of field '{defaulted}' runs before the object's constructor "
+            + "body. Set '{defaulted}' in a constructor of {quotedOwner} instead, and write '{written}' "
+            + "there.";
+    }
+    string? parameter = checker.frame().parameterDefaultName();
+    if (parameter != null) {
+        return "{opening}, and the default of parameter '{parameter}' runs in the caller, before the "
+            + "method starts.";
+    }
+    string? lazyName = checker.frame().lazyConstantName();
+    if (lazyName == null) {
+        return null;
+    }
+    string constant = checker.names().quotedNamedCode(["", ".{lazyName}"], [owner]);
+    string refusal = "{opening}, and the initializer of lazy const {constant} runs without one, because "
+        + "one lazy const value is shared by every {quotedOwner} object.";
+    if (kind == "field") {
+        return "{refusal} Remove 'lazy const' to give each instance its own '{lazyName}'.";
+    }
+    return refusal;
+}
+
+// The refusal of the static 'name' of 'declaring', the enclosing type or one of its bases, written
+// without the type name in front. 'arguments' is the argument list a call writes, as in '(1, "x")',
+// and null where the code does not call it. 'wanted' is the function type expected where it is
+// written.
+public staticWithoutType(BodyChecker checker, string name, Type declaring, string? arguments,
                          FunctionType? wanted = null) -> string {
+    let authority = types.authorityOf(declaring);
     let owner = checker.frame().enclosingOwner();
+    if (authority != null && owner != null && types.authorityOf(owner) != authority) {
+        return inheritedStaticWithoutType(checker, name, declaring, authority, arguments, wanted);
+    }
+    string ownerName = authority == null ? checker.names().of(declaring) : authority.name();
     string kind = "static method";
-    if (owner != null) {
-        let field = members.findField(typemembers.staticFieldsOf(owner), name);
-        if (field != null && field.isLazy()) {
-            kind = "lazy const";
-        } else if (field != null) {
-            kind = "static const";
-        }
+    let field = members.findField(typemembers.staticFieldsOf(declaring), name);
+    if (field != null && field.isLazy()) {
+        kind = "lazy const";
+    } else if (field != null) {
+        kind = "static const";
     }
     if (kind == "static method") {
         string refusal = "'{name}' is a static method of '{ownerName}', and a static method is always "
             + "called through its type name, even inside '{ownerName}'.";
-        if (wanted != null && owner != null) {
-            let statics = memberaccess.staticsNamed(owner, name);
+        let statics = memberaccess.staticsNamed(declaring, name);
+        if (wanted != null) {
             let fix = functionvalues.lambdaFix(checker, "method", name,
                 staticmembers.reachedSignatures(checker, statics, wanted), wanted, ownerName);
             if (fix.fit() != LambdaFit.Called) {
@@ -592,14 +691,49 @@ public staticWithoutType(BodyChecker checker, string name, string ownerName, boo
                 return "{refusal} {functionvalues.nameNotValueText(fix, spelling)}";
             }
         }
-        return "{refusal} Write '{ownerName}.{name}(...)'.";
+        if (arguments != null) {
+            return "{refusal} Write '{new StaticCallText(statics).prefix()}{ownerName}.{name}{arguments}'.";
+        }
+        return "{refusal} Write '{memberaccess.methodCallText("{ownerName}.{name}", statics)}'.";
     }
-    string refusal = "'{name}' is a {kind} of '{ownerName}', and a {kind} is always read through its "
-        + "type name, even inside '{ownerName}'. Write '{ownerName}.{name}'.";
-    if (called) {
-        return "{refusal} A {kind} is not called, so remove the arguments as well.";
+    if (arguments != null) {
+        return "'{name}' is a {kind} of '{ownerName}', and a {kind} is read through its type name, not "
+            + "called, even inside '{ownerName}'. Write '{ownerName}.{name}'.";
     }
-    return refusal;
+    return "'{name}' is a {kind} of '{ownerName}', and a {kind} is always read through its type name, "
+        + "even inside '{ownerName}'. Write '{ownerName}.{name}'.";
+}
+
+// The refusal of the static 'name' that 'authority', a base of the enclosing type, declares, written
+// without a type name in front.
+inheritedStaticWithoutType(BodyChecker checker, string name, Type declaring, DeclaredType authority,
+                           string? arguments, FunctionType? wanted) -> string {
+    string reason = typenames.staticNotInheritedReason(name, authority, checker.names());
+    let field = members.findField(typemembers.staticFieldsOf(declaring), name);
+    if (field != null) {
+        string kind = members.typeLevelFieldWord(field);
+        string spelling = typenames.qualifiedMemberSpelling(authority, name, checker.names());
+        if (arguments != null) {
+            return "{reason} A {kind} is read, not called. Write {spelling}.";
+        }
+        return "{reason} Write {spelling}.";
+    }
+    let statics = memberaccess.staticsNamed(declaring, name);
+    Type head = memberaccess.staticMethodHead(declaring, authority);
+    if (wanted != null && arguments == null) {
+        let fix = functionvalues.lambdaFix(checker, "method", name,
+            staticmembers.reachedSignatures(checker, statics, wanted), wanted,
+            checker.names().plainNameOf(authority));
+        if (fix.fit() != LambdaFit.Called) {
+            string spelling = typenames.qualifiedMemberSpelling(head, name, checker.names(), fix.before(),
+                fix.after());
+            return "{reason} {functionvalues.nameNotValueText(fix, spelling)}";
+        }
+    }
+    let call = new StaticCallText(statics);
+    string suffix = arguments ?? call.suffix();
+    return "{reason} Write "
+        + "{typenames.qualifiedMemberSpelling(head, name, checker.names(), call.prefix(), suffix)}.";
 }
 
 public analyzeThis(BodyChecker checker, ThisExpressionNode node) -> Type {
