@@ -5,6 +5,7 @@ import Value from @ens.llvm.values;
 import TypeRef from @ens.llvm.types;
 import @ens.llvm.instructions;
 import @ens.llvm.memory;
+import Win32Error from emit.errorkinds;
 import FileKind from emit.nativeshapes;
 import OpenMode from emit.nativeshapes;
 import Rename from emit.nativeshapes;
@@ -55,6 +56,18 @@ public final class Win32 {
 
     // The longest path Windows reports is 32767 characters and a terminator.
     public static const long pathCharacters = 32768;
+}
+
+// What LockFileEx is given: an exclusive lock refused at once rather than waited for, over the one
+// byte at the last offset a file can reach, so the lock covers no byte a program reads or writes.
+// The offset is written into the 32-byte OVERLAPPED block, whose other fields stay zero.
+public final class RangeLock {
+    public static const long exclusiveWithoutWaiting = 3;
+    public static const long lowOffset = 0xFFFFFFFF;
+    public static const long highOffset = 0x7FFFFFFF;
+    public static const long overlappedBytes = 32;
+    public static const long lowOffsetField = 16;
+    public static const long highOffsetField = 20;
 }
 
 // Where WIN32_FIND_DATAW holds what an enumeration returns, in 592 bytes.
@@ -543,6 +556,92 @@ public windowsOpen(Runtime runtime, TypeRef type) -> RuntimeFunction {
     memory.buildStore(builder, runtime.int32(Win32.outOfMemory), errorSlot);
     instructions.buildRet(builder, runtime.nullPointer());
     return runtime.endDefinition(definition);
+}
+
+// Win32 locks a range of bytes rather than a whole file. A path cannot stop naming a file a stream
+// is open on, because every stream this library opens keeps the right to remove the file to itself.
+public windowsLock(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let lockRange = runtime.libc("LockFileEx", runtime.int32Type.functionType([runtime.pointerType,
+        runtime.int32Type, runtime.int32Type, runtime.int32Type, runtime.int32Type,
+        runtime.pointerType]));
+    let definition = runtime.beginDefinition("ens_fs_lock", type);
+    let builder = runtime.builder;
+    let takenBlock = runtime.block(definition, "lock.taken");
+    let refusedBlock = runtime.block(definition, "lock.refused");
+    let heldBlock = runtime.block(definition, "lock.held");
+    let failedBlock = runtime.block(definition, "lock.failed");
+    let taken = runtime.parameter(definition, 1);
+    let overlapped = lockedRange(runtime);
+    let handle = streamHandle(runtime, runtime.parameter(definition, 0));
+    let locked = runtime.call(lockRange, [handle, runtime.int32(RangeLock.exclusiveWithoutWaiting),
+        runtime.int32(0), runtime.int32(1), runtime.int32(0), overlapped], "locked");
+    let why = runtime.lastError();
+    instructions.buildCondBr(builder,
+        instructions.buildICmpNE(builder, locked, runtime.int32(0), ""), takenBlock, refusedBlock);
+
+    builder.positionAtEnd(takenBlock);
+    memory.buildStore(builder, runtime.int32(1), taken);
+    instructions.buildRet(builder, runtime.int32(0));
+
+    builder.positionAtEnd(refusedBlock);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, why, runtime.int32(Win32Error.lockViolation), ""),
+        heldBlock, failedBlock);
+
+    builder.positionAtEnd(heldBlock);
+    memory.buildStore(builder, runtime.int32(0), taken);
+    instructions.buildRet(builder, runtime.int32(0));
+
+    builder.positionAtEnd(failedBlock);
+    instructions.buildRet(builder, why);
+    return runtime.endDefinition(definition);
+}
+
+// i32 ens_stream_unlocked_close(ptr stream): gives back the range 'windowsLock' takes and then
+// closes the stream, returning what fclose returns. Closing the handle releases the range as well,
+// but only at some point after the close, so a stream that holds it gives it back first. A stream
+// that never took it is refused the unlock, which changes nothing.
+public unlockedClose(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int32Type.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_stream_unlocked_close", type);
+    if (known != null) {
+        return known;
+    }
+    let unlockRange = runtime.libc("UnlockFileEx", runtime.int32Type.functionType([
+        runtime.pointerType, runtime.int32Type, runtime.int32Type, runtime.int32Type,
+        runtime.pointerType]));
+    let close = runtime.libc("fclose", runtime.int32Type.functionType([runtime.pointerType]));
+    let definition = runtime.beginDefinition("ens_stream_unlocked_close", type);
+    let stream = runtime.parameter(definition, 0);
+    let overlapped = lockedRange(runtime);
+    runtime.call(unlockRange, [streamHandle(runtime, stream), runtime.int32(0), runtime.int32(1),
+        runtime.int32(0), overlapped], "");
+    instructions.buildRet(runtime.builder, runtime.call(close, [stream], "outcome"));
+    return runtime.endDefinition(definition);
+}
+
+// The OVERLAPPED block naming the range every lock covers.
+lockedRange(Runtime runtime) -> Value {
+    let builder = runtime.builder;
+    let overlapped = memory.buildAlloca(builder,
+        runtime.int8Type.arrayType(RangeLock.overlappedBytes as ulong), "overlapped");
+    for (long field = 0; field < RangeLock.overlappedBytes; field = field + 8) {
+        memory.buildStore(builder, runtime.int64(0), runtime.offsetPointer(overlapped, field, ""));
+    }
+    memory.buildStore(builder, runtime.int32(RangeLock.lowOffset),
+        runtime.offsetPointer(overlapped, RangeLock.lowOffsetField, ""));
+    memory.buildStore(builder, runtime.int32(RangeLock.highOffset),
+        runtime.offsetPointer(overlapped, RangeLock.highOffsetField, ""));
+    return overlapped;
+}
+
+// The Win32 handle under a C library stream.
+streamHandle(Runtime runtime, Value stream) -> Value {
+    let descriptorOf = runtime.libc("_fileno",
+        runtime.int32Type.functionType([runtime.pointerType]));
+    let handleOf = runtime.libc("_get_osfhandle",
+        runtime.pointerType.functionType([runtime.int32Type]));
+    return runtime.call(handleOf, [runtime.call(descriptorOf, [stream], "descriptor")], "handle");
 }
 
 public windowsCreateDirectory(Runtime runtime, TypeRef type) -> RuntimeFunction {

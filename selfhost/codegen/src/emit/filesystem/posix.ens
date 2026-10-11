@@ -8,6 +8,7 @@ import @ens.llvm.globals;
 import @ens.llvm.instructions;
 import @ens.llvm.memory;
 import Errno from emit.errorkinds;
+import AdvisoryLock from emit.nativeshapes;
 import DarwinStat from emit.nativeshapes;
 import DirentKind from emit.nativeshapes;
 import FileKind from emit.nativeshapes;
@@ -278,6 +279,155 @@ public posixOpen(Runtime runtime, TypeRef type) -> RuntimeFunction {
     memory.buildStore(builder, openError, errorSlot);
     instructions.buildRet(builder, runtime.nullPointer());
     return runtime.endDefinition(definition);
+}
+
+// flock locks a file rather than a path, so a lock taken on a file that another program removed in
+// the meantime keeps nothing out. Such a lock is released again and reported as not taken.
+public posixLock(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    if (!runtime.onDarwin() && nativeshapes.statxSystemCall(runtime.targetTriple) == 0) {
+        return unsupportedLock(runtime, type);
+    }
+    let descriptorOf = runtime.libc("fileno",
+        runtime.int32Type.functionType([runtime.pointerType]));
+    let lockFile = runtime.libc("flock",
+        runtime.int32Type.functionType([runtime.int32Type, runtime.int32Type]));
+    let definition = runtime.beginDefinition("ens_fs_lock", type);
+    let builder = runtime.builder;
+    let lockedBlock = runtime.block(definition, "lock.locked");
+    let namedBlock = runtime.block(definition, "lock.named");
+    let unnamedBlock = runtime.block(definition, "lock.unnamed");
+    let refusedBlock = runtime.block(definition, "lock.refused");
+    let heldBlock = runtime.block(definition, "lock.held");
+    let failedBlock = runtime.block(definition, "lock.failed");
+    let taken = runtime.parameter(definition, 1);
+    let descriptor = runtime.call(descriptorOf, [runtime.parameter(definition, 0)], "descriptor");
+    let status = runtime.call(lockFile, [descriptor,
+        runtime.int32(AdvisoryLock.exclusive | AdvisoryLock.withoutWaiting)], "status");
+    let why = runtime.lastError();
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, status, runtime.int32(0), ""), lockedBlock, refusedBlock);
+
+    builder.positionAtEnd(lockedBlock);
+    let release = new LockRelease(lockFile, descriptor);
+    let linkCount = linkCountOf(runtime, definition, descriptor, release);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, linkCount, runtime.int64(0), ""), unnamedBlock,
+        namedBlock);
+
+    builder.positionAtEnd(namedBlock);
+    memory.buildStore(builder, runtime.int32(1), taken);
+    instructions.buildRet(builder, runtime.int32(0));
+
+    builder.positionAtEnd(unnamedBlock);
+    release.emit(runtime);
+    memory.buildStore(builder, runtime.int32(0), taken);
+    instructions.buildRet(builder, runtime.int32(0));
+
+    builder.positionAtEnd(refusedBlock);
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, why,
+        runtime.int32(nativeshapes.lockHeldError(runtime.targetTriple)), ""), heldBlock,
+        failedBlock);
+
+    builder.positionAtEnd(heldBlock);
+    memory.buildStore(builder, runtime.int32(0), taken);
+    instructions.buildRet(builder, runtime.int32(0));
+
+    builder.positionAtEnd(failedBlock);
+    instructions.buildRet(builder, why);
+    return runtime.endDefinition(definition);
+}
+
+// An architecture with no statx number has no link count this bridge can read, so it locks nothing
+// rather than take a lock it cannot check.
+unsupportedLock(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let definition = runtime.beginDefinition("ens_fs_lock", type);
+    instructions.buildRet(runtime.builder, runtime.int32(Statx.unsupportedError));
+    return runtime.endDefinition(definition);
+}
+
+// The call that gives back a lock taken on a descriptor, for a bridge that took the lock and then
+// could not keep it.
+final class LockRelease {
+    RuntimeFunction lockFile;
+    Value descriptor;
+
+    protected constructor(this.lockFile, this.descriptor);
+
+    protected emit(Runtime runtime) {
+        runtime.call(this.lockFile, [this.descriptor, runtime.int32(AdvisoryLock.release)], "");
+    }
+}
+
+// How many paths name the file the descriptor is open on, with the builder left in the block that
+// continues with that count. A count that cannot be read releases the lock and returns why.
+linkCountOf(Runtime runtime, RuntimeDefinition definition, Value descriptor, LockRelease release)
+        -> Value {
+    if (runtime.onDarwin()) {
+        return darwinLinkCount(runtime, definition, descriptor, release);
+    }
+    return linuxLinkCount(runtime, definition, descriptor, release);
+}
+
+linuxLinkCount(Runtime runtime, RuntimeDefinition definition, Value descriptor,
+               LockRelease release) -> Value {
+    let builder = runtime.builder;
+    long number = nativeshapes.statxSystemCall(runtime.targetTriple);
+    let countBlock = runtime.block(definition, "lock.count");
+    let checkBlock = runtime.block(definition, "lock.check");
+    let incompleteBlock = runtime.block(definition, "lock.incomplete");
+    let failedBlock = runtime.block(definition, "lock.unread");
+    let result = memory.buildAlloca(builder,
+        runtime.int8Type.arrayType(Statx.structBytes as ulong), "statx");
+    memory.buildStore(builder, runtime.int32(0),
+        runtime.offsetPointer(result, Statx.maskOffset, ""));
+    let status = statxCall(runtime, number,
+        instructions.buildSExt(builder, descriptor, runtime.int64Type, ""),
+        globals.buildGlobalString(builder, "", ".statx.descriptor"),
+        runtime.int64(Statx.emptyPathFlag), Statx.linkCountRequest, result);
+    let why = runtime.lastError();
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, status, runtime.int64(0), ""), checkBlock, failedBlock);
+
+    builder.positionAtEnd(failedBlock);
+    release.emit(runtime);
+    instructions.buildRet(builder, why);
+
+    builder.positionAtEnd(checkBlock);
+    instructions.buildCondBr(builder, statxClaimed(runtime, result, Statx.linkCountRequest),
+        countBlock, incompleteBlock);
+
+    builder.positionAtEnd(incompleteBlock);
+    release.emit(runtime);
+    instructions.buildRet(builder, runtime.int32(Statx.incompleteError));
+
+    builder.positionAtEnd(countBlock);
+    return instructions.buildZExt(builder, memory.buildLoad(builder, runtime.int32Type,
+        runtime.offsetPointer(result, Statx.linkCountOffset, ""), "links"), runtime.int64Type,
+        "link.count");
+}
+
+darwinLinkCount(Runtime runtime, RuntimeDefinition definition, Value descriptor,
+                LockRelease release) -> Value {
+    let builder = runtime.builder;
+    let describe = runtime.libc(nativeshapes.entryPointName(runtime.targetTriple, "fstat"),
+        runtime.int32Type.functionType([runtime.int32Type, runtime.pointerType]));
+    let countBlock = runtime.block(definition, "lock.count");
+    let failedBlock = runtime.block(definition, "lock.unread");
+    let result = memory.buildAlloca(builder,
+        runtime.int8Type.arrayType(DarwinStat.structBytes as ulong), "stat");
+    let status = runtime.call(describe, [descriptor, result], "status");
+    let why = runtime.lastError();
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, status, runtime.int32(0), ""), countBlock, failedBlock);
+
+    builder.positionAtEnd(failedBlock);
+    release.emit(runtime);
+    instructions.buildRet(builder, why);
+
+    builder.positionAtEnd(countBlock);
+    return instructions.buildZExt(builder, memory.buildLoad(builder, runtime.int16Type,
+        runtime.offsetPointer(result, DarwinStat.linkCountOffset, ""), "links"),
+        runtime.int64Type, "link.count");
 }
 
 public posixCreateDirectory(Runtime runtime, TypeRef type) -> RuntimeFunction {
@@ -563,6 +713,40 @@ statxCall(Runtime runtime, long number, Value base, Value path, Value flags, lon
         runtime.int64Type.variadicFunctionType([runtime.int64Type]));
     return runtime.call(systemCall, [runtime.int64(number), base, path, flags,
         runtime.int64(requested), result], "status");
+}
+
+// Whether the path names a directory, following links. A path whose kind cannot be read is not
+// one. Nothing here allocates, so a child between fork and exec may call it.
+public pathIsDirectory(Runtime runtime, Value path) -> Value {
+    let builder = runtime.builder;
+    if (runtime.onDarwin()) {
+        let describe = runtime.libc(nativeshapes.entryPointName(runtime.targetTriple, "stat"),
+            runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType]));
+        let result = memory.buildAlloca(builder,
+            runtime.int8Type.arrayType(DarwinStat.structBytes as ulong), "stat");
+        memory.buildStore(builder, runtime.int16Type.constInt(0, false),
+            runtime.offsetPointer(result, DarwinStat.modeOffset, ""));
+        let status = runtime.call(describe, [path, result], "status");
+        return instructions.buildAnd(builder,
+            instructions.buildICmpEQ(builder, status, runtime.int32(0), ""),
+            modeIsDirectory(runtime, result, DarwinStat.modeOffset), "path.directory");
+    }
+    long number = nativeshapes.statxSystemCall(runtime.targetTriple);
+    if (number == 0) {
+        return runtime.int1Type.constInt(0, false);
+    }
+    let result = memory.buildAlloca(builder,
+        runtime.int8Type.arrayType(Statx.structBytes as ulong), "statx");
+    memory.buildStore(builder, runtime.int32(0),
+        runtime.offsetPointer(result, Statx.maskOffset, ""));
+    memory.buildStore(builder, runtime.int16Type.constInt(0, false),
+        runtime.offsetPointer(result, Statx.modeOffset, ""));
+    let status = statxCall(runtime, number, runtime.int64(Statx.currentDirectory), path,
+        runtime.int64(0), Statx.typeRequest, result);
+    return instructions.buildAnd(builder,
+        instructions.buildICmpEQ(builder, status, runtime.int64(0), ""),
+        instructions.buildAnd(builder, statxClaimed(runtime, result, Statx.typeRequest),
+            modeIsDirectory(runtime, result, Statx.modeOffset), ""), "path.directory");
 }
 
 // True when the descriptor is known to hold a directory. A system that reports nothing gives
