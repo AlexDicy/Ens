@@ -812,6 +812,7 @@ Commands use the same three exit codes: `0` when the command did what was asked,
   The default is `-O2`, and `-O0` turns the optimizer off.
 - `--target <triple>` builds for a target other than this machine's own, such as `x86_64-unknown-linux-gnu` or `arm64-apple-macosx14.0`.
 - `--stdlib <folder>` names the folder holding `std/` instead of letting the build look for one by walking up from the sources; `ENS_STDLIB` does the same thing.
+  A folder either one names that is not there, or that does not hold the standard library in its `std/` folder, is refused before anything is compiled.
 - `--explain-arc` reports what the reference-counting optimizer elided, as described in the section on memory management.
 - `--explain-reachability` reports how much of the program is reached from its entry point: one line per module giving how many function bodies it defines and how many of them are reached, then the name of every body nothing reaches.
   A program with no entry point is a library, and what a library reaches is counted from its `export` declarations instead.

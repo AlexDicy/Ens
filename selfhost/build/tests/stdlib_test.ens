@@ -1,12 +1,14 @@
-// Standard library discovery: the environment override when it points somewhere real, else the walk
-// from the source folder up to the nearest ancestor holding libs/std/ens.package.
+// Standard library discovery: the environment override when it is set, else the walk from the
+// source folder up to the nearest ancestor holding libs/std/ens.package.
 import Path from @std.fs;
 import @std.testing;
 import MemoryFileLoader from support;
 import support;
 import SystemFileLoader from @ens.sema.support.loader;
 import target;
+import LibraryOrigin from stdlib;
 import stdlib;
+import TemporaryDirectory from @std.fs.temporary;
 
 withRepo() -> MemoryFileLoader {
     let loader = new MemoryFileLoader();
@@ -16,21 +18,106 @@ withRepo() -> MemoryFileLoader {
 
 test "an existing ENS_STDLIB wins over discovery" {
     let loader = withRepo();
-    loader.add("/elsewhere/libs", "");
+    loader.addFolder("/elsewhere/libs");
     try testing.assertEqual(stdlib.findRoot(loader, "/elsewhere/libs", Path("/repo/tools/app/src")),
         Path("/elsewhere/libs"));
 }
 
-test "a missing ENS_STDLIB falls back to the walk" {
+// The variable does what '--stdlib' does, so a folder it names that is not there is refused
+// rather than passed over for the walk.
+test "an ENS_STDLIB that names nothing is used, and refused" {
     try testing.assertEqual(
         stdlib.findRoot(withRepo(), "/nowhere/libs", Path("/repo/tools/app/src")),
-        Path("/repo/libs"));
+        Path("/nowhere/libs"));
+    try testing.assertEqual(stdlib.originOf("/nowhere/libs"), LibraryOrigin.Variable);
+    try testing.assertEqual(stdlib.libraryProblem(withRepo(), Path("/nowhere/libs"),
+        LibraryOrigin.Variable, true), "'ENS_STDLIB' names '/nowhere/libs', which is not there. "
+            + "Set 'ENS_STDLIB' to the folder that contains 'std/', or unset it");
+    try testing.assertEqual(stdlib.libraryProblem(withRepo(), Path("/nowhere/libs"),
+        LibraryOrigin.Variable, false), "'ENS_STDLIB' names '/nowhere/libs', which is not there. "
+            + "Set 'ENS_STDLIB' to the folder that contains 'std/'");
+}
+
+test "a named file is refused as no folder" {
+    let loader = withRepo();
+    loader.add("/repo/notes.txt", "not a library");
+    try testing.assertEqual(stdlib.libraryProblem(loader, Path("/repo/notes.txt"),
+        LibraryOrigin.Option, false), "'--stdlib' names '/repo/notes.txt', which is a file, not a "
+            + "folder. Write '--stdlib' with the folder that contains 'std/'");
+    loader.addFolder("/repo/empty");
+    try testing.assertEqual(stdlib.libraryProblem(loader, Path("/repo/empty"),
+        LibraryOrigin.Option, false), "'--stdlib' names '/repo/empty', which does not contain the "
+            + "standard library: there is no 'std/ens.package' in it. Write '--stdlib' with the "
+            + "folder that contains 'std/'");
 }
 
 test "the walk finds the nearest ancestor with libs/std" {
     try testing.assertEqual(stdlib.findRoot(withRepo(), null, Path("/repo/tools/app/src")),
         Path("/repo/libs"));
     try testing.assertEqual(stdlib.findRoot(withRepo(), null, Path("/repo")), Path("/repo/libs"));
+}
+
+// A library is checked where the command line or the variable named it, so a folder without one
+// is reported once by the command rather than as every module the build then cannot find.
+test "a named folder that holds no standard library says which name it came from" {
+    let scratch = try TemporaryDirectory.create("ens-build-stdlib-named");
+    Path libs = scratch.path().join("libs");
+    try libs.join("std").createDirectories();
+    try libs.join("std/ens.package").writeText("package std \{ ens \"0.1\"; \}\n");
+    Path empty = scratch.path().join("empty");
+    try empty.createDirectories();
+    Path nowhere = scratch.path().join("nowhere");
+    let loader = new SystemFileLoader();
+    try testing.assertEqual(stdlib.libraryProblem(loader, libs, LibraryOrigin.Option, false),
+        "'--stdlib' names '{libs}', which does not contain the standard library: there is no "
+            + "'std/src/core.ens' in it. Write '--stdlib' with a folder whose 'std/' holds the whole "
+            + "standard library");
+    try libs.join("std/src/io").createDirectories();
+    try libs.join("std/src/core.ens").writeText("");
+    try testing.assertEqual(stdlib.libraryProblem(loader, libs, LibraryOrigin.Variable, false),
+        "'ENS_STDLIB' names '{libs}', which does not contain the standard library: there is no "
+            + "'std/src/io/print.ens' in it. Set 'ENS_STDLIB' to a folder whose 'std/' holds the "
+            + "whole standard library");
+    try libs.join("std/src/io/print.ens").writeText("");
+    try testing.assertEqual(stdlib.libraryProblem(loader, libs, LibraryOrigin.Option, false), "");
+    try testing.assertEqual(stdlib.libraryProblem(loader, nowhere, LibraryOrigin.Option, false),
+        "'--stdlib' names '{nowhere}', which is not there. Write '--stdlib' with the folder that "
+            + "contains 'std/'");
+    try testing.assertEqual(stdlib.libraryProblem(loader, empty, LibraryOrigin.Option, false),
+        "'--stdlib' names '{empty}', which does not contain the standard library: there is no "
+            + "'std/ens.package' in it. Write '--stdlib' with the folder that contains 'std/'");
+    try testing.assertEqual(stdlib.libraryProblem(loader, empty, LibraryOrigin.Variable, true),
+        "'ENS_STDLIB' names '{empty}', which does not contain the standard library: there is no "
+            + "'std/ens.package' in it. Set 'ENS_STDLIB' to the folder that contains 'std/', or "
+            + "unset it");
+}
+
+// The 'std' folder itself is the one mistake whose fix names the exact folder to write.
+test "a named file, or the 'std' folder itself, is told apart from a folder without a library" {
+    let scratch = try TemporaryDirectory.create("ens-build-stdlib-itself");
+    Path libs = scratch.path().join("libs");
+    Path std = libs.join("std");
+    try std.join("src/io").createDirectories();
+    try std.join("ens.package").writeText("package std \{ ens \"0.1\"; \}\n");
+    try std.join("src/core.ens").writeText("");
+    try std.join("src/io/print.ens").writeText("");
+    Path file = scratch.path().join("notes.txt");
+    try file.writeText("not a library");
+    let loader = new SystemFileLoader();
+    try testing.assertEqual(stdlib.libraryProblem(loader, std, LibraryOrigin.Option, false),
+        "'--stdlib' names '{std}', which is the 'std' folder itself. Write '--stdlib {libs}'");
+    try testing.assertEqual(stdlib.libraryProblem(loader, std, LibraryOrigin.Variable, true),
+        "'ENS_STDLIB' names '{std}', which is the 'std' folder itself. Set 'ENS_STDLIB' to "
+            + "'{libs}', or unset it");
+    try testing.assertEqual(stdlib.libraryProblem(loader, file, LibraryOrigin.Option, false),
+        "'--stdlib' names '{file}', which is a file, not a folder. Write '--stdlib' with the folder "
+            + "that contains 'std/'");
+}
+
+test "a set variable is where the folder came from, and an unset one leaves it to the walk" {
+    try testing.assertEqual(stdlib.originOf("/elsewhere/libs"), LibraryOrigin.Variable);
+    try testing.assertEqual(stdlib.originOf(""), LibraryOrigin.Walk);
+    try testing.assertEqual(stdlib.originOf(null), LibraryOrigin.Walk);
 }
 
 test "no marked ancestor means no root, and the message says what to do" {

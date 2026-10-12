@@ -1,18 +1,19 @@
 // Finding the standard library: the folder holding 'std/'. A build reads the folder the environment
-// names, then walks up from the sources it was given to compile until it finds a 'libs/std' beside
-// them, which is what makes a build inside a checkout of the language work with no configuration.
+// names, or else walks up from the sources it was given to compile until it finds a 'libs/std'
+// beside them, which is what makes a build inside a checkout of the language work with no
+// configuration.
 import FileLoader from @ens.sema.support.loader;
+import @ens.sema.program.workspace;
+import @ens.host.paths;
 import Path from @std.fs;
 import BuildTarget from target;
 import TargetKind from target;
 
-// The folder containing 'std/', or null when neither the environment nor the walk found one.
+// The folder containing 'std/', or null when the environment names none and the walk finds none.
+// A folder the environment names is the one used, as '--stdlib' is, whatever is there.
 export findRoot(FileLoader loader, string? environment, Path startFolder) -> Path? {
     if (environment != null && environment.length > 0) {
-        Path named = Path(environment);
-        if (loader.exists(named)) {
-            return named;
-        }
+        return paths.native(environment);
     }
     Path? folder = startFolder.normalize();
     while (folder != null) {
@@ -37,11 +38,21 @@ export libraryRootOf(FileLoader loader, BuildTarget resolved) -> Path? {
     if (resolved.kind() != TargetKind.Package || resolved.packageName() != "std") {
         return null;
     }
-    Path sources = resolved.sourceFolder();
-    if (!loader.exists(sources.join("core.ens")) || !loader.exists(sources.join("io/print.ens"))) {
+    if (missingPrelude(loader, resolved.sourceFolder()).length > 0) {
         return null;
     }
     return resolved.root().normalize().parent();
+}
+
+// The first module every program reads without an import that `sources` lacks, as a path under
+// it, or empty text when it holds them all.
+missingPrelude(FileLoader loader, Path sources) -> string {
+    for (let module in ["core.ens", "io/print.ens"]) {
+        if (!loader.exists(sources.join(module))) {
+            return module;
+        }
+    }
+    return "";
 }
 
 // The message for a command over a standard library whose '--stdlib' names a different folder.
@@ -49,6 +60,110 @@ export otherLibraryMessage(Path target, Path given, Path library) -> string {
     return "'{target}' is the package 'std', which is the standard library, so this command uses "
         + "it as the standard library. '--stdlib' names a different folder, '{given}'. Remove "
         + "'--stdlib', or write '--stdlib {library}'";
+}
+
+// Where the folder holding the standard library a build uses came from: '--stdlib', the
+// 'ENS_STDLIB' variable, the walk up from the sources, or the target, when it is the library.
+export enum LibraryOrigin {
+    Option,
+    Variable,
+    Walk,
+    Target,
+}
+
+// Where the folder 'findRoot' returned for the variable's value `named` came from: the variable
+// when it is set, since a set variable is used whatever it names, and the walk otherwise.
+export originOf(string? named) -> LibraryOrigin {
+    if (named != null && named.length > 0) {
+        return LibraryOrigin.Variable;
+    }
+    return LibraryOrigin.Walk;
+}
+
+// What keeps `root` from being the folder that holds the standard library, or empty text when it
+// holds one. The walk finds only a folder that holds one and a target is checked as the library
+// itself, so only a folder the command line or the variable named can be anything else.
+// `walkFinds` is whether the walk up from the sources would find a library, which is when
+// unsetting the variable is a fix.
+export libraryProblem(FileLoader loader, Path root, LibraryOrigin origin, bool walkFinds)
+        -> string {
+    if (origin == LibraryOrigin.Walk || origin == LibraryOrigin.Target) {
+        return "";
+    }
+    let wording = new LibraryWording(origin, walkFinds);
+    string named = "{wording.name} names '{root}'";
+    if (!loader.exists(root)) {
+        return "{named}, which is not there. " + wording.fix("the folder that contains 'std/'");
+    }
+    if (loader.isFile(root)) {
+        return "{named}, which is a file, not a folder. "
+            + wording.fix("the folder that contains 'std/'");
+    }
+    if (!loader.exists(root.join("std/ens.package"))) {
+        if (isLibraryFolder(loader, root)) {
+            Path above = root.parent() ?? root;
+            return "{named}, which is the 'std' folder itself. {wording.exact(above)}";
+        }
+        return "{named}, which does not contain the standard library: there is no "
+            + "'std/ens.package' in it. " + wording.fix("the folder that contains 'std/'");
+    }
+    string missing = missingPrelude(loader, root.join("std/src"));
+    if (missing.length > 0) {
+        return "{named}, which does not contain the standard library: there is no "
+            + "'std/src/{missing}' in it. "
+            + wording.fix("a folder whose 'std/' holds the whole standard library");
+    }
+    return "";
+}
+
+// Whether `folder` is itself the package folder of the standard library: its manifest declares
+// the package 'std' and its sources hold the modules every program reads without an import.
+isLibraryFolder(FileLoader loader, Path folder) -> bool {
+    if (!loader.exists(folder.join("ens.package"))) {
+        return false;
+    }
+    let survey = workspace.surveyManifest(loader, folder);
+    return survey != null && survey.isPackage() && survey.packageName() == "std"
+        && missingPrelude(loader, folder.join("src")).length == 0;
+}
+
+// How a library problem names where the folder came from and what to write instead.
+final class LibraryWording {
+    protected string name;
+    LibraryOrigin origin;
+    bool walkFinds;
+
+    protected constructor(LibraryOrigin origin, bool walkFinds) {
+        this.origin = origin;
+        this.walkFinds = walkFinds;
+        this.name = "'--stdlib'";
+        if (origin == LibraryOrigin.Variable) {
+            this.name = "'ENS_STDLIB'";
+        }
+    }
+
+    // The fix that names `wanted`, the kind of folder to name instead.
+    protected fix(string wanted) -> string {
+        if (this.origin == LibraryOrigin.Option) {
+            return "Write '--stdlib' with {wanted}";
+        }
+        return "Set 'ENS_STDLIB' to {wanted}{this.unsetting()}";
+    }
+
+    // The fix that names the folder to write.
+    protected exact(Path folder) -> string {
+        if (this.origin == LibraryOrigin.Option) {
+            return "Write '--stdlib {folder}'";
+        }
+        return "Set 'ENS_STDLIB' to '{folder}'{this.unsetting()}";
+    }
+
+    unsetting() -> string {
+        if (this.walkFinds) {
+            return ", or unset it";
+        }
+        return "";
+    }
 }
 
 // The message for a user whose build found no standard library.

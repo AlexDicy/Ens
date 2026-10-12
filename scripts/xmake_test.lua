@@ -1368,6 +1368,41 @@ task("test")
                 .. "'--stdlib' names a different folder, '",
                 "Remove '--stdlib', or write '--stdlib ")
 
+            -- a folder named as the standard library that holds none is reported once, by the
+            -- command, rather than as every module the build then cannot find
+            local hello_file = path.join(tests_dir, "hello.ens")
+            run({"check", hello_file, "--stdlib", path.join(root, "nowhere")}, nil, 2,
+                "ens: '--stdlib' names '", "', which is not there. Write '--stdlib' with the "
+                .. "folder that contains 'std/'", "!Cannot find standard library module",
+                "!has no 'ens.package' file", "!problem")
+            local empty_library = path.join(root, "emptylibrary")
+            os.mkdir(empty_library)
+            local variable_env = {}
+            for key, value in pairs(env) do variable_env[key] = value end
+            variable_env.ENS_STDLIB = empty_library
+            run({"check", hello_file}, {envs = variable_env}, 2, "ens: 'ENS_STDLIB' names '",
+                "', which does not contain the standard library: there is no 'std/ens.package' "
+                .. "in it. Set 'ENS_STDLIB' to the folder that contains 'std/', or unset it",
+                "!Cannot find standard library module", "!problem")
+            variable_env.ENS_STDLIB = path.join(root, "nolibrary")
+            run({"check", hello_file}, {envs = variable_env}, 2, "ens: 'ENS_STDLIB' names '",
+                "', which is not there. Set 'ENS_STDLIB' to the folder that contains 'std/', or "
+                .. "unset it", "!Cannot find standard library module", "!problem")
+            -- a 'std' folder with a manifest and no sources is no standard library either
+            local sourceless = path.join(root, "sourceless")
+            os.mkdir(path.join(sourceless, "std"))
+            io.writefile(path.join(sourceless, "std", "ens.package"),
+                'package std {\n    ens "0.1";\n}\n')
+            run({"check", hello_file, "--stdlib", sourceless}, nil, 2, "ens: '--stdlib' names '",
+                "', which does not contain the standard library: there is no 'std/src/core.ens' "
+                .. "in it. Write '--stdlib' with a folder whose 'std/' holds the whole standard "
+                .. "library",
+                "!Cannot find standard library module", "!problem")
+            -- the 'std' folder itself is answered with the folder to write instead
+            run({"check", hello_file, "--stdlib", path.join(os.projectdir(), "libs", "std")}, nil,
+                2, "ens: '--stdlib' names '", "', which is the 'std' folder itself. Write "
+                .. "'--stdlib ", "!Cannot find standard library module", "!problem")
+
             -- a package of the user's own named 'std' is refused for the name the standard
             -- library reserves, at the name
             local user_std = path.join(root, "userstd", "std")
