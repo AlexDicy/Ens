@@ -15,9 +15,9 @@ external from libc {
     ens_standard_output() -> CFile;
     ens_standard_error() -> CFile;
     ens_standard_input() -> CFile;
-    ens_start_process(string program, byte[] argumentBlock, long argumentCount,
-                      string commandLine, byte[] environmentBlock, long environmentCount,
-                      long environmentBytes) -> ChildHandle?;
+    ens_start_child(string program, byte[] argumentBlock, long argumentCount, string commandLine,
+                    byte[] environmentBlock, long environmentCount, long environmentBytes,
+                    out int code) -> ChildHandle?;
     ens_read_child(ChildHandle child, byte[] buffer, long capacity) -> long;
     ens_poll_child(ChildHandle child, long milliseconds) -> int;
     ens_kill_child(ChildHandle child) -> int;
@@ -639,21 +639,345 @@ writtenAsPath(string program) -> bool {
     return program.contains("/") || (platformCode() == 0 && program.contains("\\"));
 }
 
+// A program the start could not run is named with what part of the start failed. A bare name is
+// looked for on PATH, so one that is not there is named as that.
 startedChild(string program, string[] arguments, string[] environmentOverrides) -> ChildProcess throws {
     string[] variables = childVariables(environmentOverrides);
     byte[] block = blocks.environmentBlock(variables);
-    ChildHandle? child = ens_start_process(program, blocks.argumentBlock(arguments),
+    int code = 0;
+    ChildHandle? child = ens_start_child(program, blocks.argumentBlock(arguments),
         arguments.length, blocks.commandLineOf(program, arguments), block, variables.length,
-        block.length);
+        block.length, out code);
     if (child == null) {
-        if (writtenAsPath(program)) {
-            throw new SystemError("could not start '{program}'. Check that the path is right and "
-                + "that the file can be run");
+        string reason = startReasonAt(program, program, "", code);
+        if (!writtenAsPath(program) && startProgramMissing(code)) {
+            reason = notOnPathReason();
         }
-        throw new SystemError("could not start '{program}'. Check the name, and give the "
-            + "program's full path if no directory the PATH environment variable lists contains "
-            + "it");
+        throw new SystemError("could not start '{program}': {reason}");
     }
     return new ChildProcess(child, program);
 }
 
+
+// The numbers 'platformCode' returns.
+public final class PlatformCode {
+    public static const int windows = 0;
+    public static const int linux = 1;
+    public static const int macOS = 2;
+}
+
+// The reasons below say why a start of a program failed, in the words a message gives after
+// "could not start '<program>':". The bridges carry what part of the start the system's number is
+// about in the bits above the number, and the reason is chosen by that part and by the kind of the
+// number. Both @std.process and this module raise their errors with them, and they read the file
+// system through the bridges here, so a program loads no module more for them.
+//
+// The system's own number in a code a start reported.
+public startNumber(int code) -> int {
+    return code & StartCode.numberMask;
+}
+
+// Why the start of `program`, tried at `path` in `directory`, failed with `code`, with what the
+// file system shows about the cases whose reason names more: a program on Windows that is there
+// with '.exe' after its name, and the program a script's first line names.
+public startReasonAt(string program, string path, string directory, int code) -> string {
+    string suggested = "";
+    let part = partOf(code);
+    if (numberKindOf(startNumber(code)) == NumberKind.NotFound && part == StartPart.Program) {
+        suggested = exeBeside(program, path);
+    }
+    FirstLine line = {program: "", longerThan: 0};
+    if (part == StartPart.MissingInterpreter || part == StartPart.RefusedScript) {
+        line = firstLineOf(path, platformCode());
+    }
+    return startReason(directory, code, platformCode(), suggested, line);
+}
+
+// Why a start in `directory`, empty for a start in this process's own, failed with `code` on the
+// system `platform` names as 'platformCode' does. A code with nothing above its number comes from a
+// bridge that carries no part, and its number alone cannot tell a missing program from a missing
+// working directory, so a start given a directory then names both. `suggested` is the name to offer
+// for a program that is not there, empty when there is none, and `line` what the first line of a
+// script names.
+public startReason(string directory, int code, int platform, string suggested,
+                   FirstLine line) -> string {
+    int number = startNumber(code);
+    let kind = numberKindOf(number);
+    return switch (partOf(code)) {
+        StartPart.WorkingDirectory -> directoryReason(directory, kind, number),
+        StartPart.WorkingDirectoryFile -> "the working directory '{directory}' is a file, not a "
+            + "directory. Start the program in a directory",
+        StartPart.Directory -> "it is a directory, not a program. Name the program inside the "
+            + "directory",
+        StartPart.NotRunnable -> "it is not a program this system can run. Check that the path "
+            + "names a program built for this system",
+        StartPart.NotProgram -> "it is not a program. Check that the path names a program, not a "
+            + "document or data file",
+        StartPart.SpecialFile -> "it is a special file, such as a named pipe or a device, not a "
+            + "program. Name the program's own file instead",
+        StartPart.MissingInterpreter -> interpreterReason(line.program),
+        StartPart.RefusedScript -> refusedScriptReason(line, kind, platform),
+        StartPart.NoProgramStart -> "it does not start the way a program does. If it is a "
+            + "script, make its first line name the program that runs it, as in '#!/bin/sh'",
+        StartPart.RefusedOnPath -> "permission was refused. Check that the file is executable, "
+            + "as with 'chmod +x', and that this user may open every directory on its path",
+        StartPart.Program -> programReason(kind, number, platform, suggested),
+        StartPart.Unplaced -> unplacedReason(directory, kind, number),
+    };
+}
+
+// Why a program written as a bare name was found in no directory the PATH variable lists.
+public notOnPathReason() -> string {
+    return "no directory that the PATH environment variable lists contains a program of that "
+        + "name. Check the name, or give the program's full path";
+}
+
+// Whether `code` says the program itself is not there.
+public startProgramMissing(int code) -> bool {
+    let part = partOf(code);
+    return numberKindOf(startNumber(code)) == NumberKind.NotFound
+        && (part == StartPart.Program || part == StartPart.Unplaced);
+}
+
+// The kind of a system's own error number, as the reasons tell them apart.
+enum NumberKind {
+    NotFound,
+    PermissionDenied,
+    Other,
+}
+
+// The kind the bridge's ordinal for a system's own error number names.
+numberKindOf(int number) -> NumberKind {
+    return switch (processErrorKind(number)) {
+        0 -> NumberKind.NotFound,
+        1 -> NumberKind.PermissionDenied,
+        default -> NumberKind.Other,
+    };
+}
+
+// Why the program itself could not be started.
+programReason(NumberKind kind, int number, int platform, string suggested) -> string {
+    if (kind == NumberKind.NotFound && !suggested.isEmpty()) {
+        return "nothing is there, but '{suggested}' is. Write the name with its '.exe'";
+    }
+    return switch (kind) {
+        NumberKind.NotFound -> "nothing is there. Check that the path names the program",
+        NumberKind.PermissionDenied -> permissionReason(platform),
+        NumberKind.Other -> "the system reported error {number}",
+    };
+}
+
+// Why a script whose first line names a program that is not there could not be started.
+interpreterReason(string interpreter) -> string {
+    string fix = "Correct the first line, or install that program";
+    if (interpreter.isEmpty()) {
+        return "its first line names a program that is not there. {fix}";
+    }
+    return "its first line names '{interpreter}', which is not there. {fix}";
+}
+
+// Why a script whose first line names a program that is there could not be started.
+refusedScriptReason(FirstLine line, NumberKind kind, int platform) -> string {
+    if (kind == NumberKind.PermissionDenied) {
+        return refusedInterpreterReason(line.program);
+    }
+    if (line.longerThan > 0) {
+        string shorten = "Shorten the path of the program it names";
+        if (platform == PlatformCode.macOS) {
+            shorten = shorten + ", or the arguments after it";
+        }
+        return "its first line is longer than the {line.longerThan} bytes this system reads of "
+            + "it. {shorten}";
+    }
+    string fix = "Make the first line name a program, as in '#!/bin/sh'";
+    if (line.program.isEmpty()) {
+        return "its first line names no program this system can run. {fix}";
+    }
+    return "its first line names '{line.program}', which is not a program this system can run. "
+        + fix;
+}
+
+// Why a script that may run was refused over the program its first line names, `interpreter`,
+// empty when the line could not be read.
+refusedInterpreterReason(string interpreter) -> string {
+    if (interpreter.isEmpty()) {
+        return "its first line names a program this user may not run. Make the first line name "
+            + "a program this user may run";
+    }
+    if (kindAt(interpreter) == EntryCode.directory) {
+        return "its first line names '{interpreter}', which is a directory, not a program. Make "
+            + "the first line name a program, as in '#!/bin/sh'";
+    }
+    return "its first line names '{interpreter}', which this user may not run. Make "
+        + "'{interpreter}' executable, as with 'chmod +x', or make the first line name a program "
+        + "this user may run";
+}
+
+// The program's name with '.exe' after it, when Windows was given a path with no extension and a
+// program of that name and '.exe' is there, and empty otherwise.
+exeBeside(string program, string path) -> string {
+    if (platformCode() != PlatformCode.windows || hasExtension(path)) {
+        return "";
+    }
+    if (kindAt(path + ".exe") == EntryCode.file) {
+        return program + ".exe";
+    }
+    return "";
+}
+
+// Whether the name `path` ends in has a '.' after its first character, the way an extension is
+// written.
+hasExtension(string path) -> bool {
+    long nameStart = 0;
+    for (long i = 0; i < path.length; i++) {
+        byte at = path.byteAt(i);
+        if (at == '/' || (at == '\\' && platformCode() == PlatformCode.windows)) {
+            nameStart = i + 1;
+        }
+    }
+    long dot = path.lastIndexOf(".");
+    return dot > nameStart;
+}
+
+// What is at `path` with links followed, as the metadata bridge numbers it, and 0 when nothing can
+// be read there.
+kindAt(string path) -> long {
+    let found = fsMetadata(path, true);
+    if (found.code != 0) {
+        return 0;
+    }
+    return found.kind;
+}
+
+// The numbers the metadata bridge gives a kind of entry.
+final class EntryCode {
+    protected static const long file = 1;
+    protected static const long directory = 2;
+}
+
+// What the first line of a script names after its '#!': the program, empty when it names none or
+// the file cannot be read, and the bytes of the line the system reads when the program's name runs
+// past them, 0 when it does not.
+public struct FirstLine {
+    public const string program;
+    public const long longerThan;
+}
+
+// The first line of the script at `path` as the system `platform` names reads it.
+public firstLineOf(string path, int platform) -> FirstLine {
+    FirstLine none = {program: "", longerThan: 0};
+    long limit = ScriptLine.linux;
+    if (platform == PlatformCode.macOS) {
+        limit = ScriptLine.macOS;
+    }
+    let opened = fsOpen(path, 0);
+    CFile? handle = opened.handle;
+    if (handle == null) {
+        return none;
+    }
+    byte[] buffer = new byte[limit];
+    let read = readFromHandle(handle, buffer);
+    long count = read.code == 0 ? read.count : 0;
+    int closed = closeHandle(handle);
+    if (count < 2 || buffer[0] != '#' || buffer[1] != '!') {
+        return none;
+    }
+    long start = 2;
+    while (start < count && (buffer[start] == ' ' || buffer[start] == '\t')) {
+        start++;
+    }
+    long end = start;
+    while (end < count && buffer[end] != ' ' && buffer[end] != '\t' && buffer[end] != '\n'
+            && buffer[end] != '\r') {
+        end++;
+    }
+    if (end == limit) {
+        return {program: "", longerThan: limit};
+    }
+    return {program: string.fromBytesLossy(buffer.slice(start, end)), longerThan: 0};
+}
+
+// How many bytes of a script's first line each system reads to find the program it names.
+final class ScriptLine {
+    protected static const long linux = 256;
+    protected static const long macOS = 512;
+}
+
+// A file the system refused to run. POSIX runs a file only when it is marked executable.
+permissionReason(int platform) -> string {
+    if (platform == PlatformCode.windows) {
+        return "permission was refused. Check that this user may run the file";
+    }
+    return "permission was refused. Make the file executable, as with 'chmod +x', or start it as "
+        + "a user who may run it";
+}
+
+// Why the working directory the program was to start in could not be entered.
+directoryReason(string directory, NumberKind kind, int number) -> string {
+    return switch (kind) {
+        NumberKind.NotFound -> "the working directory '{directory}', the directory the program "
+            + "would run in, is not a directory that exists. Create it, or start the program in "
+            + "one that does",
+        NumberKind.PermissionDenied -> "permission to enter the working directory '{directory}' "
+            + "was refused. Start the program in a directory this user may enter",
+        NumberKind.Other -> "the working directory '{directory}' could not be entered: the "
+            + "system reported error {number}",
+    };
+}
+
+// Why a start failed when the code names no part of the start.
+unplacedReason(string directory, NumberKind kind, int number) -> string {
+    if (kind == NumberKind.NotFound && !directory.isEmpty()) {
+        return "nothing is there, or the working directory '{directory}' is missing";
+    }
+    return switch (kind) {
+        NumberKind.NotFound -> "nothing is there",
+        NumberKind.PermissionDenied -> "permission was refused",
+        NumberKind.Other -> "the system reported error {number}",
+    };
+}
+
+// The part of a start a failure's code names: none, the program, the working directory, a program
+// path that names a directory, a program built for another system, a file that is no program, a
+// special file such as a named pipe, a working directory that is a file, a script whose first line
+// names a program that is not there, a runnable file that starts neither as a program nor as a
+// script, a refused permission on a file that is runnable, or a script the system would not start
+// although the program its first line names is there.
+enum StartPart {
+    Unplaced,
+    Program,
+    WorkingDirectory,
+    Directory,
+    NotRunnable,
+    NotProgram,
+    SpecialFile,
+    WorkingDirectoryFile,
+    MissingInterpreter,
+    NoProgramStart,
+    RefusedOnPath,
+    RefusedScript,
+}
+
+// The part the bits above the system's number name, the way the bridge numbers them.
+partOf(int code) -> StartPart {
+    return switch ((code >> StartCode.shift) & 0xFF) {
+        1 -> StartPart.Program,
+        2 -> StartPart.WorkingDirectory,
+        3 -> StartPart.Directory,
+        4 -> StartPart.NotRunnable,
+        5 -> StartPart.NotProgram,
+        6 -> StartPart.SpecialFile,
+        7 -> StartPart.WorkingDirectoryFile,
+        8 -> StartPart.MissingInterpreter,
+        9 -> StartPart.NoProgramStart,
+        10 -> StartPart.RefusedOnPath,
+        11 -> StartPart.RefusedScript,
+        default -> StartPart.Unplaced,
+    };
+}
+
+// Where a failure's code holds the system's number and the part of the start above it.
+final class StartCode {
+    protected static const int shift = 24;
+    protected static const int numberMask = 0xFFFFFF;
+}
