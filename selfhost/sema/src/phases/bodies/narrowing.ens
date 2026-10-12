@@ -13,6 +13,7 @@ import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
 import SubscriptExpressionNode from @ens.frontend.syntax.generated.nodes;
 import CastExpressionNode from @ens.frontend.syntax.generated.nodes;
 import CheckedCastExpressionNode from @ens.frontend.syntax.generated.nodes;
+import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
 import TypeTestExpressionNode from @ens.frontend.syntax.generated.nodes;
 import AssignmentExpressionNode from @ens.frontend.syntax.generated.nodes;
 import ParenthesizedExpressionNode from @ens.frontend.syntax.generated.nodes;
@@ -615,7 +616,7 @@ public analyzeTypeTest(BodyChecker checker, TypeTestExpressionNode node) -> Type
     if (source is ErrorType || target is ErrorType) {
         return checker.store().errorType();
     }
-    if (!checkClassTypeTest(checker, node.value(), source, target, false, node.span())) {
+    if (!checkClassTypeTest(checker, node, node.value(), source, target, false)) {
         return checker.store().errorType();
     }
     return checker.store().primitive(PrimitiveKind.Bool);
@@ -651,7 +652,7 @@ public analyzeCheckedCast(BodyChecker checker, CheckedCastExpressionNode node) -
             + "{checker.names().quoted(target)} always succeeds. Write 'as' instead of 'as?'.", node.span());
         return checker.store().errorType();
     }
-    if (!checkClassTypeTest(checker, node.value(), source, target, true, node.span())) {
+    if (!checkClassTypeTest(checker, node, node.value(), source, target, true)) {
         return checker.store().errorType();
     }
     return checker.store().optionalOf(target);
@@ -695,11 +696,48 @@ checkedCharCast(BodyChecker checker, CheckedCastExpressionNode node, Type source
     return checker.store().optionalOf(target);
 }
 
-// The 'is' and 'as?' rule set: the target must be a plain class or interface, and the pair
-// must be able to succeed without always succeeding. Open-typed operands defer to each
+// What a fix that drops the value an 'is' test or an 'as?' cast checks writes to keep what the value
+// does, as in "Call 'makeDog()' on its own line", or empty where the value is a name or a chain of
+// field reads, which reading does nothing with. 'operator' is the 'is' or 'as?' after the value.
+keptEvaluation(Expression value, string operator) -> string {
+    Expression core = syntax.unwrapParentheses(value);
+    if (readsOnly(core)) {
+        return "";
+    }
+    let spelled = wording.shortSpelling(core);
+    if (spelled == null) {
+        return "Write the value before '{operator}' as a statement of its own";
+    }
+    if (core is CallExpressionNode) {
+        return "Call '{spelled}' on its own line";
+    }
+    return "Write '{spelled};' on its own line";
+}
+
+// Whether 'value' is a name, 'this', or a chain of field reads over one of them.
+readsOnly(Expression value) -> bool {
+    switch (value) {
+        is IdentifierExpressionNode ignored -> {
+            return true;
+        },
+        is ThisExpressionNode ignored -> {
+            return true;
+        },
+        is MemberExpressionNode member -> {
+            return readsOnly(syntax.unwrapParentheses(member.object()));
+        },
+        default -> {
+            return false;
+        },
+    }
+}
+
+// The 'is' and 'as?' rule set for 'test' on 'value': the target must be a plain class or interface,
+// and the pair must be able to succeed without always succeeding. Open-typed operands defer to each
 // instantiation.
-checkClassTypeTest(BodyChecker checker, Expression value, Type source, Type target, bool isCast,
-                   Span span) -> bool {
+checkClassTypeTest(BodyChecker checker, Expression test, Expression value, Type source, Type target,
+                   bool isCast) -> bool {
+    Span span = test.span();
     string operator = "is";
     if (isCast) {
         operator = "as?";
@@ -726,7 +764,12 @@ checkClassTypeTest(BodyChecker checker, Expression value, Type source, Type targ
         checker.recordObligation(new TypeTestObligation(source, target, isCast, span));
         return true;
     }
-    let issue = capabilities.typeTestIssue(source, target, isCast, checker.names(),
+    string replaced = "";
+    if (!checker.isIfCondition(test)) {
+        replaced = wording.sideNamed(test, "the test");
+    }
+    let issue = capabilities.typeTestIssue(source, target, isCast, replaced,
+        keptEvaluation(value, isCast ? "as?" : "is"), checker.names(),
         nullguidance.oneLevelGuidance(checker, value, source));
     if (issue != null) {
         checker.reporter().report(issue, span);
