@@ -34,6 +34,7 @@ import lower.symbols;
 import lower.throwing;
 import lower.weakfields;
 import support.primitives;
+import List from @std.collections.list;
 
 // The user destructor a class declares, or null when it declares none.
 public declaredDestructor(Type classType) -> Method? {
@@ -349,12 +350,15 @@ public lowerMethodCall(LoweringContext lowering, CallExpressionNode call,
     } else if (!calls.supportedCallee(lowering, info, described, call.span())) {
         return -1;
     }
-    long object = borrowedReference(lowering, member.object(), receiverType);
+    let held = new List<long>();
+    long object = callOperand(lowering, member.object(), receiverType, held);
     if (object < 0) {
         return -1;
     }
-    return calls.lowerDispatchedCall(lowering, info, call, classType, object, dispatchSlot,
+    long result = calls.lowerDispatchedCall(lowering, info, call, classType, object, dispatchSlot,
         null);
+    releaseHeld(lowering, held);
+    return result;
 }
 
 // 'e.stackTrace()', 'e.stackFrames()' and 'e.typeName()': the placeholder bodies the standard
@@ -421,12 +425,15 @@ public lowerInterfaceCall(LoweringContext lowering, CallExpressionNode call,
             + "table", call.span());
         return -1;
     }
-    long object = borrowedReference(lowering, member.object(), receiverType);
+    let held = new List<long>();
+    long object = callOperand(lowering, member.object(), receiverType, held);
     if (object < 0) {
         return -1;
     }
-    return calls.lowerDispatchedCall(lowering, info, call, interfaceType, object, dispatchSlot,
-        resolved.definingType());
+    long result = calls.lowerDispatchedCall(lowering, info, call, interfaceType, object,
+        dispatchSlot, resolved.definingType());
+    releaseHeld(lowering, held);
+    return result;
 }
 
 // A bare 'this' inside a method whose receiver is passed as a value: the class reference or the
@@ -453,6 +460,57 @@ public borrowedReference(LoweringContext lowering, Expression node, Type type) -
     if (!places.producesOwnedValue(lowering, node)) {
         return expressions.lowerConverted(lowering, node, type);
     }
+    return parkedReference(lowering, node, type);
+}
+
+// Whether a reference a call or a statement runs over is read out of storage that its code could
+// overwrite, so it has to be kept alive while that code runs.
+needsHolding(LoweringContext lowering, Expression node, Type type) -> bool {
+    return primitives.isReferenceType(type) && !places.producesOwnedValue(lowering, node)
+        && places.readsSharedStorage(lowering, node);
+}
+
+// A reference a call runs over or through, kept alive until the call returns. One read out of
+// storage the call could overwrite is retained and recorded in `held`, which the caller hands to
+// releaseHeld once the call is done; anything else is what borrowedReference gives.
+public callOperand(LoweringContext lowering, Expression node, Type type, List<long> held)
+        -> long {
+    if (!needsHolding(lowering, node, type)) {
+        return borrowedReference(lowering, node, type);
+    }
+    long value = expressions.lowerConverted(lowering, node, type);
+    if (value < 0) {
+        return -1;
+    }
+    ownership.retainValue(lowering, value);
+    lowering.protectValue(value);
+    held.push(value);
+    return value;
+}
+
+// Releases what callOperand kept alive, once the call it was kept for has returned.
+public releaseHeld(LoweringContext lowering, List<long> held) {
+    for (long i = held.length() - 1; i >= 0; i--) {
+        lowering.unprotectValue(held.get(i));
+        ownership.releaseValue(lowering, held.get(i));
+    }
+}
+
+// A reference a statement of several blocks runs over, such as a type switch's scrutinee. One
+// read out of storage the statement's code could overwrite is retained into a slot the innermost
+// scope owns, exactly as a produced reference is parked, so the caller opens a scope of its own
+// around the statement to end the hold where the statement ends; anything else is what
+// borrowedReference gives.
+public heldReference(LoweringContext lowering, Expression node, Type type) -> long {
+    if (!needsHolding(lowering, node, type)) {
+        return borrowedReference(lowering, node, type);
+    }
+    return parkedReference(lowering, node, type);
+}
+
+// The value of an expression parked in a slot the innermost scope owns, which takes the +1 of a
+// produced value and retains a borrowed one.
+parkedReference(LoweringContext lowering, Expression node, Type type) -> long {
     let operand = stores.lowerOperand(lowering, node, type);
     if (operand == null) {
         return -1;
@@ -460,8 +518,7 @@ public borrowedReference(LoweringContext lowering, Expression node, Type type) -
     let builder = lowering.builder();
     long slot = builder.addSlot("held", type, true, false);
     if (!stores.assignSlot(lowering, slot, type, operand)) {
-        lowering.internalError("a produced reference could not be parked in a slot",
-            node.span());
+        lowering.internalError("a reference could not be parked in a slot", node.span());
         return -1;
     }
     ownership.trackSlot(lowering, slot, type);

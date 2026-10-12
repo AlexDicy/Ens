@@ -1766,7 +1766,8 @@ Memory is managed automatically through Automatic Reference Counting (ARC).
 - **Classes** are heap-allocated reference types. Each instance carries a refcount; when the last reference goes out of scope, the instance is freed.
 - **Structs** are value types. They are copied on assignment and passed by value.
 
-Atomics happen only at allocation, at assignment of class-typed fields, and at scope exit.
+Atomics happen only at allocation, at assignment of class-typed fields, at scope exit, and around a call or type switch that uses a reference read out of a field or an array element.
+Such a reference is retained until the call returns or the switch ends, because the code that runs meanwhile could overwrite that field or element and release the object while the call or switch still uses it.
 
 ```ens
 class Texture { /* ... */ }

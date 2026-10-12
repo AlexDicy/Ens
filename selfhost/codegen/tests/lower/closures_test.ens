@@ -184,3 +184,76 @@ test "a lambda inside a generic body lowers once per instance" {
         + "  ret %2\n"
         + "\}\n");
 }
+
+// A call through a closure read out of a field or an array element runs code that could overwrite
+// that storage and release the closure while it runs, so the closure is retained for the call.
+test "a closure read out of a field or an element is kept alive for the call that runs it" {
+    let dumped = try support.loweredSymbolDump(heldClosuresProgram(), "main$Holder$run");
+    try testing.assertEqual(dumped,
+        "func @main$Holder$run(%0: Holder, %1: int) -> int \{\n"
+        + "  $0 value: int\n"
+        + "b0.entry:\n"
+        + "  store $0, %1\n"
+        + "  %2 = object_field_addr %0, 0: &(int) -> int  ; %0.step\n"
+        + "  %3 = load_ptr %2: (int) -> int\n"
+        + "  retain %3\n"
+        + "  %4 = load $0: int\n"
+        + "  %5 = closure_call %3(%4): int\n"
+        + "  release %3\n"
+        + "  %6 = object_field_addr %0, 1: &((int) -> int)[]  ; %0.steps\n"
+        + "  %7 = load_ptr %6: ((int) -> int)[]\n"
+        + "  %8 = const 0: int\n"
+        + "  %9 = sext %8: long\n"
+        + "  bounds_check %7[%9] read\n"
+        + "  %10 = element_addr %7[%9]: &(int) -> int  ; %7[%9]\n"
+        + "  %11 = load_ptr %10: (int) -> int\n"
+        + "  retain %11\n"
+        + "  %12 = load $0: int\n"
+        + "  %13 = closure_call %11(%12): int\n"
+        + "  release %11\n"
+        + "  %14 = add %5, %13: int\n"
+        + "  ret %14\n"
+        + "\}\n");
+    let program = try support.lowerWholeProgram(heldClosuresProgram());
+    try testing.assertEqual(try support.optimizedDump(program, "main$Holder$run"), dumped);
+}
+
+// A parameter is the caller's to keep alive, a local owns its closure, and a capture is a copy no
+// call can write, so none of them is retained around the call once the passes have run.
+test "a closure in a parameter, a local or a capture is called as it is" {
+    let program = try support.lowerWholeProgram(heldClosuresProgram());
+    string applied = try support.optimizedDump(program, "main$apply");
+    for (let line in ["  %8 = closure_call %6(%7): int\n", "  %11 = closure_call %9(%10): int\n",
+            "  %15 = closure_call %13(%14): int\n"]) {
+        try testing.assertTrue(applied.indexOf(line) >= 0, "no '{line}' in: {applied}");
+    }
+    for (let temp in ["%6", "%9", "%13"]) {
+        try testing.assertTrue(applied.indexOf("retain {temp}\n") < 0
+            && applied.indexOf("release {temp}\n") < 0, "{temp} is retained: {applied}");
+    }
+    string captured = try support.optimizedDump(program, "main$lambda0");
+    try testing.assertTrue(captured.indexOf("retain") < 0 && captured.indexOf("release") < 0,
+        "the captured closure is retained: {captured}");
+}
+
+// A holder whose closures sit in a field and an array element, and a function that calls a
+// closure through a parameter, a local and the capture of a lambda.
+heldClosuresProgram() -> string {
+    return "class Holder \{\n"
+        + "    protected (int) -> int step;\n"
+        + "    protected ((int) -> int)[] steps;\n"
+        + "    protected constructor(this.step, this.steps);\n"
+        + "    protected run(int value) -> int \{\n"
+        + "        return this.step(value) + this.steps[0](value);\n"
+        + "    \}\n"
+        + "\}\n"
+        + "apply((int) -> int step, int value) -> int \{\n"
+        + "    (int) -> int local = step;\n"
+        + "    (int) -> int outer = (int inner) -> step(inner);\n"
+        + "    return step(value) + local(value) + outer(value);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let holder = new Holder((int value) -> value + 1, [(int value) -> value]);\n"
+        + "    return holder.run(1) + apply((int value) -> value * 2, 3);\n"
+        + "\}\n";
+}

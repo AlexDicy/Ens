@@ -227,7 +227,9 @@ compareWide(LoweringContext lowering, EirBinaryOp operation, long wide, long bou
 
 // A switch whose arms test the scrutinee's runtime type: the tests run in source order, a null
 // arm catches an absent nullable first, and a sealed hierarchy the arms cover exhaustively needs
-// no default, so the chain's miss end is unreachable.
+// no default, so the chain's miss end is unreachable. An arm's binding borrows the scrutinee, so
+// the switch is a scope of its own, and one read out of storage an arm could overwrite is kept
+// alive in it until the switch ends.
 public lowerTypeSwitch(LoweringContext lowering, Expression scrutinee, List<SwitchArm> arms,
                        Type? resultType, Span span) -> long {
     let scrutineeType = lowering.typeOf(scrutinee);
@@ -241,15 +243,36 @@ public lowerTypeSwitch(LoweringContext lowering, Expression scrutinee, List<Swit
         lowering.unsupported("a switch producing {lowering.names().quoted(resultType)}", span);
         return -1;
     }
-    long scrutineeValue = classes.borrowedReference(lowering, scrutinee, scrutineeType);
-    if (scrutineeValue < 0) {
-        return -1;
-    }
     let builder = lowering.builder();
     long resultSlot = -1;
     if (resultType != null) {
         resultSlot = ownership.defineMergeSlot(lowering, "typeswitch", resultType);
     }
+    lowering.pushScope();
+    long depth = lowering.scopeDepth();
+    bool lowered = lowerTypeArms(lowering, scrutinee, scrutineeType, arms, resultType, resultSlot,
+        span);
+    if (lowered && !lowering.failed() && !builder.terminated()) {
+        ownership.releaseScopesAbove(lowering, depth - 1);
+    }
+    lowering.popScope();
+    if (!lowered || resultType == null) {
+        return -1;
+    }
+    long temp = builder.newTemp(resultType);
+    builder.append(new EirLoadSlot(temp, resultType, resultSlot));
+    return temp;
+}
+
+// The scrutinee, the test chain and every arm of a type switch, ending in the block the arms
+// merge into. False when lowering failed.
+lowerTypeArms(LoweringContext lowering, Expression scrutinee, Type scrutineeType,
+              List<SwitchArm> arms, Type? resultType, long resultSlot, Span span) -> bool {
+    long scrutineeValue = classes.heldReference(lowering, scrutinee, scrutineeType);
+    if (scrutineeValue < 0) {
+        return false;
+    }
+    let builder = lowering.builder();
     let armBlocks = new List<long>();
     long defaultBlock = -1;
     long nullBlock = -1;
@@ -272,7 +295,7 @@ public lowerTypeSwitch(LoweringContext lowering, Expression scrutinee, List<Swit
             is ErrorSwitchArmNode arm -> {
                 lowering.internalError("a switch arm the parser could not read reached code "
                     + "generation", arm.span());
-                return -1;
+                return false;
             },
         }
     }
@@ -293,7 +316,7 @@ public lowerTypeSwitch(LoweringContext lowering, Expression scrutinee, List<Swit
         builder.moveTo(chainBlock);
     }
     if (!lowerTestChain(lowering, arms, armBlocks, scrutineeValue, missTarget, span)) {
-        return -1;
+        return false;
     }
     if (unreachableBlock >= 0) {
         builder.moveTo(unreachableBlock);
@@ -305,7 +328,7 @@ public lowerTypeSwitch(LoweringContext lowering, Expression scrutinee, List<Swit
         let arm = arms.get(a);
         if (arm is TypeArmNode) {
             if (!bindArmValue(lowering, arm, scrutineeValue)) {
-                return -1;
+                return false;
             }
         }
         let body = switches.armBodyOf(arm);
@@ -313,19 +336,14 @@ public lowerTypeSwitch(LoweringContext lowering, Expression scrutinee, List<Swit
             switches.lowerArmBody(lowering, body, resultType, resultSlot);
         }
         if (lowering.failed()) {
-            return -1;
+            return false;
         }
         if (!builder.terminated()) {
             builder.terminate(new EirJump(merge));
         }
     }
     builder.moveTo(merge);
-    if (resultType == null) {
-        return -1;
-    }
-    long temp = builder.newTemp(resultType);
-    builder.append(new EirLoadSlot(temp, resultType, resultSlot));
-    return temp;
+    return true;
 }
 
 // One test per type arm, in source order; a miss falls through to the next test and past the
