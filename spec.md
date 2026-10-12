@@ -1919,6 +1919,8 @@ The operations that follow do look at the disk, and each of them raises a `FileS
 A `true` result proves nothing about a moment later, so opening a file and catching `NotFound` beats checking first and opening second.
 `realPath()` returns the path with every symbolic link resolved, as the operating system resolves it, which needs every part of the path to be there, because a link is resolved by reading it and a `..` written after one names a different place than removing it from the text would.
 On Windows it may still return a result for a path whose middle part is missing, since Win32 removes every `..` before it resolves anything.
+`linkTarget()` returns the path a symbolic link stores, so a relative target stays relative to the link's directory; it returns `null` for a path that names something other than a link, and raises a `FileSystemError` for a path where nothing is there.
+On Windows a junction counts as a link too, and the target is the link's display form, the path as it was written when the link was made.
 
 `readBytes()` and `readText()` return everything the file at the path holds, and `readText` raises a `FileSystemError` for bytes that spell no character.
 `writeBytes(content)` and `writeText(content)` write that content as everything the file holds, creating the file when nothing is there and replacing what was there when something is.

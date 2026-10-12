@@ -242,6 +242,178 @@ public windowsMetadata(Runtime runtime, TypeRef type) -> RuntimeFunction {
     return runtime.endDefinition(definition);
 }
 
+// A link's target is the name its reparse data stores: a symbolic link's or a junction's, which are
+// the reparse points the metadata bridge reports as links. The name a person wrote is preferred,
+// and the name the system substitutes, which opens with '\??\', is the fallback, written as stored.
+public windowsReadLink(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let openFile = createFileFunction(runtime);
+    let control = runtime.libc("DeviceIoControl", runtime.int32Type.functionType([
+        runtime.pointerType, runtime.int32Type, runtime.pointerType, runtime.int32Type,
+        runtime.pointerType, runtime.int32Type, runtime.pointerType, runtime.pointerType]));
+    let closeHandle = closeHandleFunction(runtime);
+    let narrow = widetext.narrowFunction(runtime);
+    let widen = widetext.wideFromUtf8(runtime);
+    let allocate = runtime.malloc();
+    let release = runtime.free();
+    let definition = runtime.beginDefinition("ens_fs_read_link", type);
+    let builder = runtime.builder;
+    let returned = memory.buildAlloca(builder, runtime.int32Type, "returned");
+    let openBlock = runtime.block(definition, "link.open");
+    let unopenableBlock = runtime.block(definition, "link.unopenable");
+    let roomBlock = runtime.block(definition, "link.room");
+    let closeNoMemoryBlock = runtime.block(definition, "link.close.no.memory");
+    let readBlock = runtime.block(definition, "link.read");
+    let unreadBlock = runtime.block(definition, "link.unread");
+    let taggedBlock = runtime.block(definition, "link.tagged");
+    let notLinkBlock = runtime.block(definition, "link.not.link");
+    let namedBlock = runtime.block(definition, "link.named");
+    let emptyBlock = runtime.block(definition, "link.empty");
+    let measureBlock = runtime.block(definition, "link.measure");
+    let unmeasuredBlock = runtime.block(definition, "link.unmeasured");
+    let fitBlock = runtime.block(definition, "link.fit");
+    let writeBlock = runtime.block(definition, "link.write");
+    let doneBlock = runtime.block(definition, "link.done");
+    let noMemoryBlock = runtime.block(definition, "link.no.memory");
+
+    let capacity = runtime.parameter(definition, 2);
+    let wide = runtime.call(widen, [runtime.parameter(definition, 0), runtime.int32(-1)],
+        "path.wide");
+    instructions.buildCondBr(builder, runtime.isNull(wide), noMemoryBlock, openBlock);
+
+    builder.positionAtEnd(openBlock);
+    let handle = runtime.call(openFile, [wide, runtime.int32(0),
+        runtime.int32(Win32.shareEverything), runtime.nullPointer(),
+        runtime.int32(Win32.openExisting),
+        runtime.int32(Win32.backupSemantics | Win32.openReparsePoint), runtime.nullPointer()],
+        "handle");
+    let openError = runtime.lastError();
+    runtime.call(release, [wide], "");
+    instructions.buildCondBr(builder, invalidHandle(runtime, handle), unopenableBlock, roomBlock);
+
+    builder.positionAtEnd(unopenableBlock);
+    instructions.buildRet(builder, openError);
+
+    builder.positionAtEnd(roomBlock);
+    let data = runtime.call(allocate, [runtime.int64(ReparseData.largestBytes)], "data");
+    instructions.buildCondBr(builder, runtime.isNull(data), closeNoMemoryBlock, readBlock);
+
+    builder.positionAtEnd(closeNoMemoryBlock);
+    runtime.call(closeHandle, [handle], "");
+    instructions.buildRet(builder, runtime.int32(Win32.outOfMemory));
+
+    builder.positionAtEnd(readBlock);
+    let read = runtime.call(control, [handle, runtime.int32(ReparseData.getReparsePoint),
+        runtime.nullPointer(), runtime.int32(0), data, runtime.int32(ReparseData.largestBytes),
+        returned, runtime.nullPointer()], "read");
+    let readError = runtime.lastError();
+    runtime.call(closeHandle, [handle], "");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, read, runtime.int32(0), "unread"), unreadBlock,
+        taggedBlock);
+
+    builder.positionAtEnd(unreadBlock);
+    runtime.call(release, [data], "");
+    instructions.buildRet(builder, readError);
+
+    builder.positionAtEnd(taggedBlock);
+    let tag = memory.buildLoad(builder, runtime.int32Type, data, "tag");
+    let symbolic = instructions.buildICmpEQ(builder, tag,
+        runtime.int32(ReparseData.symbolicLinkTag), "symbolic");
+    let junction = instructions.buildICmpEQ(builder, tag, runtime.int32(ReparseData.junctionTag),
+        "junction");
+    instructions.buildCondBr(builder, instructions.buildOr(builder, symbolic, junction, ""),
+        namedBlock, notLinkBlock);
+
+    builder.positionAtEnd(notLinkBlock);
+    runtime.call(release, [data], "");
+    instructions.buildRet(builder, runtime.int32(ReparseData.notAReparsePoint));
+
+    builder.positionAtEnd(namedBlock);
+    let names = instructions.buildSelect(builder, symbolic,
+        runtime.int64(ReparseData.symbolicLinkNames), runtime.int64(ReparseData.junctionNames),
+        "names");
+    let printLength = nameField(runtime, data, ReparseData.printLengthField);
+    let written = instructions.buildICmpNE(builder, printLength, runtime.int64(0), "written");
+    let offset = instructions.buildSelect(builder, written,
+        nameField(runtime, data, ReparseData.printOffsetField),
+        nameField(runtime, data, ReparseData.substituteOffsetField), "offset");
+    let length = instructions.buildSelect(builder, written, printLength,
+        nameField(runtime, data, ReparseData.substituteLengthField), "length");
+    let named = memory.buildGEP(builder, runtime.int8Type, data,
+        [instructions.buildAdd(builder, names, offset, "")], "named");
+    let start = named;
+    let characters = instructions.buildTrunc(builder,
+        instructions.buildLShr(builder, length, runtime.int64(1), ""), runtime.int32Type,
+        "characters");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, characters, runtime.int32(0), "empty"), emptyBlock,
+        measureBlock);
+
+    builder.positionAtEnd(emptyBlock);
+    runtime.call(release, [data], "");
+    memory.buildStore(builder, runtime.int64(0), runtime.parameter(definition, 3));
+    instructions.buildRet(builder, runtime.int32(0));
+
+    builder.positionAtEnd(measureBlock);
+    let bytes = runtime.call(narrow, [widetext.utf8CodePage(runtime), runtime.int32(0), start,
+        characters, runtime.nullPointer(), runtime.int32(0), runtime.nullPointer(),
+        runtime.nullPointer()], "bytes");
+    let measureError = runtime.lastError();
+    let needed = instructions.buildSExt(builder, bytes, runtime.int64Type, "needed");
+    memory.buildStore(builder, needed, runtime.parameter(definition, 3));
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSGT(builder, bytes, runtime.int32(0), ""), fitBlock,
+        unmeasuredBlock);
+
+    builder.positionAtEnd(unmeasuredBlock);
+    runtime.call(release, [data], "");
+    instructions.buildRet(builder, measureError);
+
+    builder.positionAtEnd(fitBlock);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLE(builder, needed, capacity, "fits"), writeBlock, doneBlock);
+
+    builder.positionAtEnd(writeBlock);
+    runtime.call(narrow, [widetext.utf8CodePage(runtime), runtime.int32(0), start, characters,
+        runtime.parameter(definition, 1),
+        instructions.buildTrunc(builder, capacity, runtime.int32Type, ""),
+        runtime.nullPointer(), runtime.nullPointer()], "");
+    instructions.buildBr(builder, doneBlock);
+
+    builder.positionAtEnd(doneBlock);
+    runtime.call(release, [data], "");
+    instructions.buildRet(builder, runtime.int32(0));
+
+    builder.positionAtEnd(noMemoryBlock);
+    instructions.buildRet(builder, runtime.int32(Win32.outOfMemory));
+    return runtime.endDefinition(definition);
+}
+
+// One 16-bit offset or length field of reparse data, widened.
+nameField(Runtime runtime, Value data, long field) -> Value {
+    let builder = runtime.builder;
+    return instructions.buildZExt(builder, memory.buildLoad(builder, runtime.int16Type,
+        runtime.offsetPointer(data, field, ""), ""), runtime.int64Type, "");
+}
+
+// The shape of the reparse data FSCTL_GET_REPARSE_POINT writes: a tag, then for a symbolic link
+// or a junction the offsets and lengths in bytes of two names inside a buffer that starts after
+// them. A symbolic link carries a flags field before its buffer, which a junction does not.
+final class ReparseData {
+    protected static const long getReparsePoint = 0x000900A8;
+    protected static const long largestBytes = 16384;
+    protected static const long symbolicLinkTag = 0xA000000C;
+    protected static const long junctionTag = 0xA0000003;
+    protected static const long substituteOffsetField = 8;
+    protected static const long substituteLengthField = 10;
+    protected static const long printOffsetField = 12;
+    protected static const long printLengthField = 14;
+    protected static const long junctionNames = 16;
+    protected static const long symbolicLinkNames = 20;
+    // ERROR_NOT_A_REPARSE_POINT, which Windows also gives for a path that names no link at all.
+    protected static const long notAReparsePoint = 4390;
+}
+
 // Windows resolves a path only through a handle on the thing it names, so a path nothing can be
 // opened on has no real form to return.
 public windowsRealPath(Runtime runtime, TypeRef type) -> RuntimeFunction {

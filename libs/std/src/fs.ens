@@ -262,6 +262,40 @@ export struct Path implements Comparable<Path> {
             ErrorKind.Other, this, 0, null, reason);
     }
 
+    // The path the symbolic link at this path stores, so a relative target stays relative to the
+    // link's own directory. On Windows it is the link's display form. Null when the path names
+    // something that is not a link; a path where nothing is there is a failure.
+    export linkTarget() -> Path? throws FileSystemError {
+        let found = system.fsMetadata(this.text, false);
+        if (found.code != 0) {
+            throw error.failed("read the link", this, found.code);
+        }
+        if (Metadata.kindFromCode(found.kind) != EntryKind.Symlink) {
+            return null;
+        }
+        long capacity = Room.firstAttempt;
+        // Two passes are enough, because the first reports how much room the target takes and the
+        // second calls with exactly that much. A third would mean the link changed under the call.
+        for (long attempt = 0; attempt < 2; attempt++) {
+            byte[] buffer = new byte[capacity];
+            let result = system.fsReadLink(this.text, buffer, capacity);
+            if (result.code != 0) {
+                throw error.failed("read the link", this, result.code);
+            }
+            if (result.needed <= capacity) {
+                string stored = string.fromBytesLossy(buffer.slice(0, result.needed));
+                if (environment.platform() == Platform.Windows) {
+                    stored = windowsLinkText(stored);
+                }
+                return Path.fromNative(stored, environment.platform());
+            }
+            capacity = result.needed;
+        }
+        string reason = "the link changed while it was being read. Try again";
+        throw new FileSystemError("could not read the link '{this}': {reason}", ErrorKind.Other,
+            this, 0, null, reason);
+    }
+
     // Everything the file at this path holds.
     export readBytes() -> byte[] throws FileSystemError {
         let stream = try this.open();
@@ -609,6 +643,24 @@ final class Room {
 // ERROR_BAD_NETPATH or ERROR_BAD_NET_NAME.
 unreachableShare(int code) -> bool {
     return environment.platform() == Platform.Windows && (code == 53 || code == 67);
+}
+
+// The path a Windows link's stored name `stored` names, as Win32 accepts it. A name the system
+// substitutes opens with '\??\': before a drive letter that prefix is dropped, before 'UNC\' it
+// becomes the two separators a share opens with, and before anything else, such as the volume
+// name a mount point stores, it becomes '\\?\'.
+public windowsLinkText(string stored) -> string {
+    if (!stored.startsWith("\\??\\")) {
+        return stored;
+    }
+    string rest = stored.substring(4, stored.length);
+    if (rest.length >= 2 && isDriveLetter(rest.byteAt(0)) && rest.byteAt(1) == ':') {
+        return rest;
+    }
+    if (rest.startsWith("UNC\\")) {
+        return "\\\\" + rest.substring(4, rest.length);
+    }
+    return "\\\\?\\" + rest;
 }
 
 // Whether the byte is a letter a drive can be named by, which Windows writes in either case.

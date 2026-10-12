@@ -114,6 +114,81 @@ unsupportedMetadata(Runtime runtime, TypeRef type) -> RuntimeFunction {
     return runtime.endDefinition(definition);
 }
 
+// A link's target is read into memory that doubles until the whole target fits, because no
+// system bounds how long a target may be and readlink reports only how much it wrote.
+public posixReadLink(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let readLink = runtime.libc("readlink", runtime.int64Type.functionType([runtime.pointerType,
+        runtime.pointerType, runtime.int64Type]));
+    let allocate = runtime.malloc();
+    let release = runtime.free();
+    let copy = runtime.memcpy();
+    let definition = runtime.beginDefinition("ens_fs_read_link", type);
+    let builder = runtime.builder;
+    let roomSlot = memory.buildAlloca(builder, runtime.int64Type, "room.bytes");
+    let readBlock = runtime.block(definition, "link.read");
+    let callBlock = runtime.block(definition, "link.call");
+    let resultBlock = runtime.block(definition, "link.result");
+    let growBlock = runtime.block(definition, "link.grow");
+    let measuredBlock = runtime.block(definition, "link.measured");
+    let copyBlock = runtime.block(definition, "link.copy");
+    let doneBlock = runtime.block(definition, "link.done");
+    let failedBlock = runtime.block(definition, "link.failed");
+    let noMemoryBlock = runtime.block(definition, "link.no.memory");
+    memory.buildStore(builder, runtime.int64(LinkRoom.firstAttempt), roomSlot);
+    instructions.buildBr(builder, readBlock);
+
+    builder.positionAtEnd(readBlock);
+    let bytes = memory.buildLoad(builder, runtime.int64Type, roomSlot, "bytes");
+    let room = runtime.call(allocate, [bytes], "room");
+    instructions.buildCondBr(builder, runtime.isNull(room), noMemoryBlock, callBlock);
+
+    builder.positionAtEnd(callBlock);
+    let count = runtime.call(readLink, [runtime.parameter(definition, 0), room, bytes], "count");
+    let why = runtime.lastError();
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLT(builder, count, runtime.int64(0), "unread"), failedBlock,
+        resultBlock);
+
+    // A target that filled the room may have been cut short, so it is read again with twice as
+    // much.
+    builder.positionAtEnd(resultBlock);
+    instructions.buildCondBr(builder, instructions.buildICmpSLT(builder, count, bytes, "whole"),
+        measuredBlock, growBlock);
+
+    builder.positionAtEnd(growBlock);
+    runtime.call(release, [room], "");
+    memory.buildStore(builder, instructions.buildMul(builder, bytes, runtime.int64(2), ""),
+        roomSlot);
+    instructions.buildBr(builder, readBlock);
+
+    builder.positionAtEnd(measuredBlock);
+    memory.buildStore(builder, count, runtime.parameter(definition, 3));
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLE(builder, count, runtime.parameter(definition, 2), "fits"),
+        copyBlock, doneBlock);
+
+    builder.positionAtEnd(copyBlock);
+    runtime.call(copy, [runtime.parameter(definition, 1), room, count], "");
+    instructions.buildBr(builder, doneBlock);
+
+    builder.positionAtEnd(doneBlock);
+    runtime.call(release, [room], "");
+    instructions.buildRet(builder, runtime.int32(0));
+
+    builder.positionAtEnd(failedBlock);
+    runtime.call(release, [room], "");
+    instructions.buildRet(builder, why);
+
+    builder.positionAtEnd(noMemoryBlock);
+    instructions.buildRet(builder, runtime.int32(Errno.outOfMemory));
+    return runtime.endDefinition(definition);
+}
+
+// How much room the first read of a link's target takes.
+final class LinkRoom {
+    protected static const long firstAttempt = 256;
+}
+
 public posixRealPath(Runtime runtime, TypeRef type) -> RuntimeFunction {
     let resolve = runtime.libc("realpath",
         runtime.pointerType.functionType([runtime.pointerType, runtime.pointerType]));
