@@ -31,6 +31,7 @@ import Field from model.typemembers;
 import Method from model.typemembers;
 import phases.declare;
 import Signature from model.typemembers;
+import model.typenames;
 import TypeNames from model.typenames;
 import model.types;
 import Type from model.types;
@@ -205,6 +206,9 @@ class ModuleChecks {
     ModuleContext context;
     ProgramReferences references;
     Reporter reporter;
+    // The file's names, and the names inside the declaration being checked, which its type
+    // parameters hide some of.
+    TypeNames fileNames;
     TypeNames names;
     string modulePath;
     MemberConstraint[] noConstraints;
@@ -219,7 +223,8 @@ class ModuleChecks {
         this.context = context;
         this.references = references;
         this.reporter = new Reporter(context.module().filePath(), collected);
-        this.names = context.names();
+        this.fileNames = context.names();
+        this.names = this.fileNames;
         this.modulePath = context.module().canonicalPath();
         this.noConstraints = [];
         this.structNodes = new List<StructDeclarationNode>();
@@ -255,10 +260,18 @@ class ModuleChecks {
         this.checkFieldInitialization();
         this.checkImplicitBaseConstruction();
         this.checkInterfaceRedeclarations();
+        this.names = this.fileNames;
         this.checkPrimitiveConformances();
         this.checkStructConformances();
         this.checkDeclaredThrows();
         this.checkVisibilityLeaks();
+        this.names = this.fileNames;
+    }
+
+    // Names types the way code inside the declaration of 'owner', or of a function declaring
+    // 'declared', writes them.
+    within(DeclaredType? owner, TypeParamType[] declared = []) {
+        this.names = this.fileNames.withParametersOf(owner, declared);
     }
 
     bindingFor(PrimitiveDeclarationNode node) -> PrimitiveBinding? {
@@ -399,6 +412,7 @@ class ModuleChecks {
             if (structType == null) {
                 continue;
             }
+            this.within(structType);
             Span at = node.name().span();
             let checked = new Set<Type>();
             for (let implemented in structType.interfaces()) {
@@ -461,11 +475,15 @@ class ModuleChecks {
                         provided.signature().returnType(), this.names)
                     + ".", at);
             } else if (!layout.overrideCompatible(requirement.signature(), provided.signature())) {
-                string requiredReturn = this.names.quoted(requirement.signature().returnType());
+                let noting = this.names.noting();
+                Type required = requirement.signature().returnType();
+                string providedReturn = noting.quoted(provided.signature().returnType());
+                string requiredReturn = noting.quoted(required);
+                let imported = typenames.importsFor([required], noting);
                 this.reporter.report("Method '{requirement.name()}' of struct {structName} returns "
-                    + "{this.names.quoted(provided.signature().returnType())}, but interface "
-                    + "{levelName} requires {requiredReturn}. Change the return type of "
-                    + "'{requirement.name()}' to {requiredReturn}.", at);
+                    + "{providedReturn}, but interface {levelName} requires {requiredReturn}. "
+                    + typenames.withImportsFirst(imported, "Change the return type of "
+                        + "'{requirement.name()}' to {imported.names().quoted(required)}."), at);
             }
             if (requirement.isNoreturn() && !provided.isNoreturn()) {
                 this.reporter.report("Method '{requirement.name()}' of struct "
@@ -597,6 +615,7 @@ class ModuleChecks {
             if (found == null) {
                 continue;
             }
+            this.within(found);
             let component = valuecycles.componentOf(found);
             if (component == null || !component.startsAt(found)) {
                 continue;
@@ -700,13 +719,17 @@ class ModuleChecks {
     checkFieldDefaultOrder() {
         for (long i = 0; i < this.structNodes.length(); i++) {
             let node = this.structNodes.get(i);
-            if (this.structFor(node) != null) {
+            let structType = this.structFor(node);
+            if (structType != null) {
+                this.within(structType);
                 this.checkDefaultOrderIn(node.body());
             }
         }
         for (long i = 0; i < this.classNodes.length(); i++) {
             let node = this.classNodes.get(i);
-            if (this.classFor(node) != null) {
+            let classType = this.classFor(node);
+            if (classType != null) {
+                this.within(classType);
                 this.checkDefaultOrderIn(node.body());
             }
         }
@@ -795,6 +818,7 @@ class ModuleChecks {
             let node = this.classNodes.get(i);
             let classType = this.classFor(node);
             if (classType != null) {
+                this.within(classType);
                 this.checkClassFieldInitialization(classType, node);
             }
         }
@@ -849,6 +873,7 @@ class ModuleChecks {
             if (classType == null || declaresConstructor(node)) {
                 continue;
             }
+            this.within(classType);
             let chain = typemembers.implicitBaseConstructor(classType);
             if (chain.owner() == null || chain.chosen() != null || chain.chooser() != classType) {
                 continue;
@@ -876,6 +901,7 @@ class ModuleChecks {
             if (interfaceType == null) {
                 continue;
             }
+            this.within(interfaceType);
             let methods = interfaceType.methods();
             for (long m = 0; m < methods.length(); m++) {
                 let method = methods.get(m);
@@ -918,6 +944,7 @@ class ModuleChecks {
         let functions = this.context.functions().all();
         for (long i = 0; i < functions.length(); i++) {
             let entry = functions.get(i);
+            this.within(null, entry.signature().typeParameters());
             if (!entry.isBuiltin() && !entry.isExternal()) {
                 this.validateThrows(entry.signature());
             }
@@ -928,6 +955,7 @@ class ModuleChecks {
             if (owned == null || owned.declaration() != declared.node()) {
                 continue;
             }
+            this.within(owned);
             switch (owned) {
                 is StructType structType -> {
                     this.validateMethodThrows(structType.methods(), owned.declaration());
@@ -944,6 +972,7 @@ class ModuleChecks {
                 default -> { },
             }
         }
+        this.names = this.fileNames;
         this.validateFunctionTypeThrows();
     }
 
@@ -1059,6 +1088,7 @@ class ModuleChecks {
         let functions = this.context.functions().all();
         for (long i = 0; i < functions.length(); i++) {
             let entry = functions.get(i);
+            this.within(null, entry.signature().typeParameters());
             if (entry.isBuiltin() || entry.isExternal()) {
                 continue;
             }
@@ -1072,6 +1102,7 @@ class ModuleChecks {
             if (structType == null) {
                 continue;
             }
+            this.within(structType);
             string declPhrase = "Struct {this.names.quotedName(structType)}";
             this.collectBoundSites(sites, structType.typeParameterTypes(), structType.visibility(),
                 declPhrase, "{this.names.quotedName(structType)}", node.name().span(),
@@ -1087,6 +1118,7 @@ class ModuleChecks {
             if (classType == null) {
                 continue;
             }
+            this.within(classType);
             string declPhrase = "Class {this.names.quotedName(classType)}";
             this.collectClassBaseSites(sites, classType, node, declPhrase);
             this.collectImplementedInterfaceSites(sites, classType, node, declPhrase);
@@ -1117,6 +1149,7 @@ class ModuleChecks {
             if (interfaceType == null) {
                 continue;
             }
+            this.within(interfaceType);
             string interfaceName = this.names.quotedName(interfaceType);
             string declPhrase = "Interface {interfaceName}";
             this.collectInterfaceBaseSites(sites, interfaceType, node, declPhrase);

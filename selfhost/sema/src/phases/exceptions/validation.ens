@@ -8,10 +8,13 @@ import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
 import SafeMemberExpressionNode from @ens.frontend.syntax.generated.nodes;
 import TryExpressionNode from @ens.frontend.syntax.generated.nodes;
 import LambdaExpressionNode from @ens.frontend.syntax.generated.nodes;
+import NamedArgumentNode from @ens.frontend.syntax.generated.nodes;
+import Expression from @ens.frontend.syntax.generated.nodes;
 import GreenNode from @ens.frontend.syntax.green;
 import GreenToken from @ens.frontend.syntax.green;
 import Span from @ens.frontend.support.source;
 import Reporter from support.diagnostics;
+import RelatedLocation from support.diagnostics;
 import support.diagnostics;
 import SemaResult from result;
 import phases.exceptions;
@@ -25,7 +28,10 @@ import model.hierarchy;
 import model.typemembers;
 import Method from model.typemembers;
 import Signature from model.typemembers;
+import Parameter from model.typemembers;
+import model.typenames;
 import TypeNames from model.typenames;
+import TypeNameDirectory from model.typenames;
 import QuotedCode from model.typenames;
 import model.types;
 import FunctionType from model.types;
@@ -40,13 +46,18 @@ import List from @std.collections.list;
 import Set from @std.collections.set;
 import StringBuilder from @std.text.stringbuilder;
 import support.syntax;
+import Map from @std.collections.map;
 
 // Checks one module's callables and calls after every outward throw set has converged.
 public final class ThrowValidation {
     ModuleExceptions module;
     SemaResult result;
     Reporter reporter;
+    TypeNames fileNames;
     TypeNames names;
+    TypeNameDirectory directory;
+    // The call each lambda written as an argument is passed to.
+    Map<GreenNode, LambdaArgument> argumentCalls;
     ClassType? errorClass;
 
     // The methods the function being validated overrides or implements, which decide whether
@@ -55,11 +66,14 @@ public final class ThrowValidation {
     // Whether one of them is a method of a base class.
     bool answersBase;
 
-    public constructor(ModuleExceptions module) {
+    public constructor(ModuleExceptions module, TypeNameDirectory directory) {
         this.module = module;
+        this.directory = directory;
+        this.argumentCalls = new Map<GreenNode, LambdaArgument>();
         this.result = module.result();
         this.reporter = module.reporter();
-        this.names = module.names();
+        this.fileNames = module.names();
+        this.names = this.fileNames;
         this.errorClass = module.errorClass();
         this.answeredScope = new List<Signature>();
         this.answersBase = false;
@@ -120,15 +134,15 @@ public final class ThrowValidation {
         for (long i = 0; i < this.module.collectedTypes().length(); i++) {
             this.validateTypeItem(this.module.collectedTypes().get(i));
         }
-        for (long i = 0; i < this.module.collectedLambdas().length(); i++) {
-            this.validateLambda(this.module.collectedLambdas().get(i));
-        }
+        this.names = this.fileNames;
     }
 
     // A lambda's body is held to its target's throws list. It has no catch clauses of its own,
     // so the fix for an unlisted failure is in a named function. A call reported for its missing
-    // 'try' is left out, since that report already names both fixes.
+    // 'try' is left out, since that report already names both fixes. The walk of the declaration
+    // that holds the lambda reaches it, so the names are that declaration's.
     validateLambda(LambdaExpressionNode lambda) {
+        let names = this.names.noting();
         let outward = new ThrowSet();
         this.module.collectLambdaThrows(lambda, outward, ThrowCount.UnmarkedJudgment);
         if (!outward.raisesForCertain()) {
@@ -141,7 +155,7 @@ public final class ThrowValidation {
                 string example = "'(() -> void throws Error)'";
                 let error = this.errorClass;
                 if (target != null && error != null) {
-                    example = throwingTypeExample(target, [error], this.names);
+                    example = throwingTypeExample(target, [error], names);
                 }
                 this.reporter.report("This lambda can throw, but the function type it is given to has "
                     + "no 'throws' list. Add a 'throws' list after that function type's return type, "
@@ -149,25 +163,50 @@ public final class ThrowValidation {
                     + namedFunctionFix("throwing code", "it"), lambda.arrow().span());
                 return;
             }
-            string thrown = nameList(outward, this.names);
-            Type[] listed = sortedTypes(outward, this.names);
-            string clause = quotedTypeList("throws ", listed, "", this.names);
-            string written = quotedTypeList("(() -> void throws ", listed, ")", this.names);
+            string thrown = nameList(outward, names);
+            Type[] listed = sortedTypes(outward, names);
+            let site = this.targetSite(lambda);
+            let imported = typenames.importsFor(listed, site.names);
+            string clause = quotedTypeList("throws ", listed, "", imported.names());
+            string written = quotedTypeList("(() -> void throws ", listed, ")", imported.names());
             if (target != null) {
-                written = throwingTypeExample(target, listed, this.names);
+                written = throwingTypeExample(target, listed, imported.names());
             }
-            this.reporter.report("This lambda can throw {thrown}, but the function type it is given to "
-                + "has no 'throws' list. Add {clause} after that function type's return type, "
-                + "as in {written}, or "
-                + namedFunctionFix("throwing code", thrown), lambda.arrow().span());
+            string elsewhere = namedFunctionFix("throwing code", nameList(outward, names));
+            let parameter = site.parameter;
+            let otherFile = site.otherFile;
+            if (parameter != null && otherFile != null) {
+                string place = "the type of parameter '{parameter.name()}' of '{site.callable}'";
+                string fix = "Add {clause} there, as in {written}, or {elsewhere}";
+                if (imported.imports().length > 0) {
+                    fix = typenames.withImportsFirst(imported, "Add {clause} to it, as in {written}.")
+                        + " Or {elsewhere}";
+                }
+                this.reporter.report("This lambda can throw {thrown}, but {place} has no 'throws' list. "
+                    + fix, lambda.arrow().span(), [new RelatedLocation(otherFile, parameter.span(),
+                        "parameter '{parameter.name()}' of '{site.callable}' is declared here")]);
+                return;
+            }
+            string opening = "This lambda can throw {thrown}, but the function type it is given to has "
+                + "no 'throws' list.";
+            if (imported.imports().length > 0) {
+                this.reporter.report("{opening} "
+                    + typenames.withImportsFirst(imported, "Add {clause} to that function type, as in "
+                        + "{written}.")
+                    + " Or {elsewhere}", lambda.arrow().span());
+                return;
+            }
+            this.reporter.report("{opening} Add {clause} after that function type's return type, as in "
+                + "{written}, or {elsewhere}", lambda.arrow().span());
             return;
         }
         let strays = this.strayUnderScope(outward, exceptions.throwSetOf(allowed, this.errorClass));
         if (!strays.isEmpty()) {
-            string thrown = nameList(strays, this.names);
+            string thrown = nameList(strays, names);
             this.reporter.report("This lambda can throw {thrown}, which the function type it is given "
-                + "to does not list. Add {thrown} to that function type's 'throws' list, or "
-                + namedFunctionFix("throwing code", thrown), lambda.arrow().span());
+                + "to does not list. Add {nameList(strays, names)} to that function type's 'throws' "
+                + "list, or " + namedFunctionFix("throwing code", nameList(strays, names)),
+                lambda.arrow().span());
         }
     }
 
@@ -177,6 +216,83 @@ public final class ThrowValidation {
             return [];
         }
         return target.thrownTypes();
+    }
+
+    // Where the function type the lambda is given to is written. Where the lambda is an argument,
+    // that type is a parameter type of the callable called, written inside it; anywhere else it is
+    // written where the lambda is.
+    targetSite(LambdaExpressionNode lambda) -> LambdaTargetSite {
+        let argument = this.argumentCalls.get(lambda.green());
+        if (argument == null) {
+            return new LambdaTargetSite(this.names, null, null, "");
+        }
+        let callee = argument.call.callee();
+        if (callee is MemberExpressionNode || callee is SafeMemberExpressionNode) {
+            let method = this.result.methodOf(callee.green());
+            if (method != null) {
+                let owner = types.authorityOf(method.definingType());
+                if (owner != null) {
+                    let names = this.directory.namesFor(owner.filePath()).withParametersOf(owner,
+                        method.signature().typeParameters());
+                    return this.siteIn(names, owner.filePath(), method.signature(), argument);
+                }
+            }
+        }
+        let function = this.result.callableOf(callee.green());
+        let declaringFile = this.result.callableFileOf(callee.green());
+        if (function != null && declaringFile != null) {
+            let names = this.directory.namesFor(declaringFile).withParametersOf(null,
+                function.typeParameters());
+            return this.siteIn(names, declaringFile, function, argument);
+        }
+        return new LambdaTargetSite(this.fileNames, null, null, "");
+    }
+
+    // The site of a lambda passed as 'argument' to 'signature', declared in the file 'filePath'
+    // whose names are 'names'. The parameter is named only where that file is not this one.
+    siteIn(TypeNames names, string filePath, Signature signature, LambdaArgument argument)
+           -> LambdaTargetSite {
+        if (filePath == this.fileNames.filePath()) {
+            return new LambdaTargetSite(names, null, null, "");
+        }
+        Parameter? parameter = null;
+        Parameter[] parameters = signature.parameters();
+        if (argument.name.length > 0) {
+            for (let candidate in parameters) {
+                if (candidate.name() == argument.name) {
+                    parameter = candidate;
+                }
+            }
+        } else if (argument.position < parameters.length) {
+            parameter = parameters[argument.position];
+        }
+        return new LambdaTargetSite(names, filePath, parameter, signature.name());
+    }
+
+    // Records the lambdas the call passes as arguments, for targetSite to find the call from.
+    noteLambdaArguments(CallExpressionNode call) {
+        let arguments = call.arguments();
+        for (long i = 0; i < arguments.argumentsCount(); i++) {
+            let argument = arguments.arguments(i);
+            Expression? value = null;
+            string name = "";
+            switch (argument) {
+                is NamedArgumentNode named -> {
+                    value = named.value();
+                    name = named.name().text();
+                },
+                is Expression positional -> {
+                    value = positional;
+                },
+                default -> { },
+            }
+            if (value != null) {
+                let written = syntax.unwrapParentheses(value);
+                if (written is LambdaExpressionNode) {
+                    this.argumentCalls.set(written.green(), new LambdaArgument(call, i, name));
+                }
+            }
+        }
     }
 
     // The function type the lambda is given to, or null where it is given to none.
@@ -193,6 +309,7 @@ public final class ThrowValidation {
     }
 
     validateFunction(FunctionItem item) {
+        this.names = this.fileNames.withParametersOf(item.owner, item.signature.typeParameters());
         this.module.enterItemScope(item);
         this.answeredScope = this.answeredSignatures(item);
         let answering = item.method;
@@ -222,6 +339,7 @@ public final class ThrowValidation {
         this.module.leaveItemScope();
         this.answeredScope = new List<Signature>();
         this.answersBase = false;
+        this.names = this.fileNames;
     }
 
     // Checks the calls under the node. 'lambda' is the innermost lambda holding the node, and null
@@ -231,6 +349,7 @@ public final class ThrowValidation {
             is TryExpressionNode tried -> {
                 let operand = tried.operand();
                 if (operand is CallExpressionNode) {
+                    this.noteLambdaArguments(operand);
                     this.validateCall(operand, true, tried.tryKeyword().span(), site, lambda);
                     this.validateChildren(operand, site, lambda);
                 } else {
@@ -238,10 +357,12 @@ public final class ThrowValidation {
                 }
             },
             is CallExpressionNode call -> {
+                this.noteLambdaArguments(call);
                 this.validateCall(call, false, call.span(), site, lambda);
                 this.validateChildren(call, site, lambda);
             },
             is LambdaExpressionNode inner -> {
+                this.validateLambda(inner);
                 this.validateChildren(inner, site, inner);
             },
             default -> {
@@ -640,7 +761,11 @@ public final class ThrowValidation {
     // A call in a default or an initializer is refused when it can throw. 'label' opens the
     // refusal. 'why' is the reason no exception may leave the call.
     validateDefaultExpression(SyntaxNode node, string label, string why) {
+        if (node is LambdaExpressionNode) {
+            this.validateLambda(node);
+        }
         if (node is CallExpressionNode) {
+            this.noteLambdaArguments(node);
             let contract = this.module.callContract(node);
             if (this.module.requiresTry(node, contract)) {
                 string reason = "is marked 'throws'";
@@ -661,6 +786,7 @@ public final class ThrowValidation {
     }
 
     validateTypeItem(TypeItem item) {
+        this.names = this.fileNames.withParametersOf(item.declared);
         for (long i = 0; i < item.body.membersCount(); i++) {
             let member = item.body.members(i);
             if (member is FieldDeclarationNode) {
@@ -921,8 +1047,28 @@ pronounFor(ThrowSet set) -> string {
     return "it";
 }
 
-// The types in quotes as code lists them, between 'before' and 'after' and parted by commas, as in
-// 'throws IoError, ParseError', for a reader to paste.
+// A lambda written as an argument of 'call': at 'position' among the arguments, under 'name' where
+// the argument is named.
+final class LambdaArgument {
+    CallExpressionNode call;
+    long position;
+    string name;
+
+    constructor(this.call, this.position, this.name);
+}
+
+// Where the function type a lambda is given to is written: the names that place writes types with,
+// and where it is a parameter of a callable of another file, that file, the parameter, and the
+// callable's name.
+final class LambdaTargetSite {
+    TypeNames names;
+    string? otherFile;
+    Parameter? parameter;
+    string callable;
+
+    constructor(this.names, this.otherFile, this.parameter, this.callable);
+}
+
 // The function type 'target' with the 'throws' list 'thrown', in the parentheses a function type with
 // a 'throws' list is written in, as in '((int) -> string throws Failure)'.
 throwingTypeExample(FunctionType target, Type[] thrown, TypeNames names) -> string {
@@ -948,6 +1094,8 @@ throwingTypeExample(FunctionType target, Type[] thrown, TypeNames names) -> stri
     return code.quotedFor(names);
 }
 
+// The types in quotes as code lists them, between 'before' and 'after' and parted by commas, as in
+// 'throws IoError, ParseError', for a reader to paste.
 quotedTypeList(string before, Type[] types, string after, TypeNames names) -> string {
     let code = new QuotedCode();
     code.write(before);

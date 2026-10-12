@@ -174,6 +174,21 @@ public importsFor(Type[] types, TypeNames names) -> ImportedNames {
     return new ImportedNames(written.toArray(), spelling);
 }
 
+// The fix 'fix', a sentence that writes code with the names 'imported' adds, opened by the imports
+// it needs where it needs any: "Write 'import Kind as PartsKind from parts;' and change ...".
+public withImportsFirst(ImportedNames imported, string fix) -> string {
+    string[] imports = imported.imports();
+    if (imports.length == 0) {
+        return fix;
+    }
+    let quoted = new List<string>();
+    for (let written in imports) {
+        quoted.push("'{written}'");
+    }
+    return "Write {diagnostics.andJoined(quoted.toArray())} and {fix.substring(0, 1).toLowerAscii()}"
+        + fix.substring(1);
+}
+
 // Adds each declared type the type mentions that this file has no name for, once.
 collectUnnamed(Type type, TypeNames names, List<DeclaredType> found) {
     switch (type) {
@@ -297,6 +312,11 @@ export final class TypeNames {
     Map<DeclaredType, string> importedNames;
     Set<string> boundTypeNames;
     Set<string> boundModuleNames;
+    // The type parameters in scope where these names are used, whose names hide a type of the file.
+    Set<string> typeParameterNames;
+    // The types a note was already written for in the one message these names spell, or null
+    // where they spell no message of their own.
+    Set<DeclaredType>? notedTypes;
 
     public constructor(string filePath, string modulePath, string packagePrefix, TypeStore store,
                 string[] implicitPaths, Map<DeclaredType, string> imported,
@@ -309,6 +329,49 @@ export final class TypeNames {
         this.importedNames = imported;
         this.boundTypeNames = boundTypes;
         this.boundModuleNames = boundModules;
+        this.typeParameterNames = new Set<string>();
+        this.notedTypes = null;
+    }
+
+    // These names for one message, which writes the module of a type only the first time it names
+    // the type.
+    public noting() -> TypeNames {
+        let noting = new TypeNames(this.namingFilePath, this.namingModulePath, this.namingPackagePrefix,
+            this.namingStore, this.implicitModulePaths, this.importedNames, this.boundTypeNames,
+            this.boundModuleNames);
+        noting.typeParameterNames = this.typeParameterNames;
+        noting.notedTypes = new Set<DeclaredType>();
+        return noting;
+    }
+
+    // These names inside the declaration of 'owner', or of a function declaring 'declared', with
+    // the type parameters of both in scope.
+    public withParametersOf(DeclaredType? owner, TypeParamType[] declared = []) -> TypeNames {
+        let parameters = new List<string>();
+        if (owner != null) {
+            for (let name in owner.typeParameters()) {
+                parameters.push(name);
+            }
+        }
+        for (let parameter in declared) {
+            parameters.push(parameter.name());
+        }
+        if (parameters.isEmpty()) {
+            return this;
+        }
+        return this.withTypeParameters(parameters.toArray());
+    }
+
+    // These names inside a declaration whose type parameters 'parameters' are in scope, where a
+    // type of the file under one of those names cannot be written by it.
+    public withTypeParameters(string[] parameters) -> TypeNames {
+        let scoped = new TypeNames(this.namingFilePath, this.namingModulePath, this.namingPackagePrefix,
+            this.namingStore, this.implicitModulePaths, this.importedNames, this.boundTypeNames,
+            this.boundModuleNames);
+        for (let parameter in parameters) {
+            scoped.typeParameterNames.add(parameter);
+        }
+        return scoped;
     }
 
     // The file these names belong to, which is the file a diagnostic spelled with them lands in.
@@ -392,18 +455,31 @@ export final class TypeNames {
         return this.noteOver(writtenNames, head);
     }
 
+    // Whether the one message these names spell already wrote the module of this type.
+    alreadyNoted(DeclaredType declared) -> bool {
+        let record = this.notedTypes;
+        return record != null && record.contains(declared);
+    }
+
     // The note after a quote that writes 'writtenNames', in the forms moduleNoteFor describes. The
     // short form is only for a quote of one type that opens with 'head'.
     noteOver(List<WrittenType> writtenNames, DeclaredType? head) -> string {
         let noted = new List<DeclaredType>();
         for (let item in writtenNames) {
             let declared = item.declared;
-            if (declared != null && this.needsModuleNote(declared) && !noted.contains(declared)) {
+            if (declared != null && this.needsModuleNote(declared) && !noted.contains(declared)
+                    && !this.alreadyNoted(declared)) {
                 noted.push(declared);
             }
         }
         if (noted.isEmpty()) {
             return "";
+        }
+        let record = this.notedTypes;
+        if (record != null) {
+            for (let declared in noted) {
+                record.add(declared);
+            }
         }
         let entries = new StringBuilder();
         bool positioned = false;
@@ -466,6 +542,15 @@ export final class TypeNames {
         if (declared is PrimitiveBinding) {
             return declared.name();
         }
+        let name = this.fileNameFor(declared);
+        if (name != null && this.typeParameterNames.contains(name)) {
+            return null;
+        }
+        return name;
+    }
+
+    // The name the file writes for a declared type, before a type parameter in scope hides it.
+    fileNameFor(DeclaredType declared) -> string? {
         if (declared.modulePath() == this.namingModulePath) {
             return declared.name();
         }
@@ -486,7 +571,8 @@ export final class TypeNames {
         if (this.namingStore.findDeclared(this.namingModulePath, name) != null) {
             return true;
         }
-        if (this.boundTypeNames.contains(name) || this.boundModuleNames.contains(name)) {
+        if (this.boundTypeNames.contains(name) || this.boundModuleNames.contains(name)
+                || this.typeParameterNames.contains(name)) {
             return true;
         }
         return this.implicitlyImportedType(name) != null;
@@ -516,8 +602,11 @@ export final class TypeNames {
         imported.set(declared, bound);
         let boundTypes = this.boundTypeNames.copy();
         boundTypes.add(bound);
-        return new TypeNames(this.namingFilePath, this.namingModulePath, this.namingPackagePrefix,
+        let extended = new TypeNames(this.namingFilePath, this.namingModulePath, this.namingPackagePrefix,
             this.namingStore, this.implicitModulePaths, imported, boundTypes, this.boundModuleNames);
+        extended.typeParameterNames = this.typeParameterNames;
+        extended.notedTypes = this.notedTypes;
+        return extended;
     }
 
     // Whether this file can write the type, which a diagnostic offering code to paste has to

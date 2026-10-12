@@ -297,3 +297,181 @@ test "a module note spells the module the way this file imports it" {
     try testing.assertEqual(names.quoted(try sema_support.declaredType(pipeline, "sizes.parts", "Kind")),
         "'Kind' (from sizes.parts)");
 }
+
+// Inside a generic declaration a type parameter hides a type of the file under the same name, so a
+// message about that type names its module, as it does for any name the file means otherwise.
+test "a type a type parameter in scope hides is named with its module" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/parts.ens", "public enum Kind \{\n"
+        + "    Small,\n"
+        + "\}\n"
+        + "public kind() -> Kind \{\n"
+        + "    return Kind.Small;\n"
+        + "\}\n");
+    loader.add("/proj/src/main.ens", "import Kind from parts;\n"
+        + "import parts;\n"
+        + "class Holder<Kind> \{\n"
+        + "    protected constructor();\n"
+        + "\n"
+        + "    use() -> int \{\n"
+        + "        int inside = parts.kind();\n"
+        + "        return inside;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    int outside = parts.kind();\n"
+        + "    return outside;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    let reported = analysis.bodyDiagnostics();
+    try testing.assertEqual(reported.length, 2L);
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "Variable 'inside' has type 'int', but its value has type 'Kind' (from parts).");
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
+        "Variable 'outside' has type 'int', but its value has type 'Kind'. Declare 'outside' as a "
+        + "'Kind' instead.");
+}
+
+// The phases before the bodies name a hidden type the same way inside a generic declaration, with
+// its module at the first mention only: the layout of a class, the conformance check of a struct,
+// and the throws validation of a method and of a lambda inside one. A lambda's fix writes its
+// function type with the names of the place that type is written.
+test "a type a type parameter hides is named with its module in every phase" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/parts.ens", "public enum Kind \{\n"
+        + "    Small,\n"
+        + "\}\n"
+        + "public class Failure extends Error \{\n"
+        + "    public constructor() \{\n"
+        + "        super(\"failure\");\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public fail() throws Failure \{\n"
+        + "    throw new Failure();\n"
+        + "\}\n"
+        + "public failing() -> int throws Failure \{\n"
+        + "    throw new Failure();\n"
+        + "\}\n");
+    loader.add("/proj/src/main.ens", "import Kind from parts;\n"
+        + "import Failure from parts;\n"
+        + "import parts;\n"
+        + "class Base \{\n"
+        + "    protected constructor();\n"
+        + "    protected value() -> Kind \{\n"
+        + "        return Kind.Small;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "class Holder<Kind> extends Base \{\n"
+        + "    protected constructor() \{\n"
+        + "        super();\n"
+        + "    \}\n"
+        + "    override value() -> int \{\n"
+        + "        return 0;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "interface Shower \{\n"
+        + "    show() -> Kind;\n"
+        + "\}\n"
+        + "struct Shown<Kind> implements Shower \{\n"
+        + "    int count;\n"
+        + "    override show() -> int \{\n"
+        + "        return 0;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "compute(() -> int f) -> int \{\n"
+        + "    return f();\n"
+        + "\}\n"
+        + "class Thrower<Failure> \{\n"
+        + "    protected constructor();\n"
+        + "    run() \{\n"
+        + "        parts.fail();\n"
+        + "    \}\n"
+        + "    use() -> int \{\n"
+        + "        return compute(() -> try parts.failing());\n"
+        + "    \}\n"
+        + "\}\n"
+        + "class Hider<Failure> \{\n"
+        + "    protected constructor();\n"
+        + "    compute(() -> int f) -> int \{\n"
+        + "        return f();\n"
+        + "    \}\n"
+        + "    use() -> int \{\n"
+        + "        return this.compute(() -> try parts.failing());\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    string file = "/proj/src/main.ens";
+    let laidOut = analysis.layoutDiagnostics();
+    try testing.assertEqual(laidOut.length, 1L);
+    try sema_support.assertDiagnostic(laidOut, 0, file, "Override of 'value' is 'value() -> int', but the "
+        + "'value' declared in 'Base' is 'value() -> Kind' (Kind from parts). Change this 'value' to "
+        + "match it.");
+    let checked = analysis.checkDiagnostics();
+    try testing.assertEqual(checked.length, 1L);
+    try sema_support.assertDiagnostic(checked, 0, file, "Method 'show' of struct 'Shown' returns 'int', "
+        + "but interface 'Shower' requires 'Kind' (from parts). Write 'import Kind as PartsKind from "
+        + "parts;' and change the return type of 'show' to 'PartsKind'.");
+    let thrown = analysis.exceptionDiagnostics();
+    try testing.assertEqual(thrown.length, 3L);
+    try sema_support.assertDiagnostic(thrown, 0, file, "Call to 'fail' can throw 'Failure' (from parts). "
+        + "Prefix it with 'try', and either catch it with a 'catch' clause or mark this function "
+        + "'throws'.");
+    try sema_support.assertDiagnostic(thrown, 1, file, "This lambda can throw 'Failure' (from parts), but "
+        + "the function type it is given to has no 'throws' list. Add 'throws Failure' after that "
+        + "function type's return type, as in '(() -> int throws Failure)', or move the throwing code "
+        + "into a named function that catches 'Failure' with a 'catch' clause.");
+    try sema_support.assertDiagnostic(thrown, 2, file, "This lambda can throw 'Failure' (from parts), but "
+        + "the function type it is given to has no 'throws' list. Write 'import Failure as PartsFailure "
+        + "from parts;' and add 'throws PartsFailure' to that function type, as in '(() -> int throws "
+        + "PartsFailure)'. Or move the throwing code into a named function that catches 'Failure' with "
+        + "a 'catch' clause.");
+}
+
+// A lambda passed to a function of another module gets a fix spelled with the names of the file
+// that declares the function's parameter type, which can call the same type something else or need
+// an import for it, and the refusal names that parameter and points at it.
+test "a lambda passed to another module's function is fixed with that module's names" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/parts.ens", "public class Failure extends Error \{\n"
+        + "    public constructor() \{\n"
+        + "        super(\"failure\");\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public failing() -> int throws Failure \{\n"
+        + "    throw new Failure();\n"
+        + "\}\n");
+    loader.add("/proj/src/runner.ens", "import Failure as Problem from parts;\n"
+        + "public run(() -> int f) -> int \{\n"
+        + "    return f();\n"
+        + "\}\n");
+    loader.add("/proj/src/plain.ens", "public run(() -> int f) -> int \{\n"
+        + "    return f();\n"
+        + "\}\n");
+    loader.add("/proj/src/main.ens", "import Failure from parts;\n"
+        + "import parts;\n"
+        + "import runner;\n"
+        + "import plain;\n"
+        + "main() -> int \{\n"
+        + "    return runner.run(() -> try parts.failing()) + plain.run(() -> try parts.failing());\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    let thrown = analysis.exceptionDiagnostics();
+    try testing.assertEqual(thrown.length, 2L);
+    try sema_support.assertDiagnostic(thrown, 0, "/proj/src/main.ens", "This lambda can throw 'Failure', "
+        + "but the type of parameter 'f' of 'run' has no 'throws' list. Add 'throws Problem' there, as in "
+        + "'(() -> int throws Problem)', or move the throwing code into a named function that catches "
+        + "'Failure' with a 'catch' clause.");
+    let declared = try sema_support.relatedOf(thrown[0]);
+    try testing.assertEqual(declared.file(), "/proj/src/runner.ens");
+    try testing.assertEqual(declared.note(), "parameter 'f' of 'run' is declared here");
+    try sema_support.assertDiagnostic(thrown, 1, "/proj/src/main.ens", "This lambda can throw 'Failure', "
+        + "but the type of parameter 'f' of 'run' has no 'throws' list. Write 'import Failure from "
+        + "parts;' and add 'throws Failure' to it, as in '(() -> int throws Failure)'. Or move the "
+        + "throwing code into a named function that catches 'Failure' with a 'catch' clause.");
+    let unimported = try sema_support.relatedOf(thrown[1]);
+    try testing.assertEqual(unimported.file(), "/proj/src/plain.ens");
+    try testing.assertEqual(unimported.note(), "parameter 'f' of 'run' is declared here");
+}
