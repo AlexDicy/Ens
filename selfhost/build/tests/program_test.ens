@@ -1,17 +1,24 @@
 // What a load reports. A syntax error used to end the load before sema ran, so a file with one
 // syntax error and six semantic ones reported a single problem and grew to seven once the syntax
-// was fixed. Loading now reports both together.
+// was fixed. Loading now reports both together. A check also loads the tests 'ens test' reads, so
+// what it reports holds for them too.
 import Path from @std.fs;
 import @std.testing;
 import CodegenSettings from @ens.codegen.settings;
 import OptimizationLevel from @ens.codegen.settings;
 import Loaded from program;
+import Unit from program;
 import EntryReading from program;
 import program;
 import BuildOptions from options;
 import Verbosity from options;
 import packaging;
 import MemoryFileLoader from support;
+import support;
+import BuildTarget from target;
+import WorkspaceMember from target;
+import target;
+import SystemFileLoader from @ens.sema.support.loader;
 
 loadFile(string text) -> Loaded {
     let loader = new MemoryFileLoader();
@@ -144,4 +151,165 @@ test "the standard library as the target is loaded once, as the library" {
     string[] none = [];
     try assertReports(loaded, none);
     try testing.assertEqual(loaded.moduleCount(), 4L);
+}
+
+// A package whose test file imports the class: the check reads the tests, so it leaves out the fix
+// that would make the class private to its module, which a build of the sources alone offers.
+test "a checked package reads its tests, so a fix it offers keeps them compiling" {
+    let rootFolder = try support.scratch("check-package-tests");
+    Path root = rootFolder.path();
+    try writeStandardLibrary(root);
+    Path packageFolder = root.join("registry");
+    try writeRegistry(packageFolder);
+    try support.writeFile(packageFolder, "tests/registry_test.ens", "import Registry from lib;\n\n"
+        + "test \"a registry can be made\" \{\n"
+        + "    let registry = new Registry();\n"
+        + "    int wrong = \"text\";\n"
+        + "\}\n");
+    let resolved = try resolvedAt(root, packageFolder);
+    let checked = program.checkedUnitOf(resolved);
+    try testing.assertTrue(checked.loadsTests(), "a package's check reads its tests");
+    try testing.assertEqual(checked.testFilesFolder(), resolved.testsFolder());
+
+    let loaded = loadIn(root, checked);
+    try testing.assertEqual(loaded.diagnostics().length, 2L);
+    try testing.assertTrue(loaded.diagnostics()[0].endsWith(registryText(
+        "Mark 'Secret' 'public'. Or mark 'Registry' 'final'.")), loaded.diagnostics()[0]);
+    try testing.assertTrue(loaded.diagnostics()[1].endsWith("registry_test.ens:5:17: error: "
+        + "Variable 'wrong' has type 'int', but its value has type 'string'. Declare 'wrong' as a "
+        + "'string' instead."), loaded.diagnostics()[1]);
+
+    let built = loadIn(root, program.unitOf(resolved));
+    try testing.assertEqual(built.diagnostics().length, 1L);
+    try testing.assertTrue(built.diagnostics()[0].endsWith(registryText("Mark 'Secret' 'public'. "
+        + "Or remove 'public' from 'Registry' and its constructor. Or mark 'Registry' 'final'.")),
+        built.diagnostics()[0]);
+}
+
+// With no tests folder, 'ens test' reads the test files among the sources, and so does a check.
+test "a check reads the test files kept among the sources" {
+    let rootFolder = try support.scratch("check-folder-tests");
+    Path root = rootFolder.path();
+    try writeStandardLibrary(root);
+    Path folder = root.join("tool");
+    try support.writeFile(folder, "main.ens", "main() \{\n\}\n");
+    try support.writeFile(folder, "parts/count_test.ens", "test \"counting\" \{\n"
+        + "    long total = \"none\";\n"
+        + "\}\n");
+    let resolved = try resolvedAt(root, folder);
+    let checked = program.checkedUnitOf(resolved);
+    try testing.assertTrue(checked.loadsTests(), "a folder's check reads its tests");
+    try testing.assertEqual(checked.testFilesFolder(), resolved.sourceFolder());
+    let loaded = loadIn(root, checked);
+    try testing.assertEqual(loaded.diagnostics().length, 1L);
+    try testing.assertTrue(loaded.diagnostics()[0].endsWith("count_test.ens:2:18: error: "
+        + "Variable 'total' has type 'long', but its value has type 'string'. Declare 'total' as "
+        + "a 'string' instead."), loaded.diagnostics()[0]);
+}
+
+// 'ens test' refuses a single file, so a check of one has no tests to read.
+test "a checked single file reads no tests" {
+    let rootFolder = try support.scratch("check-file-tests");
+    Path root = rootFolder.path();
+    try support.writeFile(root, "hello.ens", "main() \{\n\}\n");
+    try support.writeFile(root, "hello_test.ens", "test \"never read\" \{\n\}\n");
+    let checked = program.checkedUnitOf(try resolvedAt(root, root.join("hello.ens")));
+    try testing.assertFalse(checked.loadsTests(), "a file's check reads no tests");
+    try testing.assertEqual(checked.entryFile(), "hello.ens");
+}
+
+// A member is checked against the tests 'ens test' runs for it: its own tests folder, or its
+// sources when it has none.
+test "a checked workspace member reads its own tests" {
+    let rootFolder = try support.scratch("check-member-tests");
+    Path root = rootFolder.path();
+    try support.writeFile(root, "app/src/main.ens", "main() \{\n\}\n");
+    try support.writeFile(root, "app/tests/app_test.ens", "test \"app\" \{\n\}\n");
+    try support.writeFile(root, "lib/src/lib.ens", "export one() -> int \{\n    return 1;\n\}\n");
+    string[] none = [];
+    let app = program.checkedMemberUnit(new WorkspaceMember("demo.app", root.join("app"), none,
+        "0.1"), root);
+    try testing.assertTrue(app.loadsTests(), "a member's check reads its tests");
+    try testing.assertEqual(app.testFilesFolder(), root.join("app").join("tests"));
+    try testing.assertEqual(app.overridesFolder() ?? Path(""), root);
+    let lib = program.checkedMemberUnit(new WorkspaceMember("demo.lib", root.join("lib"), none,
+        "0.1"), root);
+    try testing.assertTrue(lib.testsFolder().isEmpty(), "a member with no tests folder");
+    try testing.assertEqual(lib.testFilesFolder(), root.join("lib").join("src"));
+}
+
+// The standard library checked with its tests keeps its sources as the library, so each of its
+// types is one type however a test reaches it.
+test "the standard library checked with its tests is loaded once, as the library" {
+    let rootFolder = try support.scratch("check-library-tests");
+    Path root = rootFolder.path();
+    try writeStandardLibrary(root);
+    Path library = root.join("libs").join("std");
+    try support.writeFile(library, "src/fs.ens", "export final class Path \{\n"
+        + "    export constructor();\n"
+        + "\}\n");
+    try support.writeFile(library, "tests/fs_test.ens", "import Path from @std.fs;\n\n"
+        + "test \"a path can be made\" \{\n"
+        + "    Path made = new Path();\n"
+        + "\}\n");
+    let loaded = loadIn(root, program.checkedUnitOf(try resolvedAt(root, library)));
+    string[] none = [];
+    try assertReports(loaded, none);
+    try testing.assertEqual(loaded.moduleCount(), 4L);
+}
+
+// The modules every program imports, in the scratch tree's own standard library.
+writeStandardLibrary(Path root) throws {
+    Path library = root.join("libs").join("std");
+    try support.writeFile(library, "ens.package", "package std \{ ens \"0.1\"; \}\n");
+    try support.writeFile(library, "src/io/print.ens", "export print(string message) \{ \}\n"
+        + "export eprint(string message) \{ \}\n");
+    try support.writeFile(library, "src/core.ens", "export struct StackFrame \{\n"
+        + "    export const string function;\n"
+        + "    export const string file;\n"
+        + "    export const int line;\n"
+        + "\}\n"
+        + "export class Error \{\n"
+        + "    export string message;\n"
+        + "    export constructor(this.message);\n"
+        + "\}\n");
+}
+
+// A package with a public class whose protected method takes a type private to its module.
+writeRegistry(Path packageFolder) throws {
+    try support.writeFile(packageFolder, "ens.package",
+        "package demo.registry \{\n    ens \"0.1\";\n\}\n");
+    try support.writeFile(packageFolder, "src/main.ens", "main() \{\n\}\n");
+    try support.writeFile(packageFolder, "src/lib.ens", "class Secret \{\n"
+        + "\}\n"
+        + "\n"
+        + "public class Registry \{\n"
+        + "    public constructor();\n"
+        + "\n"
+        + "    protected keep(Secret secret) \{\n"
+        + "    \}\n"
+        + "\}\n");
+}
+
+registryText(string fixes) -> string {
+    return "lib.ens:7:20: error: Method 'keep' of class 'Registry' is protected, and 'Registry' is "
+        + "'public', so a subclass anywhere in the package can call it, but its parameter type "
+        + "uses 'Secret', which is private to module 'lib'. {fixes}";
+}
+
+resolvedAt(Path root, Path named) -> BuildTarget throws {
+    let resolution = target.resolve(new SystemFileLoader(), root, named.toString());
+    let resolved = resolution.target();
+    if (resolved == null) {
+        try testing.fail("'{named}' did not resolve: {resolution.failure()}");
+    }
+    return resolved;
+}
+
+loadIn(Path root, Unit unit) -> Loaded {
+    let options = new BuildOptions(root,
+        new CodegenSettings(OptimizationLevel.Default, "x86_64-pc-windows-msvc"),
+        root.join("libs"), Path(""), Path(""),
+        true, false, Verbosity.Normal);
+    return program.load(new SystemFileLoader(), options, packaging.none(), unit);
 }

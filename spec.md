@@ -774,6 +774,7 @@ The toolchain is one command, `ens`, with a subcommand for each thing it does.
 
 - `ens build [path]` compiles a program and writes an executable.
 - `ens check [path]` does everything a build does up to code generation and nothing after it: the same problems are reported, and no artifact is produced.
+  It also checks the test files `ens test` reads for the same path, so a problem in a test is reported, and a fix the check suggests keeps the tests compiling.
 - `ens run [path] [-- arguments]` builds a program in a folder of its own, runs it, and removes the folder, so the tree it was pointed at is left as it was found.
   Everything written after `--` is passed to the program exactly as written, and `ens run` exits with the program's exit code.
 - `ens test [path]` builds a target's tests together with its sources and runs them, as described in the section on tests.
@@ -929,7 +930,7 @@ A handler can read the trace from a caught error, either preformatted or as stru
 
 Tests are declared with the `test` keyword, a description string, and a body.
 Test declarations live in files ending `_test.ens`, next to the code they cover; everything else in a test file (helpers, classes, imports) is ordinary Ens.
-Regular builds skip `_test.ens` files entirely, so tests never ship with the program; `ens test` compiles and runs them.
+Regular builds skip `_test.ens` files entirely, so tests never ship with the program; `ens test` compiles and runs them, and `ens check` checks them along with the sources.
 
 ```ens
 import @std.testing;

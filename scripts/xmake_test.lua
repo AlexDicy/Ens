@@ -1364,6 +1364,24 @@ task("test")
             run({"check", path.join(tests_dir, "undefined_function.ens")}, nil, 1,
                 "Undefined function")
 
+            -- a package's check reads its tests as well, so a problem inside a test is reported and
+            -- a fix it offers never breaks them: the test importing 'Registry' keeps 'public' on it
+            local tested = path.join(root, "tested")
+            os.mkdir(path.join(tested, "src"))
+            os.mkdir(path.join(tested, "tests"))
+            io.writefile(path.join(tested, "ens.package"),
+                'package demo.registry {\n    ens "0.1";\n}\n')
+            io.writefile(path.join(tested, "src", "main.ens"), 'main() {\n}\n')
+            io.writefile(path.join(tested, "src", "lib.ens"), 'class Secret {\n}\n\n'
+                .. 'public class Registry {\n    public constructor();\n\n'
+                .. '    protected keep(Secret secret) {\n    }\n}\n')
+            io.writefile(path.join(tested, "tests", "registry_test.ens"),
+                'import Registry from lib;\n\ntest "a registry can be made" {\n'
+                .. '    let registry = new Registry();\n    int wrong = "text";\n}\n')
+            run({"check", tested}, nil, 1, "Mark 'Secret' 'public'. Or mark 'Registry' 'final'.",
+                "!Or remove 'public' from 'Registry'", "registry_test.ens:5:17: error: Variable "
+                .. "'wrong' has type 'int', but its value has type 'string'.", "registry: 2 problems")
+
             -- the standard library named as the target is checked once, as the library itself
             local std_folder = path.join(os.projectdir(), "libs", "std")
             run({"check", std_folder, "--stdlib", path.join(os.projectdir(), "libs")}, nil, 0,
