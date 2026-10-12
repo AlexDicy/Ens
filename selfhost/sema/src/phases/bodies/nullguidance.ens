@@ -36,6 +36,12 @@ import phases.bodies.narrowing;
 import model.hierarchy;
 import model.typemembers;
 import Field from model.typemembers;
+import Method from model.typemembers;
+import Parameter from model.typemembers;
+import Signature from model.typemembers;
+import RelatedLocation from support.diagnostics;
+import ModuleContext from context;
+import Span from @ens.frontend.support.source;
 import model.typenames;
 import TypeNames from model.typenames;
 import model.types;
@@ -647,12 +653,13 @@ charNarrowingHint(BodyChecker checker, Type target, Type source, Expression? val
 // another reason gets the conversion that keeps it, or the change of the declaration at 'origin' that
 // takes it, where either applies.
 public valueAssignabilityHint(BodyChecker checker, Type target, Type source, Expression? value,
-                              LiteralOrigin? origin = null) -> string {
+                              LiteralOrigin? origin = null, ElsewhereDeclaration? elsewhere = null)
+                              -> string {
     string narrowing = charNarrowingHint(checker, target, source, value);
     if (narrowing.length > 0) {
         return narrowing;
     }
-    string hint = assignabilityHint(target, source, checker.names());
+    string hint = assignabilityHint(target, source, checker.names(), elsewhere);
     long levels = nullLevelsAbove(target, source);
     if (target is ErrorType || hint.length > 0) {
         return hint;
@@ -1227,7 +1234,8 @@ repeatedCheck(string condition, long levels, bool everyLevel) -> string {
 // A value type flowing into an interface-typed slot it conforms to. The conformance is a
 // compile-time judgment: it lets a generic bound take the value, and nothing more, because a
 // struct and a primitive are both held as their own bits and so have no interface value.
-public valueConformanceHint(Type target, Type source, TypeNames names) -> string {
+public valueConformanceHint(Type target, Type source, TypeNames names,
+                            ElsewhereDeclaration? elsewhere = null) -> string {
     string kind = types.valueKindWord(source);
     if (kind.length == 0) {
         return "";
@@ -1242,26 +1250,144 @@ public valueConformanceHint(Type target, Type source, TypeNames names) -> string
     string shown = names.quoted(source);
     string quotedSlot = names.quoted(slot);
     string bounded = names.quotedCode(["<T: ", ">"], [slot]);
+    string fix = "Declare the type as {shown}, or declare {bounded} and use 'T'.";
+    if (elsewhere != null) {
+        let there = elsewhere.names();
+        fix = "Declare {elsewhere.described()} as {there.quoted(source)}, or declare "
+            + "{there.quotedCode(["<T: ", ">"], [slot])} after {elsewhere.typeParameterHost()} and declare "
+            + "the {elsewhere.noun()} as 'T'.";
+    }
     return " {shown} implements {quotedSlot}, but {typenames.typeArticle(kind)} {kind} can only be passed "
         + "where a type parameter such as {bounded} is declared. A value of type {quotedSlot} must be "
-        + "an object of a class, and {typenames.typeArticle(kind)} {kind} value is not one. Declare the type "
-        + "as {shown}, or declare {bounded} and use 'T'.";
+        + "an object of a class, and {typenames.typeArticle(kind)} {kind} value is not one. {fix}";
+}
+
+// Whether the hint for a value of type 'source' where 'target' is expected tells the reader to change
+// the declaration that has type 'target'.
+public hintRetypesDeclaration(BodyChecker checker, Type target, Type source, Expression? value) -> bool {
+    return charNarrowingHint(checker, target, source, value).length == 0
+        && assignabilityHint(target, source, checker.names(), null).length > 0;
+}
+
+// A declaration in another file whose type a fix tells the reader to change. The fix names it, spells
+// its types with the names of that file, and points a note at it.
+public final class ElsewhereDeclaration {
+    string declarationNoun;
+    string declarationName;
+    string declarationOwner;
+    string declarationHost;
+    TypeNames declaringNames;
+    string declaringFile;
+    Span declarationSpan;
+
+    public constructor(this.declarationNoun, this.declarationName, this.declarationOwner,
+                       this.declarationHost, this.declaringNames, this.declaringFile,
+                       this.declarationSpan);
+
+    // What the declaration is: "parameter" or "field".
+    public noun() -> string {
+        return this.declarationNoun;
+    }
+
+    // The declaration as a fix names it: "parameter 'kind' of 'use'".
+    public described() -> string {
+        return "{this.declarationNoun} '{this.declarationName}' of {this.declarationOwner}";
+    }
+
+    // Where a type parameter for the declaration is written after: "'use'" or "'Holder'".
+    public typeParameterHost() -> string {
+        return this.declarationHost;
+    }
+
+    // The names of the file that declares it.
+    public names() -> TypeNames {
+        return this.declaringNames;
+    }
+
+    // The notes a problem whose fix changes this declaration points at.
+    public notes() -> RelatedLocation[] {
+        return [new RelatedLocation(this.declaringFile, this.declarationSpan,
+            "{this.described()} is declared here")];
+    }
+}
+
+// Parameter 'parameter' of 'signature', the signature of 'method' or of a function, as a declaration in
+// another file, or null where the file being checked declares it. 'callable' names what declares it, as
+// in "'use'" or "the constructor of 'Box'".
+public parameterElsewhere(BodyChecker checker, Signature signature, Method? method, string callable,
+                          Parameter parameter) -> ElsewhereDeclaration? {
+    DeclaredType? owner = null;
+    ModuleContext? declaring = null;
+    string host = "'{signature.name()}'";
+    if (method == null) {
+        declaring = functionContextOf(checker, signature);
+    } else {
+        owner = types.authorityOf(method.definingType());
+        if (owner != null) {
+            declaring = checker.contextsByPath().get(owner.modulePath());
+            if (method.isConstructor()) {
+                host = checker.names().quotedName(owner);
+            }
+        }
+    }
+    if (declaring == null) {
+        return null;
+    }
+    string filePath = declaring.module().filePath();
+    if (filePath == checker.context().module().filePath()) {
+        return null;
+    }
+    let names = declaring.names().withParametersOf(owner, signature.typeParameters());
+    return new ElsewhereDeclaration("parameter", parameter.name(), callable, host, names, filePath,
+        parameter.span());
+}
+
+// Field 'field' as a declaration in another file, or null where the file being checked declares it.
+public fieldElsewhere(BodyChecker checker, Field field) -> ElsewhereDeclaration? {
+    let owner = types.authorityOf(field.definingType());
+    if (owner == null) {
+        return null;
+    }
+    let declaring = checker.contextsByPath().get(owner.modulePath());
+    if (declaring == null || owner.filePath() == checker.context().module().filePath()) {
+        return null;
+    }
+    string ownerName = checker.names().quotedName(owner);
+    return new ElsewhereDeclaration("field", field.name(), ownerName, ownerName,
+        declaring.names().withParametersOf(owner), owner.filePath(), field.nameSpan());
+}
+
+// The module that declares the function whose signature is 'signature', or null where no module
+// declares that signature, as for an instantiation of a generic function.
+functionContextOf(BodyChecker checker, Signature signature) -> ModuleContext? {
+    for (let context in checker.contextsByPath().values()) {
+        for (let entry in context.functions().all()) {
+            if (entry.signature() == signature) {
+                return context;
+            }
+        }
+    }
+    return null;
 }
 
 // Guidance appended to an assignability failure: a value type flowing into an interface it
 // conforms to, or 'null' flowing into a type without '?'. It opens with a space, because the
 // sentence before it ends with a full stop.
-assignabilityHint(Type target, Type source, TypeNames names) -> string {
+assignabilityHint(Type target, Type source, TypeNames names, ElsewhereDeclaration? elsewhere)
+        -> string {
     if (target is ErrorType) {
         return "";
     }
-    string conformance = valueConformanceHint(target, source, names);
+    string conformance = valueConformanceHint(target, source, names, elsewhere);
     if (conformance.length > 0) {
         return conformance;
     }
     if (source is NullType && !(target is OptionalType)) {
-        return " {names.quoted(target)} can never be null. Write the type as {names.quotedNullable(target)} "
-            + "if it should allow null.";
+        string fix = "Write the type as {names.quotedNullable(target)}";
+        if (elsewhere != null) {
+            fix = "Write the type of {elsewhere.described()} as {elsewhere.names().quotedNullable(target)}";
+        }
+        return " {names.quoted(target)} can never be null. {fix} if it should allow null.";
     }
     return "";
 }
