@@ -7,6 +7,7 @@ import @std.environment;
 import List from @std.collections.list;
 import Failure from bridges;
 import Mode from bridges;
+import Part from bridges;
 import Request from bridges;
 import Stream from bridges;
 import bridges;
@@ -117,6 +118,7 @@ test "a program that is not there is reported" {
     try testing.assertTrue(attempt.child == null, "a program that is not there was started");
     try testing.assertNotEqual(attempt.error, 0);
     try testing.assertEqual(bridges.failureOf(attempt.error), Failure.notFound);
+    try testing.assertEqual(bridges.partOf(attempt.error), Part.program);
 }
 
 // Windows may answer either of two numbers for a path that runs through a file, and both classify
@@ -130,6 +132,7 @@ test "a program path leading through a file is reported" {
         Request.reading());
     try testing.assertTrue(attempt.child == null, "a program under a file was started");
     try testing.assertEqual(bridges.failureOf(attempt.error), Failure.notFound);
+    try testing.assertEqual(bridges.partOf(attempt.error), Part.program);
 }
 
 test "a working directory that is not there is reported" {
@@ -139,10 +142,24 @@ test "a working directory that is not there is reported" {
         Request.reading().withWorkingDirectory(scratch.joined(folder, "gone")));
     try testing.assertTrue(attempt.child == null, "a child was started in a missing directory");
     try testing.assertEqual(bridges.failureOf(attempt.error), Failure.notFound);
+    try testing.assertEqual(bridges.partOf(attempt.error), Part.workingDirectory);
+}
+
+test "a working directory that is a file is reported" {
+    string folder = try scratch.folder("file.directory");
+    string file = scratch.joined(folder, "notes.txt");
+    try Path(file).writeBytes("not a directory".toBytes());
+    string program = shell.interpreter();
+    let attempt = bridges.start(program, [], bridges.commandLineOf(program, []),
+        Request.reading().withWorkingDirectory(file));
+    try testing.assertTrue(attempt.child == null, "a child was started in a file");
+    try testing.assertNotEqual(attempt.error, 0);
+    try testing.assertEqual(bridges.partOf(attempt.error), Part.workingDirectoryFile);
 }
 
 // POSIX refuses to run a file nobody may execute as a permission, and Windows refuses a file that
-// is no program image as its own kind of failure, which is an Other.
+// is no program image as its own kind of failure, which is an Other. Both name the file as no
+// program.
 test "a data file is refused as a program in each platform's own terms" {
     string folder = try scratch.folder("data");
     string program = scratch.joined(folder, "data.bin");
@@ -156,6 +173,7 @@ test "a data file is refused as a program in each platform's own terms" {
         expected = Failure.other;
     }
     try testing.assertEqual(bridges.failureOf(attempt.error), expected);
+    try testing.assertEqual(bridges.partOf(attempt.error), Part.notProgram);
 }
 
 test "a directory is refused as a program" {
@@ -165,6 +183,56 @@ test "a directory is refused as a program" {
     try testing.assertTrue(attempt.child == null, "a directory was started");
     try testing.assertNotEqual(attempt.error, 0);
     try testing.assertEqual(bridges.failureOf(attempt.error), Failure.permissionDenied);
+    try testing.assertEqual(bridges.partOf(attempt.error), Part.directory);
+}
+
+// A named pipe would block an open until a writer came, so a start that comes back at all is the
+// check that the bridge told it apart without opening it. Only POSIX has one at a path.
+test "a named pipe is refused as a special file without being opened" {
+    if (shell.onWindows()) {
+        return;
+    }
+    string folder = try scratch.folder("named.pipe");
+    string pipe = scratch.joined(folder, "pipe");
+    let made = try bridges.running(shell.start("mkfifo '{pipe}' && chmod +x '{pipe}'", "exit 0",
+        Request.reading()));
+    try testing.assertEqual(made.wait().code, 0);
+    let attempt = bridges.start(pipe, [], bridges.commandLineOf(pipe, []), Request.reading());
+    try testing.assertTrue(attempt.child == null, "a named pipe was started");
+    try testing.assertEqual(bridges.failureOf(attempt.error), Failure.permissionDenied);
+    try testing.assertEqual(bridges.partOf(attempt.error), Part.specialFile);
+}
+
+// Each file may run, so only what it starts with keeps the system from running it. Only POSIX
+// marks a file as runnable.
+test "a runnable file is told apart by how it starts" {
+    if (shell.onWindows()) {
+        return;
+    }
+    string folder = try scratch.folder("runnable");
+    string interpreted = scratch.joined(folder, "interpreted");
+    string plain = scratch.joined(folder, "plain");
+    string foreign = scratch.joined(folder, "foreign");
+    string chained = scratch.joined(folder, "chained");
+    string data = scratch.joined(folder, "data.bin");
+    string overData = scratch.joined(folder, "over-data");
+    string locked = scratch.joined(folder, "locked");
+    try Path(interpreted).writeBytes("#!/no/such/interpreter\nexit 0\n".toBytes());
+    try Path(plain).writeBytes("echo no first line\n".toBytes());
+    try Path(foreign).writeBytes("\u007FELF, then nothing a program image holds\n".toBytes());
+    try Path(chained).writeBytes("#!{plain}\nexit 0\n".toBytes());
+    try Path(data).writeBytes("not a program".toBytes());
+    try Path(overData).writeBytes("#!{data}\nexit 0\n".toBytes());
+    try Path(shell.interpreter()).copyTo(Path(locked));
+    let made = try bridges.running(shell.start("chmod +x '{interpreted}' '{plain}' '{foreign}' "
+        + "'{chained}' '{overData}' && chmod 000 '{locked}'", "exit 0", Request.reading()));
+    try testing.assertEqual(made.wait().code, 0);
+    try testing.assertEqual(try partOfStart(interpreted), Part.missingInterpreter);
+    try testing.assertEqual(try partOfStart(plain), Part.noProgramStart);
+    try testing.assertEqual(try partOfStart(foreign), Part.notRunnable);
+    try testing.assertEqual(try partOfStart(chained), Part.refusedScript);
+    try testing.assertEqual(try partOfStart(overData), Part.refusedScript);
+    try testing.assertEqual(try partOfStart(locked), Part.program);
 }
 
 // The number is the bridge's own answer rather than the system's, so it is pinned by value.
@@ -179,6 +247,7 @@ test "a stream mode the bridge does not know is refused" {
     }
     try testing.assertEqual(attempt.error, expected);
     try testing.assertEqual(bridges.failureOf(attempt.error), Failure.other);
+    try testing.assertEqual(bridges.partOf(attempt.error), Part.none);
 }
 
 test "a number no start reports classifies as Other" {
@@ -201,4 +270,12 @@ test "a second child does not inherit the first child's pipes" {
     try testing.assertEqual(sleeper.kill(), 0);
     let stopped = sleeper.wait();
     try testing.assertEqual(stopped.error, 0);
+}
+
+// The part of the start the failure to start `program` names.
+partOfStart(string program) -> long throws {
+    let attempt = bridges.start(program, [], bridges.commandLineOf(program, []),
+        Request.reading());
+    try testing.assertTrue(attempt.child == null, "'{program}' was started");
+    return bridges.partOf(attempt.error);
 }

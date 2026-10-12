@@ -75,9 +75,106 @@ test "a POSIX start closes its writing ends before the report read and releases 
         try assertBlockHolds(triple, text, "start.close.read", ["@close(i32 %read.end)",
             "br label %start.release"]);
         try assertBlockHolds(triple, text, "start.release", ["@free(ptr %child.block)",
-            "ret ptr null"]);
+            "br label %start.failed"]);
+        try assertBlockHolds(triple, text, "start.failed", ["ret ptr null"]);
         try host.finish();
     }
+}
+
+// The start that reports its code writes it into its last parameter on the one path every failure
+// leaves through, and the start that reports none writes nothing there.
+test "a start that reports its code writes it on the way out of every failure" {
+    for (let triple in childTriples()) {
+        let host = new EmissionHost("children_code_{triple}");
+        host.retarget(triple);
+        let program = host.runtime.payloadData(host.runtime.stringLiteral("git".toBytes()));
+        let code = host.runtime.payloadData(host.runtime.stringLiteral("code".toBytes()));
+        host.runtime.call(children.startChildRuntime(host.runtime), [program, program,
+            host.runtime.int64(0), program, program, host.runtime.int64(0), host.runtime.int64(0),
+            code], "child");
+        host.runtime.call(children.startProcessRuntime(host.runtime), [program, program,
+            host.runtime.int64(0), program, program, host.runtime.int64(0), host.runtime.int64(0)],
+            "child.plain");
+        string text = host.text();
+        string reporting = try functionText(text, "ens_start_child");
+        string plain = try functionText(text, "ens_start_process");
+        try testing.assertTrue(reporting.indexOf("store i32 %code.found, ptr %7") >= 0,
+            "{triple}: the start does not write its code: {reporting}");
+        try testing.assertTrue(plain.indexOf("store i32 %code.found") < 0,
+            "{triple}: the start with no code parameter writes one: {plain}");
+        try host.finish();
+    }
+}
+
+// A failed exec carries what it failed on above errno: 3 for a path naming a directory, 4 for a
+// program image of any system's format the system could not run, 5 for a file that is no program,
+// 6 for a special file such as a named pipe, 8 for a script whose first line names a program that
+// is not there, 9 for a runnable file that starts neither as an image nor as a script, 10 for a
+// refusal on a runnable program image, 11 for a script the system would not start or refused over
+// the program its first line names, and 1 otherwise. A file is opened only once its kind shows it
+// is a regular file, or once the system reported it could not run it, so a pipe that would block
+// the open is never opened. A file that cannot be opened counts as one that may hold a program.
+test "a POSIX start carries the part of the start its exec failed on" {
+    for (let triple in posixTriples()) {
+        let host = new EmissionHost("children_cause_{triple}");
+        host.retarget(triple);
+        children.startChildRuntime(host.runtime);
+        string text = host.text();
+        let flags = nativeshapes.openFlags(triple);
+        long magicFlags = flags.readOnly | flags.nonBlocking | flags.noControllingTerminal;
+        try assertBlockHolds(triple, text, "start.child.exec", ["@strchr(ptr %0, i32 47)",
+            "label %exec.cause.unrunnable, label %exec.cause.refused"]);
+        try assertBlockHolds(triple, text, "exec.cause.unrunnable", ["store i32 4, ptr %cause",
+            "label %exec.cause.image, label %exec.cause.done"]);
+        try assertBlockHolds(triple, text, "exec.cause.image",
+            ["@open(ptr %0, i32 {magicFlags})", "label %exec.magic.read, label %exec.magic.done"]);
+        try assertBlockHolds(triple, text, "exec.magic.read", ["@read(", "@close("]);
+        try assertBlockHolds(triple, text, "exec.magic.done", ["%image = or i1",
+            "i1 %script, i32 11, i32 9", "i1 %image, i32 4, i32 %"]);
+        try assertBlockHolds(triple, text, "exec.cause.refused",
+            ["label %exec.cause.kind, label %exec.cause.missing"]);
+        try assertBlockHolds(triple, text, "exec.cause.kind", ["i32 3, i32 %", "i32 10, i32 6",
+            "label %exec.cause.regular, label %exec.cause.done"]);
+        try assertBlockHolds(triple, text, "exec.cause.regular",
+            ["@open(ptr %0, i32 {magicFlags})"]);
+        for (let line in ["xor i1 %magic.opened", "%holds.program = or i1",
+                "%runnable.cause = select i1 %script", ", i32 11, i32 10",
+                "select i1 %runnable, i32 %runnable.cause, i32 1",
+                "select i1 %holds.program, i32 %"]) {
+            try testing.assertTrue(text.indexOf(line) >= 0, "{triple}: no '{line}' in: {text}");
+        }
+        try assertBlockHolds(triple, text, "exec.cause.missing",
+            ["label %exec.cause.left, label %exec.cause.done"]);
+        try assertBlockHolds(triple, text, "exec.cause.left", ["i32 8, i32 1"]);
+        try assertBlockHolds(triple, text, "exec.cause.done", ["shl i32 %cause.found, 24",
+            "store i32 %caused, ptr %reported"]);
+        try host.finish();
+    }
+}
+
+// A failed CreateProcessW carries what it failed on above its number: 3 for a program path naming
+// a directory, 4 for a file with the 'MZ' header Windows could not run, 5 for one without it, and
+// 1 otherwise. The file system is asked only once the start has failed.
+test "a Windows start carries the part of the start it failed on" {
+    let host = new EmissionHost("children_cause_windows");
+    host.retarget("x86_64-pc-windows-msvc");
+    children.startChildRuntime(host.runtime);
+    string text = host.text();
+    try assertBlockHolds("windows", text, "start.cause.probe",
+        ["label %start.cause.program.directory, label %start.cause.program.format"]);
+    try assertBlockHolds("windows", text, "start.cause.program.directory",
+        ["@GetFileAttributesW(ptr %program.wide)", "i1 %directory, i32 3, i32 1"]);
+    try assertBlockHolds("windows", text, "start.cause.program.format",
+        ["label %start.cause.program.image, label %start.cause.program.done"]);
+    try assertBlockHolds("windows", text, "start.cause.program.image",
+        ["@CreateFileW(ptr %program.wide"]);
+    try assertBlockHolds("windows", text, "start.cause.header.read", ["@ReadFile(", "i32 2",
+        "@CloseHandle("]);
+    try assertBlockHolds("windows", text, "start.cause.header.done",
+        ["icmp eq i16 %header.word, 23117", "i1 %image.header, i32 4, i32 5"]);
+    try testing.assertTrue(text.indexOf("@GetFileAttributesW(") > text.indexOf("@CreateProcessW("),
+        "the file system is asked before the start: {text}");
+    try host.finish();
 }
 
 // The entry block prints first, so a block allocated there comes before every pipe and the fork.
@@ -169,6 +266,16 @@ childTriples() -> string[] {
 
 posixTriples() -> string[] {
     return ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin23"];
+}
+
+// The text of the function called `name`, from its definition to its closing brace.
+functionText(string text, string name) -> string throws {
+    long start = text.indexOf("define internal ptr @{name}(");
+    try testing.assertTrue(start >= 0, "'{name}' was never defined: {text}");
+    string rest = text.substring(start, text.length);
+    long end = rest.indexOf("\n}");
+    try testing.assertTrue(end >= 0, "'{name}' was left unclosed: {rest}");
+    return rest.substring(0, end);
 }
 
 // Fails unless the printed block holds every line, naming the first one it lacks.

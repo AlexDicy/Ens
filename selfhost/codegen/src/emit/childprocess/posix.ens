@@ -7,6 +7,7 @@ import BasicBlock from @ens.llvm.blocks;
 import @ens.llvm.instructions;
 import @ens.llvm.memory;
 import ChildStream from emit.nativeshapes;
+import FileMode from emit.nativeshapes;
 import Kevent from emit.nativeshapes;
 import PollEvent from emit.nativeshapes;
 import PollReady from emit.nativeshapes;
@@ -19,6 +20,8 @@ import WaitStatus from emit.nativeshapes;
 import emit.nativeshapes;
 import Errno from emit.errorkinds;
 import PosixChild from emit.childprocess;
+import StartCause from emit.errorkinds;
+import emit.filesystem.posix;
 import emit.childprocess;
 import emit.clock;
 import Runtime from emit.runtime;
@@ -90,6 +93,7 @@ public posixStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
     }
     let reasonSlot = memory.buildAlloca(builder, runtime.int32Type, "reason");
     let reportedSlot = memory.buildAlloca(builder, runtime.int32Type, "reported");
+    let probe = execProbe(runtime);
     memory.buildStore(builder, runtime.int32(0), reasonSlot);
     memory.buildStore(builder, runtime.int32(0), reportedSlot);
     let argumentVector = memory.buildArrayAlloca(builder, runtime.pointerType,
@@ -140,8 +144,8 @@ public posixStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
     // Only calls that are safe after a fork run in the child, and any refusal goes back through the
     // report pipe before the child ends.
     builder.positionAtEnd(childBlock);
-    changeWorkingDirectory(runtime, definition, changeDirectory, workingDirectory, reasonSlot,
-        reportBlock);
+    changeWorkingDirectory(runtime, definition, changeDirectory, workingDirectory, probe,
+        reasonSlot, reportBlock);
     liftPipedEnd(runtime, definition, control, ends, PipeEnds.inputRead, modes[0], reasonSlot,
         reportBlock, "input");
     liftPipedEnd(runtime, definition, control, ends, PipeEnds.outputWrite, modes[1], reasonSlot,
@@ -160,7 +164,9 @@ public posixStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
         instructions.buildICmpNE(builder, environmentGiven, runtime.int32(0), ""),
         environmentVector, inherited, "environment");
     runtime.call(execProgram, [program, argumentVector, environment], "");
-    memory.buildStore(builder, runtime.lastError(), reasonSlot);
+    let refused = runtime.lastError();
+    memory.buildStore(builder, childprocess.withCause(runtime, refused,
+        execCause(runtime, definition, probe, refused, program)), reasonSlot);
     instructions.buildBr(builder, reportBlock);
 
     builder.positionAtEnd(reportBlock);
@@ -731,12 +737,215 @@ openPipe(Runtime runtime, RuntimeDefinition definition, RuntimeFunction makePipe
     builder.positionAtEnd(doneBlock);
 }
 
-// Changes to the working directory when one was given, reporting a refusal through the pipe.
+// The room the child's look at the program after a failed exec takes. It is made before the fork,
+// so the child allocates nothing.
+public final class ExecProbe {
+    protected Value cause;
+    protected Value magic;
+    protected Value status;
+
+    protected constructor(this.cause, this.magic, this.status);
+}
+
+// The room for one 'execCause', made where the builder stands, which is the bridge's entry block.
+public execProbe(Runtime runtime) -> ExecProbe {
+    let builder = runtime.builder;
+    return new ExecProbe(memory.buildAlloca(builder, runtime.int32Type, "cause"),
+        memory.buildAlloca(builder, runtime.int32Type, "magic"),
+        memory.buildAlloca(builder, runtime.int8Type.arrayType(posix.pathModeBytes() as ulong),
+            "status"));
+}
+
+// What an exec that failed with `refused` failed on. Only a path written with a '/' names a file
+// this looks at, since a bare name was looked for on PATH, and a file is read only for the numbers
+// that come from one: a file the system cannot run, which exec reports only for a regular file, and
+// a refused permission on a regular file. The read never waits and takes no terminal.
+public execCause(Runtime runtime, RuntimeDefinition definition, ExecProbe probe, Value refused,
+                 Value program) -> Value {
+    let builder = runtime.builder;
+    let findSlash = runtime.libc("strchr",
+        runtime.pointerType.functionType([runtime.pointerType, runtime.int32Type]));
+    let unrunnableBlock = runtime.block(definition, "exec.cause.unrunnable");
+    let imageBlock = runtime.block(definition, "exec.cause.image");
+    let refusedBlock = runtime.block(definition, "exec.cause.refused");
+    let kindBlock = runtime.block(definition, "exec.cause.kind");
+    let regularBlock = runtime.block(definition, "exec.cause.regular");
+    let missingBlock = runtime.block(definition, "exec.cause.missing");
+    let leftBlock = runtime.block(definition, "exec.cause.left");
+    let doneBlock = runtime.block(definition, "exec.cause.done");
+    memory.buildStore(builder, runtime.int32(StartCause.program), probe.cause);
+    let written = instructions.buildNot(builder,
+        runtime.isNull(runtime.call(findSlash, [program, runtime.int32(47)], "slash")),
+        "written.path");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, refused, runtime.int32(Errno.notExecutable), ""),
+        unrunnableBlock, refusedBlock);
+
+    builder.positionAtEnd(unrunnableBlock);
+    memory.buildStore(builder, runtime.int32(StartCause.notRunnable), probe.cause);
+    instructions.buildCondBr(builder, written, imageBlock, doneBlock);
+
+    // A file the system could not run and that cannot be opened is still reported as one it
+    // cannot run.
+    builder.positionAtEnd(imageBlock);
+    let unrunnableStart = readMagic(runtime, definition, probe, program);
+    let image = instructions.buildOr(builder,
+        instructions.buildNot(builder, unrunnableStart.opened, ""),
+        isImage(runtime, unrunnableStart.word), "image");
+    memory.buildStore(builder, instructions.buildSelect(builder, image,
+        runtime.int32(StartCause.notRunnable), instructions.buildSelect(builder,
+            isScript(runtime, unrunnableStart.word), runtime.int32(StartCause.refusedScript),
+            runtime.int32(StartCause.noProgramStart), ""), ""), probe.cause);
+    instructions.buildBr(builder, doneBlock);
+
+    builder.positionAtEnd(refusedBlock);
+    instructions.buildCondBr(builder, instructions.buildAnd(builder, written,
+        instructions.buildICmpEQ(builder, refused, runtime.int32(Errno.accessDenied), ""), ""),
+        kindBlock, missingBlock);
+
+    builder.positionAtEnd(kindBlock);
+    let mode = posix.pathMode(runtime, program, probe.status);
+    let type = instructions.buildAnd(builder, mode, runtime.int64(FileMode.typeMask), "type");
+    let regular = instructions.buildICmpEQ(builder, type, runtime.int64(FileMode.regular), "");
+    memory.buildStore(builder, instructions.buildSelect(builder,
+        instructions.buildICmpEQ(builder, type, runtime.int64(FileMode.directory), ""),
+        runtime.int32(StartCause.directory), instructions.buildSelect(builder,
+            instructions.buildICmpEQ(builder, type, runtime.int64(0), ""),
+            runtime.int32(StartCause.refusedOnPath), runtime.int32(StartCause.specialFile), ""),
+        ""), probe.cause);
+    instructions.buildCondBr(builder, regular, regularBlock, doneBlock);
+
+    // A regular file that holds no program is that, whatever its permission says. One that holds a
+    // program and may already run was refused by something on its path, or, for a script, by the
+    // program its first line names. A file that cannot be opened may hold a program.
+    builder.positionAtEnd(regularBlock);
+    let regularStart = readMagic(runtime, definition, probe, program);
+    let script = isScript(runtime, regularStart.word);
+    let holdsProgram = instructions.buildOr(builder,
+        instructions.buildNot(builder, regularStart.opened, ""), instructions.buildOr(builder,
+            isImage(runtime, regularStart.word), script, ""), "holds.program");
+    let runnable = instructions.buildICmpNE(builder,
+        instructions.buildAnd(builder, mode, runtime.int64(FileMode.anyExecute), ""),
+        runtime.int64(0), "runnable");
+    let runnableCause = instructions.buildSelect(builder, script,
+        runtime.int32(StartCause.refusedScript), runtime.int32(StartCause.refusedOnPath),
+        "runnable.cause");
+    memory.buildStore(builder, instructions.buildSelect(builder, holdsProgram,
+        instructions.buildSelect(builder, runnable, runnableCause,
+            runtime.int32(StartCause.program), ""), runtime.int32(StartCause.notProgram), ""),
+        probe.cause);
+    instructions.buildBr(builder, doneBlock);
+
+    // A file that is there and still not found is a script whose first line names a program that
+    // is not there.
+    builder.positionAtEnd(missingBlock);
+    instructions.buildCondBr(builder, instructions.buildAnd(builder, written,
+        instructions.buildICmpEQ(builder, refused, runtime.int32(Errno.noEntry), ""), ""),
+        leftBlock, doneBlock);
+
+    builder.positionAtEnd(leftBlock);
+    let leftMode = posix.pathMode(runtime, program, probe.status);
+    memory.buildStore(builder, instructions.buildSelect(builder, instructions.buildICmpEQ(builder,
+        instructions.buildAnd(builder, leftMode, runtime.int64(FileMode.typeMask), ""),
+        runtime.int64(FileMode.regular), ""), runtime.int32(StartCause.missingInterpreter),
+        runtime.int32(StartCause.program), ""), probe.cause);
+    instructions.buildBr(builder, doneBlock);
+
+    builder.positionAtEnd(doneBlock);
+    return memory.buildLoad(builder, runtime.int32Type, probe.cause, "cause.found");
+}
+
+// How a file starts: its first four bytes as one little-endian word, 0 when it holds fewer, and
+// whether it could be opened at all.
+final class FileStart {
+    protected Value word;
+    protected Value opened;
+
+    protected constructor(this.word, this.opened);
+}
+
+// How the file at `path` starts. The open never waits and takes no terminal.
+readMagic(Runtime runtime, RuntimeDefinition definition, ExecProbe probe, Value path) -> FileStart {
+    let builder = runtime.builder;
+    let openFile = runtime.libc("open",
+        runtime.int32Type.variadicFunctionType([runtime.pointerType, runtime.int32Type]));
+    let readFile = runtime.libc("read", runtime.int64Type.functionType([runtime.int32Type,
+        runtime.pointerType, runtime.int64Type]));
+    let closeFile = runtime.libc("close", runtime.int32Type.functionType([runtime.int32Type]));
+    let readBlock = runtime.block(definition, "exec.magic.read");
+    let doneBlock = runtime.block(definition, "exec.magic.done");
+    let flags = nativeshapes.openFlags(runtime.targetTriple);
+    memory.buildStore(builder, runtime.int32(0), probe.magic);
+    let descriptor = runtime.call(openFile, [path, runtime.int32(flags.readOnly
+        | flags.nonBlocking | flags.noControllingTerminal)], "magic.descriptor");
+    let opened = instructions.buildICmpSGE(builder, descriptor, runtime.int32(0), "magic.opened");
+    instructions.buildCondBr(builder, opened, readBlock, doneBlock);
+
+    builder.positionAtEnd(readBlock);
+    runtime.call(readFile, [descriptor, probe.magic, runtime.int64(4)], "");
+    runtime.call(closeFile, [descriptor], "");
+    instructions.buildBr(builder, doneBlock);
+
+    builder.positionAtEnd(doneBlock);
+    return new FileStart(memory.buildLoad(builder, runtime.int32Type, probe.magic, "magic.word"),
+        opened);
+}
+
+// Whether the word starts a program image of any system's format, so an image built for another
+// system is told apart from a file that holds no program.
+isImage(Runtime runtime, Value word) -> Value {
+    let builder = runtime.builder;
+    Value matches = startsWith(runtime, word, ProgramMagic.windowsImage, "windows.image");
+    for (let number in ProgramMagic.images()) {
+        matches = instructions.buildOr(builder, matches,
+            instructions.buildICmpEQ(builder, word, runtime.int32(number), ""), "");
+    }
+    return matches;
+}
+
+// Whether the word starts a script, whose first line opens with '#!'.
+isScript(Runtime runtime, Value word) -> Value {
+    return startsWith(runtime, word, ProgramMagic.script, "script");
+}
+
+// Whether the first two bytes of the word are `twoBytes`.
+startsWith(Runtime runtime, Value word, long twoBytes, string name) -> Value {
+    let builder = runtime.builder;
+    return instructions.buildICmpEQ(builder,
+        instructions.buildAnd(builder, word, runtime.int32(0xFFFF), ""), runtime.int32(twoBytes),
+        name);
+}
+
+// The first four bytes of a program image read as one little-endian word, and the first two of a
+// Windows image and of a script. A Mach-O image written in the other byte order reads as its
+// swapped word.
+final class ProgramMagic {
+    protected static const long elf = 0x464C457F;
+    protected static const long machObject = 0xFEEDFACE;
+    protected static const long machObject64 = 0xFEEDFACF;
+    protected static const long machObjectSwapped = 0xCEFAEDFE;
+    protected static const long machObject64Swapped = 0xCFFAEDFE;
+    protected static const long universal = 0xBEBAFECA;
+    protected static const long universal64 = 0xBFBAFECA;
+    protected static const long windowsImage = 0x5A4D;
+    protected static const long script = 0x2123;
+
+    protected static images() -> long[] {
+        return [ProgramMagic.elf, ProgramMagic.machObject, ProgramMagic.machObject64,
+            ProgramMagic.machObjectSwapped, ProgramMagic.machObject64Swapped,
+            ProgramMagic.universal, ProgramMagic.universal64];
+    }
+}
+
+// Changes to the working directory when one was given, reporting a refusal through the pipe. A
+// path that names a file is reported apart from one where nothing is there.
 changeWorkingDirectory(Runtime runtime, RuntimeDefinition definition,
-                       RuntimeFunction changeDirectory, Value directory, Value reasonSlot,
-                       BasicBlock reportBlock) {
+                       RuntimeFunction changeDirectory, Value directory, ExecProbe probe,
+                       Value reasonSlot, BasicBlock reportBlock) {
     let builder = runtime.builder;
     let changeBlock = runtime.block(definition, "child.directory.change");
+    let refusedBlock = runtime.block(definition, "child.directory.refused");
+    let fileBlock = runtime.block(definition, "child.directory.file");
     let doneBlock = runtime.block(definition, "child.directory.done");
     let first = memory.buildLoad(builder, runtime.int8Type, directory, "directory.first");
     instructions.buildCondBr(builder,
@@ -744,9 +953,28 @@ changeWorkingDirectory(Runtime runtime, RuntimeDefinition definition,
 
     builder.positionAtEnd(changeBlock);
     let status = runtime.call(changeDirectory, [directory], "changed");
-    memory.buildStore(builder, runtime.lastError(), reasonSlot);
+    let why = runtime.lastError();
+    memory.buildStore(builder, childprocess.withCause(runtime, why,
+        runtime.int32(StartCause.workingDirectory)), reasonSlot);
     instructions.buildCondBr(builder,
-        instructions.buildICmpEQ(builder, status, runtime.int32(0), ""), doneBlock, reportBlock);
+        instructions.buildICmpEQ(builder, status, runtime.int32(0), ""), doneBlock, refusedBlock);
+
+    builder.positionAtEnd(refusedBlock);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, why, runtime.int32(Errno.notADirectory), ""), fileBlock,
+        reportBlock);
+
+    builder.positionAtEnd(fileBlock);
+    let type = instructions.buildAnd(builder, posix.pathMode(runtime, directory, probe.status),
+        runtime.int64(FileMode.typeMask), "directory.type");
+    let file = instructions.buildAnd(builder,
+        instructions.buildICmpNE(builder, type, runtime.int64(0), ""),
+        instructions.buildICmpNE(builder, type, runtime.int64(FileMode.directory), ""),
+        "directory.file");
+    memory.buildStore(builder, childprocess.withCause(runtime, why, instructions.buildSelect(builder,
+        file, runtime.int32(StartCause.workingDirectoryFile),
+        runtime.int32(StartCause.workingDirectory), "")), reasonSlot);
+    instructions.buildBr(builder, reportBlock);
 
     builder.positionAtEnd(doneBlock);
 }

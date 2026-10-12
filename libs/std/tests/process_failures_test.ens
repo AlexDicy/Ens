@@ -4,11 +4,14 @@ import @std.testing;
 import Path from @std.fs;
 import TemporaryDirectory from @std.fs.temporary;
 import Environment from @std.environment;
+import @std.environment;
+import Platform from @std.environment;
 import BufferedReader from @std.io.buffered;
 import Writer from @std.io.streams;
 import ErrorKind as IoErrorKind from @std.io.streams;
 import IoError from @std.io.streams;
 import ErrorKind from @std.process;
+import FirstLine from @std.process;
 import ProcessError from @std.process;
 import @std.process;
 import CurrentDirectoryFile from process.support;
@@ -21,7 +24,8 @@ test "a program that is not there reports that nothing is there" {
         let result = try process.run(missing);
     });
     try testing.assertEqual(refused.kind, ErrorKind.NotFound);
-    try testing.assertEqual(refused.message, "could not start '{missing}': nothing is there");
+    try testing.assertEqual(refused.message,
+        "could not start '{missing}': nothing is there. Check that the path names the program");
     try testing.assertEqual(refused.program, missing.toString());
     // A start reports the platform's own number, and both number a program that is not there 2.
     try testing.assertEqual(refused.nativeError, 2);
@@ -51,8 +55,8 @@ test "a program with no name is refused" {
 }
 
 // POSIX refuses to run a file nobody may execute as a permission, and Windows refuses a file that
-// is no program image as its own kind of failure, which is an Other carrying the system's number.
-test "a data file is refused as a program in each platform's own terms" {
+// is no program image as a format, so the kinds differ while the file's content decides the text.
+test "a data file is refused as no program on every platform" {
     let scratch = try TemporaryDirectory.create("ens-std-process-data");
     Path data = scratch.path().join("data.bin");
     try data.writeText("not a program");
@@ -60,31 +64,354 @@ test "a data file is refused as a program in each platform's own terms" {
         let result = try process.run(data);
     });
     try testing.assertEqual(refused.program, data.toString());
+    try testing.assertEqual(refused.message, "could not start '{data}': it is not a program. "
+        + "Check that the path names a program, not a document or data file");
     if (support.onWindows()) {
         try testing.assertEqual(refused.kind, ErrorKind.Other);
-        try testing.assertTrue(refused.message.startsWith(
-            "could not start '{data}': the system reported error "),
-            "the message was '{refused.message}'");
+        try testing.assertEqual(refused.nativeError, 193);
         return;
     }
     try testing.assertEqual(refused.kind, ErrorKind.PermissionDenied);
-    try testing.assertEqual(refused.message, "could not start '{data}': permission was refused");
 }
 
-// The system's number does not distinguish whether the program or the directory was missing, so the
-// message names both.
-test "a working directory that is not there is named" {
+test "a script nobody may execute is refused as a permission" {
+    if (support.onWindows()) {
+        return;
+    }
+    let scratch = try TemporaryDirectory.create("ens-std-process-script-mode");
+    Path script = scratch.path().join("script");
+    try script.writeText("#!/bin/sh\nexit 0\n");
+    let refused = try testing.assertThrows<ProcessError>(() -> {
+        let result = try process.run(script);
+    });
+    try testing.assertEqual(refused.kind, ErrorKind.PermissionDenied);
+    try testing.assertEqual(refused.message, "could not start '{script}': permission was "
+        + "refused. Make the file executable, as with 'chmod +x', or start it as a user who may "
+        + "run it");
+}
+
+// Each file may run, so only what it starts with keeps the system from running it.
+test "a runnable file is told apart by how it starts" {
+    if (support.onWindows()) {
+        return;
+    }
+    let scratch = try TemporaryDirectory.create("ens-std-process-runnable");
+    Path interpreted = scratch.path().join("interpreted");
+    Path plain = scratch.path().join("plain");
+    Path foreign = scratch.path().join("foreign");
+    Path chained = scratch.path().join("chained");
+    Path overlong = scratch.path().join("long");
+    Path data = scratch.path().join("data.bin");
+    Path overData = scratch.path().join("over-data");
+    Path overFolder = scratch.path().join("over-folder");
+    try interpreted.writeText("#!/no/such/interpreter -x\nexit 0\n");
+    try plain.writeText("echo no first line\n");
+    try foreign.writeText("\u007FELF, then nothing a program image holds\n");
+    try chained.writeText("#!{plain}\nexit 0\n");
+    try overlong.writeText("#!/{"no-such-directory/".repeat(34)}interpreter\nexit 0\n");
+    try data.writeText("not a program");
+    try overData.writeText("#!{data}\nexit 0\n");
+    try overFolder.writeText("#!{scratch.path()}\nexit 0\n");
+    let made = try process.runShell("chmod +x '{interpreted}' '{plain}' '{foreign}' '{chained}' "
+        + "'{overlong}' '{overData}' '{overFolder}'");
+    try testing.assertTrue(made.status.succeeded(), "the files were not made runnable");
+    let notRunnable = try testing.assertThrows<ProcessError>(() -> {
+        let result = try process.run(overData);
+    });
+    try testing.assertEqual(notRunnable.kind, ErrorKind.PermissionDenied);
+    try testing.assertEqual(notRunnable.message, "could not start '{overData}': its first line "
+        + "names '{data}', which this user may not run. Make '{data}' executable, as with 'chmod "
+        + "+x', or make the first line name a program this user may run");
+    let folderNamed = try testing.assertThrows<ProcessError>(() -> {
+        let result = try process.run(overFolder);
+    });
+    try testing.assertEqual(folderNamed.message, "could not start '{overFolder}': its first line "
+        + "names '{scratch.path()}', which is a directory, not a program. Make the first line "
+        + "name a program, as in '#!/bin/sh'");
+    let refused = try testing.assertThrows<ProcessError>(() -> {
+        let result = try process.run(chained);
+    });
+    try testing.assertEqual(refused.message, "could not start '{chained}': its first line names "
+        + "'{plain}', which is not a program this system can run. Make the first line name a "
+        + "program, as in '#!/bin/sh'");
+    long limit = 256;
+    string shorten = "Shorten the path of the program it names";
+    if (environment.platform() == Platform.MacOS) {
+        limit = 512;
+        shorten = shorten + ", or the arguments after it";
+    }
+    let tooLong = try testing.assertThrows<ProcessError>(() -> {
+        let result = try process.run(overlong);
+    });
+    try testing.assertEqual(tooLong.message, "could not start '{overlong}': its first line is "
+        + "longer than the {limit} bytes this system reads of it. {shorten}");
+    let missing = try testing.assertThrows<ProcessError>(() -> {
+        let result = try process.run(interpreted);
+    });
+    try testing.assertEqual(missing.kind, ErrorKind.NotFound);
+    try testing.assertEqual(missing.message, "could not start '{interpreted}': its first line "
+        + "names '/no/such/interpreter', which is not there. Correct the first line, or install "
+        + "that program");
+    let unmarked = try testing.assertThrows<ProcessError>(() -> {
+        let result = try process.run(plain);
+    });
+    try testing.assertEqual(unmarked.message, "could not start '{plain}': it does not start the "
+        + "way a program does. If it is a script, make its first line name the program that runs "
+        + "it, as in '#!/bin/sh'");
+    let image = try testing.assertThrows<ProcessError>(() -> {
+        let result = try process.run(foreign);
+    });
+    try testing.assertEqual(image.message, "could not start '{foreign}': it is not a program this "
+        + "system can run. Check that the path names a program built for this system");
+}
+
+// A program nobody may run or read is refused as a permission, since what it holds cannot be read.
+test "an unreadable program is refused as a permission" {
+    if (support.onWindows()) {
+        return;
+    }
+    let scratch = try TemporaryDirectory.create("ens-std-process-unreadable");
+    Path locked = scratch.path().join("locked");
+    try support.interpreter().copyTo(locked);
+    let made = try process.runShell("chmod 000 '{locked}'");
+    try testing.assertTrue(made.status.succeeded(), "the program was not locked");
+    let refused = try testing.assertThrows<ProcessError>(() -> {
+        let result = try process.run(locked);
+    });
+    try testing.assertEqual(refused.kind, ErrorKind.PermissionDenied);
+    try testing.assertEqual(refused.message, "could not start '{locked}': permission was refused. "
+        + "Make the file executable, as with 'chmod +x', or start it as a user who may run it");
+}
+
+// POSIX refuses to run a named pipe as a permission. Reading its first bytes would wait for a
+// writer that never comes, so a start that came back is the check that it was told apart without
+// being opened.
+test "a named pipe marked runnable is refused without being opened" {
+    if (support.onWindows()) {
+        return;
+    }
+    let scratch = try TemporaryDirectory.create("ens-std-process-pipe");
+    Path pipe = scratch.path().join("pipe");
+    let made = try process.runShell("mkfifo '{pipe}' && chmod +x '{pipe}'");
+    try testing.assertTrue(made.status.succeeded(), "the named pipe was not made");
+    let refused = try testing.assertThrows<ProcessError>(() -> {
+        let result = try process.run(pipe);
+    });
+    try testing.assertEqual(refused.kind, ErrorKind.PermissionDenied);
+    try testing.assertEqual(refused.message, "could not start '{pipe}': it is a special file, such "
+        + "as a named pipe or a device, not a program. Name the program's own file instead");
+}
+
+test "a directory is refused as a program and named as a directory" {
+    let scratch = try TemporaryDirectory.create("ens-std-process-folder");
+    Path tools = scratch.path().join("tools");
+    try tools.createDirectories();
+    let refused = try testing.assertThrows<ProcessError>(() -> {
+        let result = try process.run(tools);
+    });
+    try testing.assertEqual(refused.kind, ErrorKind.PermissionDenied);
+    try testing.assertEqual(refused.message, "could not start '{tools}': it is a directory, not a "
+        + "program. Name the program inside the directory");
+}
+
+test "a working directory that is not there is named as the working directory" {
     let scratch = try TemporaryDirectory.create("ens-std-process-nowhere");
     Path gone = scratch.path().join("gone");
     let refused = try testing.assertThrows<ProcessError>(() -> {
         let result = try process.runShell("exit 0", workingDirectory: gone);
     });
     try testing.assertEqual(refused.kind, ErrorKind.NotFound);
-    try testing.assertTrue(refused.message.startsWith("could not start '"),
-        "the message was '{refused.message}'");
-    try testing.assertTrue(refused.message.endsWith(
-        "': nothing is there, or the working directory '{gone}' is missing"),
-        "the message was '{refused.message}'");
+    try testing.assertEqual(refused.message, "could not start '{refused.program}': the working "
+        + "directory '{gone}', the directory the program would run in, is not a directory that "
+        + "exists. Create it, or start the program in one that does");
+}
+
+test "a working directory that is a file is named as a file" {
+    let scratch = try TemporaryDirectory.create("ens-std-process-file-directory");
+    Path notes = scratch.path().join("notes.txt");
+    try notes.writeText("not a directory");
+    let refused = try testing.assertThrows<ProcessError>(() -> {
+        let result = try process.runShell("exit 0", workingDirectory: notes);
+    });
+    try testing.assertEqual(refused.message, "could not start '{refused.program}': the working "
+        + "directory '{notes}' is a file, not a directory. Start the program in a directory");
+}
+
+test "the program a script's first line names is read up to its arguments" {
+    let scratch = try TemporaryDirectory.create("ens-std-process-first-line");
+    Path folder = scratch.path();
+    try folder.join("spaced").writeText("#!  /usr/bin/env python3\n");
+    try folder.join("crlf").writeText("#!/bin/sh\r\nexit 0\r\n");
+    try folder.join("bare").writeText("#!\n");
+    try folder.join("plain").writeText("echo no first line\n");
+    try folder.join("long").writeText("#!/{"no-such-directory/".repeat(16)}interpreter\n");
+    try assertLine(folder.join("spaced"), Platform.Linux, "/usr/bin/env", 0);
+    try assertLine(folder.join("crlf"), Platform.Linux, "/bin/sh", 0);
+    try assertLine(folder.join("bare"), Platform.Linux, "", 0);
+    try assertLine(folder.join("plain"), Platform.Linux, "", 0);
+    try assertLine(folder.join("missing"), Platform.Linux, "", 0);
+    try assertLine(folder.join("long"), Platform.Linux, "", 256);
+    try assertLine(folder.join("long"), Platform.MacOS,
+        "/{"no-such-directory/".repeat(16)}interpreter", 0);
+}
+
+// Fails unless the first line of the script at `path`, as `platform` reads it, names `program`
+// and runs past `longerThan` bytes.
+assertLine(Path path, Platform platform, string program, long longerThan) throws {
+    let line = process.firstLineOf(path.toString(), platform);
+    try testing.assertEqual(line.program, program);
+    try testing.assertEqual(line.longerThan, longerThan);
+}
+
+// The text is chosen by the part of the start the code names and by the kind of the system's
+// number, so each is rendered from a code built the way a bridge builds it. A number of 2 is a
+// thing that is not there on every platform; a refused permission is 5 on Windows and 13 elsewhere.
+test "each part of a failed start has a text of its own" {
+    int denied = 13;
+    if (support.onWindows()) {
+        denied = 5;
+    }
+    int program = 1 << 24;
+    int directory = 2 << 24;
+    string where = "/work/build";
+    try testing.assertEqual(text(program | 2, where),
+        "could not start '/work/tool': nothing is there. Check that the path names the program");
+    try testing.assertEqual(text(program | 999, where),
+        "could not start '/work/tool': the system reported error 999");
+    try testing.assertEqual(text(directory | 2, where),
+        "could not start '/work/tool': the working directory '/work/build', the directory "
+            + "the program would run in, is not a directory that exists. Create it, or start the "
+            + "program in one that does");
+    try testing.assertEqual(text(directory | denied, where),
+        "could not start '/work/tool': permission to enter the working directory '/work/build' "
+            + "was refused. Start the program in a directory this user may enter");
+    try testing.assertEqual(text(directory | 999, where),
+        "could not start '/work/tool': the working directory '/work/build' could not be entered: "
+            + "the system reported error 999");
+    try testing.assertEqual(text((3 << 24) | denied, ""),
+        "could not start '/work/tool': it is a directory, not a program. Name the program "
+            + "inside the directory");
+    try testing.assertEqual(text((5 << 24) | 999, ""),
+        "could not start '/work/tool': it is not a program. Check that the path names a "
+            + "program, not a document or data file");
+    try testing.assertEqual(text((6 << 24) | denied, ""),
+        "could not start '/work/tool': it is a special file, such as a named pipe or a device, "
+            + "not a program. Name the program's own file instead");
+    try testing.assertEqual(text((4 << 24) | 999, ""),
+        "could not start '/work/tool': it is not a program this system can run. Check that the "
+            + "path names a program built for this system");
+    try testing.assertEqual(text((7 << 24) | 20, where),
+        "could not start '/work/tool': the working directory '/work/build' is a file, not a "
+            + "directory. Start the program in a directory");
+    try testing.assertEqual(text((8 << 24) | 2, ""),
+        "could not start '/work/tool': its first line names a program that is not there. "
+            + "Correct the first line, or install that program");
+    try testing.assertEqual(process.startFailure("/work/tool", "", (8 << 24) | 2, Platform.Linux,
+        "", {program: "/usr/bin/python9", longerThan: 0}).message,
+        "could not start '/work/tool': its first line names '/usr/bin/python9', which is not "
+            + "there. Correct the first line, or install that program");
+    try testing.assertEqual(text((9 << 24) | 8, ""),
+        "could not start '/work/tool': it does not start the way a program does. If it is a "
+            + "script, make its first line name the program that runs it, as in '#!/bin/sh'");
+    try testing.assertEqual(text((10 << 24) | denied, ""),
+        "could not start '/work/tool': permission was refused. Check that the file is "
+            + "executable, as with 'chmod +x', and that this user may open every directory on its "
+            + "path");
+    try testing.assertEqual(scriptText({program: "/work/plain", longerThan: 0}),
+        "could not start '/work/tool': its first line names '/work/plain', which is not a program "
+            + "this system can run. Make the first line name a program, as in '#!/bin/sh'");
+    try testing.assertEqual(scriptText(noLine()),
+        "could not start '/work/tool': its first line names no program this system can run. Make "
+            + "the first line name a program, as in '#!/bin/sh'");
+    try testing.assertEqual(scriptText({program: "", longerThan: 256}),
+        "could not start '/work/tool': its first line is longer than the 256 bytes this system "
+            + "reads of it. Shorten the path of the program it names");
+    try testing.assertEqual(process.startFailure("/work/tool", "", (11 << 24) | 8,
+        Platform.MacOS, "", {program: "", longerThan: 512}).message,
+        "could not start '/work/tool': its first line is longer than the 512 bytes this system "
+            + "reads of it. Shorten the path of the program it names, or the arguments after it");
+}
+
+// A runnable script refused as a permission is refused over the program its first line names,
+// which is told apart by whether it is a directory.
+test "a script whose first line names a program this user may not run names that program" {
+    let scratch = try TemporaryDirectory.create("ens-std-process-refused-interpreter");
+    Path folder = scratch.path();
+    try testing.assertEqual(refusedScriptText({program: "/work/data.bin", longerThan: 0}),
+        "could not start '/work/tool': its first line names '/work/data.bin', which this user may "
+            + "not run. Make '/work/data.bin' executable, as with 'chmod +x', or make the first "
+            + "line name a program this user may run");
+    try testing.assertEqual(refusedScriptText({program: folder.toString(), longerThan: 0}),
+        "could not start '/work/tool': its first line names '{folder}', which is a directory, not "
+            + "a program. Make the first line name a program, as in '#!/bin/sh'");
+    try testing.assertEqual(refusedScriptText(noLine()),
+        "could not start '/work/tool': its first line names a program this user may not run. "
+            + "Make the first line name a program this user may run");
+}
+
+// The message a script at '/work/tool' that the system would not start reads, on Linux.
+scriptText(FirstLine line) -> string {
+    return process.startFailure("/work/tool", "", (11 << 24) | 8, Platform.Linux, "", line).message;
+}
+
+// The message a runnable script at '/work/tool' refused as a permission reads, on Linux. A
+// refused permission is numbered 5 on Windows and 13 elsewhere.
+refusedScriptText(FirstLine line) -> string {
+    int denied = 13;
+    if (support.onWindows()) {
+        denied = 5;
+    }
+    return process.startFailure("/work/tool", "", (11 << 24) | denied, Platform.Linux, "", line)
+        .message;
+}
+
+test "a refused permission says what to do on each platform" {
+    int denied = 13;
+    if (support.onWindows()) {
+        denied = 5;
+    }
+    int code = (1 << 24) | denied;
+    try testing.assertEqual(process.startFailure("/work/tool", "", code, Platform.Linux, "",
+        noLine()).message,
+        "could not start '/work/tool': permission was refused. Make the file executable, as with "
+            + "'chmod +x', or start it as a user who may run it");
+    try testing.assertEqual(process.startFailure("/work/tool", "", code, Platform.Windows, "",
+        noLine()).message,
+        "could not start '/work/tool': permission was refused. Check that this user may run the "
+            + "file");
+}
+
+// Windows runs a program named without its '.exe' only when it is found on PATH, so a path written
+// without it names no file even when the program sits beside that path.
+test "a path missing its '.exe' is offered the name with it" {
+    let failure = process.startFailure("C:/work/tool", "", (1 << 24) | 2, Platform.Windows,
+        "C:/work/tool.exe", noLine());
+    try testing.assertEqual(failure.message, "could not start 'C:/work/tool': nothing is there, "
+        + "but 'C:/work/tool.exe' is. Write the name with its '.exe'");
+    if (!support.onWindows()) {
+        return;
+    }
+    let scratch = try TemporaryDirectory.create("ens-std-process-exe");
+    Path tool = scratch.path().join("tool");
+    try scratch.path().join("tool.exe").writeText("not run");
+    let refused = try testing.assertThrows<ProcessError>(() -> {
+        let result = try process.run(tool);
+    });
+    try testing.assertEqual(refused.message, "could not start '{tool}': nothing is there, but "
+        + "'{tool}.exe' is. Write the name with its '.exe'");
+}
+
+// A code with no part above its number comes from a bridge that carries none, whose number cannot
+// tell a missing program from a missing working directory.
+test "a code that names no part of the start keeps the texts that name both" {
+    try testing.assertEqual(text(2, "/work/build"), "could not start '/work/tool': nothing is "
+        + "there, or the working directory '/work/build' is missing");
+    try testing.assertEqual(text(2, ""), "could not start '/work/tool': nothing is there");
+    try testing.assertEqual(text(999, ""),
+        "could not start '/work/tool': the system reported error 999");
+    let failure = process.startFailure("/work/tool", "", (1 << 24) | 2, Platform.Linux, "",
+        noLine());
+    try testing.assertEqual(failure.nativeError, 2);
 }
 
 // A file of the name is in this process's current directory, and the PATH the child is given
@@ -106,7 +433,7 @@ test "the current directory is never searched for a program" {
     try testing.assertTrue(probe.path().isFile(), "the probe was there to be found");
 }
 
-// Every PATH directory holds a file of the name nobody may execute, so a start passes over each
+// Every PATH directory holds a script of the name nobody may execute, so a start passes over each
 // and reports the first refusal once the last has been tried.
 test "a program refused in every PATH directory reports the first refusal" {
     if (support.onWindows()) {
@@ -117,8 +444,8 @@ test "a program refused in every PATH directory reports the first refusal" {
     Path second = scratch.path().join("second");
     try first.createDirectories();
     try second.createDirectories();
-    try first.join("ens-std-process-probe").writeText("not a program");
-    try second.join("ens-std-process-probe").writeText("not a program either");
+    try first.join("ens-std-process-probe").writeText("#!/bin/sh\necho first\n");
+    try second.join("ens-std-process-probe").writeText("#!/bin/sh\necho second\n");
     let given = Environment.current();
     given.set("PATH", first.toString() + ":" + second.toString());
     let refused = try testing.assertThrows<ProcessError>(() -> {
@@ -126,7 +453,8 @@ test "a program refused in every PATH directory reports the first refusal" {
     });
     try testing.assertEqual(refused.kind, ErrorKind.PermissionDenied);
     try testing.assertEqual(refused.message,
-        "could not start 'ens-std-process-probe': permission was refused");
+        "could not start 'ens-std-process-probe': permission was refused. Make the file "
+            + "executable, as with 'chmod +x', or start it as a user who may run it");
     try testing.assertEqual(refused.program, "ens-std-process-probe");
 }
 
@@ -183,6 +511,17 @@ test "writing after closing the input reports the pipe as closed" {
     try testing.assertEqual(refused.kind, IoErrorKind.Closed);
     let ended = try child.wait();
     try testing.assertEqual(ended.code, 0);
+}
+
+// The message a start of '/work/tool' in `directory` that failed with `code` reads, on Linux.
+text(int code, string directory) -> string {
+    return process.startFailure("/work/tool", directory, code, Platform.Linux, "", noLine())
+        .message;
+}
+
+// A script line that names nothing, which every part but a script's own leaves unread.
+noLine() -> FirstLine {
+    return {program: "", longerThan: 0};
 }
 
 // The child value is destroyed when this returns, and the reader taken from it outlives it.

@@ -2,15 +2,22 @@
 // the moment the child holds one, because a reading end still open for writing anywhere would
 // never report the end of the output. The raw byte blocks use their documented x64 offsets.
 import TypeRef from @ens.llvm.types;
+import Value from @ens.llvm.values;
 import @ens.llvm.instructions;
 import @ens.llvm.memory;
 import Runtime from emit.runtime;
+import RuntimeDefinition from emit.runtime;
 import RuntimeFunction from emit.runtime;
 import ChildExit from emit.children;
+import StartCause from emit.errorkinds;
+import Win32Error from emit.errorkinds;
+import emit.childprocess;
+import emit.childprocess.windows;
 import emit.children;
 import emit.widetext;
 
-public windowsStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
+public windowsStart(Runtime runtime, TypeRef type, string name, bool reportsCode)
+        -> RuntimeFunction {
     let createPipe = runtime.libc("CreatePipe", runtime.int32Type.functionType([
         runtime.pointerType, runtime.pointerType, runtime.pointerType, runtime.int32Type]));
     let handleInformation = runtime.libc("SetHandleInformation", runtime.int32Type.functionType(
@@ -26,7 +33,7 @@ public windowsStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
     let widen = widetext.wideFromUtf8(runtime);
     let allocate = runtime.malloc();
     let release = runtime.free();
-    let definition = runtime.beginDefinition("ens_start_process", type);
+    let definition = runtime.beginDefinition(name, type);
     let builder = runtime.builder;
     let pipeBlock = runtime.block(definition, "start.pipe");
     let startBlock = runtime.block(definition, "start.process");
@@ -40,6 +47,8 @@ public windowsStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
     // would write out a second time; flushing the buffers first keeps a printed line ahead of the
     // child's output and unduplicated.
     runtime.flushBuffered();
+    let codeSlot = memory.buildAlloca(builder, runtime.int32Type, "code");
+    memory.buildStore(builder, runtime.int32(Win32Error.outOfMemory), codeSlot);
     let wideCommand = runtime.call(widen, [runtime.parameter(definition, 3), runtime.int32(-1)],
         "command.wide");
     instructions.buildCondBr(builder, runtime.isNull(wideCommand), failedBlock, pipeBlock);
@@ -55,6 +64,7 @@ public windowsStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
     let readSlot = memory.buildAlloca(builder, runtime.pointerType, "read.end");
     let writeSlot = memory.buildAlloca(builder, runtime.pointerType, "write.end");
     let piped = runtime.call(createPipe, [readSlot, writeSlot, security, runtime.int32(0)], "piped");
+    memory.buildStore(builder, runtime.lastError(), codeSlot);
     instructions.buildCondBr(builder,
         instructions.buildICmpEQ(builder, piped, runtime.int32(0), ""), failedBlock, startBlock);
 
@@ -87,11 +97,19 @@ public windowsStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
     let started = runtime.call(createProcess, [runtime.nullPointer(), wideCommand,
         runtime.nullPointer(), runtime.nullPointer(), runtime.int32(1), flags, wideEnvironment,
         runtime.nullPointer(), startup, process], "started");
+    let refused = runtime.lastError();
     runtime.call(release, [wideCommand], "");
     runtime.call(release, [wideEnvironment], "");
+    let createFailedBlock = runtime.block(definition, "start.create.failed");
     instructions.buildCondBr(builder,
-        instructions.buildICmpEQ(builder, started, runtime.int32(0), ""), closePipeBlock,
+        instructions.buildICmpEQ(builder, started, runtime.int32(0), ""), createFailedBlock,
         runningBlock);
+
+    builder.positionAtEnd(createFailedBlock);
+    memory.buildStore(builder, childprocess.withCause(runtime, refused,
+        createCause(runtime, definition, widen, refused, runtime.parameter(definition, 0))),
+        codeSlot);
+    instructions.buildBr(builder, closePipeBlock);
 
     // The child holds the writing end now, so this process closes its own copy; the end of the
     // output is a read finding no writer left. The child's thread is of no use to anyone here.
@@ -103,6 +121,7 @@ public windowsStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
     runtime.call(closeHandle, [writeEnd], "");
     runtime.call(closeHandle, [thread], "");
     let block = runtime.call(allocate, [runtime.int64(16)], "child.block");
+    memory.buildStore(builder, runtime.int32(Win32Error.outOfMemory), codeSlot);
     instructions.buildCondBr(builder, runtime.isNull(block), closeChildBlock, recordBlock);
 
     builder.positionAtEnd(recordBlock);
@@ -113,18 +132,47 @@ public windowsStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
     builder.positionAtEnd(closePipeBlock);
     runtime.call(closeHandle, [readEnd], "");
     runtime.call(closeHandle, [writeEnd], "");
+    children.reportCode(runtime, definition, reportsCode,
+        memory.buildLoad(builder, runtime.int32Type, codeSlot, "code.found"));
     instructions.buildRet(builder, runtime.nullPointer());
 
     builder.positionAtEnd(closeChildBlock);
     runtime.call(closeHandle, [readEnd], "");
     runtime.call(closeHandle, [child], "");
+    children.reportCode(runtime, definition, reportsCode,
+        memory.buildLoad(builder, runtime.int32Type, codeSlot, "code.found"));
     instructions.buildRet(builder, runtime.nullPointer());
 
     // A command line that could not be widened frees nothing, and free ignores a null pointer.
     builder.positionAtEnd(failedBlock);
     runtime.call(release, [wideCommand], "");
+    children.reportCode(runtime, definition, reportsCode,
+        memory.buildLoad(builder, runtime.int32Type, codeSlot, "code.found"));
     instructions.buildRet(builder, runtime.nullPointer());
     return runtime.endDefinition(definition);
+}
+
+// What a failed CreateProcessW that reported `refused` failed on, read from the program path the
+// command line starts with.
+createCause(Runtime runtime, RuntimeDefinition definition, RuntimeFunction widen, Value refused,
+            Value program) -> Value {
+    let builder = runtime.builder;
+    let release = runtime.free();
+    let causeSlot = memory.buildAlloca(builder, runtime.int32Type, "cause");
+    let probeBlock = runtime.block(definition, "start.cause.probe");
+    let doneBlock = runtime.block(definition, "start.cause.done");
+    memory.buildStore(builder, runtime.int32(StartCause.program), causeSlot);
+    let wideProgram = runtime.call(widen, [program, runtime.int32(-1)], "program.wide");
+    instructions.buildCondBr(builder, runtime.isNull(wideProgram), doneBlock, probeBlock);
+
+    builder.positionAtEnd(probeBlock);
+    memory.buildStore(builder, windows.programCause(runtime, definition, refused, wideProgram),
+        causeSlot);
+    runtime.call(release, [wideProgram], "");
+    instructions.buildBr(builder, doneBlock);
+
+    builder.positionAtEnd(doneBlock);
+    return memory.buildLoad(builder, runtime.int32Type, causeSlot, "cause.found");
 }
 
 public windowsRead(Runtime runtime, TypeRef type) -> RuntimeFunction {

@@ -21,13 +21,143 @@ import StartupInfo from emit.nativeshapes;
 import StdioMode from emit.nativeshapes;
 import Win32Error from emit.errorkinds;
 import Win32 from emit.filesystem.windows;
+import emit.filesystem.windows;
 import OutputRecord from emit.childprocess;
+import StartCause from emit.errorkinds;
 import WindowsChild from emit.childprocess;
 import emit.childprocess;
 import Runtime from emit.runtime;
 import RuntimeDefinition from emit.runtime;
 import RuntimeFunction from emit.runtime;
 import emit.widetext;
+
+// What a failed CreateProcessW that reported `refused` failed on. The working directory is checked
+// first, because Windows reports a missing one, and one that is a file, with the numbers it gives a
+// missing program.
+createCause(Runtime runtime, RuntimeDefinition definition, Value refused, Value programSlot,
+            Value directorySlot) -> Value {
+    let builder = runtime.builder;
+    let causeSlot = memory.buildAlloca(builder, runtime.int32Type, "cause");
+    let directoryBlock = runtime.block(definition, "start.cause.directory");
+    let programBlock = runtime.block(definition, "start.cause.program");
+    let doneBlock = runtime.block(definition, "start.cause.done");
+    let directory = memory.buildLoad(builder, runtime.pointerType, directorySlot, "directory");
+    instructions.buildCondBr(builder, runtime.isNull(directory), programBlock, directoryBlock);
+
+    builder.positionAtEnd(directoryBlock);
+    let attributes = attributesOf(runtime, directory);
+    memory.buildStore(builder, instructions.buildSelect(builder, isMissing(runtime, attributes),
+        runtime.int32(StartCause.workingDirectory), runtime.int32(StartCause.workingDirectoryFile),
+        ""), causeSlot);
+    instructions.buildCondBr(builder, isDirectory(runtime, attributes), programBlock, doneBlock);
+
+    builder.positionAtEnd(programBlock);
+    let program = memory.buildLoad(builder, runtime.pointerType, programSlot, "program");
+    memory.buildStore(builder, programCause(runtime, definition, refused, program), causeSlot);
+    instructions.buildBr(builder, doneBlock);
+
+    builder.positionAtEnd(doneBlock);
+    return memory.buildLoad(builder, runtime.int32Type, causeSlot, "cause.found");
+}
+
+// What a failed CreateProcessW that reported `refused` says about the program file at the UTF-16
+// path: a directory, which is refused as a permission; for a file Windows cannot run, a program
+// image built for another machine when it starts with the 'MZ' header and no program otherwise;
+// or the program, when nothing more is known. The file is read only for the numbers that come from
+// it.
+public programCause(Runtime runtime, RuntimeDefinition definition, Value refused,
+                    Value program) -> Value {
+    let builder = runtime.builder;
+    let causeSlot = memory.buildAlloca(builder, runtime.int32Type, "program.cause");
+    let directoryBlock = runtime.block(definition, "start.cause.program.directory");
+    let formatBlock = runtime.block(definition, "start.cause.program.format");
+    let imageBlock = runtime.block(definition, "start.cause.program.image");
+    let doneBlock = runtime.block(definition, "start.cause.program.done");
+    memory.buildStore(builder, runtime.int32(StartCause.program), causeSlot);
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, refused, runtime.int32(Win32Error.accessDenied), ""),
+        directoryBlock, formatBlock);
+
+    builder.positionAtEnd(directoryBlock);
+    memory.buildStore(builder, instructions.buildSelect(builder,
+        isDirectory(runtime, attributesOf(runtime, program)), runtime.int32(StartCause.directory),
+        runtime.int32(StartCause.program), ""), causeSlot);
+    instructions.buildBr(builder, doneBlock);
+
+    builder.positionAtEnd(formatBlock);
+    let unrunnable = instructions.buildOr(builder,
+        instructions.buildICmpEQ(builder, refused, runtime.int32(Win32Error.badExecutableFormat),
+            ""),
+        instructions.buildICmpEQ(builder, refused, runtime.int32(Win32Error.machineMismatch), ""),
+        "unrunnable");
+    instructions.buildCondBr(builder, unrunnable, imageBlock, doneBlock);
+
+    builder.positionAtEnd(imageBlock);
+    memory.buildStore(builder, instructions.buildSelect(builder,
+        startsWithImageHeader(runtime, definition, program), runtime.int32(StartCause.notRunnable),
+        runtime.int32(StartCause.notProgram), ""), causeSlot);
+    instructions.buildBr(builder, doneBlock);
+
+    builder.positionAtEnd(doneBlock);
+    return memory.buildLoad(builder, runtime.int32Type, causeSlot, "program.cause.found");
+}
+
+// Whether the file at the UTF-16 path starts with 'MZ', the header every Windows program image
+// opens with. A file that cannot be opened or holds fewer than two bytes does not.
+startsWithImageHeader(Runtime runtime, RuntimeDefinition definition, Value path) -> Value {
+    let builder = runtime.builder;
+    let openFile = windows.createFileFunction(runtime);
+    let readFile = runtime.libc("ReadFile", runtime.int32Type.functionType([runtime.pointerType,
+        runtime.pointerType, runtime.int32Type, runtime.pointerType, runtime.pointerType]));
+    let readBlock = runtime.block(definition, "start.cause.header.read");
+    let doneBlock = runtime.block(definition, "start.cause.header.done");
+    let header = memory.buildAlloca(builder, runtime.int16Type, "header");
+    let count = memory.buildAlloca(builder, runtime.int32Type, "header.count");
+    memory.buildStore(builder, runtime.int16Type.constInt(0, false), header);
+    let handle = runtime.call(openFile, [path, runtime.int32(Win32.genericRead),
+        runtime.int32(Win32.shareEverything), runtime.nullPointer(),
+        runtime.int32(Win32.openExisting), runtime.int32(0), runtime.nullPointer()],
+        "header.file");
+    instructions.buildCondBr(builder, invalidHandle(runtime, handle), doneBlock, readBlock);
+
+    builder.positionAtEnd(readBlock);
+    runtime.call(readFile, [handle, header, runtime.int32(2), count, runtime.nullPointer()], "");
+    runtime.call(closeHandleFunction(runtime), [handle], "");
+    instructions.buildBr(builder, doneBlock);
+
+    builder.positionAtEnd(doneBlock);
+    return instructions.buildICmpEQ(builder,
+        memory.buildLoad(builder, runtime.int16Type, header, "header.word"),
+        runtime.int16Type.constInt(ImageHeader.magic as ulong, false), "image.header");
+}
+
+// 'MZ' read as one little-endian word.
+final class ImageHeader {
+    protected static const long magic = 0x5A4D;
+}
+
+// The attributes of what the UTF-16 path names, INVALID_FILE_ATTRIBUTES when nothing is there.
+attributesOf(Runtime runtime, Value widePath) -> Value {
+    let builder = runtime.builder;
+    let readAttributes = runtime.libc("GetFileAttributesW",
+        runtime.int32Type.functionType([runtime.pointerType]));
+    return instructions.buildZExt(builder, runtime.call(readAttributes, [widePath], "attributes"),
+        runtime.int64Type, "attributes.word");
+}
+
+isMissing(Runtime runtime, Value attributes) -> Value {
+    return instructions.buildICmpEQ(runtime.builder, attributes,
+        runtime.int64(Win32.invalidAttributes), "missing");
+}
+
+// Whether the attributes are those of a directory that is there.
+isDirectory(Runtime runtime, Value attributes) -> Value {
+    let builder = runtime.builder;
+    return instructions.buildAnd(builder, instructions.buildNot(builder,
+        isMissing(runtime, attributes), ""), instructions.buildICmpNE(builder,
+        instructions.buildAnd(builder, attributes, runtime.int64(Win32.directoryAttribute), ""),
+        runtime.int64(0), ""), "directory");
+}
 
 public windowsStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
     let createProcess = runtime.libc("CreateProcessW", runtime.int32Type.functionType([
@@ -209,8 +339,17 @@ public windowsStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
         instructions.buildSelect(builder, listed, runtime.int32(1), runtime.int32(0), ""), flags,
         wideEnvironment, memory.buildLoad(builder, runtime.pointerType, wideSlots[2], ""),
         startup, process], "started");
-    memory.buildStore(builder, runtime.lastError(), reasonSlot);
+    let refused = runtime.lastError();
     memory.buildStore(builder, started, startedSlot);
+    memory.buildStore(builder, refused, reasonSlot);
+    let createFailedBlock = runtime.block(definition, "start.create.failed");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpEQ(builder, started, runtime.int32(0), ""), createFailedBlock,
+        cleanupBlock);
+
+    builder.positionAtEnd(createFailedBlock);
+    memory.buildStore(builder, childprocess.withCause(runtime, refused,
+        createCause(runtime, definition, refused, wideSlots[0], wideSlots[2])), reasonSlot);
     instructions.buildBr(builder, cleanupBlock);
 
     // Whatever was made for the child alone is released whether or not it started.

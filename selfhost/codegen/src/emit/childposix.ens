@@ -10,11 +10,15 @@ import @ens.llvm.memory;
 import Runtime from emit.runtime;
 import RuntimeDefinition from emit.runtime;
 import RuntimeFunction from emit.runtime;
+import Errno from emit.errorkinds;
+import emit.childprocess;
+import emit.childprocess.posix;
 import emit.children;
 import emit.spawnposix;
 import emit.system;
 
-public posixStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
+public posixStart(Runtime runtime, TypeRef type, string name, bool reportsCode)
+        -> RuntimeFunction {
     let makePipe = runtime.libc("pipe", runtime.int32Type.functionType([runtime.pointerType]));
     let control = runtime.libc("fcntl",
         runtime.int32Type.variadicFunctionType([runtime.int32Type, runtime.int32Type]));
@@ -30,7 +34,7 @@ public posixStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
     let exitChild = runtime.libc("_exit", runtime.voidType.functionType([runtime.int32Type]));
     let allocate = runtime.malloc();
     let release = runtime.free();
-    let definition = runtime.beginDefinition("ens_start_process", type);
+    let definition = runtime.beginDefinition(name, type);
     let builder = runtime.builder;
     let pipeBlock = runtime.block(definition, "start.pipe");
     let reportBlock = runtime.block(definition, "start.report");
@@ -62,12 +66,16 @@ public posixStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
     let report = memory.buildAlloca(builder, runtime.int32Type.arrayType(2 as ulong), "report");
     let reportedSlot = memory.buildAlloca(builder, runtime.int32Type, "reported");
     let statusSlot = memory.buildAlloca(builder, runtime.int32Type, "collect.status");
+    let probe = posix.execProbe(runtime);
+    let codeSlot = memory.buildAlloca(builder, runtime.int32Type, "code");
+    memory.buildStore(builder, runtime.int32(Errno.outOfMemory), codeSlot);
     // Allocated before the fork, so no failure after it can leave a child running.
     let block = runtime.call(allocate, [runtime.int64(16)], "child.block");
     instructions.buildCondBr(builder, runtime.isNull(block), failedBlock, pipeBlock);
 
     builder.positionAtEnd(pipeBlock);
     let piped = runtime.call(makePipe, [descriptors], "piped");
+    memory.buildStore(builder, runtime.lastError(), codeSlot);
     instructions.buildCondBr(builder,
         instructions.buildICmpEQ(builder, piped, runtime.int32(0), ""), reportBlock, releaseBlock);
 
@@ -77,6 +85,7 @@ public posixStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
         runtime.offsetPointer(descriptors, 0, ""), "read.end");
     let writeEnd = memory.buildLoad(builder, runtime.int32Type, writeSlot, "write.end");
     let reportPiped = runtime.call(makePipe, [report], "report.piped");
+    memory.buildStore(builder, runtime.lastError(), codeSlot);
     instructions.buildCondBr(builder,
         instructions.buildICmpEQ(builder, reportPiped, runtime.int32(0), ""), flagBlock,
         closePipeBlock);
@@ -90,6 +99,7 @@ public posixStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
         spawnposix.markCloseOnExec(runtime, control, writeEnd, "flagged.write"),
         spawnposix.markCloseOnExec(runtime, control, reportRead, "flagged.report.read"),
         spawnposix.markCloseOnExec(runtime, control, reportWrite, "flagged.report.write")];
+    memory.buildStore(builder, runtime.lastError(), codeSlot);
     Value flagged = instructions.buildICmpSGE(builder, marks[0], runtime.int32(0), "");
     for (long index = 1; index < marks.length; index++) {
         flagged = instructions.buildAnd(builder, flagged,
@@ -111,6 +121,7 @@ public posixStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
     spawnposix.blockVector(runtime, definition, environmentVector, runtime.int64(0),
         runtime.parameter(definition, 4), environmentCount, "envp");
     let child = runtime.call(forkProcess, [], "child");
+    memory.buildStore(builder, runtime.lastError(), codeSlot);
     instructions.buildCondBr(builder,
         instructions.buildICmpEQ(builder, child, runtime.int32(0), ""), childBlock, parentBlock);
 
@@ -141,7 +152,9 @@ public posixStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
     // execvp returns only when the program could not be started.
     builder.positionAtEnd(execBlock);
     runtime.call(execProgram, [program, argumentVector], "");
-    memory.buildStore(builder, runtime.lastError(), reportedSlot);
+    let refused = runtime.lastError();
+    memory.buildStore(builder, childprocess.withCause(runtime, refused,
+        posix.execCause(runtime, definition, probe, refused, program)), reportedSlot);
     instructions.buildBr(builder, childFailedBlock);
 
     builder.positionAtEnd(childFailedBlock);
@@ -166,6 +179,8 @@ public posixStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
         recordBlock);
 
     builder.positionAtEnd(execFailedBlock);
+    memory.buildStore(builder, memory.buildLoad(builder, runtime.int32Type, reportedSlot, ""),
+        codeSlot);
     spawnposix.awaitChild(runtime, definition, child, statusSlot, closeReadBlock, "collect");
     instructions.buildBr(builder, closeReadBlock);
 
@@ -195,9 +210,11 @@ public posixStart(Runtime runtime, TypeRef type) -> RuntimeFunction {
 
     builder.positionAtEnd(releaseBlock);
     runtime.call(release, [block], "");
-    instructions.buildRet(builder, runtime.nullPointer());
+    instructions.buildBr(builder, failedBlock);
 
     builder.positionAtEnd(failedBlock);
+    children.reportCode(runtime, definition, reportsCode,
+        memory.buildLoad(builder, runtime.int32Type, codeSlot, "code.found"));
     instructions.buildRet(builder, runtime.nullPointer());
     return runtime.endDefinition(definition);
 }
