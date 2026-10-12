@@ -1035,15 +1035,34 @@ class ModuleChecks {
     // A declaration's signature may not mention a type less visible than the declaration
     // itself; a caller who can name the declaration could otherwise be handed a type it
     // cannot name. Protected members are exempt: their guaranteed reach is the declaring
-    // file, which can name everything the file can.
+    // file, which can name everything the file can. Every place a signature names a type is
+    // collected first, so a fix that lowers a type can be checked against every signature that
+    // names it before anything is reported.
     checkVisibilityLeaks() {
+        let sites = this.leakSites();
+        let mentions = mentionsIn(sites);
+        for (let site in sites) {
+            switch (site) {
+                is MentionSite mention -> {
+                    this.checkMentionedType(mention, mentions);
+                },
+                is BaseSite base -> {
+                    this.checkBaseLeak(base, mentions);
+                },
+            }
+        }
+    }
+
+    // Every place a signature in this module names a type, in declaration order.
+    leakSites() -> List<LeakSite> {
+        let sites = new List<LeakSite>();
         let functions = this.context.functions().all();
         for (long i = 0; i < functions.length(); i++) {
             let entry = functions.get(i);
             if (entry.isBuiltin() || entry.isExternal()) {
                 continue;
             }
-            this.checkCallableLeaks(entry.signature(), entry.visibility(),
+            this.collectCallableSites(sites, entry.signature(), entry.visibility(),
                 "Function '{entry.signature().name()}'", "'{entry.signature().name()}'",
                 functionLowering(entry.signature().name()));
         }
@@ -1054,12 +1073,12 @@ class ModuleChecks {
                 continue;
             }
             string declPhrase = "Struct {this.names.quotedName(structType)}";
-            this.checkBoundLeaks(structType.typeParameterTypes(), structType.visibility(),
+            this.collectBoundSites(sites, structType.typeParameterTypes(), structType.visibility(),
                 declPhrase, "{this.names.quotedName(structType)}", node.name().span(),
                 typeLowering(structType));
-            this.checkMemberLeaks("struct", structType, structType.fields(), 0,
+            this.collectMemberSites(sites, "struct", structType, structType.fields(), 0,
                 structType.methods(), fileReach());
-            this.checkMemberLeaks("struct", structType, structType.staticFields(), 0,
+            this.collectMemberSites(sites, "struct", structType, structType.staticFields(), 0,
                 structType.staticMethods(), fileReach());
         }
         for (long i = 0; i < this.classNodes.length(); i++) {
@@ -1069,15 +1088,15 @@ class ModuleChecks {
                 continue;
             }
             string declPhrase = "Class {this.names.quotedName(classType)}";
-            this.checkClassBaseLeaks(classType, node, declPhrase);
-            this.checkImplementedInterfaceLeaks(classType, node, declPhrase);
-            this.checkBoundLeaks(classType.typeParameterTypes(), classType.visibility(),
+            this.collectClassBaseSites(sites, classType, node, declPhrase);
+            this.collectImplementedInterfaceSites(sites, classType, node, declPhrase);
+            this.collectBoundSites(sites, classType.typeParameterTypes(), classType.visibility(),
                 declPhrase, "{this.names.quotedName(classType)}", node.name().span(),
                 typeLowering(classType));
             let reach = subclassReach(classType);
-            this.checkMemberLeaks("class", classType, classType.fields(),
+            this.collectMemberSites(sites, "class", classType, classType.fields(),
                 classType.baseFieldCount(), classType.methods(), reach);
-            this.checkMemberLeaks("class", classType, classType.staticFields(), 0,
+            this.collectMemberSites(sites, "class", classType, classType.staticFields(), 0,
                 classType.staticMethods(), reach);
         }
         for (long i = 0; i < this.primitiveNodes.length(); i++) {
@@ -1087,9 +1106,9 @@ class ModuleChecks {
             }
             // A binding is nameable everywhere the primitive is, so an exported member of one
             // is checked for the types it mentions exactly as an exported class member does.
-            this.checkMemberLeaks("primitive", binding, binding.staticFields(), 0,
+            this.collectMemberSites(sites, "primitive", binding, binding.staticFields(), 0,
                 binding.methods(), fileReach());
-            this.checkMemberLeaks("primitive", binding, binding.staticFields(), 0,
+            this.collectMemberSites(sites, "primitive", binding, binding.staticFields(), 0,
                 binding.staticMethods(), fileReach());
         }
         for (long i = 0; i < this.interfaceNodes.length(); i++) {
@@ -1100,21 +1119,23 @@ class ModuleChecks {
             }
             string interfaceName = this.names.quotedName(interfaceType);
             string declPhrase = "Interface {interfaceName}";
-            this.checkInterfaceBaseLeaks(interfaceType, node, declPhrase);
-            this.checkBoundLeaks(interfaceType.typeParameterTypes(),
+            this.collectInterfaceBaseSites(sites, interfaceType, node, declPhrase);
+            this.collectBoundSites(sites, interfaceType.typeParameterTypes(),
                 interfaceType.visibility(), declPhrase, "{interfaceName}", node.name().span(),
                 typeLowering(interfaceType));
             let methods = interfaceType.methods();
             for (long m = 0; m < methods.length(); m++) {
                 let method = methods.get(m);
-                this.checkCallableLeaks(method.signature(), method.visibility(),
+                this.collectCallableSites(sites, method.signature(), method.visibility(),
                     "Method '{method.name()}' of interface {interfaceName}", "{interfaceName}",
                     typeLowering(interfaceType));
             }
         }
+        return sites;
     }
 
-    checkClassBaseLeaks(ClassType classType, ClassDeclarationNode node, string declPhrase) {
+    collectClassBaseSites(List<LeakSite> sites, ClassType classType, ClassDeclarationNode node,
+                          string declPhrase) {
         if (types.visibilityTier(classType.visibility()) == 0) {
             return;
         }
@@ -1129,24 +1150,19 @@ class ModuleChecks {
         }
         string target = "{this.names.quotedName(classType)}";
         let baseAuthority = types.authorityOf(base);
-        if (baseAuthority != null && types.visibilityTier(baseAuthority.visibility())
-                    < types.visibilityTier(classType.visibility())) {
-            string needed = types.visibilityWord(classType.visibility());
-            string lowering = this.loweringClause(target, classType.visibility(), baseAuthority,
-                typeLowering(classType));
-            this.reporter.report("{declPhrase} is '{needed}', but its base class "
-                + "{this.names.quotedName(baseAuthority)} is {notNameablePhrase(baseAuthority)}. Mark "
-                + "{this.names.quotedName(baseAuthority)} '{needed}'{lowering}.", at);
+        if (baseAuthority != null) {
+            sites.push(new BaseSite(classType, baseAuthority, false, declPhrase, at));
         }
         if (base is InstantiationType) {
             for (let argument in base.arguments()) {
-                this.checkMentionedType(argument, classType.visibility(), declPhrase, target,
-                    "base class type argument", at, typeLowering(classType));
+                sites.push(new MentionSite(argument, classType.visibility(), declPhrase, target,
+                    "base class type argument", at, typeLowering(classType), null));
             }
         }
     }
 
-    checkInterfaceBaseLeaks(InterfaceType interfaceType, InterfaceDeclarationNode node, string declPhrase) {
+    collectInterfaceBaseSites(List<LeakSite> sites, InterfaceType interfaceType,
+                              InterfaceDeclarationNode node, string declPhrase) {
         if (types.visibilityTier(interfaceType.visibility()) == 0) {
             return;
         }
@@ -1161,24 +1177,20 @@ class ModuleChecks {
         }
         string target = "{this.names.quotedName(interfaceType)}";
         let baseAuthority = types.authorityOf(base);
-        if (baseAuthority != null && types.visibilityTier(baseAuthority.visibility())
-                    < types.visibilityTier(interfaceType.visibility())) {
-            string needed = types.visibilityWord(interfaceType.visibility());
-            string lowering = this.loweringClause(target, interfaceType.visibility(), baseAuthority,
-                typeLowering(interfaceType));
-            this.reporter.report("{declPhrase} is '{needed}', but the interface it extends, "
-                + "{this.names.quotedName(baseAuthority)}, is {notNameablePhrase(baseAuthority)}. "
-                + "Mark {this.names.quotedName(baseAuthority)} '{needed}'{lowering}.", at);
+        if (baseAuthority != null) {
+            sites.push(new BaseSite(interfaceType, baseAuthority, true, declPhrase, at));
         }
         if (base is InstantiationType) {
             for (let argument in base.arguments()) {
-                this.checkMentionedType(argument, interfaceType.visibility(), declPhrase, target,
-                    "extended interface type argument", at, typeLowering(interfaceType));
+                sites.push(new MentionSite(argument, interfaceType.visibility(), declPhrase,
+                    target, "extended interface type argument", at, typeLowering(interfaceType),
+                    null));
             }
         }
     }
 
-    checkImplementedInterfaceLeaks(ClassType classType, ClassDeclarationNode node, string declPhrase) {
+    collectImplementedInterfaceSites(List<LeakSite> sites, ClassType classType,
+                                     ClassDeclarationNode node, string declPhrase) {
         if (types.visibilityTier(classType.visibility()) == 0) {
             return;
         }
@@ -1190,17 +1202,18 @@ class ModuleChecks {
             let reference = implementsClause.interfaces(i);
             let resolved = this.context.result().typeOf(reference.green());
             if (resolved != null) {
-                this.checkMentionedType(resolved, classType.visibility(), declPhrase,
+                sites.push(new MentionSite(resolved, classType.visibility(), declPhrase,
                     "{this.names.quotedName(classType)}", "implemented interface", reference.span(),
-                    typeLowering(classType));
+                    typeLowering(classType), null));
             }
         }
     }
 
     // A protected member checks against its class's subclass reach instead of its own tier;
     // protectedOwner carries the class into the protected message shape.
-    checkMemberLeaks(string ownerKindWord, DeclaredType ownerType, List<Field> fields,
-                     long firstOwnField, List<Method> methods, SubclassReach reach) {
+    collectMemberSites(List<LeakSite> sites, string ownerKindWord, DeclaredType ownerType,
+                       List<Field> fields, long firstOwnField, List<Method> methods,
+                       SubclassReach reach) {
         string owner = "{ownerKindWord} {this.names.quotedName(ownerType)}";
         ProtectedOwner? reached = null;
         if (types.visibilityTier(reach.scope) > 0) {
@@ -1217,9 +1230,9 @@ class ModuleChecks {
             if (types.visibilityTier(effective) == 0) {
                 continue;
             }
-            this.checkMentionedType(field.type(), effective,
+            sites.push(new MentionSite(field.type(), effective,
                 "Field '{field.name()}' of {owner}", "'{field.name()}'", "type", field.nameSpan(),
-                memberLowering(ownerType), protectedOwner);
+                memberLowering(ownerType), protectedOwner));
         }
         for (long i = 0; i < methods.length(); i++) {
             let method = methods.get(i);
@@ -1235,14 +1248,14 @@ class ModuleChecks {
                 memberWord = "Constructor";
                 target = "the constructor";
             }
-            this.checkCallableLeaks(method.signature(), effective,
+            this.collectCallableSites(sites, method.signature(), effective,
                 memberWord + " of " + owner, target, memberLowering(ownerType, method.isOverride()),
                 protectedOwner);
             for (let constraint in method.constraints()) {
                 for (let bound in constraint.bounds()) {
-                    this.checkMentionedType(bound, effective, memberWord + " of " + owner, target,
-                        "type-parameter bound", method.signature().nameSpan(),
-                        memberLowering(ownerType, method.isOverride()), protectedOwner);
+                    sites.push(new MentionSite(bound, effective, memberWord + " of " + owner,
+                        target, "type-parameter bound", method.signature().nameSpan(),
+                        memberLowering(ownerType, method.isOverride()), protectedOwner));
                 }
             }
         }
@@ -1250,43 +1263,70 @@ class ModuleChecks {
 
     // 'target' names the declaration whose visibility mark a fix changes.
     // 'lowering' is what a fix that lowers the declaration 'target' names changes.
-    checkCallableLeaks(Signature signature, Visibility declVisibility, string declPhrase,
-                       string target, Lowering lowering, ProtectedOwner? protectedOwner = null) {
+    collectCallableSites(List<LeakSite> sites, Signature signature, Visibility declVisibility,
+                         string declPhrase, string target, Lowering lowering,
+                         ProtectedOwner? protectedOwner = null) {
         if (types.visibilityTier(declVisibility) == 0) {
             return;
         }
         for (let parameter in signature.parameters()) {
-            this.checkMentionedType(parameter.type(), declVisibility, declPhrase, target,
-                "parameter type", parameter.span(), lowering, protectedOwner);
+            sites.push(new MentionSite(parameter.type(), declVisibility, declPhrase, target,
+                "parameter type", parameter.span(), lowering, protectedOwner));
         }
-        this.checkMentionedType(signature.returnType(), declVisibility, declPhrase, target,
-            "return type", signature.nameSpan(), lowering, protectedOwner);
+        sites.push(new MentionSite(signature.returnType(), declVisibility, declPhrase, target,
+            "return type", signature.nameSpan(), lowering, protectedOwner));
         Type[] thrown = signature.throwsTypes();
         Span[] thrownSpans = signature.throwsTypeSpans();
         for (long i = 0; i < thrown.length; i++) {
-            this.checkMentionedType(thrown[i], declVisibility, declPhrase, target, "thrown type",
-                thrownSpans[i], lowering, protectedOwner);
+            sites.push(new MentionSite(thrown[i], declVisibility, declPhrase, target,
+                "thrown type", thrownSpans[i], lowering, protectedOwner));
         }
-        this.checkBoundLeaks(signature.typeParameters(), declVisibility, declPhrase, target,
-            signature.nameSpan(), lowering, protectedOwner);
+        this.collectBoundSites(sites, signature.typeParameters(), declVisibility, declPhrase,
+            target, signature.nameSpan(), lowering, protectedOwner);
     }
 
-    checkBoundLeaks(TypeParamType[] parameters, Visibility declVisibility, string declPhrase,
-                    string target, Span at, Lowering lowering, ProtectedOwner? protectedOwner = null) {
+    collectBoundSites(List<LeakSite> sites, TypeParamType[] parameters, Visibility declVisibility,
+                      string declPhrase, string target, Span at, Lowering lowering,
+                      ProtectedOwner? protectedOwner = null) {
         if (types.visibilityTier(declVisibility) == 0) {
             return;
         }
         for (let parameter in parameters) {
             for (let bound in parameter.bounds()) {
-                this.checkMentionedType(bound, declVisibility, declPhrase, target,
-                    "type-parameter bound", at, lowering, protectedOwner);
+                sites.push(new MentionSite(bound, declVisibility, declPhrase, target,
+                    "type-parameter bound", at, lowering, protectedOwner));
             }
         }
     }
 
-    checkMentionedType(Type mentioned, Visibility declVisibility, string declPhrase,
-                       string target, string role, Span at, Lowering lowering,
-                       ProtectedOwner? protectedOwner = null) {
+    // A class or interface more visible than the type it extends.
+    checkBaseLeak(BaseSite site, SignatureMentions mentions) {
+        let declared = site.declared;
+        let base = site.base;
+        if (types.visibilityTier(base.visibility()) >= types.visibilityTier(declared.visibility())) {
+            return;
+        }
+        string needed = types.visibilityWord(declared.visibility());
+        string baseName = this.names.quotedName(base);
+        string lowering = this.loweringClause("{this.names.quotedName(declared)}",
+            declared.visibility(), base, typeLowering(declared), mentions);
+        string extended = "its base class {baseName} is";
+        if (site.extendsInterface) {
+            extended = "the interface it extends, {baseName}, is";
+        }
+        this.reporter.report("{site.declPhrase} is '{needed}', but {extended} "
+            + "{notNameablePhrase(base)}. Mark {baseName} '{needed}'{lowering}.", site.at);
+    }
+
+    checkMentionedType(MentionSite site, SignatureMentions mentions) {
+        Type mentioned = site.mentioned;
+        Visibility declVisibility = site.reach;
+        string declPhrase = site.declPhrase;
+        string target = site.target;
+        string role = site.role;
+        Span at = site.at;
+        Lowering lowering = site.lowering;
+        ProtectedOwner? protectedOwner = site.protectedOwner;
         let worst = leastVisibleMention(mentioned);
         if (worst == null || types.visibilityTier(worst.visibility())
                 >= types.visibilityTier(declVisibility)) {
@@ -1314,7 +1354,7 @@ class ModuleChecks {
             }
             string lowered = "";
             string closing = "";
-            if (this.lowerable(typeLowering(ownerType), ownerType.visibility(), worst)) {
+            if (this.lowerable(typeLowering(ownerType), ownerType.visibility(), worst, mentions)) {
                 lowered = " Or {loweringFix("{ownerName}", declVisibility, worst, ownerType)}.";
             }
             if (ownerType is ClassType && closable(ownerType)) {
@@ -1326,13 +1366,15 @@ class ModuleChecks {
             return;
         }
         this.reporter.report("{declPhrase} is '{needed}', but {uses}. Mark {worstName} "
-            + "'{needed}'{this.loweringClause(target, declVisibility, worst, lowering)}.", at);
+            + "'{needed}'{this.loweringClause(target, declVisibility, worst, lowering, mentions)}.",
+            at);
     }
 
     // The fix after the first that lowers 'target' to the visibility of 'worst', opening with ", or",
     // or empty where lowering it breaks other code.
-    loweringClause(string target, Visibility declared, DeclaredType worst, Lowering lowering) -> string {
-        if (!this.lowerable(lowering, declared, worst)) {
+    loweringClause(string target, Visibility declared, DeclaredType worst, Lowering lowering,
+                   SignatureMentions mentions) -> string {
+        if (!this.lowerable(lowering, declared, worst, mentions)) {
             return "";
         }
         return ", or {loweringFix(target, declared, worst, lowering.declared)}";
@@ -1340,10 +1382,12 @@ class ModuleChecks {
 
     // Whether lowering a declaration of visibility 'declared' to the visibility of 'worst' leaves every
     // other declaration valid. An 'export' declaration may be named outside the build. A type must not
-    // be imported by name into another module or be extended or implemented by a more visible type; a
+    // be imported by name into another module, be extended or implemented by a more visible type, or
+    // be mentioned in the signature of a more visible declaration other than its own members; a
     // member must override nothing and belong to a type nothing extends, in a module no other module
     // imports from; and a function must be in a module no other module imports whole.
-    lowerable(Lowering lowering, Visibility declared, DeclaredType worst) -> bool {
+    lowerable(Lowering lowering, Visibility declared, DeclaredType worst,
+              SignatureMentions mentions) -> bool {
         if (declared == Visibility.Export) {
             return false;
         }
@@ -1359,7 +1403,7 @@ class ModuleChecks {
                     return false;
                 }
             }
-            return true;
+            return !mentions.reachesAbove(declaredType, lowered);
         }
         if (owner != null) {
             return !lowering.overriding && !this.references.importedElsewhere(owner.modulePath())
@@ -1598,38 +1642,143 @@ subclassReach(ClassType classType) -> SubclassReach {
     return new SubclassReach(widest, wideners);
 }
 
-// The least-visible declared type mentioned anywhere inside the type: arrays and optionals look
-// through to their element, a function type covers its parameter and return types, an instantiation
-// covers its template and every type argument, and type parameters mention nothing themselves.
+// The least-visible declared type mentioned anywhere inside the type, the first one met where
+// several are equally visible.
 leastVisibleMention(Type type) -> DeclaredType? {
+    let mentioned = new List<DeclaredType>();
+    mentionedTypes(type, mentioned);
+    DeclaredType? worst = null;
+    for (let declared in mentioned) {
+        worst = lessVisibleOf(worst, declared);
+    }
+    return worst;
+}
+
+// Every declared type mentioned inside the type, in the order a reader meets them: arrays and
+// optionals look through to their element, a function type covers its return and parameter types,
+// an instantiation covers its template and every type argument, and type parameters mention nothing
+// themselves.
+mentionedTypes(Type type, List<DeclaredType> into) {
     switch (type) {
         is OptionalType optional -> {
-            return leastVisibleMention(optional.inner());
+            mentionedTypes(optional.inner(), into);
         },
         is ArrayType array -> {
-            return leastVisibleMention(array.element());
+            mentionedTypes(array.element(), into);
         },
         is FunctionType functionType -> {
-            DeclaredType? worst = leastVisibleMention(functionType.returnType());
+            mentionedTypes(functionType.returnType(), into);
             for (let parameter in functionType.parameterTypes()) {
-                worst = lessVisibleOf(worst, leastVisibleMention(parameter));
+                mentionedTypes(parameter, into);
             }
-            return worst;
         },
         is InstantiationType instantiation -> {
-            DeclaredType? worst = instantiation.template();
+            into.push(instantiation.template());
             for (let argument in instantiation.arguments()) {
-                worst = lessVisibleOf(worst, leastVisibleMention(argument));
+                mentionedTypes(argument, into);
             }
-            return worst;
         },
         is DeclaredType declared -> {
-            return declared;
+            into.push(declared);
         },
-        default -> {
-            return null;
-        },
+        default -> { },
     }
+}
+
+// One place a signature names a type, as the visibility check reads it.
+sealed abstract class LeakSite {
+    protected constructor();
+}
+
+// A type named in a signature: the declaration reaching as far as 'reach', described by
+// 'declPhrase', names 'mentioned' as its 'role' at 'at'. 'target' and 'lowering' are what a fix that
+// lowers the declaration names and changes, and 'protectedOwner' is the class of a protected member.
+final class MentionSite extends LeakSite {
+    protected Type mentioned;
+    protected Visibility reach;
+    protected string declPhrase;
+    protected string target;
+    protected string role;
+    protected Span at;
+    protected Lowering lowering;
+    protected ProtectedOwner? protectedOwner;
+
+    protected constructor(this.mentioned, this.reach, this.declPhrase, this.target, this.role,
+                          this.at, this.lowering, this.protectedOwner);
+}
+
+// The type 'declared' extends: 'base', a class unless 'extendsInterface', named at 'at'.
+final class BaseSite extends LeakSite {
+    protected DeclaredType declared;
+    protected DeclaredType base;
+    protected bool extendsInterface;
+    protected string declPhrase;
+    protected Span at;
+
+    protected constructor(this.declared, this.base, this.extendsInterface, this.declPhrase,
+                          this.at);
+}
+
+// The signatures among `sites` that mention each declared type. A base a type extends is not a
+// mention, since lowering the type does not lower its base.
+mentionsIn(List<LeakSite> sites) -> SignatureMentions {
+    let mentions = new SignatureMentions();
+    for (let site in sites) {
+        if (site is MentionSite) {
+            mentions.note(site.mentioned, site.reach, site.lowering.owner ?? site.lowering.declared);
+        }
+    }
+    return mentions;
+}
+
+// The signatures of one module that mention each declared type, by how far each reaches, so a fix
+// that lowers a type is withheld where a declaration that stays more visible names it. A type's own
+// members are left out, because the fix lowers them with the type.
+final class SignatureMentions {
+    Map<DeclaredType, List<Mention>> byType;
+
+    protected constructor() {
+        this.byType = new Map<DeclaredType, List<Mention>>();
+    }
+
+    // Records that a declaration reaching as far as 'reach', a member of 'owner' or a function where
+    // 'owner' is null, mentions 'mentioned' in its signature.
+    protected note(Type mentioned, Visibility reach, DeclaredType? owner) {
+        let found = new List<DeclaredType>();
+        mentionedTypes(mentioned, found);
+        for (let declared in found) {
+            let recorded = this.byType.get(declared);
+            if (recorded == null) {
+                recorded = new List<Mention>();
+                this.byType.set(declared, recorded);
+            }
+            recorded.push(new Mention(owner, types.visibilityTier(reach)));
+        }
+    }
+
+    // Whether a declaration other than a member of 'declared' mentions it and reaches further than
+    // 'lowered'.
+    protected reachesAbove(DeclaredType declared, Visibility lowered) -> bool {
+        let recorded = this.byType.get(declared);
+        if (recorded == null) {
+            return false;
+        }
+        for (let mention in recorded) {
+            if (mention.owner != declared && mention.tier > types.visibilityTier(lowered)) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+// One signature's mention of a type: the type the mentioning member belongs to, null for a
+// function, and how far the member reaches.
+final class Mention {
+    protected DeclaredType? owner;
+    protected long tier;
+
+    protected constructor(this.owner, this.tier);
 }
 
 lessVisibleOf(DeclaredType? left, DeclaredType? right) -> DeclaredType? {
