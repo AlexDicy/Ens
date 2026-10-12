@@ -2,6 +2,9 @@
 // pass spans many files. Results merge deterministically by (file, offset).
 import Span from @ens.frontend.support.source;
 import List from @std.collections.list;
+import Map from @std.collections.map;
+import Set from @std.collections.set;
+import StringBuilder from @std.text.stringbuilder;
 
 // Another place a diagnostic points at, with the sentence that says what is there. A refusal
 // reported where a generic's type arguments were written points this way at the line inside the
@@ -14,7 +17,7 @@ export class RelatedLocation {
     export constructor(string file, Span span, string note) {
         this.locationFile = file;
         this.locationSpan = span;
-        this.locationNote = note;
+        this.locationNote = render(note);
     }
 
     export file() -> string {
@@ -39,7 +42,7 @@ export class FileDiagnostic {
     // A problem at one place in the file, with no notes.
     export constructor(string file, string message, Span span) {
         this.diagnosticFile = file;
-        this.diagnosticMessage = message;
+        this.diagnosticMessage = render(message);
         this.diagnosticSpan = span;
         this.diagnosticRelated = [];
     }
@@ -47,7 +50,7 @@ export class FileDiagnostic {
     // A problem at one place in the file, with a note at one other place.
     export constructor(string file, string message, Span span, RelatedLocation related) {
         this.diagnosticFile = file;
-        this.diagnosticMessage = message;
+        this.diagnosticMessage = render(message);
         this.diagnosticSpan = span;
         this.diagnosticRelated = [related];
     }
@@ -55,7 +58,7 @@ export class FileDiagnostic {
     // A problem at one place in the file, with a note at each other place, in reading order.
     export constructor(string file, string message, Span span, RelatedLocation[] related) {
         this.diagnosticFile = file;
-        this.diagnosticMessage = message;
+        this.diagnosticMessage = render(message);
         this.diagnosticSpan = span;
         this.diagnosticRelated = related;
     }
@@ -114,6 +117,225 @@ public class Reporter {
     public noteAt(Span span, string note) -> RelatedLocation {
         return new RelatedLocation(this.reporterFile, span, note);
     }
+}
+
+// The characters of the marker a quote of types writes right after itself, which render()
+// replaces with the quote's module note. They are Unicode noncharacters, which Unicode sets aside
+// for a program's internal use.
+final class NoteMarker {
+    static const string start = "\uFDD0";
+    static const string end = "\uFDD1";
+    static const string record = "\uFDD2";
+    static const string field = "\uFDD3";
+}
+
+// Text taken from a program's source, as a message quotes it. Each character a marker is made of
+// is written as the escape a string literal writes it with, as in '\uFDD0', so the text reads as
+// it is written and never as a module note.
+export sourceText(string text) -> string {
+    return text.replace(NoteMarker.start, "\\uFDD0").replace(NoteMarker.end, "\\uFDD1")
+        .replace(NoteMarker.record, "\\uFDD2").replace(NoteMarker.field, "\\uFDD3");
+}
+
+// The marker after a quote of types, built from the names the quote writes, in order.
+public final class MentionMarker {
+    StringBuilder records;
+
+    public constructor() {
+        this.records = new StringBuilder();
+    }
+
+    // A declared type the quote writes as 'written'. 'key' tells it apart from every other type,
+    // 'needsNote' says whether a quote spelled this way names its module, and 'importPath' is
+    // the module as an import writes it.
+    public writeDeclared(string written, string key, bool needsNote, string importPath) {
+        string needed = needsNote ? "1" : "0";
+        this.records.append(NoteMarker.record);
+        this.records.append(written + NoteMarker.field + key + NoteMarker.field + needed
+            + NoteMarker.field + importPath);
+    }
+
+    // A type parameter the quote writes, which a declared type of the same name can be taken for.
+    public writeTypeParameter(string written) {
+        this.writeDeclared(written, "", false, "");
+    }
+
+    // The marker, empty when the quote writes no names. 'headKey' is the key of the type a quote
+    // of one type opens with, which can take the short note ' (from sizes.b)', and empty for any
+    // other quote. A quote that 'writesCode' always keeps its own note.
+    public marker(string headKey, bool writesCode) -> string {
+        if (this.records.isEmpty()) {
+            return "";
+        }
+        string code = writesCode ? "1" : "0";
+        return NoteMarker.start + headKey + NoteMarker.field + code + this.records.toString()
+            + NoteMarker.end;
+    }
+}
+
+// A name a quote writes, read back from its marker, with an empty key for a type parameter.
+final class MentionedName {
+    string written;
+    string key;
+    bool needsNote;
+    string importPath;
+
+    constructor(this.written, this.key, this.needsNote, this.importPath);
+}
+
+// The text of a message as it is read, with each quote's marker replaced by its module note. A
+// type's module is written after the first quote that needs it, and after a later quote only
+// when that quote is code to write or the message also writes that name for another type.
+export render(string text) -> string {
+    if (text.indexOf(NoteMarker.start) < 0) {
+        return text;
+    }
+    let between = new List<string>();
+    let quotes = new List<QuoteMention>();
+    long at = 0;
+    long searched = 0;
+    while (true) {
+        long start = text.indexOf(NoteMarker.start, searched);
+        long end = start < 0 ? -1 : text.indexOf(NoteMarker.end, start);
+        if (end < 0) {
+            break;
+        }
+        searched = start + NoteMarker.start.length;
+        let quote = parsedMention(text.substring(searched, end));
+        if (quote != null) {
+            between.push(text.substring(at, start));
+            quotes.push(quote);
+            at = end + NoteMarker.end.length;
+            searched = at;
+        }
+    }
+    between.push(text.substring(at));
+    let shared = sharedNames(quotes);
+    let placed = new Set<string>();
+    let rendered = new StringBuilder();
+    for (long i = 0; i < quotes.length(); i++) {
+        rendered.append(between.get(i));
+        rendered.append(placedNote(quotes.get(i), placed, shared));
+    }
+    rendered.append(between.get(quotes.length()));
+    return rendered.toString();
+}
+
+// The names a quote writes, read back from its marker.
+final class QuoteMention {
+    string headKey;
+    bool writesCode;
+    MentionedName[] names;
+
+    constructor(this.headKey, this.writesCode, this.names);
+}
+
+// The quote a marker's contents describe, or null when they are not a marker MentionMarker wrote.
+parsedMention(string contents) -> QuoteMention? {
+    if (contents.indexOf(NoteMarker.start) >= 0) {
+        return null;
+    }
+    string[] records = contents.split(NoteMarker.record);
+    string[] header = records[0].split(NoteMarker.field);
+    if (header.length != 2) {
+        return null;
+    }
+    let names = new List<MentionedName>();
+    for (long i = 1; i < records.length; i++) {
+        string[] fields = records[i].split(NoteMarker.field);
+        if (fields.length != 4) {
+            return null;
+        }
+        names.push(new MentionedName(fields[0], fields[1], fields[2] == "1", fields[3]));
+    }
+    if (names.isEmpty()) {
+        return null;
+    }
+    return new QuoteMention(header[0], header[1] == "1", names.toArray());
+}
+
+// The names the quotes of one message write for more than one type.
+sharedNames(List<QuoteMention> quotes) -> Set<string> {
+    let keyByName = new Map<string, string>();
+    let shared = new Set<string>();
+    for (let quote in quotes) {
+        for (let name in quote.names) {
+            let known = keyByName.get(name.written);
+            if (known == null) {
+                keyByName.set(name.written, name.key);
+            } else if (known != name.key) {
+                shared.add(name.written);
+            }
+        }
+    }
+    return shared;
+}
+
+// The note after one quote: ' (from sizes.b)' for a quote of one type that writes no other declared
+// type, and ' (Kind from sizes.b, Mode from sizes.d)' otherwise. Where the quote writes one name for
+// two types, the note says which by position: ' (the second Kind from sizes.b)'. Empty when every
+// type the quote writes is clear. 'placed' holds the keys of the types already noted.
+placedNote(QuoteMention quote, Set<string> placed, Set<string> shared) -> string {
+    let noted = new List<MentionedName>();
+    for (let name in quote.names) {
+        if (name.needsNote && !hasKey(noted, name.key)
+                && (quote.writesCode || !placed.contains(name.key) || shared.contains(name.written))) {
+            noted.push(name);
+        }
+    }
+    if (noted.isEmpty()) {
+        return "";
+    }
+    let entries = new StringBuilder();
+    bool positioned = false;
+    for (let entry in noted) {
+        placed.add(entry.key);
+        let ordinals = new List<string>();
+        bool sharedInQuote = false;
+        long seen = 0;
+        for (let name in quote.names) {
+            if (name.written == entry.written) {
+                seen++;
+                if (name.key == entry.key) {
+                    ordinals.push(ordinalWord(seen));
+                } else {
+                    sharedInQuote = true;
+                }
+            }
+        }
+        if (!entries.isEmpty()) {
+            entries.append(", ");
+        }
+        if (sharedInQuote) {
+            positioned = true;
+            entries.append("the {andJoined(ordinals.toArray())} ");
+        }
+        entries.append("{entry.written} from {entry.importPath}");
+    }
+    if (noted.length() == 1 && !positioned && quote.headKey == noted.first().key
+            && writesOneDeclaredType(quote)) {
+        return " (from {noted.first().importPath})";
+    }
+    return " ({entries.toString()})";
+}
+
+hasKey(List<MentionedName> names, string key) -> bool {
+    for (let name in names) {
+        if (name.key == key) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Whether every declared type the quote writes is the one it opens with.
+writesOneDeclaredType(QuoteMention quote) -> bool {
+    for (let name in quote.names) {
+        if (name.key.length > 0 && name.key != quote.headKey) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // A count as a word inside a sentence: "none", "one", "two" and so on up to ten.
