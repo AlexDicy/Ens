@@ -32,6 +32,151 @@ bool isSimpleEscape(char16_t c) {
            c == u't' || c == u'b' || c == u'f' || c == u'0' || c == u'{' || c == u'}';
 }
 
+// A character literal holds exactly one character: one escape or one code point, counted over the
+// literal's UTF-8 bytes.
+
+bool isHexByte(unsigned char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+bool isContinuationByte(unsigned char c) {
+    return c >= 0x80 && c <= 0xBF;
+}
+
+size_t utf8SequenceLength(unsigned char lead) {
+    if (lead < 0x80) return 1;
+    if (lead >= 0xF0 && lead <= 0xF7) return 4;
+    if (lead >= 0xE0 && lead <= 0xEF) return 3;
+    if (lead >= 0xC0 && lead <= 0xDF) return 2;
+    return 1;
+}
+
+size_t escapeLength(const std::string& text, size_t index) {
+    if (index + 5 < text.size() && text[index + 1] == 'u' &&
+        isHexByte(text[index + 2]) && isHexByte(text[index + 3]) &&
+        isHexByte(text[index + 4]) && isHexByte(text[index + 5])) {
+        return 6;
+    }
+    return 2;
+}
+
+size_t characterBytes(const std::string& text, size_t index) {
+    unsigned char lead = text[index];
+    if (lead == '\\') return escapeLength(text, index);
+    size_t length = utf8SequenceLength(lead);
+    return index + length > text.size() ? text.size() - index : length;
+}
+
+long hexValue(unsigned char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return c - 'A' + 10;
+}
+
+long codePointAt(const std::string& text, size_t index, size_t length) {
+    unsigned char lead = text[index];
+    if (lead == '\\' && length == 6) {
+        long value = 0;
+        for (size_t digit = index + 2; digit < index + 6; ++digit) {
+            value = value * 16 + hexValue(text[digit]);
+        }
+        return value;
+    }
+    if (lead == '\\') return static_cast<unsigned char>(text[index + 1]);
+    if (length == 1) return lead;
+    long leadBits = length == 2 ? 0x1F : length == 3 ? 0x0F : 0x07;
+    long value = lead & leadBits;
+    for (size_t next = index + 1; next < index + length; ++next) {
+        value = value * 64 + (static_cast<unsigned char>(text[next]) & 0x3F);
+    }
+    return value;
+}
+
+bool joinsPrevious(long codePoint) {
+    return (codePoint >= 0x0300 && codePoint <= 0x036F) ||
+           (codePoint >= 0x1AB0 && codePoint <= 0x1AFF) ||
+           (codePoint >= 0x1DC0 && codePoint <= 0x1DFF) ||
+           (codePoint >= 0x20D0 && codePoint <= 0x20FF) ||
+           (codePoint >= 0xFE20 && codePoint <= 0xFE2F) || codePoint == 0x200D ||
+           (codePoint >= 0xFE00 && codePoint <= 0xFE0F);
+}
+
+// The characters between the quotes of a character literal, where an escape counts as one and so
+// does each code point.
+long characterLiteralLength(const std::string& literal) {
+    long count = 0;
+    size_t index = 1;
+    while (index + 1 < literal.size()) {
+        unsigned char c = literal[index];
+        if (c == '\\') {
+            count++;
+            index += escapeLength(literal, index);
+            continue;
+        }
+        if (!isContinuationByte(c)) count++;
+        index++;
+    }
+    return count;
+}
+
+bool hasJoiningMark(const std::string& content) {
+    size_t index = 0;
+    bool first = true;
+    while (index < content.size()) {
+        if (isContinuationByte(content[index])) {
+            index++;
+            continue;
+        }
+        size_t length = characterBytes(content, index);
+        if (!first && joinsPrevious(codePointAt(content, index, length))) return true;
+        first = false;
+        index += length;
+    }
+    return false;
+}
+
+// What a string literal writes to hold the characters of a character literal's content.
+std::string stringContent(const std::string& content) {
+    std::string written;
+    size_t runStart = 0;
+    size_t index = 0;
+    while (index < content.size()) {
+        char c = content[index];
+        if (c == '\\') {
+            index += escapeLength(content, index);
+            continue;
+        }
+        if (c == '"' || c == '{' || c == '}') {
+            written += content.substr(runStart, index - runStart) + "\\";
+            runStart = index;
+        }
+        index++;
+    }
+    return written + content.substr(runStart);
+}
+
+std::string characterLengthRefusal(const std::string& literal) {
+    long count = characterLiteralLength(literal);
+    std::string content = literal.substr(1, literal.size() - 2);
+    if (count == 0) {
+        return "'' has no character between its quotes, but a character literal must have exactly "
+               "one. Write the character between the quotes, as in 'a', or write '\"\"' for an "
+               "empty string.";
+    }
+    std::string text = "'\"" + stringContent(content) + "\"'";
+    if (hasJoiningMark(content)) {
+        return literal + " is made of " + std::to_string(count) +
+               " Unicode code points, but a character literal must have exactly one. A code "
+               "point is one numbered entry in Unicode, and some characters, such as a letter "
+               "with a separate accent mark, take more than one. Write " + text +
+               " to make it a string.";
+    }
+    return literal + " has " + std::to_string(count) +
+           " characters, but a character literal must have exactly one. Write " + text +
+           " to make it a string, or keep one character, as in '" +
+           content.substr(0, characterBytes(content, 0)) + "'.";
+}
+
 }  // namespace
 
 Tokenizer::Tokenizer(std::u16string_view src, DiagnosticSink& s)
@@ -268,6 +413,7 @@ LexedToken Tokenizer::lexStringBody(uint32_t startPos, int startLine, int startC
 LexedToken Tokenizer::lexChar(uint32_t startPos, int startLine, int startCol) {
     advance();  // opening '
     bool closed = false;
+    size_t reportedBefore = sink.list().size();
     while (!atEnd()) {
         char16_t c = peek();
         if (c == u'\'') { advance(); closed = true; break; }
@@ -281,6 +427,12 @@ LexedToken Tokenizer::lexChar(uint32_t startPos, int startLine, int startCol) {
     if (!closed) {
         sink.error({startLine, startCol, static_cast<int>(pos - startPos)},
                    "Unterminated character literal");
+    } else if (sink.list().size() == reportedBefore) {
+        std::string literal = utf16ToUtf8(source.substr(startPos, pos - startPos));
+        if (characterLiteralLength(literal) != 1) {
+            sink.error({startLine, startCol, static_cast<int>(pos - startPos)},
+                       characterLengthRefusal(literal));
+        }
     }
     return makeToken(SyntaxKind::CharLiteral, startPos, startLine, startCol);
 }
