@@ -4,6 +4,7 @@
 import ClassDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import FunctionDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import FieldDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import @ens.frontend.syntax.generated.factory;
 import SyntaxKind from @ens.frontend.syntax.generated.kind;
 import Span from @ens.frontend.support.source;
 import FileDiagnostic from support.diagnostics;
@@ -12,6 +13,7 @@ import support.diagnostics;
 import ClassItem from context;
 import phases.members;
 import MemberModifiers from phases.members;
+import phases.bodies.wording;
 import TypeResolver from phases.resolve;
 import model.convert;
 import model.hierarchy;
@@ -575,6 +577,9 @@ class ClassLayout {
             || (methodName == "equals"
                 && members.equalsSignatureConforms(signature, this.classType));
         if (modifiers.declaresOverride) {
+            if (this.unresolvedCouldOverride(methodName, signature)) {
+                return;
+            }
             if (baseBySignature != null && baseBySignature.isConditional()) {
                 this.reporter.report("Cannot override '{methodName}': "
                     + "{this.names.quoted(baseBySignature.definingType())} declares it "
@@ -595,9 +600,9 @@ class ClassLayout {
                         + "declared 'final' in {ownerName}. {fix}.", nameSpan);
                 }
                 if (narrowsReturnShape(baseBySignature.signature(), signature)) {
-                    string declared = this.names.quoted(baseBySignature.signature().returnType());
+                    string declared = quotedReturnType(baseBySignature.signature(), this.names);
                     this.reporter.report("Override of '{methodName}' returns "
-                        + "{this.names.quoted(signature.returnType())}, but the '{methodName}' "
+                        + "{quotedReturnType(signature, this.names)}, but the '{methodName}' "
                         + "declared in {ownerName} returns {declared}, "
                         + narrowedReturnAdvice(baseBySignature.signature().returnType(),
                             signature.returnType(), this.names)
@@ -752,6 +757,40 @@ class ClassLayout {
         return null;
     }
 
+    // The methods named `methodName` that the base classes declare and this class can see.
+    visibleBaseMethods(string methodName) -> List<Method> {
+        let found = new List<Method>();
+        Type? current = hierarchy.baseOf(this.classType);
+        while (current != null) {
+            let methods = typemembers.methodsOf(current);
+            if (methods != null) {
+                for (let method in methods) {
+                    if (method.name() == methodName && method.visibility() != Visibility.Private) {
+                        found.push(method);
+                    }
+                }
+            }
+            current = hierarchy.baseOf(current);
+        }
+        return found;
+    }
+
+    // Whether a visible base class method or an interface method named `methodName` differs from
+    // `signature` only where a type did not resolve.
+    unresolvedCouldOverride(string methodName, Signature signature) -> bool {
+        if (unresolvedCouldReplace(this.visibleBaseMethods(methodName), methodName, signature)) {
+            return true;
+        }
+        for (let implemented in this.classType.interfaces()) {
+            for (let level in hierarchy.interfaceLadderOf(implemented)) {
+                if (unresolvedCouldReplace(typemembers.methodsOf(level), methodName, signature)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     // A base class's private method of this name, which is what a mistaken 'override' was aiming
     // at when nothing visible declares the name.
     findPrivateInBase(string methodName) -> Method? {
@@ -835,6 +874,10 @@ class ClassLayout {
                 continue;
             }
             let provided = this.findDeclaring(required.name(), required.signature());
+            if (provided == null && (unresolvedCouldProvide(this.classType.methods(), required)
+                    || unresolvedCouldProvide(this.visibleBaseMethods(required.name()), required))) {
+                continue;
+            }
             if (provided == null) {
                 if (level == implemented) {
                     this.reporter.report("Class {this.names.quotedName(this.classType)} implements "
@@ -857,25 +900,27 @@ class ClassLayout {
                     + "from '{required.name()}', or stop implementing {interfaceName}.", at);
                 continue;
             }
-            if (narrowsReturnShape(required.signature(), provided.signature())) {
-                string requiredReturn = this.names.quoted(required.signature().returnType());
+            bool comparable = !unresolvedCouldMatch(required.signature(), provided.signature());
+            if (comparable && narrowsReturnShape(required.signature(), provided.signature())) {
+                string requiredReturn = quotedReturnType(required.signature(), this.names);
                 this.reporter.report("Method '{required.name()}' of "
                     + "{this.names.quotedName(this.classType)} returns "
-                    + "{this.names.quoted(provided.signature().returnType())}, but interface "
+                    + "{quotedReturnType(provided.signature(), this.names)}, but interface "
                     + "{levelName} requires {requiredReturn}, "
                     + narrowedReturnAdvice(required.signature().returnType(),
                         provided.signature().returnType(), this.names) + ".", at);
-            } else if (!overrideCompatible(required.signature(), provided.signature())) {
+            } else if (comparable && !overrideCompatible(required.signature(), provided.signature())) {
                 let noting = this.names.noting();
                 Type requiredType = required.signature().returnType();
-                string providedReturn = noting.quoted(provided.signature().returnType());
-                string requiredReturn = noting.quoted(requiredType);
+                string providedReturn = quotedReturnType(provided.signature(), noting);
+                string requiredReturn = quotedReturnType(required.signature(), noting);
                 let imported = typenames.importsFor([requiredType], noting);
                 this.reporter.report("Method '{required.name()}' of "
                     + "{this.names.quotedName(this.classType)} returns {providedReturn}, but interface "
                     + "{levelName} requires {requiredReturn}. "
                     + typenames.withImportsFirst(imported, "Change the return type of "
-                        + "'{required.name()}' to {imported.names().quoted(requiredType)}."), at);
+                        + "'{required.name()}' to "
+                        + "{quotedReturnType(required.signature(), imported.names())}."), at);
             }
             if (required.isNoreturn() && !provided.isNoreturn()) {
                 this.reporter.report("Method '{required.name()}' of "
@@ -958,6 +1003,58 @@ editableDeclaration(Type type) -> bool {
 // what a caller reads unchanged. A dispatch slot has one calling convention, and a caller holding a
 // base reference reads the result at the type the base declared, so two spellings of one pointer
 // are interchangeable while a narrower number or a nullable value type is not.
+// Whether a type that did not resolve could be the whole difference between the two signatures,
+// because they agree wherever both resolved. `base` is the one `derived` replaces, so its return
+// type may be wider.
+public unresolvedCouldMatch(Signature base, Signature derived) -> bool {
+    if (!typemembers.mentionsUnresolved(base) && !typemembers.mentionsUnresolved(derived)) {
+        return false;
+    }
+    let baseParameters = base.parameters();
+    let derivedParameters = derived.parameters();
+    if (baseParameters.length != derivedParameters.length) {
+        return false;
+    }
+    for (long i = 0; i < baseParameters.length; i++) {
+        if (!types.couldBeSame(baseParameters[i].type(), derivedParameters[i].type())) {
+            return false;
+        }
+    }
+    Type declared = base.returnType();
+    Type actual = derived.returnType();
+    if (types.mentionsError(declared) || types.mentionsError(actual)) {
+        return types.couldBeSame(declared, actual);
+    }
+    return convert.isAssignableStrict(declared, actual)
+        && (declared == actual || sameReturnShape(declared, actual));
+}
+
+// Whether a method named `name` among `replaced` differs from `signature`, the signature of the
+// method that replaces it, only where a type did not resolve.
+public unresolvedCouldReplace(List<Method>? replaced, string name, Signature signature) -> bool {
+    if (replaced == null) {
+        return false;
+    }
+    for (let method in replaced) {
+        if (method.name() == name && unresolvedCouldMatch(method.signature(), signature)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Whether a method among `candidates` named after `requirement` differs from it only where a type
+// did not resolve.
+public unresolvedCouldProvide(List<Method> candidates, Method requirement) -> bool {
+    for (let candidate in candidates) {
+        if (candidate.name() == requirement.name()
+                && unresolvedCouldMatch(requirement.signature(), candidate.signature())) {
+            return true;
+        }
+    }
+    return false;
+}
+
 public overrideCompatible(Signature base, Signature derived) -> bool {
     if (!typemembers.sameParameterTypes(base, derived)) {
         return false;
@@ -1024,22 +1121,94 @@ mismatchedOverrideMessage(Method method, Method declared, string owner, TypeName
         + "declared in {owner} is {quotedMethod(declared, names)}. {fix}";
 }
 
-// The signature in quotes as an interface requirement reads: 'speak(int) -> string'.
+// The signature in quotes as an interface requirement reads: 'speak(int) -> string'. A type that
+// did not resolve is spelled the way its declaration writes it.
 public quotedMethod(Method method, TypeNames names) -> string {
+    let signature = method.signature();
     let code = new QuotedCode();
     code.write("{method.name()}(");
-    let parameters = method.signature().parameters();
+    let parameters = signature.parameters();
     for (long i = 0; i < parameters.length; i++) {
         if (i > 0) {
             code.write(", ");
         }
-        code.writeType(parameters[i].type());
+        let type = parameters[i].type();
+        string? written = null;
+        if (types.mentionsError(type)) {
+            written = writtenParameterType(signature, i);
+        }
+        if (written != null) {
+            code.write(written);
+        } else {
+            code.writeType(type);
+        }
     }
     code.write(")");
-    let returned = method.signature().returnType();
+    let returned = signature.returnType();
     if (!types.isVoidType(returned)) {
         code.write(" -> ");
-        code.writeType(returned);
+        string? written = null;
+        if (types.mentionsError(returned)) {
+            written = writtenReturnType(signature);
+        }
+        if (written != null) {
+            code.write(written);
+        } else {
+            code.writeType(returned);
+        }
     }
     return code.quotedFor(names);
+}
+
+// The return type of the signature in quotes. A type that did not resolve is spelled the way its
+// declaration writes it.
+public quotedReturnType(Signature signature, TypeNames names) -> string {
+    let returned = signature.returnType();
+    if (types.mentionsError(returned)) {
+        let written = writtenReturnType(signature);
+        if (written != null) {
+            return "'{written}'";
+        }
+    }
+    return names.quoted(returned);
+}
+
+// The type of parameter `index` as the signature's declaration writes it, or null when no
+// declaration writes one.
+writtenParameterType(Signature signature, long index) -> string? {
+    let declaration = declarationOf(signature);
+    if (declaration == null) {
+        return null;
+    }
+    let parameters = declaration.parameters();
+    if (index >= parameters.parametersCount()) {
+        return null;
+    }
+    let written = parameters.parameters(index).declaredType();
+    if (written == null) {
+        return null;
+    }
+    return wording.greenSpelling(written.green());
+}
+
+// The return type as the signature's declaration writes it, or null when no declaration writes
+// one.
+writtenReturnType(Signature signature) -> string? {
+    let declaration = declarationOf(signature);
+    if (declaration == null) {
+        return null;
+    }
+    let clause = declaration.returnType();
+    if (clause == null) {
+        return null;
+    }
+    return wording.greenSpelling(clause.returnedType().green());
+}
+
+declarationOf(Signature signature) -> FunctionDeclarationNode? {
+    let green = signature.declaration();
+    if (green == null) {
+        return null;
+    }
+    return factory.createRoot(green) as? FunctionDeclarationNode;
 }
