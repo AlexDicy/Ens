@@ -1618,6 +1618,60 @@ task("test")
                 assertEmptyFolder(temp, "temp folder", after)
             end
 
+            -- start an 'ens test' and stop it while it emits object files, which is while a
+            -- staging folder is under its run folder in the temp directory. Returns nil once it
+            -- was stopped then, and what happened instead otherwise.
+            --
+            -- The run is watched through the temp folder alone, and the process is waited for
+            -- once, after it was stopped or ended. A job runs as a coroutine, where each wait
+            -- with a timeout that expires leaves the process in xmake's process poller, and the
+            -- next wait adds it again. The poller hands all of them to WaitForMultipleObjects,
+            -- which fails for a list holding one handle twice, and that failure stops the poller
+            -- every job is waiting on. The one wait here adds the process once, and its exit
+            -- takes it out again.
+            local function stoppedWhileEmitting(argv)
+                local envs = {}
+                for key, value in pairs(base) do
+                    table.insert(envs, key .. "=" .. value)
+                end
+                local logfile = io.open(log, "w")
+                local proc = process.openv(host_exe, argv,
+                    {envs = envs, stdout = logfile, stderr = logfile})
+                if not proc then
+                    logfile:close()
+                    return "it did not start"
+                end
+                local deadline = os.mclock() + 120000
+                local started = false
+                local outcome = nil
+                while not outcome and os.mclock() < deadline do
+                    if #os.dirs(path.join(temp, "*", "staging-*")) > 0 then
+                        proc:kill()
+                        outcome = "stopped"
+                    elseif #os.dirs(path.join(temp, "ens-test-*")) > 0 then
+                        started = true
+                    elseif started then
+                        outcome = "finished"
+                    end
+                    if not outcome then
+                        os.sleep(5)
+                    end
+                end
+                if not outcome then
+                    proc:kill()
+                end
+                proc:wait(-1)
+                proc:close()
+                logfile:close()
+                if outcome == "stopped" then
+                    return nil
+                end
+                if outcome == "finished" then
+                    return "it finished first:\n" .. (io.readfile(log) or "")
+                end
+                return "it emitted nothing within two minutes"
+            end
+
             local function writePackage(folder, manifest, files)
                 os.mkdir(path.join(folder, "src"))
                 io.writefile(path.join(folder, "ens.package"), manifest)
@@ -1772,6 +1826,20 @@ task("test")
                 .. "so no test ran. Use a '--filter' text that is part of one of the 2 tests' "
                 .. "descriptions")
             assertTempEmpty("a filter that matched nothing")
+
+            -- an 'ens test' stopped while it emits leaves its folder behind, and the next run
+            -- removes that folder, since nothing holds its marker once the run that made it ended
+            if is_host("windows") then
+                local missed = stoppedWhileEmitting({"test", suite})
+                if missed then
+                    table.insert(failures, "ens test was not stopped while it emitted: " .. missed)
+                elseif #os.dirs(path.join(temp, "ens-test-*")) == 0 then
+                    table.insert(failures, "a stopped ens test left no folder behind")
+                else
+                    run({"test", suite}, nil, 0, "2/2 tests passed", "!was left by an earlier run")
+                    assertTempEmpty("an ens test after one that was stopped")
+                end
+            end
 
             local failing = path.join(root, "failing")
             writePackage(failing, 'package demo.failing {\n    ens "0.1";\n}\n', {

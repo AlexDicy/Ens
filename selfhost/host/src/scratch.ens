@@ -2,8 +2,11 @@
 // pointed at is left exactly as it was found. A free name is found by trying names in turn, since
 // there is no clock to build one from, and claimed in one step so two runs cannot take the same.
 import Path from @std.fs;
+import File from @std.fs.file;
+import EntryKind from @std.fs.metadata;
 import ErrorKind from @std.fs.error;
 import FileSystemError from @std.fs.error;
+import IoError from @std.io.streams;
 import Environment from @std.environment;
 import Platform from @std.environment;
 import @std.environment;
@@ -15,8 +18,10 @@ import home;
 export final class Scratch {
     Path folderPath;
     string problem;
+    Ownership? owner;
+    string[] unreclaimed;
 
-    protected constructor(this.folderPath, this.problem);
+    protected constructor(this.folderPath, this.problem, this.owner, this.unreclaimed);
 
     export folder() -> Path {
         return this.folderPath;
@@ -24,6 +29,23 @@ export final class Scratch {
 
     export failure() -> string {
         return this.problem;
+    }
+
+    // Why each folder an earlier run left behind is still there, for every one this run found
+    // ended and could not remove.
+    export leftBehind() -> string[] {
+        return this.unreclaimed;
+    }
+
+    // Removes the folder and everything under it, and gives up the mark that kept other runs out
+    // of it. Returns "" when nothing is left, or what stopped it, the way 'discard' does.
+    export remove() -> string {
+        Ownership? owner = this.owner;
+        this.owner = null;
+        if (owner == null) {
+            return discard(this.folderPath);
+        }
+        return owner.removeMarked(this.folderPath);
     }
 }
 
@@ -40,16 +62,25 @@ export temporaryFolder(Environment environment) -> Path? {
     return conventionalFolder(environment);
 }
 
-// A folder of its own under the system's, named after what it is for.
+// A folder of its own under the system's, named after what it is for and marked as this run's
+// until it is removed. The folders earlier runs took under the same name and never removed,
+// because they ended part-way, are removed first.
 export create(Environment environment, string prefix) -> Scratch {
     Path? root = temporaryFolder(environment);
     string variable = temporaryVariable(environment);
+    string[] nothingLeft = [];
     if (root == null) {
         return new Scratch(Path(""), "could not find a folder for temporary files: none of "
             + "'TMP', 'TEMP' and 'TMPDIR' is set, and neither is 'USERPROFILE'. Set '{variable}' "
-            + "to a folder that can be written to");
+            + "to a folder that can be written to", null, nothingLeft);
     }
-    return claimUnder(root, prefix, ". Set '{variable}' to a folder that can be written to");
+    string[] unreclaimed = reclaimed(root, prefix);
+    string advice = ". Set '{variable}' to a folder that can be written to";
+    let claimed = claimUnder(root, prefix, advice);
+    if (claimed.failure().length > 0) {
+        return new Scratch(Path(""), claimed.failure(), null, unreclaimed);
+    }
+    return marked(claimed.folder(), advice, unreclaimed);
 }
 
 // A folder of its own under the given one, named after what it is for. The name is the first of
@@ -62,6 +93,7 @@ export createUnder(Path root, string prefix) -> Scratch {
 
 // createUnder, with advice to add when the folder cannot be created at all.
 claimUnder(Path root, string prefix, string advice) -> Scratch {
+    string[] nothingLeft = [];
     for (long attempt = 1; attempt <= Attempts.limit; attempt++) {
         Path candidate = root.join("{prefix}-{attempt}");
         if (candidate.exists()) {
@@ -69,14 +101,178 @@ claimUnder(Path root, string prefix, string advice) -> Scratch {
         }
         bool mine = try claimed(candidate);
         if (mine) {
-            return new Scratch(candidate, "");
+            return new Scratch(candidate, "", null, nothingLeft);
         }
     }
     return new Scratch(Path(""), "could not make a folder under '{root}': '{prefix}-1' through "
         + "'{prefix}-{Attempts.limit}' all exist already. Remove the ones left behind by runs "
-        + "that did not finish");
+        + "that did not finish", null, nothingLeft);
 } catch (FileSystemError refused) {
-    return new Scratch(Path(""), refused.message + advice);
+    string[] nothingLeft = [];
+    return new Scratch(Path(""), refused.message + advice, null, nothingLeft);
+}
+
+// The claimed folder with this run's mark in it. A folder that cannot be marked is removed again,
+// since no later run would ever remove a folder no run marked.
+marked(Path folder, string advice, string[] unreclaimed) -> Scratch {
+    let owner = try Ownership.taken(folder);
+    return new Scratch(folder, "", owner, unreclaimed);
+} catch (FileSystemError refused) {
+    let all = new List<string>();
+    for (let leftover in unreclaimed) {
+        all.push(leftover);
+    }
+    string leftBehind = discard(folder);
+    if (leftBehind.length > 0) {
+        all.push(leftBehind);
+    }
+    return new Scratch(Path(""), refused.message + advice, null, all.toArray());
+}
+
+// Removes each folder under `root` named '<prefix>-<number>' whose run ended without removing it,
+// and returns why each one that could not be removed is still there. A root that cannot be read
+// holds nothing to remove, and creating this run's own folder there reports what is wrong with it.
+reclaimed(Path root, string prefix) -> string[] {
+    let unreclaimed = new List<string>();
+    for (let entry in try root.entries()) {
+        if (entry.kind == EntryKind.Directory && numbered(entry.name, prefix)) {
+            string leftBehind = reclaimedFolder(entry.path);
+            if (leftBehind.length > 0) {
+                unreclaimed.push(leftBehind);
+            }
+        }
+    }
+    return unreclaimed.toArray();
+} catch (FileSystemError unreadable) {
+    string[] nothingLeft = [];
+    return nothingLeft;
+}
+
+// Removes `folder` when the run that marked it has ended. Returns why the folder is still there,
+// or "" when it is gone or left alone. A run that removes the marker is the one that removes the
+// folder, so of two runs finding it at once only one goes on. A folder whose marker is missing or
+// cannot be removed is left alone, since a run still starting has not marked its folder yet, and
+// a folder another user made is not this run's to remove.
+reclaimedFolder(Path folder) -> string {
+    Path marker = folder.join(Marker.name);
+    File? held = null;
+    if (environment.platform() != Platform.Windows) {
+        held = abandonedMarker(marker);
+        if (held == null) {
+            return "";
+        }
+    }
+    bool taken = removedFile(marker);
+    FileSystemError? refused = null;
+    if (taken) {
+        refused = removalRefusal(folder);
+    }
+    if (held != null) {
+        closeMarker(held);
+    }
+    if (refused == null) {
+        return "";
+    }
+    return reclaimText(folder, refused, environment.platform());
+}
+
+// The marker of a run that has ended, open and locked by this run, or null when a run still holds
+// it or it cannot be opened.
+abandonedMarker(Path marker) -> File? {
+    let opened = try marker.open();
+    if (try opened.tryLock()) {
+        return opened;
+    }
+    closeMarker(opened);
+    return null;
+} catch (FileSystemError unreadable) {
+    return null;
+}
+
+// Whether this call removed the file at `path`.
+removedFile(Path path) -> bool {
+    try path.removeFile();
+    return true;
+} catch (FileSystemError refused) {
+    return false;
+}
+
+// Closes a marker, which holds nothing written, so a close that fails loses nothing.
+closeMarker(File marker) {
+    try marker.close();
+} catch (IoError ignored) {
+}
+
+// Whether `name` is '<prefix>-<number>', a name 'claimUnder' gives a folder.
+public numbered(string name, string prefix) -> bool {
+    string start = "{prefix}-";
+    if (!name.startsWith(start) || name.length == start.length) {
+        return false;
+    }
+    for (let character in name.substring(start.length).bytes()) {
+        if (character < '0' || character > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The mark a run keeps in its folder for as long as it works there, which ends with the run however
+// the run ends. Windows keeps the marker open, and a file that is open there cannot be removed.
+// Every other system holds the marker's lock. A later run takes a folder over by removing its
+// marker, which it does only once no run holds the mark.
+final class Ownership {
+    File marker;
+
+    protected constructor(this.marker);
+
+    // Marks `folder` as this run's. Everywhere but Windows the marker is locked under a name of its
+    // own first and then moved into place, so no run finds it in place and unlocked.
+    protected static taken(Path folder) -> Ownership throws FileSystemError {
+        Path marker = folder.join(Marker.name);
+        if (environment.platform() == Platform.Windows) {
+            return new Ownership(try marker.create());
+        }
+        Path pending = folder.join(Marker.pendingName);
+        let opened = try pending.create();
+        bool locked = try opened.tryLock();
+        bool moved = try pending.moveTo(marker);
+        if (!locked || !moved) {
+            throw new FileSystemError("Internal: another run locked or moved the marker of "
+                + "'{folder}', which only this run writes to", ErrorKind.Other, marker, 0, null,
+                "another run locked or moved it");
+        }
+        return new Ownership(opened);
+    }
+
+    // Removes `folder`, which this run marked, and gives the mark up. Windows cannot remove an open
+    // file, so there the marker is closed first, and whichever run then removes it removes the
+    // folder. Everywhere else the lock is held until the folder is gone.
+    protected removeMarked(Path folder) -> string {
+        if (environment.platform() != Platform.Windows) {
+            string leftBehind = discard(folder);
+            closeMarker(this.marker);
+            return leftBehind;
+        }
+        closeMarker(this.marker);
+        FileSystemError? refused = removalRefusal(folder.join(Marker.name));
+        if (refused == null) {
+            return discard(folder);
+        }
+        if (refused.kind == ErrorKind.NotFound) {
+            return "";
+        }
+        return refusalText(folder, refused, Platform.Windows);
+    }
+}
+
+// The file a run keeps in its folder to mark it, named with a leading dot like the other folders
+// and files the tool keeps for itself.
+final class Marker {
+    protected static const string name = ".ens-owner";
+
+    // The name a marker is locked under before it is moved into place.
+    protected static const string pendingName = ".ens-owner-pending";
 }
 
 // Removes the folder and everything under it. Returns "" when nothing is left, or what
@@ -86,33 +282,30 @@ export discard(Path folder) -> string {
     if (folder.isEmpty() || !folder.isDirectory()) {
         return "";
     }
-    FileSystemError? refused = attempted(folder);
+    FileSystemError? refused = removalRefusal(folder);
     if (refused == null) {
         return "";
     }
-    if (!waitingCanClear(refused.kind, environment.platform())) {
-        return refusalText(folder, refused, environment.platform());
-    }
-    return waitedOut(folder, refused);
+    return refusalText(folder, refused, environment.platform());
 }
 
-// Retries over the schedule of waits, until the folder is gone or the waits run out. A virus
-// scanner opens a program the moment it is run. A removal that lands inside that opening is
+// Removes `target` and everything under it, retrying over the schedule of waits while the refusal
+// is one waiting can clear. Returns null once nothing is left, or the refusal that kept it. A
+// virus scanner opens a program the moment it is run. A removal that lands inside that opening is
 // refused. Waiting a moment and retrying is what gets past it.
-waitedOut(Path folder, FileSystemError first) -> string {
-    FileSystemError last = first;
+removalRefusal(Path target) -> FileSystemError? {
+    FileSystemError? refused = attempted(target);
+    if (refused == null || !waitingCanClear(refused.kind, environment.platform())) {
+        return refused;
+    }
     for (let wait in Retry.schedule()) {
         Thread.sleep(wait);
-        FileSystemError? refused = attempted(folder);
-        if (refused == null) {
-            return "";
-        }
-        last = refused;
-        if (!waitingCanClear(last.kind, environment.platform())) {
-            return refusalText(folder, last, environment.platform());
+        refused = attempted(target);
+        if (refused == null || !waitingCanClear(refused.kind, environment.platform())) {
+            return refused;
         }
     }
-    return refusalText(folder, last, environment.platform());
+    return refused;
 }
 
 // One attempt at the removal. Returns null when the folder is gone, or the refusal that stopped it.
@@ -130,6 +323,16 @@ public refusalText(Path folder, FileSystemError refused, Platform platform) -> s
         return "{refused.message}. Remove '{folder}' once nothing is using it";
     }
     return "{refused.message}. Remove '{folder}' by hand";
+}
+
+// The message for the folder of an earlier run that is still there: the refusal, which names what
+// could not be removed and why, then where the folder came from and what to do with it.
+public reclaimText(Path folder, FileSystemError refused, Platform platform) -> string {
+    string origin = "'{folder}' was left by an earlier run that did not finish";
+    if (waitingCanClear(refused.kind, platform)) {
+        return "{refused.message}. {origin}. Remove it once nothing is using it";
+    }
+    return "{refused.message}. {origin}. Remove it by hand";
 }
 
 // Whether waiting can clear a refusal. Only Windows refuses a removal over a file another program

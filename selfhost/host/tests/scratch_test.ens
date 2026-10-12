@@ -65,10 +65,119 @@ test "a run takes the first free name under the folder and creates it" {
     try testing.assertEqual(second.folder(), root.join("ens-run-2"));
     try testing.assertTrue(second.folder().isDirectory(), "the second folder was created");
 
-    try testing.assertEqual(scratch.discard(first.folder()), "");
+    try testing.assertEqual(first.remove(), "");
     try testing.assertFalse(first.folder().isDirectory(), "the first folder is gone");
     let third = scratch.create(read, "ens-run");
     try testing.assertEqual(third.folder(), root.join("ens-run-1"));
+
+    try testing.assertEqual(second.remove(), "");
+    try testing.assertEqual(third.remove(), "");
+}
+
+// The marker of a run that ended part-way is a file nothing holds, which is what a run that was
+// stopped leaves behind, since the system closes every file of a program that ends.
+test "a folder whose run ended part-way is removed by the next run" {
+    let rootFolder = try support.scratch("scratch-reclaim");
+    Path root = rootFolder.path();
+    Path ended = root.join("ens-run-4");
+    try support.writeFile(ended, ".ens-owner", "");
+    try support.writeFile(ended, "objects/staging-1/main.obj", "not really an object\n");
+
+    let next = scratch.create(here(root), "ens-run");
+    try testing.assertEqual(next.failure(), "");
+    try testing.assertEqual(next.leftBehind().length, 0L);
+    try testing.assertFalse(ended.exists(), "the folder of the run that ended is still there");
+    try testing.assertEqual(next.remove(), "");
+}
+
+// The run holding the first folder is this one, through a marker of its own that it keeps open
+// or locked. The second run reads it through a file of its own, as a run in another process does.
+test "a folder whose run is still going is left alone" {
+    let rootFolder = try support.scratch("scratch-held");
+    Path root = rootFolder.path();
+    let running = scratch.create(here(root), "ens-run");
+    try support.writeFile(running.folder(), "program.exe", "not really a program\n");
+
+    let next = scratch.create(here(root), "ens-run");
+    try testing.assertEqual(next.folder(), root.join("ens-run-2"));
+    try testing.assertEqual(next.leftBehind().length, 0L);
+    try testing.assertTrue(running.folder().join("program.exe").exists(),
+        "the folder of a run still going lost what it held");
+
+    try testing.assertEqual(running.remove(), "");
+    try testing.assertFalse(running.folder().exists(), "the run did not remove its own folder");
+    try testing.assertEqual(next.remove(), "");
+}
+
+// A run that is still starting has created its folder and not marked it yet, which is what a
+// folder with no marker looks like. A marker that is a folder is one that cannot be read.
+test "a folder whose marker is missing or cannot be read is left alone" {
+    let rootFolder = try support.scratch("scratch-unmarked");
+    Path root = rootFolder.path();
+    Path unmarked = root.join("ens-run-1");
+    try support.writeFile(unmarked, "program.exe", "not really a program\n");
+    Path unreadable = root.join("ens-run-2");
+    try support.writeFile(unreadable, ".ens-owner/inside", "a folder where the marker goes\n");
+
+    let next = scratch.create(here(root), "ens-run");
+    try testing.assertEqual(next.folder(), root.join("ens-run-3"));
+    try testing.assertEqual(next.leftBehind().length, 0L);
+    try testing.assertTrue(unmarked.join("program.exe").exists(),
+        "a folder with no marker was removed");
+    try testing.assertTrue(unreadable.join(".ens-owner/inside").exists(),
+        "a folder whose marker cannot be read was removed");
+    try testing.assertEqual(next.remove(), "");
+}
+
+test "only the folders named after the prefix and a number are taken for leftovers" {
+    let rootFolder = try support.scratch("scratch-names-only");
+    Path root = rootFolder.path();
+    for (let name in ["ens-test-1", "ens-runner-1", "ens-run-", "ens-run-1a", "other-ens-run-1"]) {
+        try support.writeFile(root.join(name), ".ens-owner", "");
+    }
+    let next = scratch.create(here(root), "ens-run");
+    try testing.assertEqual(next.folder(), root.join("ens-run-1"));
+    for (let name in ["ens-test-1", "ens-runner-1", "ens-run-", "ens-run-1a", "other-ens-run-1"]) {
+        try testing.assertTrue(root.join(name).exists(), "'{name}' was taken for a leftover");
+    }
+    try testing.assertEqual(next.remove(), "");
+}
+
+test "a folder's name is a prefix, a dash and a number" {
+    try testing.assertTrue(scratch.numbered("ens-test-1", "ens-test"), "ens-test-1");
+    try testing.assertTrue(scratch.numbered("ens-test-512", "ens-test"), "ens-test-512");
+    try testing.assertFalse(scratch.numbered("ens-test-", "ens-test"), "no number");
+    try testing.assertFalse(scratch.numbered("ens-test-1b", "ens-test"), "a letter after it");
+    try testing.assertFalse(scratch.numbered("ens-test1", "ens-test"), "no dash");
+    try testing.assertFalse(scratch.numbered("ens-run-1", "ens-test"), "another prefix");
+}
+
+// Windows refuses to remove a file that is open, so a file the test keeps open inside the folder
+// of an ended run is one the next run cannot remove. No other system refuses that.
+test "a folder of an ended run that cannot be removed is reported with where it came from" {
+    if (environment.platform() != Platform.Windows) {
+        return;
+    }
+    let rootFolder = try support.scratch("scratch-reclaim-refused");
+    Path root = rootFolder.path();
+    Path ended = root.join("ens-run-1");
+    try support.writeFile(ended, ".ens-owner", "");
+    try support.writeFile(ended, "program.exe", "not really a program\n");
+    Path program = ended.join("program.exe");
+    let busy = try program.open();
+
+    let next = scratch.create(here(root), "ens-run");
+    try testing.assertEqual(next.folder(), root.join("ens-run-2"));
+    string[] reported = next.leftBehind();
+    try testing.assertEqual(reported.length, 1L);
+    try testing.assertTrue(reported[0].startsWith("could not remove the file '{program}': "),
+        "the refusal does not name the file: {reported[0]}");
+    try testing.assertTrue(reported[0].endsWith(". '{ended}' was left by an earlier run that did "
+        + "not finish. Remove it once nothing is using it"),
+        "the refusal does not name the folder and what to do: {reported[0]}");
+
+    try busy.close();
+    try testing.assertEqual(next.remove(), "");
 }
 
 test "a folder is claimed by the first caller and by nobody after that" {
@@ -89,7 +198,7 @@ test "discarding removes everything under the folder and returns no leftover" {
     try support.writeFile(made.folder(), "objects/one.obj", "not really an object\n");
     try support.writeFile(made.folder(), "objects/deeper/two.obj", "nor this\n");
 
-    try testing.assertEqual(scratch.discard(made.folder()), "");
+    try testing.assertEqual(made.remove(), "");
     try testing.assertFalse(made.folder().exists(), "the folder and its tree are gone");
     try testing.assertEqual(scratch.discard(made.folder()), "");
 }
@@ -169,4 +278,21 @@ test "a folder still there is named with the refusal that kept it" {
     try testing.assertEqual(scratch.refusalText(Path("/tmp/ens-test-4"), denied, Platform.Linux),
         "could not remove '/tmp/ens-test-4/staging-1': permission denied. Remove '/tmp/ens-test-4' "
         + "by hand");
+}
+
+// The folder of an earlier run is one this run did not make, so the message names where it came
+// from before what to do with it.
+test "a folder an earlier run left is named with the refusal and where it came from" {
+    let held = new FileSystemError("could not remove 'C:/Temp/ens-test-4/tests.exe': another "
+        + "program is using it", ErrorKind.PermissionDenied, Path("C:/Temp/ens-test-4/tests.exe"),
+        32);
+    try testing.assertEqual(scratch.reclaimText(Path("C:/Temp/ens-test-4"), held,
+        Platform.Windows), "could not remove 'C:/Temp/ens-test-4/tests.exe': another program is "
+        + "using it. 'C:/Temp/ens-test-4' was left by an earlier run that did not finish. Remove it "
+        + "once nothing is using it");
+    let denied = new FileSystemError("could not remove '/tmp/ens-test-4/tests': permission denied",
+        ErrorKind.PermissionDenied, Path("/tmp/ens-test-4/tests"), 13);
+    try testing.assertEqual(scratch.reclaimText(Path("/tmp/ens-test-4"), denied, Platform.Linux),
+        "could not remove '/tmp/ens-test-4/tests': permission denied. '/tmp/ens-test-4' was left by "
+        + "an earlier run that did not finish. Remove it by hand");
 }

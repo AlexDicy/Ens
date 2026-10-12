@@ -798,6 +798,8 @@ Every target triple and every optimization level has a folder of its own, so an 
 Each kept object file's name carries a digest of its bytes, and a build removes the earlier versions of the objects it keeps.
 The `.ens` folder carries a `.gitignore` that ignores everything under it, and a build leaves what it put there in place.
 `ens run` and `ens test` are the exception: each builds in a folder of its own under the system's temporary directory and removes that folder afterwards, object files included, so neither leaves anything anywhere.
+A run that is stopped before it removes its folder leaves the folder behind, and the next run of the same command removes it, because a folder is marked as in use only for as long as the run that made it is running.
+A leftover folder the next run cannot remove is reported along with what to do about it, and the run goes on.
 
 A command reports every problem it found rather than stopping at the first, and a syntax error does not hide the semantic problems around it: the compiler reads on past it and still reports what it can be sure of, so fixing one problem does not uncover a fresh crop of them.
 Where a syntax error leaves what a file declares in doubt, though, it is reported on its own, because any report about the meaning of that file would be a consequence of the syntax error rather than a problem in its own right.
