@@ -28,6 +28,7 @@ import QuotedCode from model.typenames;
 import model.types;
 import Type from model.types;
 import ClassType from model.types;
+import InterfaceType from model.types;
 import InstantiationType from model.types;
 import OptionalType from model.types;
 import Visibility from model.types;
@@ -136,6 +137,16 @@ sortedByBaseDepth(List<ClassItem> items) -> List<ClassItem> {
     return ordered;
 }
 
+// An 'override' that matches no method of a base class or interface, with where it is named and
+// whether its name and shape make it one of the built-in behaviors 'hash', 'equals' or 'toString'.
+final class UnmatchedOverride {
+    protected Method method;
+    protected Span nameSpan;
+    protected bool reservedIntent;
+
+    protected constructor(this.method, this.nameSpan, this.reservedIntent);
+}
+
 class ClassLayout {
     ClassItem item;
     ClassType classType;
@@ -143,6 +154,7 @@ class ClassLayout {
     TypeResolver resolver;
     Reporter reporter;
     TypeNames names;
+    List<UnmatchedOverride> unmatchedOverrides;
 
     protected constructor(ClassItem item, List<FileDiagnostic> collected) {
         this.item = item;
@@ -151,6 +163,7 @@ class ClassLayout {
         this.resolver = item.context().resolver();
         this.reporter = new Reporter(item.context().module().filePath(), collected);
         this.names = item.context().names().withParametersOf(this.classType);
+        this.unmatchedOverrides = new List<UnmatchedOverride>();
     }
 
     protected run() {
@@ -160,6 +173,9 @@ class ClassLayout {
         this.collectOwnFields();
         this.collectMethods();
         this.classType.setMembersComplete();
+        for (let pending in this.unmatchedOverrides) {
+            this.reportUnmatchedOverride(pending);
+        }
         members.checkHashEqualsPairing(this.reporter, this.classType, this.node.name().span(),
             this.names);
         this.checkInterfaceSatisfaction();
@@ -504,6 +520,73 @@ class ClassLayout {
         this.checkOverrideRules(member, method, methodName, nameSpan, modifiers);
     }
 
+    // Reports an 'override' that matches no method of a base class or interface. It runs once the
+    // class has all of its methods, since the overload it was most likely written for depends on
+    // the ones the class declares after it as well.
+    reportUnmatchedOverride(UnmatchedOverride pending) {
+        let method = pending.method;
+        Span nameSpan = pending.nameSpan;
+        string methodName = method.name();
+        let signature = method.signature();
+        let intended = this.overrideTarget(method);
+        if (intended != null) {
+            string owner = this.names.quoted(intended.definingType());
+            if (intended.definingType() is InterfaceType) {
+                owner = "interface {owner}";
+            }
+            this.reporter.report(mismatchedOverrideMessage(method, intended, owner, this.names),
+                nameSpan);
+            return;
+        }
+        if (this.findInBase(methodName, signature, false) != null
+                || this.findInInterfaces(methodName, signature, false) != null) {
+            string className = this.names.quotedName(this.classType);
+            this.reporter.report("Method '{methodName}' of {className} is marked 'override', "
+                + "but every '{methodName}' its base classes and interfaces declare already "
+                + "has a matching method in {className}, so this one overrides nothing. "
+                + "Remove 'override'.", nameSpan);
+            return;
+        }
+        if (pending.reservedIntent) {
+            return;
+        }
+        let privateBase = this.findPrivateInBase(methodName);
+        if (privateBase != null) {
+            // A private abstract method is already refused where it is declared.
+            if (privateBase.isAbstract()) {
+                return;
+            }
+            string owner = this.names.quoted(privateBase.definingType());
+            string className = this.names.quotedName(this.classType);
+            string fix = "Mark it 'protected' in {owner}, or remove 'override' to declare a separate "
+                + "method of {className}.";
+            if (!editableDeclaration(privateBase.definingType())) {
+                fix = "Remove 'override' to declare a separate method of {className}.";
+            }
+            this.reporter.report("Cannot override '{methodName}': {owner} declares it "
+                + "privately, so {className} does not inherit it. {fix}", nameSpan);
+            return;
+        }
+        if (methodName == "toString" && signature.parameters().length > 0) {
+            this.reporter.report("Method 'toString' of {this.names.quotedName(this.classType)} is marked "
+                + "'override' but takes parameters, which makes it an ordinary method "
+                + "rather than the text form every class has. Remove 'override'.",
+                nameSpan);
+            return;
+        }
+        string className = this.names.quotedName(this.classType);
+        string undeclared = "Method '{methodName}' of {className} is marked 'override', but no "
+            + "base class or interface of {className} declares '{methodName}'";
+        if (methodName == "equals") {
+            this.reporter.report("{undeclared}. An 'equals' that does not take exactly one "
+                + "{this.names.quoted(this.classType)} is an ordinary method, not the class's "
+                + "equality. Remove 'override'.", nameSpan);
+            return;
+        }
+        this.reporter.report("{undeclared}. Remove 'override', or check the spelling of "
+            + "'{methodName}'.", nameSpan);
+    }
+
     findDestructor() -> Method? {
         let methods = this.classType.methods();
         for (long i = 0; i < methods.length(); i++) {
@@ -633,56 +716,7 @@ class ClassLayout {
             if (this.findInInterfaces(methodName, signature, true) != null) {
                 return;
             }
-            let baseByName = this.findInBase(methodName, signature, false);
-            if (baseByName != null) {
-                this.reporter.report(mismatchedOverrideMessage(method, baseByName,
-                    "{this.names.quoted(baseByName.definingType())}", this.names), nameSpan);
-                return;
-            }
-            let interfaceByName = this.findInInterfaces(methodName, signature, false);
-            if (interfaceByName != null) {
-                this.reporter.report(mismatchedOverrideMessage(method, interfaceByName,
-                    "interface {this.names.quoted(interfaceByName.definingType())}", this.names), nameSpan);
-                return;
-            }
-            if (reservedIntent) {
-                return;
-            }
-            let privateBase = this.findPrivateInBase(methodName);
-            if (privateBase != null) {
-                // A private abstract method is already refused where it is declared.
-                if (privateBase.isAbstract()) {
-                    return;
-                }
-                string owner = this.names.quoted(privateBase.definingType());
-                string className = this.names.quotedName(this.classType);
-                string fix = "Mark it 'protected' in {owner}, or remove 'override' to declare a separate "
-                    + "method of {className}.";
-                if (!editableDeclaration(privateBase.definingType())) {
-                    fix = "Remove 'override' to declare a separate method of {className}.";
-                }
-                this.reporter.report("Cannot override '{methodName}': {owner} declares it "
-                    + "privately, so {className} does not inherit it. {fix}", nameSpan);
-                return;
-            }
-            if (methodName == "toString" && signature.parameters().length > 0) {
-                this.reporter.report("Method 'toString' of {this.names.quotedName(this.classType)} is marked "
-                    + "'override' but takes parameters, which makes it an ordinary method "
-                    + "rather than the text form every class has. Remove 'override'.",
-                    nameSpan);
-                return;
-            }
-            string className = this.names.quotedName(this.classType);
-            string undeclared = "Method '{methodName}' of {className} is marked 'override', but no "
-                + "base class or interface of {className} declares '{methodName}'";
-            if (methodName == "equals") {
-                this.reporter.report("{undeclared}. An 'equals' that does not take exactly one "
-                    + "{this.names.quoted(this.classType)} is an ordinary method, not the class's "
-                    + "equality. Remove 'override'.", nameSpan);
-                return;
-            }
-            this.reporter.report("{undeclared}. Remove 'override', or check the spelling of "
-                + "'{methodName}'.", nameSpan);
+            this.unmatchedOverrides.push(new UnmatchedOverride(method, nameSpan, reservedIntent));
             return;
         }
         if (baseBySignature != null) {
@@ -773,6 +807,71 @@ class ClassLayout {
             current = hierarchy.baseOf(current);
         }
         return found;
+    }
+
+    // The method an 'override' that matches nothing was most likely written for: a visible base
+    // class method this class does not override yet, or failing one an interface method nothing
+    // provides yet, with the closest parameter count. Null when there is none.
+    overrideTarget(Method method) -> Method? {
+        let fromBase = intendedOverride(method, this.visibleBaseMethods(method.name()),
+            this.classType.methods());
+        if (fromBase != null) {
+            return fromBase;
+        }
+        let providers = new List<Method>();
+        for (let own in this.classType.methods()) {
+            providers.push(own);
+        }
+        Type? current = hierarchy.baseOf(this.classType);
+        while (current != null) {
+            let methods = typemembers.methodsOf(current);
+            if (methods != null) {
+                for (let inherited in methods) {
+                    if (inherited.visibility() != Visibility.Private) {
+                        providers.push(inherited);
+                    }
+                }
+            }
+            current = hierarchy.baseOf(current);
+        }
+        return intendedOverride(method, this.interfaceMethodsNamed(method.name()), providers);
+    }
+
+    // The methods named `methodName` that the interfaces this class implements declare, the ones
+    // they extend included.
+    interfaceMethodsNamed(string methodName) -> List<Method> {
+        let found = new List<Method>();
+        for (let implemented in this.classType.interfaces()) {
+            for (let level in hierarchy.interfaceLadderOf(implemented)) {
+                let methods = typemembers.methodsOf(level);
+                if (methods == null) {
+                    continue;
+                }
+                for (let method in methods) {
+                    if (method.name() == methodName) {
+                        found.push(method);
+                    }
+                }
+            }
+        }
+        return found;
+    }
+
+    // Whether an 'override' of this class that matches nothing is reported against `required`,
+    // which then needs no report of its own for being missing.
+    isOverrideTarget(Method required) -> bool {
+        for (let method in this.classType.methods()) {
+            if (!method.isOverride() || method.name() != required.name()
+                    || this.findInBase(method.name(), method.signature(), true) != null
+                    || this.findInInterfaces(method.name(), method.signature(), true) != null
+                    || this.unresolvedCouldOverride(method.name(), method.signature())) {
+                continue;
+            }
+            if (this.overrideTarget(method) == required) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // Whether a visible base class method or an interface method named `methodName` differs from
@@ -875,7 +974,8 @@ class ClassLayout {
             }
             let provided = this.findDeclaring(required.name(), required.signature());
             if (provided == null && (unresolvedCouldProvide(this.classType.methods(), required)
-                    || unresolvedCouldProvide(this.visibleBaseMethods(required.name()), required))) {
+                    || unresolvedCouldProvide(this.visibleBaseMethods(required.name()), required)
+                    || this.isOverrideTarget(required))) {
                 continue;
             }
             if (provided == null) {
@@ -1043,6 +1143,31 @@ public unresolvedCouldReplace(List<Method>? replaced, string name, Signature sig
     return false;
 }
 
+// The method among `candidates` that an 'override' of `method` matching none of them was most
+// likely written for: one of its name that no method among `providers` matches yet, with the
+// parameter count closest to its own, the first of those on a tie. Null when there is none.
+public intendedOverride(Method method, List<Method> candidates, List<Method> providers)
+        -> Method? {
+    Method? closest = null;
+    long closestDistance = 0;
+    long count = method.signature().parameters().length;
+    for (let candidate in candidates) {
+        if (candidate.name() != method.name() || members.findSameSignature(providers,
+                candidate.name(), candidate.signature()) != null) {
+            continue;
+        }
+        long distance = candidate.signature().parameters().length - count;
+        if (distance < 0) {
+            distance = -distance;
+        }
+        if (closest == null || distance < closestDistance) {
+            closest = candidate;
+            closestDistance = distance;
+        }
+    }
+    return closest;
+}
+
 // Whether a method among `candidates` named after `requirement` differs from it only where a type
 // did not resolve.
 public unresolvedCouldProvide(List<Method> candidates, Method requirement) -> bool {
@@ -1111,7 +1236,8 @@ public narrowedReturnAdvice(Type declared, Type actual, TypeNames names) -> stri
 // with 'owner' naming where that method is declared.
 // Removing 'override' is offered only when the parameters differ, which makes the method a
 // separate overload; with the same parameters it would hide the declared one.
-mismatchedOverrideMessage(Method method, Method declared, string owner, TypeNames names) -> string {
+public mismatchedOverrideMessage(Method method, Method declared, string owner, TypeNames names)
+        -> string {
     string name = method.name();
     string fix = "Change this '{name}' to match it.";
     if (!typemembers.sameParameterTypes(method.signature(), declared.signature())) {
