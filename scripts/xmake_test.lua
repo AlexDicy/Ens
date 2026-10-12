@@ -555,6 +555,15 @@ task("test")
             end
         end
 
+        -- whether ENS_SEEDS holds a seed for `tag`, which is how a host the pin names no seed for
+        -- bootstraps, from one built for it elsewhere. Nothing pins what that seed is, so it is the
+        -- one case where the seed is not checked against a hash.
+        local function unpinnedSeed(tag)
+            local named = os.getenv("ENS_SEEDS")
+            return named ~= nil and #named > 0
+                and os.isfile(path.join(path.normalize(named), tag, "ens" .. exe_suffix))
+        end
+
         -- what the tree pins the seed to: the release tag it was published under and the sha256 of
         -- each host's binary. One file covers all three hosts, because a refresh replaces every one
         -- of them together and a per-host pin would let one host bootstrap from a seed the others
@@ -583,6 +592,9 @@ task("test")
                     .. "sha256 of its seed.", pin_file)
             end
             local sha256 = pin.hosts[seed_host]
+            if type(sha256) ~= "string" and unpinnedSeed(pin.tag) then
+                return pin.tag, pin.url, nil
+            end
             if type(sha256) ~= "string" then
                 local named = {}
                 for host in pairs(pin.hosts) do
@@ -656,16 +668,22 @@ task("test")
         local function locateSeed()
             local tag, url, sha256 = seedPin()
             local installed = path.join(path.join(seedRoot(), tag), "ens" .. exe_suffix)
-            if not os.isfile(installed) then
-                fetchSeed(tag, url, sha256, installed)
-            end
-            -- checked on every run and not only when downloaded: this is the one binary the suite
-            -- runs that the tree did not build, so what it is stays verified rather than assumed.
-            local found = hash.sha256(installed)
-            if found ~= sha256 then
-                os.raise("the %s bootstrap seed at '%s' is not what this tree pins.\n  pinned "
-                    .. "sha256 %s\n  found         %s\nDelete it to have the pinned one downloaded "
-                    .. "again.", seed_host, installed, sha256, found)
+            if not sha256 then
+                print(string.format("Using the %s bootstrap seed at '%s', which '%s' pins no "
+                    .. "hash for.", seed_host, installed, path.join("seed", "seed.json")))
+            else
+                if not os.isfile(installed) then
+                    fetchSeed(tag, url, sha256, installed)
+                end
+                -- checked on every run and not only when downloaded: this is the one binary the
+                -- suite runs that the tree did not build, so what it is stays verified rather than
+                -- assumed.
+                local found = hash.sha256(installed)
+                if found ~= sha256 then
+                    os.raise("the %s bootstrap seed at '%s' is not what this tree pins.\n  pinned "
+                        .. "sha256 %s\n  found         %s\nDelete it to have the pinned one "
+                        .. "downloaded again.", seed_host, installed, sha256, found)
+                end
             end
             local env, native_libraries, env_error = llvmEnvironment()
             if not env then
@@ -1357,6 +1375,23 @@ task("test")
             run({"build", path.join(tests_dir, "pkg_import_dep"), "--output",
                 path.join(root, "tools.exe")}, nil, 2, "so it is a library and there is no "
                 .. "executable to write. Remove '--output' to compile it as a library")
+
+            -- a build that links nothing leaves its object files, for a linker on another
+            -- machine, and writes no program
+            local unlinked = path.join(root, "unlinked")
+            os.tryrm(path.join(work, "hello" .. exe_suffix))
+            run({"build", hello, "--no-link", "--objects", unlinked}, in_work, 0,
+                "hello: Emitted 8 object files from 14 modules into '", "', and linked nothing")
+            if #os.files(path.join(unlinked, "*" .. obj_suffix)) ~= 8 then
+                table.insert(failures, string.format("a build that links nothing left %d object "
+                    .. "files", #os.files(path.join(unlinked, "*" .. obj_suffix))))
+            end
+            if os.isfile(path.join(work, "hello" .. exe_suffix)) then
+                table.insert(failures, "a build that links nothing wrote a program")
+            end
+            run({"build", hello, "--no-link", "--output", path.join(root, "x" .. exe_suffix)}, nil,
+                2, "'--output' names the executable to write, and '--no-link' writes none. Remove "
+                .. "one of the two")
 
             -- check writes nothing and reports what it found
             run({"check", hello}, nil, 0, "nothing to report")
