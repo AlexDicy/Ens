@@ -1,4 +1,5 @@
-// One thing inside a directory, and the reading that returns what a directory holds.
+// One thing inside a directory, the reading that returns what a directory holds, and the walk
+// under one.
 import Path from @std.fs;
 import EntryKind from @std.fs.metadata;
 import Metadata from @std.fs.metadata;
@@ -30,14 +31,125 @@ public entriesOf(Path directory) -> Iterable<Entry> throws FileSystemError {
     return try listedUnder(directory);
 }
 
-// Every entry under `directory`, depth first, each directory's entries in ascending byte order of
-// name. A `followLinks` of false reports a symbolic link and never descends into it, and true
-// descends into one that names a directory. Either way a link reaching a place the walk has
-// already been is reported and not entered twice, so a tree of links cannot trap the walk.
+// Every entry under `directory`, in the order a walker returns them.
 public walkOf(Path directory, bool followLinks) -> Iterable<Entry> throws FileSystemError {
+    let walker = new Walker(directory, followLinks);
     let found = new List<Entry>();
-    try collectUnder(directory, followLinks, new Set<Path>(), found);
+    Entry? next = try walker.next();
+    while (next != null) {
+        found.push(next);
+        next = try walker.next();
+    }
     return found;
+}
+
+// Every entry under one directory, depth first, each directory's entries in ascending byte order
+// of name. A directory is read only when the walk gets to it, and it is read to its end and sorted
+// before the walk goes into any directory under it, so no directory is held open while a deeper
+// one is read.
+//
+// A `followLinks` of false reports a symbolic link and never goes into it, and true goes into one
+// that names a directory. Either way a link reaching a place the walk has already been is reported
+// and not gone into again, so a tree of links cannot trap the walk.
+export final class Walker {
+    const Path root;
+    const bool followsLinks;
+    List<WalkLevel> levels;
+    // Where each directory the walk has gone into resolves to, filled only when it follows links,
+    // since a walk that follows none cannot reach one directory twice.
+    Set<Path> entered;
+
+    // The directory the walk goes into on the next call, which is the entry the last call
+    // returned when it is one to go into.
+    Path? descent;
+    bool returnedEntry;
+    bool started;
+    bool ended;
+
+    public constructor(this.root, this.followsLinks) {
+        this.levels = new List<WalkLevel>();
+        this.entered = new Set<Path>();
+        this.descent = null;
+        this.returnedEntry = false;
+        this.started = false;
+        this.ended = false;
+    }
+
+    // The next entry, or null once every entry has been returned. A directory is gone into on the
+    // call after the one that returned it, unless 'skip()' came between. A failure to read a
+    // directory ends the walk, so every call after one that threw returns null.
+    export next() -> Entry? throws FileSystemError {
+        this.returnedEntry = false;
+        if (this.ended) {
+            return null;
+        }
+        this.ended = true;
+        Entry? found = try this.advance();
+        if (found != null) {
+            this.ended = false;
+            this.returnedEntry = true;
+        }
+        return found;
+    }
+
+    // Leaves out everything under the entry 'next()' returned last, which is then never read. An
+    // entry the walk would not go into, such as a file, has nothing under it to leave out, so
+    // skipping one changes nothing.
+    export skip() {
+        if (!this.returnedEntry) {
+            panic("tried to skip a directory of the walk under '{this.root}', but its last next() "
+                + "returned no entry. Call skip() right after next() returns the directory to "
+                + "leave out");
+        }
+        this.descent = null;
+    }
+
+    advance() -> Entry? throws FileSystemError {
+        if (!this.started) {
+            this.started = true;
+            try this.enter(this.root);
+        }
+        Path? into = this.descent;
+        if (into != null) {
+            this.descent = null;
+            try this.enter(into);
+        }
+        while (this.levels.length() > 0) {
+            let level = this.levels.last();
+            if (level.position < level.entries.length()) {
+                let child = level.entries.get(level.position);
+                level.position = level.position + 1;
+                if (this.goesInto(child)) {
+                    this.descent = child.path;
+                }
+                return child;
+            }
+            let finished = this.levels.pop();
+        }
+        return null;
+    }
+
+    goesInto(Entry child) -> bool {
+        return child.kind == EntryKind.Directory
+            || (this.followsLinks && child.kind == EntryKind.Symlink && child.path.isDirectory());
+    }
+
+    enter(Path directory) throws FileSystemError {
+        if (this.followsLinks && !this.entered.add(try directory.realPath())) {
+            return;
+        }
+        this.levels.push(new WalkLevel(try listedUnder(directory)));
+    }
+}
+
+// One directory of a walk: its entries, read and sorted, and how many of them have been returned.
+final class WalkLevel {
+    protected List<Entry> entries;
+    protected long position;
+
+    protected constructor(this.entries) {
+        this.position = 0;
+    }
 }
 
 // Everything one directory holds, sorted. Nothing is returned until the directory has been read to
@@ -54,29 +166,6 @@ listedUnder(Path directory) -> List<Entry> throws FileSystemError {
     }
     found.sort((left, right) -> left.name.compareTo(right.name));
     return found;
-}
-
-// Each level's entries, then the entries under each directory among them. A level is read to its
-// end before the walk descends, so no directory is held open while a deeper one is read.
-//
-// `entered` holds the place each directory the walk has gone into resolves to, which is what stops
-// a link that reaches one of them being entered a second time. It is filled only for a walk that
-// follows links, since a walk that follows none cannot reach one directory twice at all.
-collectUnder(Path directory, bool followLinks, Set<Path> entered,
-             List<Entry> found) throws FileSystemError {
-    if (followLinks && !entered.add(try directory.realPath())) {
-        return;
-    }
-    for (let child in try listedUnder(directory)) {
-        found.push(child);
-        if (child.kind == EntryKind.Directory) {
-            try collectUnder(child.path, followLinks, entered, found);
-            continue;
-        }
-        if (followLinks && child.kind == EntryKind.Symlink && child.path.isDirectory()) {
-            try collectUnder(child.path, followLinks, entered, found);
-        }
-    }
 }
 
 // A directory being read, whose handle goes back to the operating system when this value is destroyed, so

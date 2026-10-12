@@ -1915,6 +1915,8 @@ A name with no `.`, and one whose only `.` starts it the way a hidden file is na
 `normalize()` drops the `.` parts and the repeated separators and resolves every `..` that has a part before it to remove, keeps a `..` with nothing left to remove in a relative path, drops one at a root, returns `.` for a path that turns out to name nowhere in particular, and keeps both separators of a path starting `//`.
 Symbolic links are text like any other here, so a normalized path can name a different place than the path it came from.
 `absolute(workingDirectory)` resolves a relative path against that directory and normalizes the result, leaving a path that is already absolute only normalized, and `absolute()` resolves it against the directory the program was started in.
+`relativeTo(base)` returns the path written relative to `base`, so joining the result to `base` names the same place, and returns `null` for a path that is not under `base`.
+Both are normalized and compared part by part as text, so `ab` is not under `a`, a relative path is never under an absolute one nor the other way round, and a path relative to itself is `.`.
 
 The operations that follow do look at the disk, and each of them raises a `FileSystemError` when it could not be carried out.
 `metadata()` returns what is at the path as a `Metadata?`, and `null` when nothing is there, so a missing path is a `null` result rather than an error, while every other failure is raised.
@@ -1943,6 +1945,11 @@ The directory is read to its end before anything is returned, so a walk visits t
 `walk(followLinks)` returns every entry under the directory, depth first, each directory's entries in the order `entries` returns them.
 A symbolic link is reported and not descended into, which is what `followLinks` defaulting to `false` means, and a `followLinks` of `true` descends into a link that names a directory while stepping over a place the walk has already been, so a cycle cannot trap the walk either way.
 Both return an `Iterable<Entry>`, which a `for`-in loop walks, and an `Entry` from `@std.fs.entry` is a struct holding the entry's `path`, its own `name` with no directory written in front of it, and its `kind`, which is `Symlink` for a link rather than what the link points to.
+`walker(followLinks)` returns a `Walker` from `@std.fs.entry`, whose `next()` returns the entries `walk` returns, in the same order, and `null` once there are none left.
+A walker reads a directory only when it gets there, and reads all of it before it goes into any directory under it, so no directory stays open while a deeper one is read.
+`skip()` leaves out everything under the entry `next()` returned last, so that directory is never read, and after an entry with nothing under it, such as a file, it changes nothing.
+Calling `skip()` before `next()` has returned an entry, or after it has returned `null`, is a mistake in the program, and it panics.
+`next()` raises a `FileSystemError` for a directory it could not read, and that ends the walk, so every later call returns `null`.
 
 `createDirectories()` creates the directory and every missing directory above it, leaving a path that is already a directory alone.
 `createDirectoryExclusive()` creates them the same way and returns whether this call is the one that created the directory itself, so two programs racing for the same name get different results and the one that gets `true` may treat the directory as its own.

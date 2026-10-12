@@ -3,9 +3,12 @@
 import @std.testing;
 import Path from @std.fs;
 import @std.fs;
+import Entry from @std.fs.entry;
+import Walker from @std.fs.entry;
 import EntryKind from @std.fs.metadata;
 import Metadata from @std.fs.metadata;
 import FileSystemError from @std.fs.error;
+import ErrorKind from @std.fs.error;
 import TemporaryDirectory from @std.fs.temporary;
 import TemporaryFile from @std.fs.temporary;
 import Platform from @std.environment;
@@ -175,6 +178,113 @@ test "walk visits a tree depth first, each level in the order entries returns" {
 
     try testing.assertEqual(try walkedNames(root),
         ["one", "beside.txt", "two", "leaf.txt", "zz.txt"]);
+}
+
+test "a walker returns what walk returns, in the same order" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-walker");
+    Path root = scratch.path();
+    try root.join("one/two").createDirectories();
+    try root.join("one/two/leaf.txt").writeText("leaf");
+    try root.join("one/beside.txt").writeText("beside");
+    try root.join("zz.txt").writeText("last");
+
+    try testing.assertEqual(try walkerNames(root.walker()),
+        ["one", "beside.txt", "two", "leaf.txt", "zz.txt"]);
+    try testing.assertEqual(try walkerNames(root.walker()), try walkedNames(root));
+}
+
+// A directory is read when the walk gets to it, and all of it before the walk goes further down,
+// so a name added to the root after the walk started is not returned, while one added to a
+// directory the walk has not reached yet is.
+test "a walker reads each directory when it gets there, and all of it at once" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-walker-lazy");
+    Path root = scratch.path();
+    try root.join("one").createDirectories();
+    try root.join("one/early.txt").writeText("early");
+    try root.join("two").createDirectories();
+
+    let walker = root.walker();
+    let first = try walker.next();
+    try testing.assertEqual(first?.name ?? "", "one");
+    try root.join("added.txt").writeText("too late for the root");
+    try root.join("two/late.txt").writeText("read when the walk gets here");
+    try testing.assertEqual(try walkerNames(walker), ["early.txt", "two", "late.txt"]);
+}
+
+// Skipping right after a directory leaves out everything under it, and skipping after a file,
+// which has nothing under it, changes nothing.
+test "skip leaves out the directory the walker returned last" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-walker-skip");
+    Path root = scratch.path();
+    try root.join("a/inner").createDirectories();
+    try root.join("a/inner/deep.txt").writeText("deep");
+    try root.join("a/held.txt").writeText("held");
+    try root.join("b.txt").writeText("b");
+    try root.join("c").createDirectories();
+    try root.join("c/kept.txt").writeText("kept");
+
+    let walker = root.walker();
+    let found = new List<string>();
+    Entry? next = try walker.next();
+    while (next != null) {
+        found.push(next.name);
+        if (next.name == "a" || next.name == "b.txt") {
+            walker.skip();
+        }
+        next = try walker.next();
+    }
+    try testing.assertEqual(found.toArray(), ["a", "b.txt", "c", "kept.txt"]);
+}
+
+// The failure names the directory that could not be read, and the walk is over once it has
+// thrown, even though entries the walk had not reached are still there.
+test "a walker that fails to read a directory ends there" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-walker-fails");
+    Path root = scratch.path();
+    try root.join("gone").createDirectories();
+    try root.join("still.txt").writeText("still");
+
+    let walker = root.walker();
+    let first = try walker.next();
+    try testing.assertEqual(first?.name ?? "", "gone");
+    try root.join("gone").removeDirectory();
+    let failure = try testing.assertThrows<FileSystemError>(() -> {
+        let never = try walker.next();
+    });
+    string gone = root.join("gone").toString();
+    try testing.assertTrue(failure.message.indexOf(gone) >= 0, failure.message);
+    let after = try walker.next();
+    try testing.assertTrue(after == null, "a walk that threw returned another entry");
+
+    let missing = root.join("missing").walker();
+    let refused = try testing.assertThrows<FileSystemError>(() -> {
+        let never = try missing.next();
+    });
+    try testing.assertEqual(refused.kind, ErrorKind.NotFound);
+    let afterRefusal = try missing.next();
+    try testing.assertTrue(afterRefusal == null, "a walk that threw returned an entry");
+}
+
+// The walk that follows links goes into a link the way it goes into a directory, so skipping
+// right after one leaves out what the link names.
+test "skip leaves out a linked directory a walker would follow" {
+    let scratch = try TemporaryDirectory.create("ens-std-fs-walker-link");
+    Path tree = scratch.path().join("tree");
+    Path beside = scratch.path().join("beside");
+    try tree.createDirectories();
+    try beside.createDirectories();
+    try beside.join("held.txt").writeText("held");
+    try testing.assertTrue(try linked(beside, tree.join("beside-link")),
+        "this system would not make a link under '{tree}' to test with");
+
+    try testing.assertEqual(try walkerNames(tree.walker(followLinks: true)),
+        ["beside-link", "held.txt"]);
+    let walker = tree.walker(followLinks: true);
+    let link = try walker.next();
+    try testing.assertEqual(link?.name ?? "", "beside-link");
+    walker.skip();
+    let after = try walker.next();
+    try testing.assertTrue(after == null, "the skipped link was followed");
 }
 
 // A link pointing at its own parent is a cycle, so a walk that followed it would never end. The
@@ -560,6 +670,17 @@ walkedNames(Path directory) -> string[] throws FileSystemError {
     let found = new List<string>();
     for (let child in try directory.walk()) {
         found.push(child.name);
+    }
+    return found.toArray();
+}
+
+// The names the walker returns from where it stands until the walk is over.
+walkerNames(Walker walker) -> string[] throws FileSystemError {
+    let found = new List<string>();
+    Entry? next = try walker.next();
+    while (next != null) {
+        found.push(next.name);
+        next = try walker.next();
     }
     return found.toArray();
 }
