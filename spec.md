@@ -238,7 +238,7 @@ A method named `toString` that takes parameters is an ordinary method of either 
 Like a `toString` on a struct, one written `override` follows its class's visibility when unmarked and may not be marked less visible than the class itself.
 
 Inside a method, a constructor, or a destructor, a struct's or a class's own fields and methods are reached through `this`, as in `this.width` and `this.area()`, because a bare name there is a local, a parameter, or a top-level declaration and never a member.
-A field's default value is the one place a member is named on its own: a default may read the fields declared before it, as `string name = "{width}x{height}";` does.
+A field's default value is the one place a member is named on its own: a default may read the fields declared before it in the same class, as `string name = "{width}x{height}";` does.
 A default reads those fields and assigns none of them, so `int b = (a = 5);` is an error where `a` is a sibling field.
 
 `super.method(...)` calls the base class's implementation, bypassing any override. A constructor may call `super(...)` as its first statement to run the base constructor; if it does not, the base class must be constructible with no arguments. `protected` members (see above) are reachable from subclasses.
