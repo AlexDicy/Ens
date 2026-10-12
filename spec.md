@@ -786,6 +786,7 @@ At a workspace root every member is built, checked, or tested, each one after th
 
 An executable is named after what was built: a single file's own name, the last segment of a package's name (`acme.tools` builds `tools`), or the folder's name when a folder declares no package.
 It is written to the folder the command was run in unless `--output` names a file.
+Any folder on the path `--output` names that is not there yet is created.
 A package whose main module defines no `main()` is a library: it is compiled and checked just as thoroughly, no executable is written, and `--output` is refused because there is none to write.
 `--output` is an error at a workspace root for the same reason: it builds more than one artifact.
 

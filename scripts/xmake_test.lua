@@ -1191,6 +1191,16 @@ task("test")
             run({"build", hello}, in_work, 0, ": Built '")
             run_program(path.join(work, "hello" .. exe_suffix), 0, "Hello, world!")
 
+            -- the folders above a named program are made when they are not there, and one that
+            -- cannot be made is reported with the option that names another
+            local nested_exe = path.join(root, "made", "for", "hello.exe")
+            run({"build", hello, "--output", nested_exe}, nil, 0, ": Built '")
+            run_program(nested_exe, 0, "Hello, world!")
+            run({"build", hello, "--output", path.join(root, "notes.txt", "sub", "hello.exe")}, nil,
+                1, "ens: could not create the folder '", "notes.txt/sub' for the program: "
+                .. "something in its path is a file, not a folder. Name a folder that can be "
+                .. "written to with '--output'")
+
             -- every optimization level is a shipped configuration, so every one is run
             for _, level in ipairs({"-O0", "-O1", "-O2", "-O3"}) do
                 local leveled = path.join(root, "hello" .. level .. ".exe")
