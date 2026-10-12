@@ -1,6 +1,7 @@
 // The grammar of statements and blocks, switch statements and switch expressions included.
 import support.source;
 import SyntaxKind from syntax.generated.kind;
+import syntax.generated.kind;
 import Parser from parse.parser;
 import parse.parser.types;
 import parse.parser.expressions;
@@ -35,7 +36,7 @@ public parseStatement(Parser parser) {
                 parseVariableDeclaration(parser);
             } else if (expressions.canStartExpression(parser.currentKind())) {
                 parseExpressionStatement(parser);
-            } else if (parser.followsReportedMissing()) {
+            } else if (parser.followsReportedMissing() || followsMissingMember(parser)) {
                 skipStatementError(parser);
             } else {
                 parseStatementError(parser, "Expected a statement, such as an assignment, a call "
@@ -135,11 +136,22 @@ atBlockEndingHeader(Parser parser) -> bool {
 // Expects the ';' that ends a statement. A statement cut off by a declaration header that ends its
 // block leaves its ';' to the block's missing '}', which is reported once there.
 expectStatementEnd(Parser parser, string message) {
-    if (!parser.at(SyntaxKind.Semicolon) && atBlockEndingHeader(parser)) {
+    if (!parser.at(SyntaxKind.Semicolon)
+            && (atBlockEndingHeader(parser) || followsMissingMember(parser))) {
         parser.missingUnreported(SyntaxKind.Semicolon);
         return;
     }
     parser.expect(SyntaxKind.Semicolon, message);
+}
+
+// True right after a '.' or '?.' whose missing member name was reported, so a ';' missing there,
+// or a statement that cannot begin with the next token, is part of that problem.
+followsMissingMember(Parser parser) -> bool {
+    if (!parser.atReportedMissing() || parser.position() == 0) {
+        return false;
+    }
+    let previous = parser.tokens()[parser.position() - 1].kind;
+    return previous == SyntaxKind.Dot || previous == SyntaxKind.QuestionDot;
 }
 
 // What a block too deep to parse reports, whether it nests directly or through a statement that
@@ -319,7 +331,8 @@ skipStatementError(Parser parser) {
     parser.complete(marker, SyntaxKind.ErrorStatement);
 }
 
-// True at `Type name = ...` or `Type name;`. The type is parsed speculatively and always
+// True at `Type name = ...` or `Type name;`, and at the same shape with a keyword written as the
+// name, which the declaration then refuses as a name. The type is parsed speculatively and always
 // rewound, and the caller re-parses it for real. A type the parser could not read keeps the
 // reading it was written as, so it reports its own problem once. Dropping the statement to the
 // expression path would re-read the same text and report once per link of a broken chain.
@@ -329,7 +342,7 @@ public atTypedVariableDeclaration(Parser parser) -> bool {
     }
     let restore = parser.mark();
     types.parseType(parser, "");
-    bool named = parser.at(SyntaxKind.Identifier)
+    bool named = (parser.at(SyntaxKind.Identifier) || kind.isKeyword(parser.currentKind()))
         && (parser.peekKind(1) == SyntaxKind.Equals
             || parser.peekKind(1) == SyntaxKind.Semicolon);
     // A chain that ran into the end of the file has no name to look for, and nothing more was
@@ -404,15 +417,23 @@ parseVariableDeclaration(Parser parser) {
     } else {
         parser.nullSlot();
     }
-    bool bareName = parser.at(SyntaxKind.Identifier)
-        && (parser.peekKind(1) == SyntaxKind.Equals || parser.peekKind(1) == SyntaxKind.Semicolon);
+    bool endsName = parser.peekKind(1) == SyntaxKind.Equals
+        || parser.peekKind(1) == SyntaxKind.Semicolon;
+    bool bareName = parser.at(SyntaxKind.Identifier) && endsName;
     if (bareName) {
         parser.nullSlot();
         parser.bump();
+    } else if (kind.isKeyword(parser.currentKind()) && endsName) {
+        parser.nullSlot();
+        reportKeywordName(parser, "variable", "value");
     } else if (types.isTypeOrGroupStart(parser.currentKind())) {
         types.parseType(parser, "Expected the variable's type.");
-        parser.expect(SyntaxKind.Identifier,
-            "Expected the variable's name after its type. For example, write 'int count = 0;'.");
+        if (kind.isKeyword(parser.currentKind())) {
+            reportKeywordName(parser, "variable", "value");
+        } else {
+            parser.expect(SyntaxKind.Identifier, "Expected the variable's name after its type. "
+                + "For example, write 'int count = 0;'.");
+        }
     } else {
         parser.nullSlot();
         parser.missing(SyntaxKind.Identifier,
@@ -426,6 +447,22 @@ parseVariableDeclaration(Parser parser) {
     expectStatementEnd(parser,
         "Expected ';' after the variable declaration. For example, write 'let count = 0;'.");
     parser.complete(marker, SyntaxKind.VariableDeclaration);
+}
+
+// Refuses the keyword the parser is at as the name of a `what`, such as a variable, and reads it
+// as that name, so the rest of the declaration parses as written. A type name such as 'long' is
+// told apart from another keyword such as 'computed', which is refused with `suggested` as the
+// name to use instead.
+public reportKeywordName(Parser parser, string what, string suggested) {
+    string word = parser.currentText();
+    if (types.isPrimitiveTypeKeyword(parser.currentKind())) {
+        parser.reportAtCurrent("'{word}' is a type name, so it cannot be a {what} name. Choose "
+            + "another name, such as '{word}Value'.");
+    } else {
+        parser.reportAtCurrent("'{word}' is a keyword, a word Ens keeps for its own use, so it "
+            + "cannot be a {what} name. Choose another name, such as '{suggested}'.");
+    }
+    parser.bumpAs(SyntaxKind.Identifier);
 }
 
 // Initializer = '=' value. The caller is at '='.
@@ -568,10 +605,17 @@ parseForStatement(Parser parser) {
         if (parser.at(SyntaxKind.Identifier) && parser.peekIsContextual(1, "in")) {
             parser.nullSlot();
             parser.bump();
+        } else if (kind.isKeyword(parser.currentKind()) && parser.peekIsContextual(1, "in")) {
+            parser.nullSlot();
+            reportKeywordName(parser, "loop variable", "item");
         } else {
             types.parseType(parser, "Expected 'let' or a type for the loop variable. For example, "
                 + "write 'for (let item in items)'.");
-            parser.expect(SyntaxKind.Identifier, "Expected the loop variable's name.");
+            if (kind.isKeyword(parser.currentKind())) {
+                reportKeywordName(parser, "loop variable", "item");
+            } else {
+                parser.expect(SyntaxKind.Identifier, "Expected the loop variable's name.");
+            }
         }
         if (parser.atContextual("in")) {
             parser.bumpAs(SyntaxKind.InKeyword);
@@ -625,11 +669,13 @@ atForEachHeader(Parser parser) -> bool {
         parser.bump();
     }
     bool result;
-    if (parser.at(SyntaxKind.Identifier) && parser.peekIsContextual(1, "in")) {
+    if ((parser.at(SyntaxKind.Identifier) || kind.isKeyword(parser.currentKind()))
+            && parser.peekIsContextual(1, "in")) {
         result = true;
     } else if (types.isTypeOrGroupStart(parser.currentKind())) {
         types.parseType(parser, "");
-        result = parser.clean(restore) && parser.at(SyntaxKind.Identifier)
+        result = parser.clean(restore)
+            && (parser.at(SyntaxKind.Identifier) || kind.isKeyword(parser.currentKind()))
             && parser.peekIsContextual(1, "in");
     } else {
         result = false;
