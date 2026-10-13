@@ -1838,9 +1838,9 @@ The word stays an ordinary identifier everywhere else, so a variable, field, par
 
 The library is a set of module families under `@std`, and an import names a module rather than a family, so the chapters below give the module every type and function lives in.
 `@std.core` and `@std.io.print` are the two modules the compiler imports for every program.
-The families are `@std.collections` for the walking contracts and the containers, `@std.text` for the members of `string` together with `StringBuilder` and the parsers, `@std.io` for byte streams and the streams a program starts with, `@std.fs` for paths and files, `@std.environment` for what surrounds a running program, `@std.process` for starting other programs, `@std.system` for `Platform`, `@std.thread` for a wait, `@std.testing` for what a test throws, and `@std.ffi` for reading a C string.
+The families are `@std.collections` for the walking contracts and the containers, `@std.text` for the members of `string` together with `StringBuilder` and the parsers, `@std.io` for byte streams and the streams a program starts with, `@std.fs` for paths and files, `@std.environment` for what surrounds a running program, `@std.process` for starting other programs, `@std.platform` for `Platform`, `@std.thread` for a wait, `@std.testing` for what a test throws, and `@std.ffi` for reading a C string.
 A family's own name is a module too where one type stands at its head, which is why `@std.fs` is where `Path` lives while `@std.collections` is a prefix alone.
-`@std.system` also holds the library's own calls into the operating system, which are internal to the library rather than part of what a program writes.
+`@std.system` holds the library's own calls into the operating system, which are internal to the library rather than part of what a program writes.
 
 ---
 
@@ -2011,7 +2011,7 @@ listing(Path folder) throws FileSystemError {
 `environment.arguments()` returns the arguments the program was started with as a `string[]`, not counting the program's own name, which every system passes as the first of them.
 The program's own identity is `environment.executablePath()`, which returns the path of the running program itself, or `null` when the operating system would not report it.
 `environment.currentDirectory()` returns the directory the program was started in, and `.` when the operating system would not report it; it is read and never written, so to work somewhere else, a program joins this onto the paths it uses.
-`environment.platform()` returns the system the program was built for as a `Platform` from `@std.system`, one of `Windows`, `Linux` and `MacOS`, which was fixed when the program was compiled and cannot change while it runs.
+`environment.platform()` returns the system the program was built for as a `Platform` from `@std.platform`, one of `Windows`, `Linux` and `MacOS`, which was fixed when the program was compiled and cannot change while it runs.
 `Linux` is also the result on every other system the compiler can target, whose behavior it treats as Linux's.
 
 `Environment` from the same module is a set of variables, matched by name the way one system matches them: on Windows two names that differ only in ASCII case are one variable, and everywhere else they are two.
