@@ -3148,6 +3148,17 @@ task("test")
                 "written for Ens 9.9", hopped_to, ": Built '")
             run_program(spaced_out, 0, "built by a delegate")
 
+            -- a single file and a source folder of the package are written for the package's
+            -- version too, so they hop to the same toolchain
+            local single_out = path.join(root, "single file.exe")
+            run(host_exe, {"build", path.join(pkg, "src", "main.ens"), "--output", single_out, "-v"},
+                chains, 0, "written for Ens 9.9", hopped_to, ": Built '")
+            run_program(single_out, 0, "built by a delegate")
+            local folder_out = path.join(root, "source folder.exe")
+            run(host_exe, {"build", path.join(pkg, "src"), "--output", folder_out, "-v"}, chains, 0,
+                "written for Ens 9.9", hopped_to, ": Built '")
+            run_program(folder_out, 0, "built by a delegate")
+
             -- the exit code of the toolchain that did the work is this command's own
             run(host_exe, {"check", broken, "-v"}, chains, 1, hopped_to,
                 "Undefined function 'missing'")
