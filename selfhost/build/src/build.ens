@@ -13,6 +13,7 @@ import FileLoader from @ens.sema.support.loader;
 import ProgramAnalysis from @ens.sema.pipeline;
 import @ens.host.scratch;
 import Retry from @ens.host.scratch;
+import Scratch from @ens.host.scratch;
 import @ens.codegen.driver;
 import @ens.codegen.settings;
 import LinkRequest from @ens.link.request;
@@ -262,15 +263,15 @@ export finishUnit(BuildOptions options, Packaging packaging, Loaded loaded, stri
     let emitted = emitObjects(options, analysis, objectsFolder, output.stem() + ".");
     if (emitted.failure.length > 0) {
         return failed([emitted.failure], loaded.moduleCount(),
-            withLeftover(loaded.notices(), emitted.leftBehind));
+            withLeftovers(loaded.notices(), emitted.leftBehind));
     }
     if (emitted.diagnostics.length > 0) {
         return failedWithDiagnostics(diagnostics.formatAll(emitted.diagnostics, loaded.catalog()),
-            loaded.moduleCount(), withLeftover(loaded.notices(), emitted.leftBehind));
+            loaded.moduleCount(), withLeftovers(loaded.notices(), emitted.leftBehind));
     }
     let attempt = linkStaged(packaging, loaded, emitted, output, options, toolchain);
-    string[] notices = withLeftovers(withLeftovers(loaded.notices(),
-        keepObjects(emitted, objectsFolder)), attempt.leftBehind);
+    string[] notices = withLeftovers(withLeftovers(withLeftovers(loaded.notices(),
+        emitted.leftBehind), keepObjects(emitted, objectsFolder)), attempt.leftBehind);
     if (attempt.failure.length > 0) {
         return failed(attempt.failure, loaded.moduleCount(), notices);
     }
@@ -290,13 +291,14 @@ emitUnlinked(BuildOptions options, ProgramAnalysis analysis, Loaded loaded,
     let emitted = emitObjects(options, analysis, objectsFolder, artifactStem + ".");
     if (emitted.failure.length > 0) {
         return failed([emitted.failure], loaded.moduleCount(),
-            withLeftover(loaded.notices(), emitted.leftBehind));
+            withLeftovers(loaded.notices(), emitted.leftBehind));
     }
     if (emitted.diagnostics.length > 0) {
         return failedWithDiagnostics(diagnostics.formatAll(emitted.diagnostics, loaded.catalog()),
-            loaded.moduleCount(), withLeftover(loaded.notices(), emitted.leftBehind));
+            loaded.moduleCount(), withLeftovers(loaded.notices(), emitted.leftBehind));
     }
-    string[] notices = withLeftovers(loaded.notices(), keepObjects(emitted, objectsFolder));
+    string[] notices = withLeftovers(withLeftovers(loaded.notices(), emitted.leftBehind),
+        keepObjects(emitted, objectsFolder));
     return new UnitReport(BuildOutcome.EmittedObjects, objectsFolder, nothing(), nothing(),
         loaded.moduleCount(), emitted.objects.length, emitted.account, notices);
 }
@@ -412,13 +414,14 @@ buildLibrary(BuildOptions options, ProgramAnalysis analysis, Loaded loaded,
     let emitted = emitObjects(options, analysis, objectsFolder, artifactStem + ".");
     if (emitted.failure.length > 0) {
         return failed([emitted.failure], loaded.moduleCount(),
-            withLeftover(loaded.notices(), emitted.leftBehind));
+            withLeftovers(loaded.notices(), emitted.leftBehind));
     }
     if (emitted.diagnostics.length > 0) {
         return failedWithDiagnostics(diagnostics.formatAll(emitted.diagnostics, loaded.catalog()),
-            loaded.moduleCount(), withLeftover(loaded.notices(), emitted.leftBehind));
+            loaded.moduleCount(), withLeftovers(loaded.notices(), emitted.leftBehind));
     }
-    string[] notices = withLeftovers(loaded.notices(), keepObjects(emitted, objectsFolder));
+    string[] notices = withLeftovers(withLeftovers(loaded.notices(), emitted.leftBehind),
+        keepObjects(emitted, objectsFolder));
     return new UnitReport(BuildOutcome.ValidatedLibrary, Path(""), nothing(), nothing(),
         loaded.moduleCount(), emitted.objects.length, emitted.account, notices);
 }
@@ -445,10 +448,11 @@ final class Emitted {
     protected FileDiagnostic[] diagnostics;
     protected string[] account;
     protected string failure;
-    // Why the staging folder is still there, or empty text when it was removed.
-    protected string leftBehind;
-    // The build's own folder the objects are in until they are kept, or empty once it is gone.
-    protected Path staging;
+    // Why the staging folder is still there, and why each staging folder an earlier build left
+    // could not be removed.
+    protected string[] leftBehind;
+    // The build's own folder the objects are in until they are kept, or null once it is gone.
+    protected Scratch? staging;
 
     protected constructor(this.objects, this.diagnostics, this.account, this.failure,
                 this.leftBehind, this.staging);
@@ -456,27 +460,29 @@ final class Emitted {
 
 // Generates the program's object files into a folder of this build's own, each named there after its
 // bytes. What is in that folder is never read or written by another build, so the link reads the
-// objects there, and 'keepObjects' then puts them where the build keeps them.
+// objects there, and 'keepObjects' then puts them where the build keeps them. The folder is marked
+// as this build's, so one a stopped build leaves is removed by the next build.
 emitObjects(BuildOptions options, ProgramAnalysis analysis, Path objectsFolder,
             string filePrefix) -> Emitted {
-    let staging = scratch.createUnder(objectsFolder, FolderPrefixes.staging);
+    let staging = scratch.createMarkedUnder(objectsFolder, FolderPrefixes.staging);
     if (staging.failure().length > 0) {
-        return failedEmission(staging.failure());
+        return failedEmission(staging.failure(), staging.leftBehind());
     }
     let emitted = driver.emitProgram(analysis, staging.folder().toString(), filePrefix,
         options.codegen());
     string[] nothing = [];
     if (!emitted.succeeded()) {
         return new Emitted(nothing, emitted.diagnostics(), emitted.explanation(), "",
-            scratch.discard(staging.folder()), Path(""));
+            withRemoval(staging.leftBehind(), staging.remove()), null);
     }
     let named = nameObjects(emitted.objects());
     FileDiagnostic[] clean = [];
     if (named.failure.length > 0) {
         return new Emitted(nothing, clean, nothing, named.failure,
-            scratch.discard(staging.folder()), Path(""));
+            withRemoval(staging.leftBehind(), staging.remove()), null);
     }
-    return new Emitted(named.files, clean, emitted.explanation(), "", "", staging.folder());
+    return new Emitted(named.files, clean, emitted.explanation(), "", staging.leftBehind(),
+        staging);
 }
 
 // The object files of one emission, each under the name its bytes give it.
@@ -524,17 +530,27 @@ keepObjects(Emitted emitted, Path objectsFolder) -> string[] {
             problems.push(refused);
         }
     }
-    string leftBehind = scratch.discard(emitted.staging);
+    string leftBehind = removedStaging(emitted);
     if (leftBehind.length > 0) {
         problems.push(leftBehind);
     }
     return problems.toArray();
 } catch (FileSystemError refused) {
-    string leftBehind = scratch.discard(emitted.staging);
+    string leftBehind = removedStaging(emitted);
     if (leftBehind.length > 0) {
         return [refused.message, leftBehind];
     }
     return [refused.message];
+}
+
+// Removes the emission's staging folder. Returns why it is still there, or "" when it is gone.
+removedStaging(Emitted emitted) -> string {
+    Scratch? staging = emitted.staging;
+    emitted.staging = null;
+    if (staging == null) {
+        return "";
+    }
+    return staging.remove();
 }
 
 // Removes an object the build no longer keeps, or says why it is still there.
@@ -545,10 +561,10 @@ removedOrWhy(Path stale) -> string {
     return refused.message;
 }
 
-failedEmission(string problem) -> Emitted {
+failedEmission(string problem, string[] leftBehind) -> Emitted {
     string[] nothing = [];
     FileDiagnostic[] clean = [];
-    return new Emitted(nothing, clean, nothing, problem, "", Path(""));
+    return new Emitted(nothing, clean, nothing, problem, leftBehind, null);
 }
 
 // The notices of a unit, with the staging folder its emission could not remove among them, so a

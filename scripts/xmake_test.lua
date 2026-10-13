@@ -1349,6 +1349,8 @@ task("test")
                     table.insert(failures, "a build left the folder of the build the linker ended "
                         .. "beside the program")
                 end
+                expectNoStaging(path.join(damaged, "app", ".ens", triple, "O2"),
+                    "a build after the one the linker ended")
             end
 
             -- and nowhere else: not beside the executable, and not in the folder it was run from
