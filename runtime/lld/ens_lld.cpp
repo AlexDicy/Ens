@@ -167,22 +167,30 @@ bool runDriver(int flavor, llvm::ArrayRef<const char*> arguments, llvm::raw_ostr
     return linked;
 }
 
-// One link, as both entry points run it; `entry` is the entry point's name, which a refused
-// request names, and `program` is null when the caller named none.
-int runLink(const char* entry, int flavor, const char* argumentBlock, long long argumentCount,
-            const char* program, char** output) {
+}  // namespace
+
+extern "C" {
+
+// Runs one link. `argumentBlock` holds `argumentCount` NUL-terminated arguments back to back,
+// starting with the linker name the flavor answers to. `program` is the program the caller reports
+// linking, which a link that ends the process names. `output` receives everything the linker
+// printed, or stays null when it printed nothing; a null `output` is accepted and drops the text.
+// Returns 0 when the executable was written, 1 when the linker refused or gave up on the link, and
+// 2 when the request itself was unusable.
+ENS_LLD_EXPORT int ens_lld_link_program(int flavor, const char* argumentBlock,
+                                        long long argumentCount, const char* program,
+                                        char** output) {
     if (output != nullptr) *output = nullptr;
     if (argumentBlock == nullptr || argumentCount <= 0) {
         if (output != nullptr) {
-            *output = copied("Internal: " + std::string(entry) + " was called with no arguments");
+            *output = copied("Internal: ens_lld_link_program was called with no arguments");
         }
         return kUnusableRequest;
     }
     if (flavor != kFlavorCoff && flavor != kFlavorElf && flavor != kFlavorMachO) {
         if (output != nullptr) {
-            *output = copied("Internal: " + std::string(entry)
-                             + " was called with the unknown linker flavor "
-                             + std::to_string(flavor));
+            *output = copied("Internal: ens_lld_link_program was called with the unknown "
+                             "linker flavor " + std::to_string(flavor));
         }
         return kUnusableRequest;
     }
@@ -205,29 +213,8 @@ int runLink(const char* entry, int flavor, const char* argumentBlock, long long 
     return linked ? kLinked : kLinkFailed;
 }
 
-}  // namespace
-
-extern "C" {
-
-// Runs one link. `argumentBlock` holds `argumentCount` NUL-terminated arguments back to back,
-// starting with the linker name the flavor answers to. `program` is the program the caller reports
-// linking, which a link that ends the process names. `output` receives everything the linker
-// printed, or stays null when it printed nothing; a null `output` is accepted and drops the text.
-// Returns 0 when the executable was written, 1 when the linker refused or gave up on the link, and
-// 2 when the request itself was unusable.
-ENS_LLD_EXPORT int ens_lld_link_program(int flavor, const char* argumentBlock,
-                                        long long argumentCount, const char* program,
-                                        char** output) {
-    return runLink("ens_lld_link_program", flavor, argumentBlock, argumentCount, program, output);
-}
-
-// ens_lld_link_program naming no program, for a compiler built before that entry point existed.
-ENS_LLD_EXPORT int ens_lld_link(int flavor, const char* argumentBlock, long long argumentCount,
-                                char** output) {
-    return runLink("ens_lld_link", flavor, argumentBlock, argumentCount, nullptr, output);
-}
-
-// Releases a text ens_lld_link handed back, so ownership stays with the allocator that made it.
+// Releases a text ens_lld_link_program handed back, so ownership stays with the allocator that
+// made it.
 ENS_LLD_EXPORT void ens_lld_free(char* output) {
     std::free(output);
 }
