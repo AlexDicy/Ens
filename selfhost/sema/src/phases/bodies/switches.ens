@@ -317,6 +317,8 @@ public checkSwitchArms(BodyChecker checker, Expression scrutinee, List<SwitchArm
                         current.define(binding);
                     }
                     checker.result().setBinding(arm.green(), binding);
+                } else if (armTarget != null) {
+                    narrowing.narrowArmValue(checker, scrutinee, armTarget);
                 }
                 if (walkArmBodyFlow(checker, arm.body(), requireValue, armTargetType,
                         valueExpressions, armFlows, armNarrowings, deferLiterals, origin, fixTarget)) {
@@ -401,6 +403,22 @@ public checkSwitchArms(BodyChecker checker, Expression scrutinee, List<SwitchArm
         checker.assignment().restore(switchEntry);
     }
 
+    // A switch used as a value with no arm, a type switch whose every arm is refused and one with an
+    // arm refused for matching every value get no refusal of a missing arm.
+    bool everyValueHasArm = hasDefault || everyValueArm;
+    if (valueScrutinee && !hasDefault && (arms.length() > 0 || !requireValue)) {
+        everyValueHasArm = checkValueExhaustiveness(checker, inner, coveredEnumOrdinals, span);
+    }
+    if (typeSwitch && !hasDefault && armTargets.length() > 0 && !everyValueArm) {
+        everyValueHasArm = checkTypeExhaustiveness(checker, inner, armTargets, span);
+    }
+    if ((valueScrutinee || typeSwitch) && scrutineeType is OptionalType && !nullCovered && !hasDefault) {
+        everyValueHasArm = false;
+        checker.reporter().report("{wording.sideNamed(scrutinee, "The value of this switch")} can be null, "
+            + "and no arm of this switch matches null. Add a 'null ->' arm or a 'default' arm.", span);
+    }
+
+    // A value no arm matches leaves the switch with the narrowings it entered with.
     checker.narrowing().restoreLayers(entryLayers);
     let survivors = new List<Map<NarrowingPath, Type>>();
     for (long i = 0; i < armFlows.length(); i++) {
@@ -408,20 +426,10 @@ public checkSwitchArms(BodyChecker checker, Expression scrutinee, List<SwitchArm
             survivors.push(armNarrowings.get(i));
         }
     }
+    if (!everyValueHasArm) {
+        survivors.push(entryFacts);
+    }
     narrowing.applyNarrowingJoin(checker, entryFacts, survivors);
-
-    // A switch used as a value with no arm, a type switch whose every arm is refused and one with an
-    // arm refused for matching every value get no refusal of a missing arm.
-    if (valueScrutinee && !hasDefault && (arms.length() > 0 || !requireValue)) {
-        checkValueExhaustiveness(checker, inner, coveredEnumOrdinals, span);
-    }
-    if (typeSwitch && !hasDefault && armTargets.length() > 0 && !everyValueArm) {
-        checkTypeExhaustiveness(checker, inner, armTargets, span);
-    }
-    if ((valueScrutinee || typeSwitch) && scrutineeType is OptionalType && !nullCovered && !hasDefault) {
-        checker.reporter().report("{wording.sideNamed(scrutinee, "The value of this switch")} can be null, "
-            + "and no arm of this switch matches null. Add a 'null ->' arm or a 'default' arm.", span);
-    }
     if (!requireValue) {
         return checker.store().primitive(PrimitiveKind.Void);
     }
@@ -765,7 +773,7 @@ checkTypeArmReachable(BodyChecker checker, Type armTarget, List<Type> earlier, S
 
 // An enum switch without a default must cover every member; integer and string switches
 // always need one.
-checkValueExhaustiveness(BodyChecker checker, Type inner, Set<long> coveredEnumOrdinals, Span span) {
+checkValueExhaustiveness(BodyChecker checker, Type inner, Set<long> coveredEnumOrdinals, Span span) -> bool {
     if (inner is EnumType) {
         string[] names = inner.memberNames();
         let missing = new List<string>();
@@ -788,12 +796,14 @@ checkValueExhaustiveness(BodyChecker checker, Type inner, Set<long> coveredEnumO
             }
             string members = diagnostics.andJoined(qualified.toArray());
             checker.reporter().report("This switch has no arm for {members}. {add}", span);
+            return false;
         }
-        return;
+        return true;
     }
     string shown = checker.names().quoted(inner);
     checker.reporter().report("A switch on {shown} must have a 'default' arm, because its arms cannot "
         + "list every {shown} value. Add a 'default -> ...' arm.", span);
+    return false;
 }
 
 // A value label in a switch of 'is' arms. An arm of value labels alone goes as a whole; one that
@@ -822,32 +832,32 @@ reportMixedLabels(BodyChecker checker, ValueArmNode arm) {
 // A type switch without a default: an interface or an unsealed or concrete root always
 // needs one; a sealed abstract root instead needs every direct subclass covered, an arm
 // for a subclass covering its descendants.
-checkTypeExhaustiveness(BodyChecker checker, Type inner, List<Type> armTargets, Span span) {
+checkTypeExhaustiveness(BodyChecker checker, Type inner, List<Type> armTargets, Span span) -> bool {
     string rootName = checker.names().quoted(inner);
     let authority = types.authorityOf(inner);
     if (authority is InterfaceType) {
         checker.reporter().report("A switch over {rootName} must have a 'default' arm: "
             + "interfaces are open, so any class anywhere may implement {rootName}. Add a "
             + "'default -> ...' arm.", span);
-        return;
+        return false;
     }
     if (authority is ClassType) {
         if (authority.isFinal()) {
             checker.reporter().report("A switch over {rootName} must have a 'default' arm, because an arm "
                 + "for a type parameter may not match every {rootName}. Add a 'default -> ...' arm.", span);
-            return;
+            return false;
         }
         if (!authority.isSealed()) {
             checker.reporter().report("A switch over {rootName} must have a 'default' arm, because "
                 + "{rootName} is not 'sealed', so it can have subclasses that no arm matches. Add a "
                 + "'default -> ...' arm.", span);
-            return;
+            return false;
         }
         if (!authority.isAbstract()) {
             checker.reporter().report("A switch over {rootName} must have a 'default' arm, because "
                 + "{rootName} is not abstract, so a value can be a {rootName} itself, which no "
                 + "subclass arm matches. Add a 'default -> ...' arm.", span);
-            return;
+            return false;
         }
         let missing = new List<string>();
         let subclasses = authority.directSubclasses();
@@ -873,8 +883,10 @@ checkTypeExhaustiveness(BodyChecker checker, Type inner, List<Type> armTargets, 
             }
             checker.reporter().report("This switch has no arm for {wording.quotedList(missing)}, {noun} of "
                 + "sealed class {rootName}. {add}", span);
+            return false;
         }
     }
+    return true;
 }
 
 // Walks one switch arm from the state after the scrutinee and records both its assignment

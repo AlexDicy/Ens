@@ -15,6 +15,9 @@ import CastExpressionNode from @ens.frontend.syntax.generated.nodes;
 import CheckedCastExpressionNode from @ens.frontend.syntax.generated.nodes;
 import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
 import NullCoalesceExpressionNode from @ens.frontend.syntax.generated.nodes;
+import phases.bodies.memberaccess;
+import MissingMember from phases.bodies.memberaccess;
+import model.typenames;
 import TypeTestExpressionNode from @ens.frontend.syntax.generated.nodes;
 import AssignmentExpressionNode from @ens.frontend.syntax.generated.nodes;
 import ParenthesizedExpressionNode from @ens.frontend.syntax.generated.nodes;
@@ -52,6 +55,9 @@ public final class NarrowingFact {
     protected NarrowingPath path;
     protected Type proven;
     protected bool narrowsWhenTrue;
+    // For a comparison of an 'as?' cast with null, which narrows nothing, the fix that writes the
+    // 'is' test that would narrow; empty for every fact that narrows.
+    protected string castHint = "";
 
     protected constructor(this.path, this.proven, this.narrowsWhenTrue);
 }
@@ -196,10 +202,10 @@ detectTypeTest(BodyChecker checker, TypeTestExpressionNode test) -> NarrowingFac
 // negation flips the polarity, '&&' facts hold where the conjunction held, '||' facts
 // hold where the disjunction failed, and both descend into their operands.
 public collectNarrowings(BodyChecker checker, Expression condition, bool conditionHolds,
-                         List<NarrowingFact> sink) {
+                         List<NarrowingFact> sink, ConditionSite? site = null) {
     Expression core = syntax.unwrapParentheses(condition);
     if (core is PrefixExpressionNode && core.operator().kind() == SyntaxKind.Exclamation) {
-        collectNarrowings(checker, core.operand(), !conditionHolds, sink);
+        collectNarrowings(checker, core.operand(), !conditionHolds, sink, site);
         return;
     }
     if (core is TypeTestExpressionNode) {
@@ -214,8 +220,8 @@ public collectNarrowings(BodyChecker checker, Expression condition, bool conditi
         bool descend = (conditionHolds && operator == SyntaxKind.AmpersandAmpersand)
             || (!conditionHolds && operator == SyntaxKind.PipePipe);
         if (descend) {
-            collectNarrowings(checker, core.left(), conditionHolds, sink);
-            collectNarrowings(checker, core.right(), conditionHolds, sink);
+            collectNarrowings(checker, core.left(), conditionHolds, sink, site);
+            collectNarrowings(checker, core.right(), conditionHolds, sink, site);
             return;
         }
     }
@@ -223,11 +229,126 @@ public collectNarrowings(BodyChecker checker, Expression condition, bool conditi
     if (fact != null && fact.narrowsWhenTrue == conditionHolds) {
         sink.push(fact);
     }
+    let hint = detectCastComparison(checker, core, site);
+    if (hint != null && hint.narrowsWhenTrue == conditionHolds) {
+        sink.push(hint);
+    }
 }
 
 public applyFacts(BodyChecker checker, List<NarrowingFact> facts) {
     for (long i = 0; i < facts.length(); i++) {
-        checker.narrowing().narrow(facts.get(i).path, facts.get(i).proven);
+        let fact = facts.get(i);
+        checker.narrowing().narrow(fact.path, fact.proven);
+        if (fact.castHint.length > 0) {
+            checker.recordCastHint(fact.path, fact.castHint);
+        }
+    }
+}
+
+// Where a condition is written, which a fix that rewrites it writes around it: 'if (' and ')'
+// around the condition of an 'if', and nothing around a '?:' or '&&' written whole.
+public final class ConditionSite {
+    string opening;
+    Expression whole;
+    string closing;
+
+    public constructor(this.opening, this.whole, this.closing);
+
+    // The condition as written with its part 'replaced' written as 'replacement', or null where
+    // that is too long to quote or 'replaced' is not written exactly once in it.
+    public rewritten(Expression replaced, string replacement) -> string? {
+        string written = wording.oneLineSpelling(this.whole);
+        string part = wording.oneLineSpelling(replaced);
+        long at = written.indexOf(part);
+        if (at < 0 || written.indexOf(part, at + 1) >= 0) {
+            return null;
+        }
+        string result = this.opening + written.substring(0, at) + replacement
+            + written.substring(at + part.length) + this.closing;
+        if (result.length > wording.quotedCodeLimit()) {
+            return null;
+        }
+        return result;
+    }
+}
+
+// The path an 'as?' cast compared with null would narrow if it were an 'is' test, which holds the
+// cast's type where that comparison holds, for a read through the operand to name the test to write.
+castHintPath(NarrowingPath path) -> NarrowingPath {
+    return path.extended(narrow.fieldSegment("as?"));
+}
+
+// Recognizes '(x as? T) != null' and '(x as? T) == null' over a narrowable 'x' and a class or
+// interface 'T'. The comparison narrows nothing; the fact it gives records the 'is' test that would,
+// written into the condition at 'site'.
+detectCastComparison(BodyChecker checker, Expression condition, ConditionSite? site) -> NarrowingFact? {
+    if (!(condition is BinaryExpressionNode)) {
+        return null;
+    }
+    SyntaxKind operator = condition.operator().kind();
+    if (operator != SyntaxKind.EqualsEquals && operator != SyntaxKind.NotEquals) {
+        return null;
+    }
+    Expression compared = condition.left();
+    if (wording.isNullLiteral(syntax.unwrapParentheses(condition.left()))) {
+        compared = condition.right();
+    } else if (!wording.isNullLiteral(syntax.unwrapParentheses(condition.right()))) {
+        return null;
+    }
+    Expression cast = syntax.unwrapParentheses(compared);
+    if (!(cast is CheckedCastExpressionNode)) {
+        return null;
+    }
+    let castType = checker.result().typeOf(cast.green());
+    if (!(castType is OptionalType) || !types.isClassLike(castType.inner())) {
+        return null;
+    }
+    let path = buildNarrowingPath(checker, cast.value());
+    if (path == null) {
+        return null;
+    }
+    string tested = "{wording.oneLineSpelling(syntax.unwrapParentheses(cast.value()))} is "
+        + wording.greenSpelling(cast.target().green());
+    bool narrowsWhenTrue = operator == SyntaxKind.NotEquals;
+    string replacement = narrowsWhenTrue ? tested : "!({tested})";
+    string? rewritten = site == null ? null : site.rewritten(condition, replacement);
+    let fact = new NarrowingFact(castHintPath(path), castType.inner(), narrowsWhenTrue);
+    if (rewritten != null) {
+        fact.castHint = "Write '{rewritten}' to narrow it.";
+    } else {
+        fact.castHint = "Replace {wording.sideNamed(condition, "the comparison")} with '{replacement}' "
+            + "to narrow it.";
+    }
+    return fact;
+}
+
+// The refusal of the member 'member' read through 'object', a value of type 'core' that has no such
+// member, where a comparison of an 'as?' cast with null would have narrowed 'object' to a type that
+// has it. Null anywhere else.
+public castComparisonHint(BodyChecker checker, Expression object, Type core, string member) -> string? {
+    let path = buildNarrowingPath(checker, object);
+    if (path == null) {
+        return null;
+    }
+    let hinted = castHintPath(path);
+    let proven = checker.narrowing().provenType(hinted);
+    let fix = checker.castHintAt(hinted);
+    if (proven == null || fix == null
+            || memberaccess.lookupMember(checker, proven, member) is MissingMember) {
+        return null;
+    }
+    string spelled = wording.oneLineSpelling(syntax.unwrapParentheses(object));
+    return "'{spelled}' is still {typenames.typeArticle(checker.names().of(core))} "
+        + "{checker.names().quoted(core)} here, because comparing an 'as?' cast with null does not "
+        + "narrow '{spelled}'. {fix}";
+}
+
+// Narrows 'scrutinee' to 'armType' inside a type arm that binds no name, where the switched value
+// is a place that narrows.
+public narrowArmValue(BodyChecker checker, Expression scrutinee, Type armType) {
+    let path = buildNarrowingPath(checker, scrutinee);
+    if (path != null) {
+        checker.narrowing().narrow(path, armType);
     }
 }
 
@@ -357,9 +478,10 @@ public applyNarrowingJoin(BodyChecker checker, Map<NarrowingPath, Type> entryFac
 // Analyzes a '?:' branch or the right side of '&&' or '||' under the facts the condition proves
 // there. 'target' is the type the branch is checked against, set at 'origin', or null.
 public analyzeGuardedBranch(BodyChecker checker, Expression condition, Expression branch, bool conditionHolds,
-                            Type? target, LiteralOrigin? origin = null) -> Type {
+                            Type? target, LiteralOrigin? origin = null, ConditionSite? site = null)
+                            -> Type {
     let facts = new List<NarrowingFact>();
-    collectNarrowings(checker, condition, conditionHolds, facts);
+    collectNarrowings(checker, condition, conditionHolds, facts, site);
     checker.narrowing().push();
     applyFacts(checker, facts);
     bool previous = checker.assignment().unconditionalPosition();

@@ -1266,6 +1266,7 @@ So `value is T` narrows `value` to `T` where it matches, an instantiation whose 
 
 `if (x is Derived)` narrows `x` to `Derived` inside the branch, following the same rules as null narrowing above: the same places narrow (locals, parameters, `this`, and chains of `const` fields), `x is Derived && x.derivedMethod()` narrows the right side of `&&`, conjunctions narrow the branch, a loop condition narrows the body, and the same writes drop the narrowing.
 Failing the test proves nothing about the value's type, so the plain else branch of a positive `is` does not narrow.
+An `as?` cast never narrows its operand, because comparing its result with `null` tests the result and not `x`: write `x is Circle` for `(x as? Circle) != null` and `!(x is Circle)` for `(x as? Circle) == null` to narrow `x`.
 
 Negating a check flips what it proves, so the fact that survives is the negated test and a negative guard narrows.
 `!(x is Circle)` proves `x is Circle` on its surviving side, which is the else branch and the code following a guard that always exits, as in `if (!(x is Circle)) { return; }` where `x` is a `Circle` on every line below.
@@ -1542,6 +1543,7 @@ let length = switch (name) {      // name is string?, the null case is handled
 
 A switch over a class or interface value matches on the runtime type instead of on labels.
 A type arm is written `is Type binding -> body`; the binding is an arm-scoped constant of type `Type`, and it may be omitted when the value is not needed.
+An arm without a binding narrows the switched value to `Type` inside the arm when that value is a place that narrows (a local, a parameter, `this`, or a chain of `const` fields), and the writes that drop any narrowing drop this one.
 Arm types follow the same rules as the `is` operator: an arm that could never match and an arm the static type already satisfies (which would match everything, `default`'s job) are both compile errors.
 An arm may name an interface, and a switch over an interface value may test both classes and interfaces.
 Arms are tested in source order, and an arm whose type is already covered by an earlier arm is a compile error, just like a `catch` clause shadowed by a broader one.
