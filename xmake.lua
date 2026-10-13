@@ -96,7 +96,8 @@ target("ens-lld")
     -- the source marks, so this says the same thing for the platforms that would otherwise export
     -- everything.
     if is_plat("macosx") then
-        add_shflags("-Wl,-exported_symbol,_ens_lld_link", "-Wl,-exported_symbol,_ens_lld_free",
+        add_shflags("-Wl,-exported_symbol,_ens_lld_link",
+            "-Wl,-exported_symbol,_ens_lld_link_program", "-Wl,-exported_symbol,_ens_lld_free",
             "-Wl,-exported_symbol,_ens_lld_shutdown", { force = true })
     elseif not is_plat("windows") then
         add_shflags("-Wl,--exclude-libs,ALL", { force = true })
