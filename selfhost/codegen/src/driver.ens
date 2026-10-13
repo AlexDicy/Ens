@@ -124,19 +124,19 @@ export emitProgram(ProgramAnalysis analysis, string outputFolder, string filePre
     let reached = reachable.analyze(programIndex, plans, moduleBodies(lowered));
     let reachability = reachabilityAccount(programIndex, lowered, reached, settings);
     let kept = reachedModules(lowered, reached);
-    let pipeline = optimizeModules(programIndex, kept, plans, settings);
+    let pipeline = optimizeModules(programIndex, kept, reached.namedPlans(), settings);
     let optimizationProblems = gathered(pipeline.modules);
     if (optimizationProblems.length() > 0) {
         return new EmitResult(new List<string>(), optimizationProblems.toArray());
     }
-    let dangling = danglingReferences(programIndex, pipeline.modules, lowered, plans, reached);
+    let dangling = danglingReferences(programIndex, pipeline.modules, lowered, reached);
     if (dangling.length() > 0) {
         return new EmitResult(new List<string>(), dangling.toArray());
     }
     let stackFrame = analysis.store().findDeclared(StandardLibrary.coreModule, "StackFrame");
     let errorClass = analysis.store().findDeclared(StandardLibrary.coreModule, "Error");
-    let emitted = emitModules(pipeline.modules, plans, reached, stackFrame, errorClass,
-        outputFolder, filePrefix, settings);
+    let emitted = emitModules(pipeline.modules, reached, stackFrame, errorClass, outputFolder,
+        filePrefix, settings);
     return new EmitResult(emitted.paths, emitted.problems.toArray(),
         combinedAccount(reachability, pipeline.account));
 }
@@ -176,14 +176,15 @@ reachabilityAccount(ProgramIndex programIndex, List<LoweredModule> lowered,
     return explained;
 }
 
-// Every module as emission sees it, holding the bodies the program reaches and nothing else. A
-// module the program reaches no body in is left out altogether, and the descriptors it owns are
-// defined in the core module's object instead.
+// Every module as emission sees it, holding the bodies the program reaches, in the order the walk
+// reached them, and nothing else. A module the program reaches no body in is left out altogether,
+// and the descriptors it owns are defined in the core module's object instead.
 reachedModules(List<LoweredModule> lowered, ReachedProgram reached) -> List<LoweredModule> {
     let kept = new List<LoweredModule>();
+    let reachedBodies = gate.reachedBodies(moduleBodies(lowered), reached);
     for (long m = 0; m < lowered.length(); m++) {
         let unit = lowered.get(m);
-        let bodies = gate.reachedBodies(unit.functions, reached);
+        let bodies = reachedBodies.get(m).bodies();
         string modulePath = unit.definitions.context().module().canonicalPath();
         if (!gate.writesObject(modulePath, bodies.length())) {
             continue;
@@ -207,12 +208,11 @@ writingModules(List<LoweredModule> kept) -> Set<string> {
 // a reference is. Every build runs this check, at every optimization level, so a root set that is
 // not closed stops the build that found it rather than the link that follows it.
 danglingReferences(ProgramIndex programIndex, List<LoweredModule> optimized,
-                   List<LoweredModule> lowered, DescriptorPlans plans,
-                   ReachedProgram reached) -> List<FileDiagnostic> {
+                   List<LoweredModule> lowered, ReachedProgram reached) -> List<FileDiagnostic> {
     let problems = new List<FileDiagnostic>();
     let files = filePathsByModule(programIndex);
-    for (let found in references.check(moduleBodies(optimized), moduleBodies(lowered), plans,
-            reached)) {
+    for (let found in references.check(moduleBodies(optimized), moduleBodies(lowered),
+            reached.namedPlans(), reached)) {
         problems.push(new FileDiagnostic(files.get(found.modulePath()) ?? found.modulePath(),
             found.message(), source.makeSpan(0, 0)));
     }
@@ -520,8 +520,9 @@ checkLowered(EirFunction function, string filePath, Span span) -> List<FileDiagn
 // Writes one object file per module it is given. Only a program that lowered and verified cleanly
 // gets here, so a failed compile leaves no objects behind. Emission stops at the first module that
 // fails, because a module that cannot be emitted means the compiler is broken, not the program.
-emitModules(List<LoweredModule> lowered, DescriptorPlans plans, ReachedProgram reached,
-            Type? stackFrame, Type? errorClass, string outputFolder, string filePrefix,
+// Every descriptor emission reads is one the reached bodies name.
+emitModules(List<LoweredModule> lowered, ReachedProgram reached, Type? stackFrame,
+            Type? errorClass, string outputFolder, string filePrefix,
             CodegenSettings settings) -> EmittedObjects {
     let objects = new List<string>();
     let problems = new List<FileDiagnostic>();
@@ -531,9 +532,9 @@ emitModules(List<LoweredModule> lowered, DescriptorPlans plans, ReachedProgram r
         string moduleName = unit.definitions.context().module().canonicalPath();
         string objectPath = outputFolder + "/" + filePrefix
             + symbols.sanitizeModulePath(moduleName) + settings.objectExtension();
-        string failure = emit.emitModule(moduleName, unit.functions, unit.entry, plans,
-            gate.definedDescriptors(moduleName, plans, writing, reached), stackFrame, errorClass,
-            objectPath, settings, reached);
+        string failure = emit.emitModule(moduleName, unit.functions, unit.entry,
+            reached.namedPlans(), gate.definedDescriptors(moduleName, reached, writing),
+            stackFrame, errorClass, objectPath, settings, reached);
         if (failure.length > 0) {
             problems.push(new FileDiagnostic(unit.definitions.context().module().filePath(),
                 failure, source.makeSpan(0, 0)));

@@ -9,10 +9,12 @@
 // implementation of the slot reached and the slot kept, which is rapid type analysis run to its
 // fixed point. A slot that no reached call reads that way is dropped, and a descriptor is written
 // only for a type a reached body names. A library has no entry point, and a program that links it
-// may dispatch anywhere, so a library keeps every descriptor and every slot.
+// may dispatch anywhere, so a library keeps the descriptor of every type it declares and every
+// slot.
 //
-// The result is a set of symbols, descriptors and slots, and nothing here changes what a build
-// emits.
+// The result is a set of symbols, descriptors and slots, each kept in the order the walk found
+// it, and nothing here changes what a build emits. The walk reads only what the reached bodies
+// name, so its result is the same however many other bodies and descriptors were planned.
 import EirFunction from eir.model;
 import EirInstruction from eir.model;
 import EirTerminator from eir.model;
@@ -66,13 +68,15 @@ public enum SlotKind {
 // slots a reached call reads, and the roots it started from.
 public final class ReachedProgram {
     Set<string> reachedSymbols;
+    List<string> reachedInOrder;
     Set<Type> namedDescriptors;
+    DescriptorPlans namedInOrder;
     Set<string> keptSlots;
     bool keepsEverySlot;
     List<Root> startingRoots;
 
-    protected constructor(this.reachedSymbols, this.namedDescriptors, this.keptSlots,
-                this.keepsEverySlot, this.startingRoots);
+    protected constructor(this.reachedSymbols, this.reachedInOrder, this.namedDescriptors,
+                this.namedInOrder, this.keptSlots, this.keepsEverySlot, this.startingRoots);
 
     // Whether the roots reach the body defined under this symbol. False for a symbol no lowered
     // body defines, such as a foreign C name.
@@ -84,6 +88,11 @@ public final class ReachedProgram {
         return this.reachedSymbols.length();
     }
 
+    // The reached symbols in the order the walk reached them.
+    public order() -> List<string> {
+        return this.reachedInOrder;
+    }
+
     // How many types' descriptors the reached bodies name, counting the parent and the implemented
     // interfaces each named descriptor names in turn.
     public descriptorCount() -> long {
@@ -93,6 +102,11 @@ public final class ReachedProgram {
     // Whether the reached bodies name this type's descriptor, parents and interfaces included.
     public namesDescriptor(Type described) -> bool {
         return this.namedDescriptors.contains(described);
+    }
+
+    // The plans of the descriptors the reached bodies name, in the order the walk named them.
+    public namedPlans() -> DescriptorPlans {
+        return this.namedInOrder;
     }
 
     // Whether a reached call can read this slot of the planned descriptor. `conformed` is the
@@ -110,15 +124,37 @@ public final class ReachedProgram {
 // dropped here; the result is a set the caller reads.
 public analyze(ProgramIndex index, DescriptorPlans plans,
                List<ModuleBodies> modules) -> ReachedProgram {
-    return analyzeFrom(plans, modules, roots.collect(index), index.entryFunction() == null);
+    List<Type>? libraryTypes = null;
+    if (index.entryFunction() == null) {
+        libraryTypes = declaredTypes(index);
+    }
+    return analyzeFrom(plans, modules, roots.collect(index), libraryTypes);
 }
 
 // Walks the lowered program from a root list a caller chose, which is how a test walks from an
-// incomplete one. A library keeps every descriptor and every slot.
+// incomplete one. `libraryTypes` is null for a program. For a library it lists the types the
+// library declares, whose descriptors it keeps along with every slot.
 public analyzeFrom(DescriptorPlans plans, List<ModuleBodies> modules, List<Root> started,
-                   bool library = false) -> ReachedProgram {
-    let walked = new Walk(plans, modules, library);
-    return walked.run(started);
+                   List<Type>? libraryTypes = null) -> ReachedProgram {
+    let walked = new Walk(plans, modules, libraryTypes != null);
+    return walked.run(started, libraryTypes ?? new List<Type>());
+}
+
+// The classes and interfaces the program declares, in index order, leaving out instantiations.
+declaredTypes(ProgramIndex index) -> List<Type> {
+    let declared = new List<Type>();
+    let modules = index.modules();
+    for (long m = 0; m < modules.length(); m++) {
+        let interfaces = modules.get(m).interfaces();
+        for (long i = 0; i < interfaces.length(); i++) {
+            declared.push(interfaces.get(i));
+        }
+        let classes = modules.get(m).classes();
+        for (long i = 0; i < classes.length(); i++) {
+            declared.push(classes.get(i));
+        }
+    }
+    return declared;
 }
 
 // The key a kept slot is recorded under: the descriptor's symbol, the kind, the interface's
@@ -162,7 +198,9 @@ final class Walk {
     DescriptorPlans plans;
     Map<string, EirFunction> bodyBySymbol;
     Set<string> reached;
+    List<string> reachedInOrder;
     Set<Type> descriptors;
+    DescriptorPlans namedPlans;
     List<string> pending;
     Set<Type> instantiated;
     List<Type> instantiatedInOrder;
@@ -175,7 +213,9 @@ final class Walk {
         this.plans = plans;
         this.bodyBySymbol = new Map<string, EirFunction>();
         this.reached = new Set<string>();
+        this.reachedInOrder = new List<string>();
         this.descriptors = new Set<Type>();
+        this.namedPlans = new DescriptorPlans();
         this.pending = new List<string>();
         this.instantiated = new Set<Type>();
         this.instantiatedInOrder = new List<Type>();
@@ -191,11 +231,9 @@ final class Walk {
         }
     }
 
-    protected run(List<Root> started) -> ReachedProgram {
-        if (this.library) {
-            for (let plan in this.plans.all()) {
-                this.nameDescriptor(plan.type());
-            }
+    protected run(List<Root> started, List<Type> libraryTypes) -> ReachedProgram {
+        for (long i = 0; i < libraryTypes.length(); i++) {
+            this.nameDescriptor(libraryTypes.get(i));
         }
         for (long i = 0; i < started.length(); i++) {
             this.reach(started.get(i).symbol());
@@ -203,8 +241,8 @@ final class Walk {
         while (!this.pending.isEmpty()) {
             this.scan(this.pending.pop());
         }
-        return new ReachedProgram(this.reached, this.descriptors, this.keptSlots, this.library,
-            started);
+        return new ReachedProgram(this.reached, this.reachedInOrder, this.descriptors,
+            this.namedPlans, this.keptSlots, this.library, started);
     }
 
     // Marks the body under one symbol reached and queues it for scanning. A symbol the lowered
@@ -217,6 +255,7 @@ final class Walk {
         if (!this.reached.add(symbol)) {
             return;
         }
+        this.reachedInOrder.push(symbol);
         this.pending.push(symbol);
     }
 
@@ -361,6 +400,7 @@ final class Walk {
         if (plan == null) {
             return;
         }
+        this.namedPlans.add(plan);
         if (this.library) {
             this.keepEverySlot(plan);
         }

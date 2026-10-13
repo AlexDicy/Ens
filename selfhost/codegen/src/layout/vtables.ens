@@ -1,10 +1,14 @@
 // Dispatch slot assignment, the first half of the layout stage, run after the monomorphization
 // closure and before any function lowers. A class method gets a vtable slot only when it is
 // abstract or overridden. An interface method's slot is its declaration-order position.
+//
+// Which methods get a slot is read off the declarations, generic templates included, so the
+// slots of a type are the same whichever other instantiations the program has.
 import @ens.sema.model.hierarchy;
 import Method from @ens.sema.model.typemembers;
 import Signature from @ens.sema.model.typemembers;
 import @ens.sema.model.typemembers;
+import InstantiationType from @ens.sema.model.types;
 import Type from @ens.sema.model.types;
 import Visibility from @ens.sema.model.types;
 import ProgramIndex from lower.index;
@@ -16,11 +20,18 @@ import Set from @std.collections.set;
 // The assigned slots. A signature identifies one method declaration, so both maps key on it;
 // a method with no entry dispatches directly.
 public final class DispatchTables {
+    Set<Signature> forcedSlots;
+    Set<Type> assignedTypes;
+
     Map<Signature, long> methodSlots;
     Map<Type, long> tableSizes;
     Map<Signature, long> interfaceSlots;
 
-    public constructor() {
+    // `forced` holds the declarations that need a slot, keyed the way `slotDeclarationOf` keys
+    // them.
+    public constructor(Set<Signature> forced) {
+        this.forcedSlots = forced;
+        this.assignedTypes = new Set<Type>();
         this.methodSlots = new Map<Signature, long>();
         this.tableSizes = new Map<Type, long>();
         this.interfaceSlots = new Map<Signature, long>();
@@ -54,50 +65,103 @@ public final class DispatchTables {
         return slot;
     }
 
-    public setMethodSlot(Signature signature, long slot) {
-        this.methodSlots.set(signature, slot);
-    }
-
-    public setVtableSize(Type classType, long size) {
+    // Gives one class, declared or instantiated, its slots, after its base's. A subclass starts its
+    // table where its base's ends and an override takes its base method's slot, which leaves a
+    // derived table prefix-compatible with its base's. A type is assigned once.
+    public assignClass(Type classType) {
+        if (!this.assignedTypes.add(classType)) {
+            return;
+        }
+        long size = 0;
+        let base = baseClassOf(classType);
+        if (base != null) {
+            this.assignClass(base);
+            size = this.vtableSizeOf(base);
+        }
+        let methods = typemembers.methodsOf(classType);
+        if (methods == null) {
+            return;
+        }
+        for (long i = 0; i < methods.length(); i++) {
+            let method = methods.get(i);
+            if (method.isConstructor() || method.isDestructor()
+                    || !this.forcedSlots.contains(slotDeclarationOf(classType, i))) {
+                continue;
+            }
+            long slot = -1;
+            let overridden = declaringBaseMethod(classType, method);
+            if (overridden != null) {
+                slot = this.vtableSlotOf(overridden.signature());
+            }
+            if (slot < 0) {
+                slot = size;
+                size++;
+            }
+            this.methodSlots.set(method.signature(), slot);
+        }
         this.tableSizes.set(classType, size);
     }
 
-    public setInterfaceSlot(Signature signature, long slot) {
-        this.interfaceSlots.set(signature, slot);
+    // Numbers an interface's method table, declared or instantiated, in declaration order.
+    public assignInterface(Type interfaceType) {
+        if (!this.assignedTypes.add(interfaceType)) {
+            return;
+        }
+        let methods = typemembers.methodsOf(interfaceType);
+        if (methods == null) {
+            return;
+        }
+        for (long i = 0; i < methods.length(); i++) {
+            this.interfaceSlots.set(methods.get(i).signature(), i);
+        }
     }
 }
 
-// Assigns every dispatch slot of the program. Classes are visited base-first, so a subclass
-// starts its table where its base's ends and an override finds its base method's slot already
-// assigned, which leaves a derived table prefix-compatible with its base's.
+// Assigns every dispatch slot of the indexed program.
 public assignSlots(ProgramIndex index) -> DispatchTables {
-    let tables = new DispatchTables();
-    let ordered = classesBaseFirst(index);
-    let pending = new Set<Signature>();
-    for (long i = 0; i < ordered.length(); i++) {
-        markForcedSlots(ordered.get(i), pending);
-    }
-    for (long i = 0; i < ordered.length(); i++) {
-        assignClassSlots(ordered.get(i), pending, tables);
-    }
+    let tables = new DispatchTables(forcedSlots(index));
     let modules = index.modules();
     for (long m = 0; m < modules.length(); m++) {
+        let classes = modules.get(m).classes();
+        for (long i = 0; i < classes.length(); i++) {
+            tables.assignClass(classes.get(i));
+        }
         let interfaces = modules.get(m).interfaces();
         for (long i = 0; i < interfaces.length(); i++) {
-            assignInterfaceSlots(interfaces.get(i), tables);
+            tables.assignInterface(interfaces.get(i));
         }
         let instantiations = modules.get(m).instantiations();
         for (long i = 0; i < instantiations.length(); i++) {
-            if (primitives.interfaceOf(instantiations.get(i)) != null) {
-                assignInterfaceSlots(instantiations.get(i), tables);
+            let instantiation = instantiations.get(i);
+            if (primitives.classOf(instantiation) != null) {
+                tables.assignClass(instantiation);
+            } else if (primitives.interfaceOf(instantiation) != null) {
+                tables.assignInterface(instantiation);
             }
         }
     }
     return tables;
 }
 
-// Marks the methods that need a slot: every abstract method, and both ends of every override.
-markForcedSlots(Type classType, Set<Signature> pending) {
+// The declarations that need a slot: every abstract method, and both ends of every override, over
+// the classes the program declares and the generic classes it declares.
+public forcedSlots(ProgramIndex index) -> Set<Signature> {
+    let forced = new Set<Signature>();
+    let modules = index.modules();
+    for (long m = 0; m < modules.length(); m++) {
+        let classes = modules.get(m).classes();
+        for (long i = 0; i < classes.length(); i++) {
+            markForcedSlots(classes.get(i), forced);
+        }
+        let templates = modules.get(m).classTemplates();
+        for (long i = 0; i < templates.length(); i++) {
+            markForcedSlots(templates.get(i), forced);
+        }
+    }
+    return forced;
+}
+
+markForcedSlots(Type classType, Set<Signature> forced) {
     let methods = typemembers.methodsOf(classType);
     if (methods == null) {
         return;
@@ -108,58 +172,43 @@ markForcedSlots(Type classType, Set<Signature> pending) {
             continue;
         }
         if (method.isAbstract()) {
-            let ignored = pending.add(method.signature());
+            let ignored = forced.add(slotDeclarationOf(classType, i));
         }
         if (!method.isOverride()) {
             continue;
         }
-        let overridden = declaringBaseMethod(classType, method);
-        if (overridden != null) {
-            let ignoredOwn = pending.add(method.signature());
-            let ignoredBase = pending.add(overridden.signature());
-        }
-    }
-}
-
-// Gives every marked method of one class its slot: the base method's when it overrides one, and
-// a fresh index at the end of the table otherwise.
-assignClassSlots(Type classType, Set<Signature> pending, DispatchTables tables) {
-    long size = 0;
-    let base = baseClassOf(classType);
-    if (base != null) {
-        size = tables.vtableSizeOf(base);
-    }
-    let methods = typemembers.methodsOf(classType);
-    if (methods == null) {
-        return;
-    }
-    for (long i = 0; i < methods.length(); i++) {
-        let method = methods.get(i);
-        if (method.isConstructor() || method.isDestructor() || !pending.contains(method.signature())) {
+        let level = declaringBase(classType, method);
+        if (level == null) {
             continue;
         }
-        long slot = -1;
-        let overridden = declaringBaseMethod(classType, method);
-        if (overridden != null) {
-            slot = tables.vtableSlotOf(overridden.signature());
+        let ignoredOwn = forced.add(slotDeclarationOf(classType, i));
+        let levelMethods = typemembers.methodsOf(level);
+        if (levelMethods == null) {
+            continue;
         }
-        if (slot < 0) {
-            slot = size;
-            size++;
+        for (long j = 0; j < levelMethods.length(); j++) {
+            if (levelMethods.get(j) == overriddenIn(level, method)) {
+                let ignoredBase = forced.add(slotDeclarationOf(level, j));
+            }
         }
-        tables.setMethodSlot(method.signature(), slot);
     }
-    tables.setVtableSize(classType, size);
 }
 
-assignInterfaceSlots(Type interfaceType, DispatchTables tables) {
-    let methods = typemembers.methodsOf(interfaceType);
+// The declaration whose slot decision the method at this position of a type's method list follows:
+// the template's method at the same position for an instantiation, whose list is parallel to its
+// template's, and the method's own declaration otherwise.
+public slotDeclarationOf(Type owner, long index) -> Signature {
+    let methods = typemembers.methodsOf(owner);
     if (methods == null) {
-        return;
+        panic("Internal: a slot was asked of a type with no methods");
     }
-    for (long i = 0; i < methods.length(); i++) {
-        tables.setInterfaceSlot(methods.get(i).signature(), i);
+    if (owner is InstantiationType) {
+        let templateMethods = typemembers.methodsOf(owner.template());
+        if (templateMethods != null && index < templateMethods.length()) {
+            return templateMethods.get(index).signature();
+        }
     }
+    return methods.get(index).signature();
 }
 
 // The nearest method up the base chain that this method overrides, matched by name and exact
@@ -168,24 +217,44 @@ assignInterfaceSlots(Type interfaceType, DispatchTables tables) {
 // not inherited, so it is never an override target and never earns a dispatch slot; sema refuses
 // the override, and this keeps the table from being built around one it did not.
 public declaringBaseMethod(Type classType, Method method) -> Method? {
+    let level = declaringBase(classType, method);
+    if (level == null) {
+        return null;
+    }
+    return overriddenIn(level, method);
+}
+
+// The nearest class up the base chain declaring the method this one overrides, or null.
+declaringBase(Type classType, Method method) -> Type? {
     let current = baseClassOf(classType);
     while (current != null) {
-        let methods = typemembers.methodsOf(current);
-        if (methods == null) {
+        if (typemembers.methodsOf(current) == null) {
             return null;
         }
-        for (long i = 0; i < methods.length(); i++) {
-            let candidate = methods.get(i);
-            if (candidate.isConstructor() || candidate.isDestructor()
-                    || candidate.name() != method.name()
-                    || candidate.visibility() == Visibility.Private) {
-                continue;
-            }
-            if (primitives.sameParameterTypes(candidate.signature(), method.signature())) {
-                return candidate;
-            }
+        if (overriddenIn(current, method) != null) {
+            return current;
         }
         current = baseClassOf(current);
+    }
+    return null;
+}
+
+// The method one class declares that `method` would override, or null.
+overriddenIn(Type level, Method method) -> Method? {
+    let methods = typemembers.methodsOf(level);
+    if (methods == null) {
+        return null;
+    }
+    for (long i = 0; i < methods.length(); i++) {
+        let candidate = methods.get(i);
+        if (candidate.isConstructor() || candidate.isDestructor()
+                || candidate.name() != method.name()
+                || candidate.visibility() == Visibility.Private) {
+            continue;
+        }
+        if (primitives.sameParameterTypes(candidate.signature(), method.signature())) {
+            return candidate;
+        }
     }
     return null;
 }
@@ -198,43 +267,4 @@ public baseClassOf(Type classType) -> Type? {
         return null;
     }
     return primitives.classOf(base);
-}
-
-// Every indexed class, declared or instantiated, base classes before their subclasses.
-classesBaseFirst(ProgramIndex index) -> List<Type> {
-    let all = new List<Type>();
-    let modules = index.modules();
-    for (long m = 0; m < modules.length(); m++) {
-        let classes = modules.get(m).classes();
-        for (long i = 0; i < classes.length(); i++) {
-            all.push(classes.get(i));
-        }
-        let instantiations = modules.get(m).instantiations();
-        for (long i = 0; i < instantiations.length(); i++) {
-            if (primitives.classOf(instantiations.get(i)) != null) {
-                all.push(instantiations.get(i));
-            }
-        }
-    }
-    let ordered = new List<Type>();
-    long depth = 0;
-    while (ordered.length() < all.length()) {
-        for (long i = 0; i < all.length(); i++) {
-            if (chainDepthOf(all.get(i)) == depth) {
-                ordered.push(all.get(i));
-            }
-        }
-        depth++;
-    }
-    return ordered;
-}
-
-chainDepthOf(Type classType) -> long {
-    long depth = 0;
-    let current = baseClassOf(classType);
-    while (current != null) {
-        depth++;
-        current = baseClassOf(current);
-    }
-    return depth;
 }
