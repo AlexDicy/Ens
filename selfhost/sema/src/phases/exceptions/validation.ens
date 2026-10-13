@@ -43,6 +43,7 @@ import ClassType from model.types;
 import StructType from model.types;
 import PrimitiveBinding from model.types;
 import List from @std.collections.list;
+import phases.bodies.wording;
 import Set from @std.collections.set;
 import StringBuilder from @std.text.stringbuilder;
 import support.syntax;
@@ -58,6 +59,10 @@ public final class ThrowValidation {
     TypeNameDirectory directory;
     // The call each lambda written as an argument is passed to.
     Map<GreenNode, LambdaArgument> argumentCalls;
+    // A call inside the arguments of a call that cannot throw, written after a 'try', which belongs
+    // on the inner call: the inner call, with the call the 'try' is written before and the 'try'.
+    Map<GreenNode, CallExpressionNode> misplacedTries;
+    Map<GreenNode, Span> misplacedTrySpans;
     ClassType? errorClass;
 
     // The methods the function being validated overrides or implements, which decide whether
@@ -70,6 +75,8 @@ public final class ThrowValidation {
         this.module = module;
         this.directory = directory;
         this.argumentCalls = new Map<GreenNode, LambdaArgument>();
+        this.misplacedTries = new Map<GreenNode, CallExpressionNode>();
+        this.misplacedTrySpans = new Map<GreenNode, Span>();
         this.result = module.result();
         this.reporter = module.reporter();
         this.fileNames = module.names();
@@ -349,7 +356,13 @@ public final class ThrowValidation {
                 let operand = tried.operand();
                 if (operand is CallExpressionNode) {
                     this.noteLambdaArguments(operand);
-                    this.validateCall(operand, true, tried.tryKeyword().span(), site, lambda);
+                    let misplaced = this.misplacedTryTarget(operand);
+                    if (misplaced != null) {
+                        this.misplacedTries.set(misplaced.green(), operand);
+                        this.misplacedTrySpans.set(misplaced.green(), tried.tryKeyword().span());
+                    } else {
+                        this.validateCall(operand, true, tried.tryKeyword().span(), site, lambda);
+                    }
                     this.validateChildren(operand, site, lambda);
                 } else {
                     this.validateExpressions(operand, site, lambda);
@@ -387,12 +400,85 @@ public final class ThrowValidation {
                 raised = "can throw {nameList(contract, this.names)}.";
             }
             string fix = this.missingTryFix(contract, site, lambda);
+            let outer = this.misplacedTries.get(call.green());
+            let triedSpan = this.misplacedTrySpans.get(call.green());
+            if (outer != null && fix.startsWith(movableFix())) {
+                this.reporter.report(this.misplacedTryRefusal(call, outer, contract, fix), call.span());
+                return;
+            }
+            if (outer != null && triedSpan != null) {
+                this.reporter.report("'try' is not needed here: {calleePhrase(outer)} cannot throw. Remove "
+                    + "'try'.", triedSpan);
+            }
             this.reporter.report("Call to {calleePhrase(call)} {raised} {fix}", call.span());
         }
         if (!required && contract.raisesNothing() && tried) {
             this.reporter.report("'try' is not needed here: {calleePhrase(call)} cannot throw. Remove 'try'.",
                 triedAt);
         }
+    }
+
+    // The one call inside the arguments of 'tried' that needs a 'try' where 'tried' itself cannot
+    // throw, which is where the 'try' written before 'tried' belongs, or null.
+    misplacedTryTarget(CallExpressionNode tried) -> CallExpressionNode? {
+        let contract = this.module.callContract(tried);
+        if (this.module.requiresTry(tried, contract) || !contract.raisesNothing()) {
+            return null;
+        }
+        let needing = new List<CallExpressionNode>();
+        this.collectUncoveredCalls(tried.arguments(), needing);
+        if (needing.length() != 1) {
+            return null;
+        }
+        return needing.get(0);
+    }
+
+    // Adds each call under 'node' that needs a 'try' and has none, leaving out lambdas, whose bodies
+    // are checked on their own.
+    collectUncoveredCalls(SyntaxNode node, List<CallExpressionNode> into) {
+        switch (node) {
+            is TryExpressionNode ignored -> {
+                return;
+            },
+            is LambdaExpressionNode ignored -> {
+                return;
+            },
+            is CallExpressionNode call -> {
+                if (this.module.requiresTry(call, this.module.callContract(call))) {
+                    into.push(call);
+                }
+            },
+            default -> { },
+        }
+        let children = node.childNodes();
+        for (long i = 0; i < children.length(); i++) {
+            this.collectUncoveredCalls(children.get(i), into);
+        }
+    }
+
+    // The refusal of 'call', which needs a 'try', inside the arguments of 'outer', the call that
+    // cannot throw and has the 'try' written before it. 'fix' is the fix a 'try' missing from 'call'
+    // takes, which this one moves the 'try' to.
+    misplacedTryRefusal(CallExpressionNode call, CallExpressionNode outer, ThrowSet contract,
+                        string fix) -> string {
+        string raised = "can throw";
+        if (!contract.isEmpty()) {
+            raised = "can throw {nameList(contract, this.names)}";
+        }
+        string moved = "Move the 'try' to {calleePhrase(call)}";
+        let written = writtenOnOneLine(outer.green());
+        let inner = writtenOnOneLine(call.green());
+        long at = written == null || inner == null ? -1 : written.indexOf(inner);
+        if (written != null && at >= 0) {
+            string rewritten = written.substring(0, at) + "try " + written.substring(at);
+            if (rewritten.length <= wording.quotedCodeLimit()) {
+                moved = moved + ", as in '{rewritten}'";
+            }
+        }
+        string rest = fix.substring(movableFix().length);
+        return "Call to {calleePhrase(call)} {raised}, and the 'try' before {calleePhrase(outer)} does "
+            + "not cover it: a call inside an argument needs its own 'try', and {calleePhrase(outer)} "
+            + "cannot throw. {moved}{rest}";
     }
 
     // The fix for a call that can throw and has no 'try', as its position allows. A test may throw
@@ -888,6 +974,12 @@ initializerReason(TypeItem item, FieldDeclarationNode member, TypeNames names) -
 // How a diagnostic names what a call calls. A function, method or variable holding a function
 // value is named by its quoted name. Any other callee is the function value its expression
 // produces, quoted when that expression is written on one line without a comment.
+// How a fix for a missing 'try' opens when writing the 'try' before the call is the whole of it, which a
+// 'try' written in the wrong place moves to.
+movableFix() -> string {
+    return "Prefix it with 'try'";
+}
+
 calleePhrase(CallExpressionNode call) -> string {
     switch (call.callee()) {
         is IdentifierExpressionNode identifier -> {
