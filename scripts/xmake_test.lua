@@ -1307,6 +1307,40 @@ task("test")
                 running:close()
             end
 
+            -- a library the linker cannot read can end the build from one of the linker's own
+            -- threads, and the build still says why before the process ends
+            if is_host("windows") then
+                local damaged = path.join(root, "damaged")
+                os.mkdir(path.join(damaged, "app", "src"))
+                io.writefile(path.join(damaged, "app", "ens.package"), 'package demo.damaged {\n'
+                    .. '    ens "0.1";\n\n'
+                    .. '    native damaged {\n        windows "damaged";\n    }\n}\n')
+                io.writefile(path.join(damaged, "app", "src", "main.ens"),
+                    'main() -> int {\n    return 0;\n}\n')
+                -- an x86-64 object whose one relocation names the aux record of its section
+                -- symbol, which the linker reads as a symbol whose name lies past the string table.
+                -- It reads that name only while writing the program, on its thread pool.
+                local object = table.concat({
+                    "6486010000000000560000000300000000000000",
+                    "2e746578740000000000000000000000100000003c000000",
+                    "4c000000000000000100000020005060",
+                    "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+                    "00000000010000000100",
+                    "2e7465787400000000000000010000000301",
+                    "00000000ffffffff00000000000000000000",
+                    "737461727400000000000000010020000200",
+                    "04000000",
+                })
+                local library = io.open(path.join(damaged, "damaged.lib"), "wb")
+                library:write((object:gsub("%x%x", function (pair)
+                    return string.char(tonumber(pair, 16))
+                end)))
+                library:close()
+                run({"build", "app", "--output", path.join(damaged, "app.exe")}, {curdir = damaged},
+                    1, "ens: linking stopped the build; the linker reported:",
+                    "lld-link: error: string table empty")
+            end
+
             -- and nowhere else: not beside the executable, and not in the folder it was run from
             for _, elsewhere in ipairs({root, work}) do
                 if #os.files(path.join(elsewhere, "*" .. obj_suffix)) > 0 then

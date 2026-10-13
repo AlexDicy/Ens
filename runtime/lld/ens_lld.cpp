@@ -2,17 +2,22 @@
 // exposes only a C++ interface. It carries no policy - the caller hands over a finished argument
 // vector and the flavor to run it under, and everything the linker printed comes back as one
 // allocated text the caller releases through ens_lld_free. ens_lld_shutdown stops lld's thread
-// pool once, after the last link, while the process can still wait for its threads.
+// pool once, after the last link, while the process can still wait for its threads. A link that
+// ends the process prints what the linker reported on standard error first.
 
 #include "lld/Common/CommonLinkerContext.h"
 #include "lld/Common/Driver.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/Support/CrashRecoveryContext.h"
 #include "llvm/Support/ManagedStatic.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <atomic>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -47,6 +52,56 @@ std::vector<std::string> splitArguments(const char* block, long long count) {
     }
     return arguments;
 }
+
+// Everything the linker printed during one link. lld writes to it from every thread it runs a step
+// on, so each write takes the lock that taking the text does.
+class LinkerText final : public llvm::raw_ostream {
+public:
+    LinkerText() { SetUnbuffered(); }
+
+    std::string taken() {
+        std::lock_guard<std::mutex> lock(guard);
+        return std::move(text);
+    }
+
+private:
+    void write_impl(const char* data, std::size_t size) override {
+        std::lock_guard<std::mutex> lock(guard);
+        text.append(data, size);
+        written += size;
+    }
+
+    std::uint64_t current_pos() const override { return written; }
+
+    std::mutex guard;
+    std::string text;
+    std::atomic<std::uint64_t> written{0};
+};
+
+std::atomic<LinkerText*> linkInProgress{nullptr};
+
+void reportStoppedLink(const std::string& text) {
+    const llvm::StringRef reported = llvm::StringRef(text).trim();
+    llvm::raw_ostream& stream = llvm::errs();
+    if (reported.empty()) {
+        stream << "ens: linking stopped the build and the linker reported no reason\n";
+    } else {
+        stream << "ens: linking stopped the build; the linker reported:\n" << reported << "\n";
+    }
+    stream.flush();
+}
+
+// lld ends the process from a thread outside every recovery context, a thread of its pool, by
+// running llvm_shutdown and then terminating the process. llvm_shutdown destroys this object, so
+// its destructor is the last point at which the text of the link in progress can be printed.
+struct StoppedLinkReporter {
+    ~StoppedLinkReporter() {
+        LinkerText* stopped = linkInProgress.exchange(nullptr);
+        if (stopped != nullptr) reportStoppedLink(stopped->taken());
+    }
+};
+
+llvm::ManagedStatic<StoppedLinkReporter> stoppedLinkReporter;
 
 char* copied(const std::string& text) {
     char* buffer = static_cast<char*>(std::malloc(text.size() + 1));
@@ -134,12 +189,15 @@ ENS_LLD_EXPORT int ens_lld_link(int flavor, const char* argumentBlock, long long
     argv.reserve(arguments.size());
     for (const std::string& argument : arguments) argv.push_back(argument.c_str());
 
-    std::string printed;
-    llvm::raw_string_ostream stream(printed);
-    const bool linked = runDriver(flavor, argv, stream, stream);
-    stream.flush();
+    // Constructed before the first link, so llvm_shutdown has it to destroy.
+    *stoppedLinkReporter;
+    LinkerText printed;
+    linkInProgress.store(&printed);
+    const bool linked = runDriver(flavor, argv, printed, printed);
+    linkInProgress.store(nullptr);
 
-    if (output != nullptr && !printed.empty()) *output = copied(printed);
+    const std::string text = printed.taken();
+    if (output != nullptr && !text.empty()) *output = copied(text);
     return linked ? kLinked : kLinkFailed;
 }
 
