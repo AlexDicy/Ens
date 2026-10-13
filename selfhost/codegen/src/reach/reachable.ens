@@ -120,15 +120,57 @@ public final class ReachedProgram {
     }
 }
 
+// Where a walk reads the program from: the body defined under a symbol and the descriptor plan of
+// a type. The walk asks in the order it meets them, so a source that lowers and plans on the first
+// request walks the same as one that holds everything beforehand.
+public interface ProgramSource {
+    // The body defined under this symbol, or null when the program defines none, as for a foreign
+    // C name or a lazy const's storage.
+    bodyOf(string symbol) -> EirFunction?;
+
+    // The descriptor plan of this type, or null when it has none.
+    planOf(Type described) -> DescriptorPlan?;
+}
+
+// A program lowered and planned before the walk.
+public final class LoweredSource implements ProgramSource {
+    DescriptorPlans plans;
+    Map<string, EirFunction> bodyBySymbol;
+
+    public constructor(DescriptorPlans plans, List<ModuleBodies> modules) {
+        this.plans = plans;
+        this.bodyBySymbol = new Map<string, EirFunction>();
+        for (long m = 0; m < modules.length(); m++) {
+            let bodies = modules.get(m).bodies();
+            for (long b = 0; b < bodies.length(); b++) {
+                this.bodyBySymbol.set(bodies.get(b).symbol(), bodies.get(b));
+            }
+        }
+    }
+
+    public override bodyOf(string symbol) -> EirFunction? {
+        return this.bodyBySymbol.get(symbol);
+    }
+
+    public override planOf(Type described) -> DescriptorPlan? {
+        return this.plans.planFor(described);
+    }
+}
+
 // Walks the lowered program from the roots its index and its descriptors give it. Nothing is
 // dropped here; the result is a set the caller reads.
 public analyze(ProgramIndex index, DescriptorPlans plans,
                List<ModuleBodies> modules) -> ReachedProgram {
+    return analyzeSource(index, new LoweredSource(plans, modules));
+}
+
+// Walks the program a source gives from the roots its index gives.
+public analyzeSource(ProgramIndex index, ProgramSource source) -> ReachedProgram {
     List<Type>? libraryTypes = null;
     if (index.entryFunction() == null) {
         libraryTypes = declaredTypes(index);
     }
-    return analyzeFrom(plans, modules, roots.collect(index), libraryTypes);
+    return walkFrom(source, roots.collect(index), libraryTypes);
 }
 
 // Walks the lowered program from a root list a caller chose, which is how a test walks from an
@@ -136,7 +178,11 @@ public analyze(ProgramIndex index, DescriptorPlans plans,
 // library declares, whose descriptors it keeps along with every slot.
 public analyzeFrom(DescriptorPlans plans, List<ModuleBodies> modules, List<Root> started,
                    List<Type>? libraryTypes = null) -> ReachedProgram {
-    let walked = new Walk(plans, modules, libraryTypes != null);
+    return walkFrom(new LoweredSource(plans, modules), started, libraryTypes);
+}
+
+walkFrom(ProgramSource source, List<Root> started, List<Type>? libraryTypes) -> ReachedProgram {
+    let walked = new Walk(source, libraryTypes != null);
     return walked.run(started, libraryTypes ?? new List<Type>());
 }
 
@@ -191,11 +237,11 @@ final class Dispatch {
     }
 }
 
-// One walk in progress: the bodies keyed by symbol, what it has reached, and the symbols it still
-// has to scan. It lives no longer than the analyze call that made it, so two walks share nothing.
-// The lists keep the order things were found in, so the walk visits them the same way every run.
+// One walk in progress: the bodies it has reached keyed by symbol, and the symbols it still has to
+// scan. It lives no longer than the analyze call that made it, so two walks share nothing. The
+// lists keep the order things were found in, so the walk visits them the same way every run.
 final class Walk {
-    DescriptorPlans plans;
+    ProgramSource source;
     Map<string, EirFunction> bodyBySymbol;
     Set<string> reached;
     List<string> reachedInOrder;
@@ -209,8 +255,8 @@ final class Walk {
     Set<string> keptSlots;
     bool library;
 
-    protected constructor(DescriptorPlans plans, List<ModuleBodies> modules, bool library) {
-        this.plans = plans;
+    protected constructor(ProgramSource source, bool library) {
+        this.source = source;
         this.bodyBySymbol = new Map<string, EirFunction>();
         this.reached = new Set<string>();
         this.reachedInOrder = new List<string>();
@@ -223,12 +269,6 @@ final class Walk {
         this.dispatchedInOrder = new List<Dispatch>();
         this.keptSlots = new Set<string>();
         this.library = library;
-        for (long m = 0; m < modules.length(); m++) {
-            let bodies = modules.get(m).bodies();
-            for (long b = 0; b < bodies.length(); b++) {
-                this.bodyBySymbol.set(bodies.get(b).symbol(), bodies.get(b));
-            }
-        }
     }
 
     protected run(List<Root> started, List<Type> libraryTypes) -> ReachedProgram {
@@ -245,16 +285,19 @@ final class Walk {
             this.namedPlans, this.keptSlots, this.library, started);
     }
 
-    // Marks the body under one symbol reached and queues it for scanning. A symbol the lowered
-    // program defines no body for is left out, which is what a foreign C name and a lazy const's
-    // storage symbol are.
+    // Marks the body under one symbol reached and queues it for scanning. A symbol the program
+    // defines no body for is left out, which is what a foreign C name and a lazy const's storage
+    // symbol are.
     reach(string symbol) {
-        if (this.bodyBySymbol.get(symbol) == null) {
+        if (this.reached.contains(symbol)) {
             return;
         }
-        if (!this.reached.add(symbol)) {
+        let body = this.source.bodyOf(symbol);
+        if (body == null) {
             return;
         }
+        let added = this.reached.add(symbol);
+        this.bodyBySymbol.set(symbol, body);
         this.reachedInOrder.push(symbol);
         this.pending.push(symbol);
     }
@@ -346,7 +389,7 @@ final class Walk {
     // Keeps the slot `call` reads in the descriptor of `allocated`, and reaches what it holds, when
     // an object of that class can be the receiver.
     select(Type allocated, Dispatch call) {
-        let plan = this.plans.planFor(allocated);
+        let plan = this.source.planOf(allocated);
         if (plan == null || !this.isBelow(plan, call.through, call.kind)) {
             return;
         }
@@ -385,7 +428,7 @@ final class Walk {
             if (parent == null) {
                 return false;
             }
-            current = this.plans.planFor(parent);
+            current = this.source.planOf(parent);
         }
         return false;
     }
@@ -396,7 +439,7 @@ final class Walk {
         if (!this.descriptors.add(described)) {
             return;
         }
-        let plan = this.plans.planFor(described);
+        let plan = this.source.planOf(described);
         if (plan == null) {
             return;
         }

@@ -1,8 +1,16 @@
-// The monomorphization closure, the pipeline's first stage. Every concrete instantiation and
-// generic function instance gets exactly one home module, the one declaring its template, so
-// every other module names its symbols externally and emission order can never matter.
+// Monomorphization. Every concrete instantiation and generic function instance gets exactly one
+// home module, the one declaring its template, so every other module names its symbols externally
+// and emission order can never matter.
+//
+// What gets planned follows the requests the checked syntax makes, read from sema's side tables.
+// A build plans from the bodies it lowers: the declarations' parameter defaults first, because any
+// call may lower them, then each body as it is reached, and a type with what its members and field
+// defaults name the first time a request names it. A build that lowers every body instead plans
+// from the whole of every file and every template body. Each planned function and instantiation
+// joins the index the moment it is planned.
 import FieldDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import FunctionDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import MemberListNode from @ens.frontend.syntax.generated.nodes;
 import GreenNode from @ens.frontend.syntax.green;
 import SyntaxNode from @ens.frontend.syntax.node;
 import Span from @ens.frontend.support.source;
@@ -18,6 +26,7 @@ import @ens.sema.model.typemembers;
 import @ens.sema.model.typenames;
 import ArrayType from @ens.sema.model.types;
 import ClassType from @ens.sema.model.types;
+import DeclaredType from @ens.sema.model.types;
 import FunctionType from @ens.sema.model.types;
 import InstantiationType from @ens.sema.model.types;
 import InterfaceType from @ens.sema.model.types;
@@ -40,7 +49,7 @@ import List from @std.collections.list;
 import Map from @std.collections.map;
 import Set from @std.collections.set;
 
-// One reached instantiation and the module that owns its definition.
+// One planned instantiation and the module that owns its definition.
 public final class PlannedInstantiation {
     InstantiationType plannedType;
     ModuleContext homeContext;
@@ -83,6 +92,7 @@ public final class PlannedFunctionInstance {
     }
 }
 
+// Everything planned so far, each list in the order it was planned.
 public final class MonoPlan {
     List<FileDiagnostic> planProblems;
     List<PlannedInstantiation> plannedInstantiations;
@@ -104,7 +114,7 @@ public final class MonoPlan {
         return this.plannedInstantiations;
     }
 
-    // The methods of every planned instantiation, in discovery order.
+    // The methods of every planned instantiation, in planning order.
     public members() -> List<FunctionInfo> {
         return this.plannedMembers;
     }
@@ -114,53 +124,12 @@ public final class MonoPlan {
     }
 }
 
-// Computes the plan for an analyzed program over its concrete index.
+// Plans everything every file and every template body requests, for a build that lowers every
+// body, and registers it into the index.
 public close(ProgramAnalysis analysis, ProgramIndex index) -> MonoPlan {
-    let closure = new Closure(analysis, index);
-    return closure.run();
-}
-
-// Registers the plan's work into the index: each instantiation joins its home module, each
-// instance function becomes resolvable at its call sites, and each entry with a body joins its
-// home module's lowering list.
-public apply(MonoPlan plan, ProgramIndex index) {
-    let modulesByContext = new Map<ModuleContext, ModuleFunctions>();
-    let modules = index.modules();
-    for (long m = 0; m < modules.length(); m++) {
-        modulesByContext.set(modules.get(m).context(), modules.get(m));
-    }
-    for (long i = 0; i < plan.instantiations().length(); i++) {
-        let planned = plan.instantiations().get(i);
-        let home = modulesByContext.get(planned.home());
-        if (home != null) {
-            home.instantiations().push(planned.type());
-        }
-        let record = planned.record();
-        if (record != null) {
-            index.registerRecord(planned.type(), record);
-        }
-    }
-    for (long i = 0; i < plan.members().length(); i++) {
-        let member = plan.members().get(i);
-        index.register(member.signature(), member);
-        let declaration = member.declaration();
-        bool lowerable = member.isConstructor() || (declaration != null && declaration.body() != null);
-        if (lowerable) {
-            let home = modulesByContext.get(member.context());
-            if (home != null) {
-                index.addFunction(home, member);
-            }
-        }
-    }
-    for (long i = 0; i < plan.functions().length(); i++) {
-        let planned = plan.functions().get(i);
-        index.registerFunctionInstance(planned.template(), planned.arguments(),
-            planned.info());
-        let home = modulesByContext.get(planned.info().context());
-        if (home != null) {
-            index.addFunction(home, planned.info());
-        }
-    }
+    let planner = new Monomorphizer(analysis, index, true);
+    planner.planDeclarations();
+    return planner.plan();
 }
 
 // A generic function instance under construction is identified by template and arguments.
@@ -197,43 +166,102 @@ class InstanceKey {
     }
 }
 
-final class Closure {
+// The planner. It keeps what it has planned and the depth each planned body sits at, so asking it
+// for a body or a type a second time plans nothing new.
+public final class Monomorphizer {
     ProgramAnalysis analysis;
     ProgramIndex index;
     TypeStore store;
-    MonoPlan plan;
+    bool harvestsEveryBody;
+    MonoPlan record;
+
     Map<string, ModuleContext> contextsByPath;
+    Map<ModuleContext, ModuleFunctions> modulesByContext;
+
     Set<InstantiationType> seenInstantiations;
+    Set<DeclaredType> seenDeclared;
     Set<InstanceKey> seenFunctions;
     Set<GreenNode> reportedOverflows;
     Map<GreenNode, BodyRequests> requestCache;
+    Map<string, long> depthBySymbol;
+    Set<string> plannedBodies;
 
-    protected constructor(ProgramAnalysis analysis, ProgramIndex index) {
+    // `harvestsEveryBody` plans from the whole of every file and every template body at once, for
+    // a build that lowers every body. Without it, a body is planned when `planBody` is asked for it.
+    public constructor(ProgramAnalysis analysis, ProgramIndex index, bool harvestsEveryBody) {
         this.analysis = analysis;
         this.index = index;
         this.store = analysis.store();
-        this.plan = new MonoPlan();
+        this.harvestsEveryBody = harvestsEveryBody;
+        this.record = new MonoPlan();
         this.contextsByPath = new Map<string, ModuleContext>();
+        this.modulesByContext = new Map<ModuleContext, ModuleFunctions>();
         this.seenInstantiations = new Set<InstantiationType>();
+        this.seenDeclared = new Set<DeclaredType>();
         this.seenFunctions = new Set<InstanceKey>();
         this.reportedOverflows = new Set<GreenNode>();
         this.requestCache = new Map<GreenNode, BodyRequests>();
-    }
-
-    protected run() -> MonoPlan {
-        let contexts = this.analysis.contexts();
+        this.depthBySymbol = new Map<string, long>();
+        this.plannedBodies = new Set<string>();
+        let contexts = analysis.contexts();
         for (long i = 0; i < contexts.length(); i++) {
             this.contextsByPath.set(contexts.get(i).module().canonicalPath(), contexts.get(i));
         }
-        for (long i = 0; i < contexts.length(); i++) {
-            let context = contexts.get(i);
-            let root = context.root();
-            if (root == null) {
-                continue;
-            }
-            this.harvest(this.requestsFor(context.result(), root), null, 0);
+        let modules = index.modules();
+        for (long m = 0; m < modules.length(); m++) {
+            this.modulesByContext.set(modules.get(m).context(), modules.get(m));
         }
-        return this.plan;
+    }
+
+    public plan() -> MonoPlan {
+        return this.record;
+    }
+
+    // Plans what the declarations request before any body is lowered: every parameter default of a
+    // declared function, since a call anywhere that leaves the parameter out lowers it. A build that
+    // lowers every body plans the whole of every file here instead.
+    public planDeclarations() {
+        if (this.harvestsEveryBody) {
+            let contexts = this.analysis.contexts();
+            for (long i = 0; i < contexts.length(); i++) {
+                let root = contexts.get(i).root();
+                if (root != null) {
+                    this.harvest(this.requestsFor(contexts.get(i).result(), root), null, 0);
+                }
+            }
+            return;
+        }
+        let modules = this.index.modules();
+        for (long m = 0; m < modules.length(); m++) {
+            let functions = modules.get(m).functions();
+            long declared = functions.length();
+            for (long f = 0; f < declared; f++) {
+                let info = functions.get(f);
+                if (info.substitution() == null) {
+                    this.harvestDefaults(info, 0);
+                }
+            }
+        }
+    }
+
+    // Plans what one function's own body requests, under the substitution it is lowered beneath.
+    public planBody(FunctionInfo info) {
+        if (this.harvestsEveryBody || !this.plannedBodies.add(info.symbol())) {
+            return;
+        }
+        let body = bodyNodeOf(info);
+        if (body == null) {
+            return;
+        }
+        long depth = this.depthBySymbol.get(info.symbol()) ?? 0;
+        this.harvest(this.requestsFor(info.context().result(), body), info.substitution(),
+            depth + 1);
+    }
+
+    // Plans every concrete instantiation a type mentions, including the arguments of an
+    // instantiation that is itself still open.
+    public requestType(Type type) {
+        this.requestTypeAt(type, 0);
     }
 
     requestsFor(SemaResult result, SyntaxNode root) -> BodyRequests {
@@ -246,13 +274,13 @@ final class Closure {
         return scanned;
     }
 
-    // Applies the scan's raw requests under one substitution. With none - the whole-file walk
-    // over concrete code - a request that still mentions a type parameter belongs to a template
-    // body and is served per instance instead.
+    // Applies the scan's raw requests under one substitution. With none - concrete code - a
+    // request that still mentions a type parameter belongs to a template body and is served per
+    // instance instead.
     harvest(BodyRequests found, Substitution? active, long depth) {
         let mentioned = found.types();
         for (long i = 0; i < mentioned.length(); i++) {
-            this.requestType(substitution.apply(this.store, active, mentioned.get(i)), depth);
+            this.requestTypeAt(substitution.apply(this.store, active, mentioned.get(i)), depth);
         }
         let calls = found.calls();
         for (long i = 0; i < calls.length(); i++) {
@@ -271,29 +299,101 @@ final class Closure {
         }
     }
 
-    // Requests every concrete instantiation a type mentions, including the arguments of an
-    // instantiation that is itself still open.
-    requestType(Type type, long depth) {
+    // A declared struct, class or interface the first time a request names it: the types its
+    // members' signatures and its fields name, its base and interfaces, and the requests of its
+    // field defaults, which is what lowering a use of it may read, as an instantiation's members
+    // are. A generic declaration is planned per instantiation instead.
+    requestDeclared(DeclaredType declared, long depth) {
+        if (declared.isGeneric() || !this.seenDeclared.add(declared)) {
+            return;
+        }
+        for (let methodList in [typemembers.methodsOf(declared),
+                typemembers.staticMethodsOf(declared)]) {
+            if (methodList != null) {
+                for (let method in methodList) {
+                    this.requestSignature(method.signature(), null, depth + 1);
+                }
+            }
+        }
+        let fields = typemembers.fieldsOf(declared);
+        if (fields != null) {
+            for (let field in fields) {
+                this.requestTypeAt(field.type(), depth + 1);
+            }
+        }
+        let base = hierarchy.baseOf(declared);
+        if (base != null) {
+            this.requestTypeAt(base, depth + 1);
+        }
+        for (let implemented in hierarchy.interfacesOf(declared)) {
+            this.requestTypeAt(implemented, depth + 1);
+        }
+        let declaredRecord = this.index.recordFor(declared);
+        if (declaredRecord != null) {
+            this.harvestFields(declaredRecord.context().result(), declaredRecord.members(), null,
+                depth + 1);
+        }
+    }
+
+    // The types a signature names, under the substitution it is lowered beneath, since a call to it
+    // lowers with its parameter and result types whatever the calling body itself names.
+    requestSignature(Signature signature, Substitution? active, long depth) {
+        for (let parameter in signature.parameters()) {
+            this.requestTypeAt(substitution.apply(this.store, active, parameter.type()), depth);
+        }
+        this.requestTypeAt(substitution.apply(this.store, active, signature.returnType()), depth);
+    }
+
+    // The parameter defaults of one planned function, which a call leaving a parameter out lowers.
+    harvestDefaults(FunctionInfo info, long depth) {
+        let declaration = info.declaration();
+        if (declaration == null) {
+            return;
+        }
+        this.harvest(this.requestsFor(info.context().result(), declaration.parameters()),
+            info.substitution(), depth);
+    }
+
+    // The field declarations of one record, whose defaults every construction of it lowers.
+    harvestFields(SemaResult result, MemberListNode members, Substitution? active, long depth) {
+        for (long i = 0; i < members.membersCount(); i++) {
+            let member = members.members(i);
+            if (member is FieldDeclarationNode) {
+                this.harvest(this.requestsFor(result, member), active, depth);
+            }
+        }
+    }
+
+    requestTypeAt(Type type, long depth) {
         switch (type) {
             is OptionalType optional -> {
-                this.requestType(optional.inner(), depth);
+                this.requestTypeAt(optional.inner(), depth);
             },
             is ArrayType array -> {
-                this.requestType(array.element(), depth);
+                this.requestTypeAt(array.element(), depth);
             },
             is FunctionType functionType -> {
                 for (let parameter in functionType.parameterTypes()) {
-                    this.requestType(parameter, depth);
+                    this.requestTypeAt(parameter, depth);
                 }
-                this.requestType(functionType.returnType(), depth);
+                this.requestTypeAt(functionType.returnType(), depth);
             },
             is InstantiationType instantiation -> {
                 if (!substitution.containsTypeParameter(instantiation)) {
                     this.requestInstantiation(instantiation, depth);
                 }
                 for (let argument in instantiation.arguments()) {
-                    this.requestType(argument, depth);
+                    this.requestTypeAt(argument, depth);
                 }
+            },
+            is ClassType declared -> {
+                this.requestDeclared(declared, depth);
+            },
+            is StructType declared -> {
+                this.requestDeclared(declared, depth);
+            },
+            is InterfaceType declared -> {
+                this.requestDeclared(declared, depth);
             },
             default -> { },
         }
@@ -311,72 +411,92 @@ final class Closure {
         }
         let home = this.contextsByPath.get(template.modulePath());
         if (home == null) {
-            this.plan.problems().push(new FileDiagnostic(template.filePath(),
+            this.record.problems().push(new FileDiagnostic(template.filePath(),
                 "Internal: the instantiation '{typenames.display(instantiation)}' has no home "
                 + "module: '{template.modulePath()}' is not part of the program.",
                 source.makeSpan(0, 0)));
             return;
         }
-        RecordInfo? record = this.index.recordFor(template);
-        this.plan.instantiations().push(new PlannedInstantiation(instantiation, home, record));
+        RecordInfo? templateRecord = this.index.recordFor(template);
+        this.record.instantiations().push(new PlannedInstantiation(instantiation, home,
+            templateRecord));
+        let homeFunctions = this.modulesByContext.get(home);
+        if (homeFunctions != null) {
+            homeFunctions.instantiations().push(instantiation);
+        }
+        if (templateRecord != null) {
+            this.index.registerRecord(instantiation, templateRecord);
+        }
         if (template is InterfaceType) {
-            this.planMethods(instantiation, template.methods(), home, null, depth);
+            this.planMemberList(instantiation, template.methods(), instantiation.methods(), home,
+                null, depth, true);
             let extended = hierarchy.baseOf(instantiation);
             if (extended != null) {
-                this.requestType(extended, depth + 1);
+                this.requestTypeAt(extended, depth + 1);
             }
             return;
         }
         if (template is ClassType) {
             this.planRecordInstantiation(instantiation, template.methods(),
-                template.staticMethods(), home, record, depth);
+                template.staticMethods(), home, templateRecord, depth);
         } else if (template is StructType) {
             this.planRecordInstantiation(instantiation, template.methods(),
-                template.staticMethods(), home, record, depth);
+                template.staticMethods(), home, templateRecord, depth);
         }
         let base = hierarchy.baseOf(instantiation);
         if (base != null) {
-            this.requestType(base, depth + 1);
+            this.requestTypeAt(base, depth + 1);
         }
         for (let implemented in hierarchy.interfacesOf(instantiation)) {
-            this.requestType(implemented, depth + 1);
+            this.requestTypeAt(implemented, depth + 1);
         }
         let fields = typemembers.fieldsOf(instantiation);
         if (fields != null) {
             for (long i = 0; i < fields.length(); i++) {
-                this.requestType(fields.get(i).type(), depth + 1);
+                this.requestTypeAt(fields.get(i).type(), depth + 1);
             }
         }
     }
 
     planRecordInstantiation(InstantiationType instantiation, List<Method> templateMethods,
-                            List<Method> templateStatics, ModuleContext home, RecordInfo? record,
-                            long depth) {
-        if (record == null) {
-            this.plan.problems().push(new FileDiagnostic(
+                            List<Method> templateStatics, ModuleContext home,
+                            RecordInfo? templateRecord, long depth) {
+        if (templateRecord == null) {
+            this.record.problems().push(new FileDiagnostic(
                 instantiation.template().filePath(),
                 "Internal: the template of '{typenames.display(instantiation)}' has no indexed "
                 + "member list.", source.makeSpan(0, 0)));
             return;
         }
         this.planMemberList(instantiation, templateMethods, instantiation.methods(), home,
-            record, depth, true);
+            templateRecord, depth, true);
         this.planMemberList(instantiation, templateStatics, instantiation.staticMethods(),
-            home, record, depth, false);
-        this.harvestRecordBodies(instantiation, record, depth);
+            home, templateRecord, depth, false);
+        let active = substitution.forInstantiation(instantiation);
+        let homeFunctions = this.modulesByContext.get(home);
+        if (homeFunctions != null) {
+            index.indexRecordLambdas(this.index, this.store, homeFunctions,
+                templateRecord.members(), instantiation.template().name(), active);
+        }
+        if (this.harvestsEveryBody) {
+            this.harvestRecordBodies(instantiation, templateRecord, depth);
+            return;
+        }
+        this.harvestFields(templateRecord.context().result(), templateRecord.members(), active,
+            depth + 1);
     }
 
     // The template bodies' requests, applied under this instantiation's substitution. A template
     // with conditional members harvests member by member, skipping the bodies of the members
     // this instantiation excludes; everything else harvests the member list in one pass.
-    harvestRecordBodies(InstantiationType instantiation, RecordInfo record, long depth) {
+    harvestRecordBodies(InstantiationType instantiation, RecordInfo templateRecord, long depth) {
         let active = substitution.forInstantiation(instantiation);
-        let result = record.context().result();
+        let result = templateRecord.context().result();
         if (!hierarchy.hasConditionalMembers(instantiation.template())) {
-            this.harvest(this.requestsFor(result, record.members()), active, depth + 1);
+            this.harvest(this.requestsFor(result, templateRecord.members()), active, depth + 1);
             return;
         }
-        let membersNode = record.members();
+        let membersNode = templateRecord.members();
         for (long i = 0; i < membersNode.membersCount(); i++) {
             switch (membersNode.members(i)) {
                 is FunctionDeclarationNode declaration -> {
@@ -410,24 +530,17 @@ final class Closure {
         return null;
     }
 
-    // Builds the instance entry of every method, parallel to the template's list so each takes
-    // its body from the matching template declaration. Passing no record plans an interface's
-    // methods, which have no bodies and serve call resolution only.
-    planMethods(InstantiationType instantiation, List<Method> templateMethods,
-                ModuleContext home, RecordInfo? record, long depth) {
-        this.planMemberList(instantiation, templateMethods, instantiation.methods(), home,
-            record, depth, true);
-    }
-
-    // One parallel member list of an instantiation: the instance methods run over the
-    // instantiation, so their entries carry it as the receiver; the statics take none and lower
-    // like the instances of a generic free function.
+    // One parallel member list of an instantiation, each taking its body from the matching
+    // template declaration. The instance methods run over the instantiation, so their entries carry
+    // it as the receiver; the statics take none and lower like the instances of a generic free
+    // function. Passing no record plans an interface's methods, which have no bodies and serve call
+    // resolution only.
     planMemberList(InstantiationType instantiation, List<Method> templateMethods,
-                   List<Method> instanceMethods, ModuleContext home, RecordInfo? record,
+                   List<Method> instanceMethods, ModuleContext home, RecordInfo? templateRecord,
                    long depth, bool withReceiver) {
         Map<GreenNode, FunctionDeclarationNode> declarations = new Map<GreenNode, FunctionDeclarationNode>();
-        if (record != null) {
-            declarations = index.redMemberDeclarations(record.members());
+        if (templateRecord != null) {
+            declarations = index.redMemberDeclarations(templateRecord.members());
         }
         let active = substitution.forInstantiation(instantiation);
         for (long i = 0; i < instanceMethods.length(); i++) {
@@ -454,11 +567,17 @@ final class Closure {
                 overloadedIn(instanceMethods, method.name()));
             let info = new FunctionInfo(home, signature, method.visibility(), false, null,
                 receiverType, method, declaration, symbol, active);
-            this.plan.members().push(info);
-            for (let parameter in signature.parameters()) {
-                this.requestType(parameter.type(), depth + 1);
+            this.record.members().push(info);
+            this.index.register(signature, info);
+            bool lowerable = method.isConstructor()
+                || (declaration != null && declaration.body() != null);
+            if (lowerable) {
+                this.addPlannedFunction(home, info, depth);
             }
-            this.requestType(signature.returnType(), depth + 1);
+            for (let parameter in signature.parameters()) {
+                this.requestTypeAt(parameter.type(), depth + 1);
+            }
+            this.requestTypeAt(signature.returnType(), depth + 1);
         }
     }
 
@@ -473,7 +592,7 @@ final class Closure {
         let declaration = templateInfo.declaration();
         let owner = call.callee().declaration();
         if (declaration == null || owner == null) {
-            this.plan.problems().push(new FileDiagnostic(
+            this.record.problems().push(new FileDiagnostic(
                 templateInfo.context().module().filePath(),
                 "Internal: the generic function '{call.callee().name()}' has no declaration "
                 + "to instantiate.", call.callee().nameSpan()));
@@ -490,20 +609,62 @@ final class Closure {
         let active = substitution.forFunction(owner, arguments);
         let info = new FunctionInfo(home, call.callee(), templateInfo.visibility(), false,
             null, null, null, declaration, symbol, active);
-        this.plan.functions().push(new PlannedFunctionInstance(call.callee(), arguments,
+        this.record.functions().push(new PlannedFunctionInstance(call.callee(), arguments,
             info));
-        this.harvest(this.requestsFor(home.result(), declaration), active, depth + 1);
+        this.index.registerFunctionInstance(call.callee(), arguments, info);
+        this.addPlannedFunction(home, info, depth);
+        if (this.harvestsEveryBody) {
+            this.harvest(this.requestsFor(home.result(), declaration), active, depth + 1);
+        }
+    }
+
+    // Adds one planned function to its home module's list with the lambdas its body writes, and
+    // plans its parameter defaults, which a call leaving a parameter out lowers wherever it is.
+    addPlannedFunction(ModuleContext home, FunctionInfo info, long depth) {
+        let homeFunctions = this.modulesByContext.get(home);
+        if (homeFunctions == null) {
+            return;
+        }
+        this.index.addFunction(homeFunctions, info);
+        this.depthBySymbol.set(info.symbol(), depth);
+        index.indexFunctionLambdas(this.index, this.store, homeFunctions, info);
+        if (!this.harvestsEveryBody) {
+            this.harvestDefaults(info, depth + 1);
+        }
     }
 
     reportOverflow(GreenNode declaration, string name, string filePath, Span span) {
         if (!this.reportedOverflows.add(declaration)) {
             return;
         }
-        this.plan.problems().push(new FileDiagnostic(filePath,
+        this.record.problems().push(new FileDiagnostic(filePath,
             "Internal: the instantiations of '{name}' nest past the cascade limit, and sema refuses "
             + "every chain of generic uses that grows without end.", span));
     }
 }
+
+// The syntax one function lowers: its declaration, its test, its lambda, or a lazy const's
+// initializer. Null for a function with nothing written, such as an implicit constructor.
+bodyNodeOf(FunctionInfo info) -> SyntaxNode? {
+    let declaration = info.declaration();
+    if (declaration != null) {
+        return declaration;
+    }
+    let test = info.testDeclaration();
+    if (test != null) {
+        return test;
+    }
+    let lambda = info.lambdaDeclaration();
+    if (lambda != null) {
+        return lambda;
+    }
+    let lazyValue = info.lazyValue();
+    if (lazyValue != null) {
+        return lazyValue.initializer();
+    }
+    return null;
+}
+
 
 overloadedIn(List<Method> methods, string name) -> bool {
     long seen = 0;
@@ -517,6 +678,6 @@ overloadedIn(List<Method> methods, string name) -> bool {
 
 final class Limits {
     // A chain that only ever deepens is a polymorphically recursive generic, which can never
-    // finish instantiating, so discovery stops here.
+    // finish instantiating, so planning stops here.
     protected static const long cascade = 200;
 }

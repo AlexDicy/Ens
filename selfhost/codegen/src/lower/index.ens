@@ -488,53 +488,66 @@ public final class ProgramIndex {
     }
 }
 
-// Adds one entry per lambda body the program lowers, once per enclosing instance. It runs after
-// monomorphization has filled the function lists, so a lambda inside a template that nothing
-// instantiates gets no entry.
-//
-// The module that writes a lambda defines its body, whichever module builds a closure over it, so
-// a field default's lambda is indexed from the record rather than from a function body. A lambda's
-// symbol names its module and its position among that module's lambdas, because a lambda in a
-// default has no one enclosing function to be named after.
-public indexLambdas(ProgramIndex index, TypeStore store) {
-    let modules = index.modules();
-    for (long m = 0; m < modules.length(); m++) {
-        let moduleFunctions = modules.get(m);
-        let taken = new Set<string>();
-        let entries = new List<FunctionInfo>();
-        indexBodyLambdas(index, store, moduleFunctions, taken, entries);
-        indexFieldDefaultLambdas(index, store, moduleFunctions, taken, entries);
-        for (long i = 0; i < entries.length(); i++) {
-            index.addFunction(moduleFunctions, entries.get(i));
-        }
+// The lambdas one function writes, each indexed once under the function's substitution: a
+// declaration covers its parameter defaults, its body and its catch clauses, and a test its body.
+// The module that writes a lambda defines its body, whichever module builds a closure over it, and
+// a lambda's symbol names its module and its position among that module's lambdas.
+public indexFunctionLambdas(ProgramIndex index, TypeStore store, ModuleFunctions moduleFunctions,
+                            FunctionInfo owner) {
+    SyntaxNode? node = owner.declaration();
+    if (node == null) {
+        node = owner.testDeclaration();
     }
+    if (node == null) {
+        return;
+    }
+    addLambdaEntries(index, store, moduleFunctions, owner.substitution(), closures.lambdasIn(node),
+        owner.accountName());
 }
 
-// The lambdas one module's own callables hold, each under that callable's substitution: a
-// declaration covers its parameter defaults, its body and its catch clauses, and a test its body.
-indexBodyLambdas(ProgramIndex index, TypeStore store, ModuleFunctions moduleFunctions,
-                 Set<string> taken, List<FunctionInfo> entries) {
-    let functions = moduleFunctions.functions();
-    for (long f = 0; f < functions.length(); f++) {
-        let owner = functions.get(f);
-        SyntaxNode? node = owner.declaration();
-        if (node == null) {
-            node = owner.testDeclaration();
-        }
-        if (node == null) {
+// The lambdas one record writes in its field defaults, under the substitution of the record they
+// are lowered for: none for a declared record, the instantiation's own for an instantiation. A
+// default is lowered wherever the record is built, which is why the declaring module indexes it
+// rather than waiting for a construction it may never read.
+public indexRecordLambdas(ProgramIndex index, TypeStore store, ModuleFunctions moduleFunctions,
+                          MemberListNode members, string recordName, Substitution? active) {
+    let lambdas = closures.lambdasInFieldDefaults(members);
+    if (lambdas.length() == 0) {
+        return;
+    }
+    addLambdaEntries(index, store, moduleFunctions, active, lambdas,
+        "a field default of '{recordName}'");
+}
+
+addLambdaEntries(ProgramIndex index, TypeStore store, ModuleFunctions moduleFunctions,
+                 Substitution? active, List<LambdaExpressionNode> lambdas, string owner) {
+    let context = moduleFunctions.context();
+    for (long i = 0; i < lambdas.length(); i++) {
+        let lambda = lambdas.get(i);
+        let info = context.result().lambdaOf(lambda.green());
+        if (info == null) {
             continue;
         }
-        addLambdaEntries(index, store, owner.context(), owner.substitution(),
-            closures.lambdasIn(node), taken, entries, owner.accountName());
+        let symbol = index.lambdaSymbolOf(lambda.green(), active);
+        if (symbol == null || index.functionForSymbol(symbol) != null) {
+            continue;
+        }
+        Type closureType = substitution.apply(store, active, info.type());
+        index.addFunction(moduleFunctions, new FunctionInfo(context, info.signature(),
+            Visibility.Private, false, null, closureType, null, null, symbol, active, null,
+            lambda));
+        index.registerLambdaOwner(symbol, owner);
     }
 }
 
-// The lambdas one module's records hold in their field defaults. A default is lowered wherever the
-// record is built, which is why the declaring module indexes it here rather than waiting for a
-// construction it may never read: once for the declared record, and once for every instantiation of
-// it this module homes, because that is the set of substitutions a default is ever lowered under.
-indexFieldDefaultLambdas(ProgramIndex index, TypeStore store, ModuleFunctions moduleFunctions,
-                         Set<string> taken, List<FunctionInfo> entries) {
+// Indexes the lambdas of everything one module declares, which monomorphization does not plan: its
+// own functions and the field defaults of its records that are not generic.
+indexDeclaredLambdas(ProgramIndex index, TypeStore store, ModuleFunctions moduleFunctions) {
+    let functions = moduleFunctions.functions();
+    long declared = functions.length();
+    for (long f = 0; f < declared; f++) {
+        indexFunctionLambdas(index, store, moduleFunctions, functions.get(f));
+    }
     let context = moduleFunctions.context();
     let root = context.root();
     if (root == null) {
@@ -554,46 +567,11 @@ indexFieldDefaultLambdas(ProgramIndex index, TypeStore store, ModuleFunctions mo
         if (members == null) {
             continue;
         }
-        let lambdas = closures.lambdasInFieldDefaults(members);
-        if (lambdas.length() == 0) {
+        let declaredType = store.findDeclared(context.module().canonicalPath(), name);
+        if (declaredType == null || declaredType.isGeneric()) {
             continue;
         }
-        let declared = store.findDeclared(context.module().canonicalPath(), name);
-        if (declared == null) {
-            continue;
-        }
-        string owner = "a field default of '{name}'";
-        if (!declared.isGeneric()) {
-            addLambdaEntries(index, store, context, null, lambdas, taken, entries, owner);
-        }
-        for (long n = 0; n < moduleFunctions.instantiations().length(); n++) {
-            let instantiation = moduleFunctions.instantiations().get(n);
-            if (!(instantiation is InstantiationType) || instantiation.template() != declared) {
-                continue;
-            }
-            addLambdaEntries(index, store, context,
-                substitution.forInstantiation(instantiation), lambdas, taken, entries, owner);
-        }
-    }
-}
-
-addLambdaEntries(ProgramIndex index, TypeStore store, ModuleContext context,
-                 Substitution? active, List<LambdaExpressionNode> lambdas, Set<string> taken,
-                 List<FunctionInfo> entries, string owner) {
-    for (long i = 0; i < lambdas.length(); i++) {
-        let lambda = lambdas.get(i);
-        let info = context.result().lambdaOf(lambda.green());
-        if (info == null) {
-            continue;
-        }
-        let symbol = index.lambdaSymbolOf(lambda.green(), active);
-        if (symbol == null || !taken.add(symbol)) {
-            continue;
-        }
-        Type closureType = substitution.apply(store, active, info.type());
-        entries.push(new FunctionInfo(context, info.signature(), Visibility.Private, false,
-            null, closureType, null, null, symbol, active, null, lambda));
-        index.registerLambdaOwner(symbol, owner);
+        indexRecordLambdas(index, store, moduleFunctions, members, name, null);
     }
 }
 
@@ -651,6 +629,7 @@ public buildIndex(ProgramAnalysis analysis) -> ProgramIndex {
             }
         }
         indexRecords(analysis, index, context, moduleFunctions);
+        indexDeclaredLambdas(index, analysis.store(), moduleFunctions);
         index.addModule(moduleFunctions);
     }
     return index;

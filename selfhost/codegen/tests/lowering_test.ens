@@ -1,0 +1,138 @@
+// The program a walk lowers as it goes: what it lowers when it is asked for a symbol, what it
+// plans when it is asked for a descriptor, and what it leaves alone.
+import @std.testing;
+import ProgramAnalysis from @ens.sema.pipeline;
+import EirFunction from eir.model;
+import layout.vtables;
+import ProgramIndex from lower.index;
+import lower.index;
+import OnDemandLowering from lowering;
+import Monomorphizer from mono.closure;
+import support;
+import List from @std.collections.list;
+
+// The entry calls 'used' and nothing calls 'unused'. 'kept' captures a string, so its closure has
+// a destructor, and 'Held' has a destructor of its own.
+demandProgram() -> string {
+    return "class Held \{\n"
+        + "    protected string name;\n"
+        + "\n"
+        + "    protected constructor(this.name);\n"
+        + "\}\n"
+        + "class Box<T> \{\n"
+        + "    protected T held;\n"
+        + "\n"
+        + "    protected constructor(this.held);\n"
+        + "\}\n"
+        + "used() -> int \{\n"
+        + "    string word = \"word\";\n"
+        + "    () -> int kept = () -> word.length as int;\n"
+        + "    let held = new Held(word);\n"
+        + "    let box = new Box<int>(kept());\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "unused() -> int \{\n"
+        + "    return 1;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return used();\n"
+        + "\}\n";
+}
+
+// The program ready for a walk, as the driver prepares it for a build that lowers what it reaches.
+demandOf(ProgramAnalysis analysis) -> OnDemandLowering {
+    let programIndex = index.buildIndex(analysis);
+    let planner = new Monomorphizer(analysis, programIndex, false);
+    planner.planDeclarations();
+    return new OnDemandLowering(analysis, programIndex, vtables.assignSlots(programIndex), planner);
+}
+
+test "a body is lowered the first time it is asked for, and nothing else is" {
+    let demand = demandOf(try support.analyzeMain(demandProgram()));
+    let first = demand.bodyOf("main$used");
+    let again = demand.bodyOf("main$used");
+    try testing.assertTrue(first != null, "'used' is lowered");
+    try testing.assertTrue(first == again, "'used' is lowered once");
+    try testing.assertTrue(demand.problems().length() == 0, "lowering 'used' reports nothing");
+    let lowered = loweredIn(demand, "main");
+    try testing.assertTrue(has(lowered, "main$used"), "'used' is kept under 'main'");
+    try testing.assertFalse(has(lowered, "main$unused"), "nothing asked for 'unused'");
+    try testing.assertFalse(has(lowered, "ens.main"), "nothing asked for the entry");
+    try testing.assertTrue(demand.bodyOf("foreign_name") == null,
+        "a symbol the program defines no body for has none");
+}
+
+// A destructor has no declaration, so it is written from its symbol: a closure's from its lambda,
+// a class's from the class.
+test "a destructor is written when its symbol is asked for" {
+    let demand = demandOf(try support.analyzeMain(demandProgram()));
+    let ignored = demand.bodyOf("main$used");
+    try testing.assertTrue(demand.bodyOf("main$lambda0$dtor") != null,
+        "the closure's destructor is written with its lambda");
+    try testing.assertTrue(has(loweredIn(demand, "main"), "main$lambda0"),
+        "asking for the closure's destructor lowers its lambda");
+    try testing.assertTrue(demand.bodyOf("_dtor$main$Held") != null,
+        "'Held' has its destructor written");
+    try testing.assertTrue(demand.problems().length() == 0, "the destructors verify");
+}
+
+test "a descriptor is planned when it is asked for, and a generic class has none" {
+    let analysis = try support.analyzeMain(demandProgram());
+    let demand = demandOf(analysis);
+    let held = demand.planOf(try support.classNamed(analysis, "Held"));
+    try testing.assertTrue(held != null, "'Held' has a descriptor");
+    if (held != null) {
+        try testing.assertEqual(held.symbol(), "_typedesc$main$Held");
+        try testing.assertTrue(demand.planOf(try support.classNamed(analysis, "Held")) == held,
+            "'Held' is planned once");
+    }
+    try testing.assertTrue(demand.planOf(try support.classNamed(analysis, "Box")) == null,
+        "the generic 'Box' itself has no descriptor");
+}
+
+// 'Rank' conforms to 'Ordered<Rank>', which no body names, and its descriptor still numbers that
+// interface's method table.
+test "a descriptor's interfaces are planned before it is" {
+    let analysis = try support.analyzeMain(
+        "interface Ordered<T> \{\n"
+        + "    before(T other) -> bool;\n"
+        + "\}\n"
+        + "class Rank implements Ordered<Rank> \{\n"
+        + "    protected constructor();\n"
+        + "\n"
+        + "    override before(Rank other) -> bool \{\n"
+        + "        return false;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() \{\}\n");
+    let demand = demandOf(analysis);
+    let rank = demand.planOf(try support.classNamed(analysis, "Rank"));
+    if (rank == null) {
+        try testing.fail("'Rank' has no descriptor");
+        return;
+    }
+    try testing.assertEqual(rank.conformances().length, 1);
+    let implementations = rank.conformances()[0].implementations();
+    try testing.assertEqual(implementations.length, 1);
+    let before = implementations[0];
+    try testing.assertTrue(before != null && before.symbol() == "main$Rank$before",
+        "the method table holds 'Rank.before'");
+}
+
+loweredIn(OnDemandLowering demand, string modulePath) -> List<EirFunction> {
+    for (let unit in demand.loweredModules()) {
+        if (unit.modulePath() == modulePath) {
+            return unit.bodies();
+        }
+    }
+    return new List<EirFunction>();
+}
+
+has(List<EirFunction> bodies, string symbol) -> bool {
+    for (let body in bodies) {
+        if (body.symbol() == symbol) {
+            return true;
+        }
+    }
+    return false;
+}

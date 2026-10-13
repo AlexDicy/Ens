@@ -5,11 +5,15 @@ import @std.testing;
 import MemoryFileLoader from support;
 import support;
 import @ens.sema.model.typenames;
+import TestFailure from @std.testing;
+import Signature from @ens.sema.model.typemembers;
 import MonoPlan from mono.closure;
+import Monomorphizer from mono.closure;
 import PlannedFunctionInstance from mono.closure;
 import PlannedInstantiation from mono.closure;
 import mono.closure;
 import FunctionInfo from lower.index;
+import ProgramIndex from lower.index;
 import lower.index;
 
 planFor(string text) -> MonoPlan throws {
@@ -362,4 +366,128 @@ test "a conditional member is planned only for instantiations satisfying its con
         "the satisfied body's requests cascade");
     try testing.assertTrue(instantiationDisplayed(plan, "Wrap<Plain>") == null,
         "an excluded body's requests must not cascade");
+}
+
+// A build that lowers what it reaches plans from the declarations first, so nothing a body
+// requests is planned before that body is.
+test "planning the declarations plans only what their defaults request" {
+    let analysis = try support.analyzeMain(onDemandProgram());
+    let programIndex = index.buildIndex(analysis);
+    let planner = new Monomorphizer(analysis, programIndex, false);
+    planner.planDeclarations();
+    let plan = planner.plan();
+    try assertClean(plan);
+    try testing.assertTrue(instantiationDisplayed(plan, "Box<bool>") != null,
+        "the parameter default builds a 'Box<bool>'");
+    try testing.assertTrue(instantiationDisplayed(plan, "Box<long>") == null,
+        "nothing names 'Holder', whose field default builds a 'Box<long>'");
+    try testing.assertTrue(instantiationDisplayed(plan, "Box<double>") == null,
+        "nothing calls 'made', whose signature names a 'Box<double>'");
+    try testing.assertTrue(functionInstanceNamed(plan, "main$identity__string__") == null,
+        "a body requests 'identity<string>', and no body is planned yet");
+    try testing.assertTrue(memberOn(plan, "Box<bool>", "get") != null,
+        "a planned instantiation registers its members");
+    let identity = try identityOf(programIndex);
+    try testing.assertTrue(programIndex.functionInstance(identity,
+        [analysis.store().stringType()]) == null, "nothing registered 'identity<string>'");
+}
+
+// Lowering a use of a declared type may read any member's signature and any field default, so the
+// first request that names the type plans what those name.
+test "a declared type plans what its members and field defaults name when a request names it" {
+    let analysis = try support.analyzeMain(onDemandProgram());
+    let programIndex = index.buildIndex(analysis);
+    let planner = new Monomorphizer(analysis, programIndex, false);
+    planner.planDeclarations();
+    planner.requestType(try support.classNamed(analysis, "Holder"));
+    planner.requestType(try support.classNamed(analysis, "Maker"));
+    let plan = planner.plan();
+    try assertClean(plan);
+    try testing.assertTrue(instantiationDisplayed(plan, "Box<long>") != null,
+        "'Holder' builds a 'Box<long>' in its field default");
+    try testing.assertTrue(instantiationDisplayed(plan, "Box<string>") != null,
+        "'Maker.make' returns a 'Box<string>'");
+}
+
+test "planning a body plans what it requests and nothing an unplanned body requests" {
+    let analysis = try support.analyzeMain(onDemandProgram());
+    let programIndex = index.buildIndex(analysis);
+    let planner = new Monomorphizer(analysis, programIndex, false);
+    planner.planDeclarations();
+    planner.planBody(try support.functionNamed(analysis, programIndex, "used"));
+    let plan = planner.plan();
+    try assertClean(plan);
+    let instance = functionInstanceNamed(plan, "main$identity__string__");
+    try testing.assertTrue(instance != null, "'used' requests 'identity<string>'");
+    try testing.assertTrue(functionInstanceNamed(plan, "main$identity__int__") == null,
+        "only 'unused' requests 'identity<int>'");
+    if (instance != null) {
+        try testing.assertTrue(programIndex.functionForSymbol(instance.info().symbol()) != null,
+            "the instance joins its home module's functions as it is planned");
+        let planned = plan.functions().length();
+        planner.planBody(instance.info());
+        planner.planBody(try support.functionNamed(analysis, programIndex, "used"));
+        try testing.assertEqual(plan.functions().length(), planned);
+    }
+}
+
+// A program with a parameter default and a field default that build instantiations, signatures
+// naming instantiations, a generic call in a body the entry calls, and another in a body nothing
+// calls.
+onDemandProgram() -> string {
+    return "class Box<T> \{\n"
+        + "    protected T held;\n"
+        + "\n"
+        + "    protected constructor(this.held);\n"
+        + "\n"
+        + "    protected get() -> T \{\n"
+        + "        return this.held;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "class Holder \{\n"
+        + "    protected Box<long> boxed = new Box<long>(5);\n"
+        + "\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "identity<T>(T value) -> T \{\n"
+        + "    return value;\n"
+        + "\}\n"
+        + "flagged(Box<bool> flag = new Box<bool>(true)) -> bool \{\n"
+        + "    return flag.get();\n"
+        + "\}\n"
+        + "class Maker \{\n"
+        + "    protected constructor();\n"
+        + "\n"
+        + "    protected make() -> Box<string> \{\n"
+        + "        return new Box<string>(\"made\");\n"
+        + "    \}\n"
+        + "\}\n"
+        + "made() -> Box<double> \{\n"
+        + "    return new Box<double>(1.5);\n"
+        + "\}\n"
+        + "used() -> string \{\n"
+        + "    return identity<string>(\"x\");\n"
+        + "\}\n"
+        + "unused() -> int \{\n"
+        + "    return identity<int>(1);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return used().length as int;\n"
+        + "\}\n";
+}
+
+// The template signature of the program's 'identity'.
+identityOf(ProgramIndex programIndex) -> Signature throws {
+    let modules = programIndex.modules();
+    for (long m = 0; m < modules.length(); m++) {
+        let context = modules.get(m).context();
+        if (context.module().canonicalPath() != "main") {
+            continue;
+        }
+        let named = context.functions().entriesNamed("identity");
+        if (named != null && named.length() == 1) {
+            return named.get(0).signature();
+        }
+    }
+    throw new TestFailure("no function 'identity'");
 }

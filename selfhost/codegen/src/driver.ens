@@ -1,8 +1,9 @@
 // The code-generation driver: from a checked ProgramAnalysis to one native object file per Ens
 // module the program still reaches a body in, plus one for the core module whatever it reaches.
-// Every module is lowered and verified before the reachability walk drops anything, and the
-// optimized output is re-verified before emission whatever the level, so an unoptimized build is
-// never an unchecked one, and a program that fails to lower writes no object files at all.
+// A body is lowered and verified the first time the reachability walk reaches it, or before the
+// walk runs in a build that verifies every body. The optimized output is re-verified before
+// emission whatever the level, so an unoptimized build is never an unchecked one, and a program
+// that fails to lower writes no object files at all.
 import ProgramAnalysis from @ens.sema.pipeline;
 import StandardLibrary from @ens.sema.program.implicit;
 import FileDiagnostic from @ens.sema.support.diagnostics;
@@ -12,7 +13,6 @@ import PrimitiveType from @ens.sema.model.types;
 import PrimitiveKind from @ens.sema.model.types;
 import Type from @ens.sema.model.types;
 import @ens.sema.model.types;
-import Span from @ens.frontend.support.source;
 import @ens.frontend.support.source;
 import EirFunction from eir.model;
 import eir.verify;
@@ -27,7 +27,9 @@ import ArrayContentPlan from lower.arraycontent;
 import ProgramIndex from lower.index;
 import ModuleFunctions from lower.index;
 import FunctionInfo from lower.index;
-import mono.closure;
+import Monomorphizer from mono.closure;
+import OnDemandLowering from lowering;
+import lowering;
 import CodegenSettings from settings;
 import PassContext from passes.optimize;
 import passes.optimize;
@@ -104,24 +106,18 @@ final class EmittedObjects {
 export emitProgram(ProgramAnalysis analysis, string outputFolder, string filePrefix,
                    CodegenSettings settings) -> EmitResult {
     let programIndex = index.buildIndex(analysis);
-    let plan = closure.close(analysis, programIndex);
-    if (plan.problems().length() > 0) {
-        return new EmitResult(new List<string>(), plan.problems().toArray());
+    let planner = new Monomorphizer(analysis, programIndex, settings.lowersEverything());
+    planner.planDeclarations();
+    if (planner.plan().problems().length() > 0) {
+        return new EmitResult(new List<string>(), planner.plan().problems().toArray());
     }
-    closure.apply(plan, programIndex);
-    index.indexLambdas(programIndex, analysis.store());
     let tables = vtables.assignSlots(programIndex);
-    let plans = descriptors.planProgram(programIndex, tables);
-    let lowered = lowerModules(programIndex, tables, analysis);
-    let loweringProblems = gathered(lowered);
-    if (loweringProblems.length() > 0) {
-        return new EmitResult(new List<string>(), loweringProblems.toArray());
+    let walked = walkProgram(analysis, programIndex, tables, planner, settings);
+    let reached = walked.reached;
+    if (walked.problems.length() > 0 || reached == null) {
+        return new EmitResult(new List<string>(), walked.problems.toArray());
     }
-    let collisions = symbolCollisions(lowered);
-    if (collisions.length() > 0) {
-        return new EmitResult(new List<string>(), collisions.toArray());
-    }
-    let reached = reachable.analyze(programIndex, plans, moduleBodies(lowered));
+    let lowered = walked.lowered;
     let reachability = reachabilityAccount(programIndex, lowered, reached, settings);
     let kept = reachedModules(lowered, reached);
     let pipeline = optimizeModules(programIndex, kept, reached.namedPlans(), settings);
@@ -139,6 +135,64 @@ export emitProgram(ProgramAnalysis analysis, string outputFolder, string filePre
         filePrefix, settings);
     return new EmitResult(emitted.paths, emitted.problems.toArray(),
         combinedAccount(reachability, pipeline.account));
+}
+
+// The lowered program and what the walk reached in it, or the problems that stopped it before the
+// walk could run. The lowered modules hold every body lowering produced, in index order.
+final class WalkedProgram {
+    protected List<LoweredModule> lowered;
+    protected ReachedProgram? reached;
+    protected List<FileDiagnostic> problems;
+
+    protected constructor(this.lowered, this.reached, this.problems);
+}
+
+// The program lowered by the route the settings choose, and walked.
+walkProgram(ProgramAnalysis analysis, ProgramIndex programIndex, DispatchTables tables,
+            Monomorphizer planner, CodegenSettings settings) -> WalkedProgram {
+    if (settings.lowersEverything()) {
+        return lowerEverything(analysis, programIndex, tables);
+    }
+    return lowerReached(analysis, programIndex, tables, planner);
+}
+
+// Lowers each body the first time the walk reaches it, with what its own syntax requests planned
+// just before, so the bodies a build lowers are the ones it emits.
+lowerReached(ProgramAnalysis analysis, ProgramIndex programIndex, DispatchTables tables,
+             Monomorphizer planner) -> WalkedProgram {
+    let demand = new OnDemandLowering(analysis, programIndex, tables, planner);
+    let reached = reachable.analyzeSource(programIndex, demand);
+    let lowered = new List<LoweredModule>();
+    let problems = demand.problems();
+    let modules = programIndex.modules();
+    let bodies = demand.loweredModules();
+    for (long m = 0; m < modules.length(); m++) {
+        let moduleProblems = new List<FileDiagnostic>();
+        let entry = entryPointOf(programIndex, modules.get(m), analysis, moduleProblems);
+        appendAll(problems, moduleProblems);
+        lowered.push(new LoweredModule(modules.get(m), bodies.get(m).bodies(), entry,
+            new List<FileDiagnostic>()));
+    }
+    appendAll(problems, symbolCollisions(lowered));
+    return new WalkedProgram(lowered, reached, problems);
+}
+
+// Lowers and verifies every body the whole of every file and every template body requests, then
+// walks what was lowered. A build that verifies every body runs this route, and the walk keeps
+// what it emits the same as the route that lowers only what it reaches.
+lowerEverything(ProgramAnalysis analysis, ProgramIndex programIndex,
+                DispatchTables tables) -> WalkedProgram {
+    let plans = descriptors.planProgram(programIndex, tables);
+    let lowered = lowerModules(programIndex, tables, analysis);
+    let problems = gathered(lowered);
+    if (problems.length() == 0) {
+        appendAll(problems, symbolCollisions(lowered));
+    }
+    if (problems.length() > 0) {
+        return new WalkedProgram(lowered, null, problems);
+    }
+    return new WalkedProgram(lowered, reachable.analyze(programIndex, plans,
+        moduleBodies(lowered)), problems);
 }
 
 // The lines a build's accounts print, in the one channel that carries them. A build that asked for
@@ -162,15 +216,16 @@ combinedAccount(List<string> reachability, List<string> arc) -> string[] {
 }
 
 // The account of which function bodies the program's roots reach, for a build that asked for one,
-// and nothing for every other build. It reads the whole lowered program, so it names the bodies
-// emission drops as well as counting the ones it writes.
+// and nothing for every other build. It names the declared functions emission leaves out as well
+// as counting the bodies it writes.
 reachabilityAccount(ProgramIndex programIndex, List<LoweredModule> lowered,
                     ReachedProgram reached, CodegenSettings settings) -> List<string> {
     let explained = new List<string>();
     if (!settings.explainsReachability()) {
         return explained;
     }
-    for (let line in account.lines(programIndex, moduleBodies(lowered), reached)) {
+    for (let line in account.lines(programIndex, gate.reachedBodies(moduleBodies(lowered), reached),
+            reached)) {
         explained.push(line);
     }
     return explained;
@@ -323,18 +378,20 @@ lowerModule(ModuleFunctions moduleFunctions, ProgramIndex programIndex, Dispatch
         if (function == null) {
             continue;
         }
-        appendAll(problems, checkLowered(function, filePath, info.signature().nameSpan()));
+        appendAll(problems, lowering.checkLowered(function, filePath, info.signature().nameSpan()));
         functions.push(function);
         // A closure with captures carries a destructor of its own in every object it makes, so
         // the module that lowers the lambda's body defines it too.
         let released = destructors.synthesizeClosure(info, analysis.store());
         if (released != null) {
-            appendAll(problems, checkLowered(released, filePath, info.signature().nameSpan()));
+            appendAll(problems,
+                lowering.checkLowered(released, filePath, info.signature().nameSpan()));
             functions.push(released);
         }
     }
     for (let contentFunction in contentPlan.builtFunctions()) {
-        appendAll(problems, checkLowered(contentFunction, filePath, source.makeSpan(0, 0)));
+        appendAll(problems,
+            lowering.checkLowered(contentFunction, filePath, source.makeSpan(0, 0)));
         functions.push(contentFunction);
     }
     for (long c = 0; c < moduleFunctions.classes().length(); c++) {
@@ -343,7 +400,7 @@ lowerModule(ModuleFunctions moduleFunctions, ProgramIndex programIndex, Dispatch
         if (finalizer == null) {
             continue;
         }
-        appendAll(problems, checkLowered(finalizer, filePath, source.makeSpan(0, 0)));
+        appendAll(problems, lowering.checkLowered(finalizer, filePath, source.makeSpan(0, 0)));
         functions.push(finalizer);
     }
     for (long c = 0; c < moduleFunctions.instantiations().length(); c++) {
@@ -355,25 +412,33 @@ lowerModule(ModuleFunctions moduleFunctions, ProgramIndex programIndex, Dispatch
         if (finalizer == null) {
             continue;
         }
-        appendAll(problems, checkLowered(finalizer, filePath, source.makeSpan(0, 0)));
+        appendAll(problems, lowering.checkLowered(finalizer, filePath, source.makeSpan(0, 0)));
         functions.push(finalizer);
     }
-    EntryPoint? entry = null;
-    let candidate = entryFunctionOf(programIndex, moduleFunctions);
-    if (candidate != null) {
-        let signature = candidate.signature();
-        string rejected = unsupportedEntryShape(signature,
-            analysis.namesByFile().namesFor(filePath));
-        if (rejected.length > 0) {
-            problems.push(new FileDiagnostic(filePath,
-                "Internal: the program entry 'main' reached code generation although {rejected}; "
-                + "the signature phase must reject such an entry point.", signature.nameSpan()));
-        } else {
-            entry = new EntryPoint(candidate.symbol(), types.isVoidType(signature.returnType()),
-                signature.declaresThrows());
-        }
-    }
+    let entry = entryPointOf(programIndex, moduleFunctions, analysis, problems);
     return new LoweredModule(moduleFunctions, functions, entry, problems);
+}
+
+// The entry wrapper of the module defining the program's entry function, and null for every other
+// module. An entry the wrapper cannot call is a problem added to `problems`.
+entryPointOf(ProgramIndex programIndex, ModuleFunctions moduleFunctions, ProgramAnalysis analysis,
+             List<FileDiagnostic> problems) -> EntryPoint? {
+    let candidate = entryFunctionOf(programIndex, moduleFunctions);
+    if (candidate == null) {
+        return null;
+    }
+    string filePath = moduleFunctions.context().module().filePath();
+    let signature = candidate.signature();
+    string rejected = unsupportedEntryShape(signature,
+        analysis.namesByFile().namesFor(filePath));
+    if (rejected.length > 0) {
+        problems.push(new FileDiagnostic(filePath,
+            "Internal: the program entry 'main' reached code generation although {rejected}; "
+            + "the signature phase must reject such an entry point.", signature.nameSpan()));
+        return null;
+    }
+    return new EntryPoint(candidate.symbol(), types.isVoidType(signature.returnType()),
+        signature.declaresThrows());
 }
 
 // What the optimization stage produced: every module as the pipeline left it, and the account of
@@ -490,29 +555,6 @@ checkOptimized(EirFunction function, string filePath) -> List<FileDiagnostic> {
         problems.push(new FileDiagnostic(filePath,
             "Internal: optimization moved a slot's reference out too early: {violation}",
             source.makeSpan(0, 0)));
-    }
-    return problems;
-}
-
-// Gates one lowered function on the four verifiers: its shape, the ownership its value temps carry,
-// the ownership the storage it reaches holds, and the reads any moved-out slot leaves behind.
-checkLowered(EirFunction function, string filePath, Span span) -> List<FileDiagnostic> {
-    let problems = new List<FileDiagnostic>();
-    for (let violation in verify.verifyFunction(function)) {
-        problems.push(new FileDiagnostic(filePath,
-            "Internal: lowering produced malformed EIR: {violation}", span));
-    }
-    for (let violation in ownership.verifyOwnership(function)) {
-        problems.push(new FileDiagnostic(filePath,
-            "Internal: lowering produced unbalanced ownership: {violation}", span));
-    }
-    for (let violation in storage.verifyStorage(function)) {
-        problems.push(new FileDiagnostic(filePath,
-            "Internal: lowering produced unbalanced storage ownership: {violation}", span));
-    }
-    for (let violation in takes.verifyTakes(function)) {
-        problems.push(new FileDiagnostic(filePath,
-            "Internal: lowering moved a slot's reference out too early: {violation}", span));
     }
     return problems;
 }

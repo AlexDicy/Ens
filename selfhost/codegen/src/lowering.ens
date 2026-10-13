@@ -1,0 +1,279 @@
+// Lowering a program the way the reachability walk reaches it. A body is lowered and verified the
+// first time the walk asks for it, after monomorphization has planned what the body's own syntax
+// requests, and a descriptor is planned the first time the walk asks for it. Nothing the walk does
+// not reach is lowered, so the bodies a build lowers are the ones it emits.
+import ProgramAnalysis from @ens.sema.pipeline;
+import FileDiagnostic from @ens.sema.support.diagnostics;
+import @ens.sema.model.hierarchy;
+import Type from @ens.sema.model.types;
+import Span from @ens.frontend.support.source;
+import @ens.frontend.support.source;
+import EirFunction from eir.model;
+import eir.verify;
+import eir.ownership;
+import eir.storage;
+import eir.takes;
+import DescriptorPlan from layout.descriptors;
+import DescriptorPlans from layout.descriptors;
+import layout.descriptors;
+import DispatchTables from layout.vtables;
+import ArrayContentPlan from lower.arraycontent;
+import FunctionInfo from lower.index;
+import ProgramIndex from lower.index;
+import lower.classes;
+import lower.closures;
+import lower.destructors;
+import lower.lower;
+import Monomorphizer from mono.closure;
+import ModuleBodies from reach.reachable;
+import ProgramSource from reach.reachable;
+import support.primitives;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+import Set from @std.collections.set;
+
+// The program a walk lowers as it goes. It lowers a body once, plans a descriptor once, and keeps
+// every body it lowered, in the order it lowered them, under the module that defines it.
+public final class OnDemandLowering implements ProgramSource {
+    ProgramAnalysis analysis;
+    ProgramIndex index;
+    DispatchTables tables;
+    Monomorphizer planner;
+
+    DescriptorPlans plans;
+    Set<Type> unplanned;
+    long assignedInstantiations;
+    Map<string, Type> destroyedTypes;
+    Map<string, string> destructorModules;
+
+    Map<string, EirFunction> bodies;
+    Set<string> bodiless;
+    Map<string, ArrayContentPlan> contentPlans;
+    Map<string, long> contentRecorded;
+    Map<string, long> modulePositions;
+    List<List<EirFunction>> bodiesByModule;
+    List<FileDiagnostic> loweringProblems;
+
+    // `tables` holds the slots of every type planned so far; the slots of each instantiation
+    // planned later are assigned as it is planned.
+    public constructor(ProgramAnalysis analysis, ProgramIndex index, DispatchTables tables,
+                       Monomorphizer planner) {
+        this.analysis = analysis;
+        this.index = index;
+        this.tables = tables;
+        this.planner = planner;
+        this.plans = new DescriptorPlans();
+        this.unplanned = new Set<Type>();
+        this.assignedInstantiations = 0;
+        this.destroyedTypes = new Map<string, Type>();
+        this.destructorModules = new Map<string, string>();
+        this.bodies = new Map<string, EirFunction>();
+        this.bodiless = new Set<string>();
+        this.contentPlans = new Map<string, ArrayContentPlan>();
+        this.contentRecorded = new Map<string, long>();
+        this.modulePositions = new Map<string, long>();
+        this.bodiesByModule = new List<List<EirFunction>>();
+        this.loweringProblems = new List<FileDiagnostic>();
+        let modules = index.modules();
+        for (long m = 0; m < modules.length(); m++) {
+            string modulePath = modules.get(m).context().module().canonicalPath();
+            this.modulePositions.set(modulePath, m);
+            this.bodiesByModule.push(new List<EirFunction>());
+            let classTypes = modules.get(m).classes();
+            for (long c = 0; c < classTypes.length(); c++) {
+                this.addDestroyedType(classTypes.get(c), modulePath);
+            }
+        }
+        this.assignPlannedInstantiations();
+    }
+
+    public override bodyOf(string symbol) -> EirFunction? {
+        let known = this.bodies.get(symbol);
+        if (known != null) {
+            return known;
+        }
+        if (this.bodiless.contains(symbol)) {
+            return null;
+        }
+        let info = this.index.functionForSymbol(symbol);
+        if (info != null) {
+            this.lowerIndexed(info);
+        } else if (closures.lambdaSymbolOfDestructor(symbol) != null) {
+            let lambda = this.index.functionForSymbol(
+                closures.lambdaSymbolOfDestructor(symbol) ?? "");
+            if (lambda != null && lambda.lambdaDeclaration() != null) {
+                let ignored = this.bodyOf(lambda.symbol());
+            }
+        } else {
+            this.assignPlannedInstantiations();
+            let destroyed = this.destroyedTypes.get(symbol);
+            if (destroyed != null) {
+                this.synthesizeDestructor(destroyed, this.destructorModules.get(symbol) ?? "");
+            }
+        }
+        let found = this.bodies.get(symbol);
+        if (found == null) {
+            let ignored = this.bodiless.add(symbol);
+        }
+        return found;
+    }
+
+    // A type the walk names is a request for it like any other, so it is planned first if nothing
+    // planned it yet, and so is every base and interface its descriptor names, which its method
+    // tables are numbered by.
+    public override planOf(Type described) -> DescriptorPlan? {
+        let known = this.plans.planFor(described);
+        if (known != null) {
+            return known;
+        }
+        if (this.unplanned.contains(described)) {
+            return null;
+        }
+        for (let level in hierarchy.conformanceLadderOf(described)) {
+            this.planner.requestType(level);
+        }
+        this.assignPlannedInstantiations();
+        let planned = descriptors.planType(described, this.index, this.tables);
+        if (planned == null) {
+            let ignored = this.unplanned.add(described);
+            return null;
+        }
+        this.plans.add(planned);
+        return planned;
+    }
+
+    // Every module of the index with the bodies lowered for it, in the order they were lowered.
+    public loweredModules() -> List<ModuleBodies> {
+        let lowered = new List<ModuleBodies>();
+        let modules = this.index.modules();
+        for (long m = 0; m < modules.length(); m++) {
+            lowered.push(new ModuleBodies(modules.get(m).context().module().canonicalPath(),
+                this.bodiesByModule.get(m)));
+        }
+        return lowered;
+    }
+
+    // What planning and lowering reported, planning first.
+    public problems() -> List<FileDiagnostic> {
+        let found = new List<FileDiagnostic>();
+        for (let problem in this.planner.plan().problems()) {
+            found.push(problem);
+        }
+        for (let problem in this.loweringProblems) {
+            found.push(problem);
+        }
+        return found;
+    }
+
+    // Lowers one indexed function, then the closure destructor of a lambda that captures and the
+    // array-content functions its body asked for.
+    lowerIndexed(FunctionInfo info) {
+        this.planner.planBody(info);
+        this.assignPlannedInstantiations();
+        string modulePath = info.context().module().canonicalPath();
+        string filePath = info.context().module().filePath();
+        let contentPlan = this.contentPlanFor(modulePath);
+        let outcome = lower.lowerFunction(info, this.index, this.tables, this.analysis.store(),
+            this.analysis.namesByFile(), contentPlan);
+        for (let problem in outcome.diagnostics()) {
+            this.loweringProblems.push(problem);
+        }
+        let function = outcome.function();
+        if (function != null) {
+            this.record(modulePath, function, filePath, info.signature().nameSpan());
+            let released = destructors.synthesizeClosure(info, this.analysis.store());
+            if (released != null) {
+                this.record(modulePath, released, filePath, info.signature().nameSpan());
+            }
+        }
+        long recorded = this.contentRecorded.get(modulePath) ?? 0;
+        while (recorded < contentPlan.builtCount()) {
+            this.record(modulePath, contentPlan.builtFunction(recorded), filePath,
+                source.makeSpan(0, 0));
+            recorded++;
+        }
+        this.contentRecorded.set(modulePath, recorded);
+    }
+
+    synthesizeDestructor(Type classType, string modulePath) {
+        let finalizer = destructors.synthesize(classType, this.index, this.analysis.store());
+        if (finalizer == null) {
+            return;
+        }
+        long position = this.modulePositions.get(modulePath) ?? -1;
+        if (position < 0) {
+            return;
+        }
+        string filePath = this.index.modules().get(position).context().module().filePath();
+        this.record(modulePath, finalizer, filePath, source.makeSpan(0, 0));
+    }
+
+    // One array-content plan per module, so each element type gets exactly one equals, hash and
+    // text function in the module's object file.
+    contentPlanFor(string modulePath) -> ArrayContentPlan {
+        let known = this.contentPlans.get(modulePath);
+        if (known != null) {
+            return known;
+        }
+        let created = new ArrayContentPlan(this.index, this.analysis.store(), modulePath);
+        this.contentPlans.set(modulePath, created);
+        return created;
+    }
+
+    record(string modulePath, EirFunction function, string filePath, Span span) {
+        for (let problem in checkLowered(function, filePath, span)) {
+            this.loweringProblems.push(problem);
+        }
+        this.bodies.set(function.symbol(), function);
+        long position = this.modulePositions.get(modulePath) ?? -1;
+        if (position >= 0) {
+            this.bodiesByModule.get(position).push(function);
+        }
+    }
+
+    // Gives every instantiation planned since the last call its slots, and a class instantiation
+    // its destructor's symbol.
+    assignPlannedInstantiations() {
+        let planned = this.planner.plan().instantiations();
+        while (this.assignedInstantiations < planned.length()) {
+            let instantiation = planned.get(this.assignedInstantiations);
+            this.assignedInstantiations++;
+            let type = instantiation.type();
+            if (primitives.classOf(type) != null) {
+                this.tables.assignClass(type);
+                this.addDestroyedType(type, instantiation.home().module().canonicalPath());
+            } else if (primitives.interfaceOf(type) != null) {
+                this.tables.assignInterface(type);
+            }
+        }
+    }
+
+    addDestroyedType(Type classType, string modulePath) {
+        string symbol = classes.destructorSymbol(classType);
+        this.destroyedTypes.set(symbol, classType);
+        this.destructorModules.set(symbol, modulePath);
+    }
+}
+
+// Gates one lowered function on the four verifiers: its shape, the ownership its value temps carry,
+// the ownership the storage it reaches holds, and the reads any moved-out slot leaves behind.
+public checkLowered(EirFunction function, string filePath, Span span) -> List<FileDiagnostic> {
+    let problems = new List<FileDiagnostic>();
+    for (let violation in verify.verifyFunction(function)) {
+        problems.push(new FileDiagnostic(filePath,
+            "Internal: lowering produced malformed EIR: {violation}", span));
+    }
+    for (let violation in ownership.verifyOwnership(function)) {
+        problems.push(new FileDiagnostic(filePath,
+            "Internal: lowering produced unbalanced ownership: {violation}", span));
+    }
+    for (let violation in storage.verifyStorage(function)) {
+        problems.push(new FileDiagnostic(filePath,
+            "Internal: lowering produced unbalanced storage ownership: {violation}", span));
+    }
+    for (let violation in takes.verifyTakes(function)) {
+        problems.push(new FileDiagnostic(filePath,
+            "Internal: lowering moved a slot's reference out too early: {violation}", span));
+    }
+    return problems;
+}

@@ -1,6 +1,6 @@
-// The driver stages the whole program: every module is lowered and verified before any module is
-// emitted, so a problem in one module neither hides another's nor leaves object files behind. The
-// failing tests point emission at the current folder, which stays untouched.
+// The driver stages the whole program: every body it reaches is lowered and verified before any
+// module is emitted, so a problem in one module neither hides another's nor leaves object files
+// behind. The failing tests point emission at the current folder, which stays untouched.
 import @std.testing;
 import Path from @std.fs;
 import FileDiagnostic from @ens.sema.support.diagnostics;
@@ -14,17 +14,20 @@ import MemoryFileLoader from support;
 import driver;
 import List from @std.collections.list;
 
-// A two-module program: 'main' calls the helper, and each module's text is given separately so a
-// test can select which of them lowers cleanly. Both carry the declaration the unlowerable
-// statements need, so either body can be the failing one.
+// A two-module program: 'main' calls a local function and the helper, and each module's text is
+// given separately so a test can select which of them lowers cleanly. Both carry the declaration
+// the unlowerable statements need, so either body can be the failing one.
 twoModuleProgram(string mainBody, string helperBody) -> MemoryFileLoader {
     let loader = new MemoryFileLoader();
     loader.add("/src/main.ens",
         "import lib.helper;\n"
         + support.unlowerableDeclaration()
-        + "main() -> int \{\n"
+        + "local() -> int \{\n"
         + mainBody
-        + "    return helper.doubled(21);\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return local() + helper.doubled(21);\n"
         + "\}\n");
     loader.add("/src/lib/helper.ens",
         support.unlowerableDeclaration()
@@ -58,6 +61,34 @@ test "every failing module reports its own problem" {
         emitted.diagnostics()[1].file());
     try testing.assertEqual(emitted.diagnostics()[1].message(),
         "The compiler does not support 'slice' on an array of 'Tagged' values yet.");
+}
+
+// A body nothing reaches is never lowered, so a construct the compiler cannot lower yet fails only
+// the build that verifies every body.
+test "a body nothing reaches is lowered only by a build that verifies every body" {
+    let loader = new MemoryFileLoader();
+    loader.add("/src/main.ens",
+        support.unlowerableDeclaration()
+        + "unreached() -> int \{\n"
+        + support.unlowerableStatements()
+        + "    return 0;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let analysis = try support.analyzeLoaded(loader);
+    string folder = try scratchFolder();
+    let reached = driver.emitProgram(analysis, folder, "reached.", support.testSettings());
+    try testing.assertTrue(reached.succeeded(),
+        "nothing reaches the body: {describe(reached.diagnostics())}");
+    string[] everyPass = [];
+    let everything = driver.emitProgram(analysis, folder, "everything.",
+        new CodegenSettings(OptimizationLevel.Default, hostTriple(), everyPass, false, false,
+            false, true));
+    try testing.assertEqual(everything.diagnostics().length, 1);
+    try testing.assertEqual(everything.diagnostics()[0].message(),
+        "The compiler does not support 'slice' on an array of 'Tagged' values yet.");
+    try emptyFolder(Path(folder));
 }
 
 test "a program emits at every optimization level" {
@@ -169,7 +200,33 @@ test "the account of an explained build closes with the program's total" {
 // A build that lowers every body verifies more than one that lowers what it reaches, and writes
 // the same objects byte for byte, so what codegencheck verifies is what every build emits.
 test "lowering every body emits the same objects as lowering what is reached" {
-    let analysis = try support.analyzeLoaded(bothModesProgram());
+    try assertSameInBothModes(bothModesProgram());
+}
+
+// A library keeps every type it declares and roots at its exports, and an instance of a generic
+// export is written only where a reached body uses it, in either mode.
+test "a library emits the same objects whether it lowers every body or what it reaches" {
+    let loader = bothModesProgram();
+    loader.add("/src/main.ens",
+        "import lib.shapes;\n"
+        + "import Box from lib.shapes;\n"
+        + "import Base from lib.shapes;\n"
+        + "import Derived from lib.shapes;\n"
+        + "export firstOf<T>(T[] items) -> T \{\n"
+        + "    return items[0];\n"
+        + "\}\n"
+        + "export offered() -> int \{\n"
+        + "    let box = new Box<int>(1);\n"
+        + "    Base<int> base = new Derived<int>();\n"
+        + "    return box.get() + base.act() + shapes.scaled(1) + firstOf<int>([3]);\n"
+        + "\}\n");
+    try assertSameInBothModes(loader);
+}
+
+// Builds the program at no optimization and at the default level, each once lowering every body
+// and once lowering what it reaches, and compares the objects byte for byte.
+assertSameInBothModes(MemoryFileLoader loader) throws {
+    let analysis = try support.analyzeLoaded(loader);
     for (let level in [OptimizationLevel.None, OptimizationLevel.Default]) {
         string[] everyPass = [];
         let reached = try emittedBytes(analysis, new CodegenSettings(level, hostTriple()));
@@ -184,9 +241,11 @@ test "lowering every body emits the same objects as lowering what is reached" {
     }
 }
 
-// A program with what reachability decides about: a class hierarchy dispatched through, an
-// interface, the built-in behaviors, a generic class and a generic function, a closure, and a
-// function, a class and a generic instance nothing reaches.
+// A program with what reachability and planning decide about: a class hierarchy dispatched
+// through, an interface, the built-in behaviors, a generic class and a generic function, an
+// override only a generic subclass declares, a field default and a parameter default that build
+// instantiations, array equality, a closure, and a function, a class and a generic instance
+// nothing reaches.
 bothModesProgram() -> MemoryFileLoader {
     let loader = new MemoryFileLoader();
     loader.add("/src/lib/shapes.ens",
@@ -236,6 +295,37 @@ bothModesProgram() -> MemoryFileLoader {
         + "public unreached() -> int \{\n"
         + "    let box = new Box<string>(\"never\");\n"
         + "    return first<int>([new Unused().value()]) + (box.get().length as int);\n"
+        + "\}\n"
+        + "public class Base<T> \{\n"
+        + "    public constructor();\n"
+        + "    public act() -> int \{\n"
+        + "        return 1;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class Derived<T> extends Base<T> \{\n"
+        + "    public constructor();\n"
+        + "    public override act() -> int \{\n"
+        + "        return 2;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class Holder \{\n"
+        + "    public Box<long> boxed = new Box<long>(5);\n"
+        + "    public constructor();\n"
+        + "\}\n"
+        + "public interface Ordered<T> \{\n"
+        + "    before(T other) -> bool;\n"
+        + "\}\n"
+        + "public class Rank implements Ordered<Rank> \{\n"
+        + "    public constructor();\n"
+        + "    public override before(Rank other) -> bool \{\n"
+        + "        return false;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public scaled(int value, Box<bool> flag = new Box<bool>(true)) -> int \{\n"
+        + "    if (flag.get()) \{\n"
+        + "        return value * 2;\n"
+        + "    \}\n"
+        + "    return value;\n"
         + "\}\n");
     loader.add("/src/main.ens",
         "import lib.shapes;\n"
@@ -243,12 +333,24 @@ bothModesProgram() -> MemoryFileLoader {
         + "import Square from lib.shapes;\n"
         + "import Measured from lib.shapes;\n"
         + "import Box from lib.shapes;\n"
+        + "import Base from lib.shapes;\n"
+        + "import Derived from lib.shapes;\n"
+        + "import Holder from lib.shapes;\n"
+        + "import Rank from lib.shapes;\n"
         + "main() -> int \{\n"
         + "    Shape shape = new Square(3);\n"
         + "    Measured measured = shape;\n"
         + "    let box = new Box<int>(shape.area());\n"
         + "    (int) -> int add = (n) -> n + measured.measure();\n"
-        + "    return add(box.get()) + shapes.first<int>([1, 2]) + (shape.hash() as int);\n"
+        + "    Base<int> base = new Derived<int>();\n"
+        + "    let holder = new Holder();\n"
+        + "    let rank = new Rank();\n"
+        + "    int[] left = [1, 2];\n"
+        + "    int[] right = [1, 2];\n"
+        + "    string shown = \"\{box.get()\} \{left == right\}\";\n"
+        + "    return add(box.get()) + shapes.first<int>([1, 2]) + (shape.hash() as int)\n"
+        + "        + base.act() + (holder.boxed.get() as int) + shapes.scaled(1)\n"
+        + "        + (shown.length as int);\n"
         + "\}\n");
     return loader;
 }
