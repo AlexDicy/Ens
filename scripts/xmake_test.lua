@@ -1308,7 +1308,8 @@ task("test")
             end
 
             -- a library the linker cannot read can end the build from one of the linker's own
-            -- threads, and the build still says why before the process ends
+            -- threads, and the build still says why before the process ends, after everything
+            -- it printed before the link
             if is_host("windows") then
                 local damaged = path.join(root, "damaged")
                 os.mkdir(path.join(damaged, "app", "src"))
@@ -1336,9 +1337,18 @@ task("test")
                     return string.char(tonumber(pair, 16))
                 end)))
                 library:close()
+                run({"build", "app", "--output", path.join(damaged, "app.exe"), "-v"},
+                    {curdir = damaged}, 1, "damaged: Reading '",
+                    "damaged/app.exe' stopped the build; the linker reported:",
+                    "lld-link: error: string table empty", "!.ens-link")
+                -- the folder that build was linking in is taken back by the next build beside it
+                os.rm(path.join(damaged, "damaged.lib"))
                 run({"build", "app", "--output", path.join(damaged, "app.exe")}, {curdir = damaged},
-                    1, "ens: linking stopped the build; the linker reported:",
-                    "lld-link: error: string table empty")
+                    1, "could not open 'damaged.lib'")
+                if #os.dirs(path.join(damaged, ".ens-link-*")) > 0 then
+                    table.insert(failures, "a build left the folder of the build the linker ended "
+                        .. "beside the program")
+                end
             end
 
             -- and nowhere else: not beside the executable, and not in the folder it was run from

@@ -1,9 +1,10 @@
-// The linker bridge: one C entry point over lld's three object-file drivers, since lld itself
+// The linker bridge: a C entry point over lld's three object-file drivers, since lld itself
 // exposes only a C++ interface. It carries no policy - the caller hands over a finished argument
 // vector and the flavor to run it under, and everything the linker printed comes back as one
 // allocated text the caller releases through ens_lld_free. ens_lld_shutdown stops lld's thread
 // pool once, after the last link, while the process can still wait for its threads. A link that
-// ends the process prints what the linker reported on standard error first.
+// ends the process prints the program its caller named and what the linker reported on standard
+// error first.
 
 #include "lld/Common/CommonLinkerContext.h"
 #include "lld/Common/Driver.h"
@@ -78,15 +79,23 @@ private:
     std::atomic<std::uint64_t> written{0};
 };
 
-std::atomic<LinkerText*> linkInProgress{nullptr};
+// The link that is running: the program its caller named and what the linker has printed so far.
+struct RunningLink {
+    std::string program;
+    LinkerText printed;
+};
 
-void reportStoppedLink(const std::string& text) {
+std::atomic<RunningLink*> linkInProgress{nullptr};
+
+void reportStoppedLink(const std::string& program, const std::string& text) {
     const llvm::StringRef reported = llvm::StringRef(text).trim();
     llvm::raw_ostream& stream = llvm::errs();
+    stream << "ens: linking ";
+    if (!program.empty()) stream << "'" << program << "' ";
     if (reported.empty()) {
-        stream << "ens: linking stopped the build and the linker reported no reason\n";
+        stream << "stopped the build and the linker reported no reason\n";
     } else {
-        stream << "ens: linking stopped the build; the linker reported:\n" << reported << "\n";
+        stream << "stopped the build; the linker reported:\n" << reported << "\n";
     }
     stream.flush();
 }
@@ -96,8 +105,8 @@ void reportStoppedLink(const std::string& text) {
 // its destructor is the last point at which the text of the link in progress can be printed.
 struct StoppedLinkReporter {
     ~StoppedLinkReporter() {
-        LinkerText* stopped = linkInProgress.exchange(nullptr);
-        if (stopped != nullptr) reportStoppedLink(stopped->taken());
+        RunningLink* stopped = linkInProgress.exchange(nullptr);
+        if (stopped != nullptr) reportStoppedLink(stopped->program, stopped->printed.taken());
     }
 };
 
@@ -158,27 +167,21 @@ bool runDriver(int flavor, llvm::ArrayRef<const char*> arguments, llvm::raw_ostr
     return linked;
 }
 
-}  // namespace
-
-extern "C" {
-
-// Runs one link. `argumentBlock` holds `argumentCount` NUL-terminated arguments back to back,
-// starting with the linker name the flavor answers to. `output` receives everything the linker
-// printed, or stays null when it printed nothing; a null `output` is accepted and drops the text.
-// Returns 0 when the executable was written, 1 when the linker refused or gave up on the link, and
-// 2 when the request itself was unusable.
-ENS_LLD_EXPORT int ens_lld_link(int flavor, const char* argumentBlock, long long argumentCount,
-                                char** output) {
+// One link, as both entry points run it; `entry` is the entry point's name, which a refused
+// request names, and `program` is null when the caller named none.
+int runLink(const char* entry, int flavor, const char* argumentBlock, long long argumentCount,
+            const char* program, char** output) {
     if (output != nullptr) *output = nullptr;
     if (argumentBlock == nullptr || argumentCount <= 0) {
         if (output != nullptr) {
-            *output = copied("Internal: ens_lld_link was called with no arguments");
+            *output = copied("Internal: " + std::string(entry) + " was called with no arguments");
         }
         return kUnusableRequest;
     }
     if (flavor != kFlavorCoff && flavor != kFlavorElf && flavor != kFlavorMachO) {
         if (output != nullptr) {
-            *output = copied("Internal: ens_lld_link was called with the unknown linker flavor "
+            *output = copied("Internal: " + std::string(entry)
+                             + " was called with the unknown linker flavor "
                              + std::to_string(flavor));
         }
         return kUnusableRequest;
@@ -191,14 +194,37 @@ ENS_LLD_EXPORT int ens_lld_link(int flavor, const char* argumentBlock, long long
 
     // Constructed before the first link, so llvm_shutdown has it to destroy.
     *stoppedLinkReporter;
-    LinkerText printed;
-    linkInProgress.store(&printed);
-    const bool linked = runDriver(flavor, argv, printed, printed);
+    RunningLink running;
+    if (program != nullptr) running.program = program;
+    linkInProgress.store(&running);
+    const bool linked = runDriver(flavor, argv, running.printed, running.printed);
     linkInProgress.store(nullptr);
 
-    const std::string text = printed.taken();
+    const std::string text = running.printed.taken();
     if (output != nullptr && !text.empty()) *output = copied(text);
     return linked ? kLinked : kLinkFailed;
+}
+
+}  // namespace
+
+extern "C" {
+
+// Runs one link. `argumentBlock` holds `argumentCount` NUL-terminated arguments back to back,
+// starting with the linker name the flavor answers to. `program` is the program the caller reports
+// linking, which a link that ends the process names. `output` receives everything the linker
+// printed, or stays null when it printed nothing; a null `output` is accepted and drops the text.
+// Returns 0 when the executable was written, 1 when the linker refused or gave up on the link, and
+// 2 when the request itself was unusable.
+ENS_LLD_EXPORT int ens_lld_link_program(int flavor, const char* argumentBlock,
+                                        long long argumentCount, const char* program,
+                                        char** output) {
+    return runLink("ens_lld_link_program", flavor, argumentBlock, argumentCount, program, output);
+}
+
+// ens_lld_link_program naming no program, for a compiler built before that entry point existed.
+ENS_LLD_EXPORT int ens_lld_link(int flavor, const char* argumentBlock, long long argumentCount,
+                                char** output) {
+    return runLink("ens_lld_link", flavor, argumentBlock, argumentCount, nullptr, output);
 }
 
 // Releases a text ens_lld_link handed back, so ownership stays with the allocator that made it.
