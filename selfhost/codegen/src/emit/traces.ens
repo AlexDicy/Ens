@@ -8,10 +8,20 @@ import Linkage from @ens.llvm.globals;
 import UnnamedAddress from @ens.llvm.globals;
 import @ens.llvm.globals;
 import @ens.llvm.instructions;
+import EirFunction from eir.model;
 import Runtime from emit.runtime;
 import emit.traceshapes;
 import List from @std.collections.list;
 import Map from @std.collections.map;
+
+// Where a site a trace can stop at was written: its source line, or -1 when it never appears in a
+// trace, and the inline frame of the function holding it that it was written in, or -1.
+public struct TraceSite {
+    public long line;
+    public long inlinedAt;
+
+    public constructor(this.line, this.inlinedAt);
+}
 
 // One defined function: where it starts, how a trace prints it, and whether it is the program
 // entry, where a captured trace stops walking.
@@ -25,23 +35,30 @@ class SymbolRecord {
     protected constructor(this.function, this.name, this.file, this.line, this.entry);
 }
 
-// One marked call site: the address the marker block starts at and the call's source line.
+// One marked call site: the address the marker block starts at, the call's source line, and the
+// index of the inline frame it was written in, or -1.
 class MarkerRecord {
     protected Value address;
     protected long line;
+    protected long frame;
 
-    protected constructor(this.address, this.line);
+    protected constructor(this.address, this.line, this.frame);
 }
 
 public final class TraceTables {
     List<SymbolRecord> symbols;
     List<MarkerRecord> markers;
     Map<string, Value> texts;
+    // The module's inline frames, each entry once, and where each function's frames went in it.
+    List<Value> frameEntries;
+    Map<string, long> frameIndexes;
 
     public constructor() {
         this.symbols = new List<SymbolRecord>();
         this.markers = new List<MarkerRecord>();
         this.texts = new Map<string, Value>();
+        this.frameEntries = new List<Value>();
+        this.frameIndexes = new Map<string, long>();
     }
 
     public record(Value function, string name, string file, long line, bool entry) {
@@ -50,11 +67,35 @@ public final class TraceTables {
 
     // Ends the current block at a call site and positions into a fresh one, recording the new
     // block's address as the site's line marker. The call must be the block's first instruction.
-    public markCallSite(Runtime runtime, Value function, long line) {
-        let site = runtime.context.appendBasicBlock(function, "call.site");
-        instructions.buildBr(runtime.builder, site);
-        runtime.builder.positionAtEnd(site);
-        this.markers.push(new MarkerRecord(blocks.blockAddress(function, site), line));
+    // 'owner' is the lowered function the site is in, whose inline frames the site names.
+    public markCallSite(Runtime runtime, Value function, TraceSite site, EirFunction owner) {
+        let marked = runtime.context.appendBasicBlock(function, "call.site");
+        instructions.buildBr(runtime.builder, marked);
+        runtime.builder.positionAtEnd(marked);
+        this.markers.push(new MarkerRecord(blocks.blockAddress(function, marked), site.line,
+            this.frameIndex(runtime, owner, site.inlinedAt)));
+    }
+
+    // Where one of a function's inline frames is in the module's table, entered once per frame,
+    // or -1 for a site written in the function itself.
+    frameIndex(Runtime runtime, EirFunction owner, long index) -> long {
+        if (index < 0) {
+            return -1;
+        }
+        string key = "{owner.symbol()}#{index}";
+        let known = this.frameIndexes.get(key);
+        if (known != null) {
+            return known;
+        }
+        let frame = owner.inlineFrames().get(index);
+        long parent = this.frameIndex(runtime, owner, frame.parent());
+        this.frameEntries.push(runtime.context.constStruct([this.text(runtime, frame.name()),
+            this.text(runtime, frame.file()),
+            runtime.int32Type.constInt(frame.callLine() as ulong, true),
+            runtime.int32Type.constInt(parent as ulong, true)], false));
+        long entered = this.frameEntries.length() - 1;
+        this.frameIndexes.set(key, entered);
+        return entered;
     }
 
     // Emits the module's tables and the constructor that registers them at load. A module that
@@ -86,7 +127,8 @@ public final class TraceTables {
         for (long i = 0; i < this.markers.length(); i++) {
             let marker = this.markers.get(i);
             lines.push(runtime.context.constStruct([marker.address,
-                runtime.int32Type.constInt(marker.line as ulong, true)], false));
+                runtime.int32Type.constInt(marker.line as ulong, true),
+                runtime.int32Type.constInt(marker.frame as ulong, true)], false));
         }
         let linesGlobal = constantTable(runtime, markerType.arrayType(lines.length() as ulong),
             markerType.constArray(lines.toArray()), "_ens_linetab");
@@ -95,11 +137,17 @@ public final class TraceTables {
             runtime.pointerType.arrayType(internals.length as ulong),
             runtime.pointerType.constArray(internals), "_ens_internaltab");
 
+        let frameType = traceshapes.inlineFrameType(runtime);
+        let framesGlobal = constantTable(runtime,
+            frameType.arrayType(this.frameEntries.length() as ulong),
+            frameType.constArray(this.frameEntries.toArray()), "_ens_inlinetab");
+
         let chunkType = traceshapes.chunkType(runtime);
         let chunk = globals.addGlobal(runtime.module, chunkType, "_ens_symtab_chunk");
         globals.setInitializer(chunk, chunkType.constNamedStruct([runtime.nullPointer(),
             entriesGlobal, runtime.int64(entries.length()), linesGlobal,
-            runtime.int64(lines.length()), internalsGlobal, runtime.int64(internals.length)]));
+            runtime.int64(lines.length()), internalsGlobal, runtime.int64(internals.length),
+            framesGlobal, runtime.int64(this.frameEntries.length())]));
         globals.setLinkage(chunk, Linkage.privateSymbol);
 
         let register = runtime.libc("ens_symtab_register",

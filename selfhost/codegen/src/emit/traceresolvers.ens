@@ -137,10 +137,13 @@ public defineResolveAddress(Runtime runtime) {
     traceruntime.finishBody(runtime, saved);
 }
 
-// ptr ens_resolve_lineentry(i64 addr, i64 start): the line marker with the greatest marked
-// call-site address at or below the captured address and at or above 'start', the start of the
-// function the address is in, or null. The caller falls back to the function's declaration line,
-// so an address no call site of its own function precedes never takes another function's line.
+// ptr ens_resolve_lineentry(i64 addr, i64 start, ptr chunk): the line marker with the greatest
+// marked call-site address at or below the captured address and at or above 'start', the start of
+// the function the address is in, or null; the chunk holding it is written through 'chunk' unless
+// that is null. The caller falls back to the function's declaration line,
+// so an address no call site of its own function precedes never takes another function's line. Of
+// two markers at one address, the one recorded later wins: the optimizer can leave a trace site
+// with no code of its own, at the address of the call that follows it.
 public defineResolveLine(Runtime runtime) {
     let resolver = lineResolver(runtime);
     globals.setLinkage(resolver.function, Linkage.internalSymbol);
@@ -150,14 +153,16 @@ public defineResolveLine(Runtime runtime) {
     let chunkShape = traceshapes.chunkType(runtime);
     let address = globals.getParam(resolver.function, 0);
     let floor = globals.getParam(resolver.function, 1);
+    let chunkOut = globals.getParam(resolver.function, 2);
 
     let best = memory.buildAlloca(builder, runtime.pointerType, "best");
+    let bestChunk = memory.buildAlloca(builder, runtime.pointerType, "best.chunk");
     let bestStart = memory.buildAlloca(builder, runtime.int64Type, "best.start");
     let chunkCursor = memory.buildAlloca(builder, runtime.pointerType, "chunk");
     let index = memory.buildAlloca(builder, runtime.int64Type, "i");
     memory.buildStore(builder, runtime.nullPointer(), best);
-    memory.buildStore(builder, instructions.buildSub(builder, floor, runtime.int64(1), ""),
-        bestStart);
+    memory.buildStore(builder, runtime.nullPointer(), bestChunk);
+    memory.buildStore(builder, floor, bestStart);
     memory.buildStore(builder, memory.buildLoad(builder, runtime.pointerType,
         traceruntime.head(runtime), "head"), chunkCursor);
 
@@ -195,13 +200,14 @@ public defineResolveLine(Runtime runtime) {
             memory.buildStructGEP(builder, markerType, marker, 0, ""), "site"),
         runtime.int64Type, "start");
     let below = instructions.buildICmpULE(builder, start, address, "");
-    let above = instructions.buildICmpUGT(builder, start,
+    let above = instructions.buildICmpUGE(builder, start,
         memory.buildLoad(builder, runtime.int64Type, bestStart, ""), "");
     instructions.buildCondBr(builder, instructions.buildAnd(builder, below, above, ""), keep,
         markNext);
 
     builder.positionAtEnd(keep);
     memory.buildStore(builder, marker, best);
+    memory.buildStore(builder, chunk, bestChunk);
     memory.buildStore(builder, start, bestStart);
     instructions.buildBr(builder, markNext);
 
@@ -216,6 +222,16 @@ public defineResolveLine(Runtime runtime) {
     instructions.buildBr(builder, chunkTest);
 
     builder.positionAtEnd(done);
+    let report = traceruntime.block(runtime, resolver, "report.chunk");
+    let finish = traceruntime.block(runtime, resolver, "finish");
+    instructions.buildCondBr(builder, runtime.isNull(chunkOut), finish, report);
+
+    builder.positionAtEnd(report);
+    memory.buildStore(builder, memory.buildLoad(builder, runtime.pointerType, bestChunk, ""),
+        chunkOut);
+    instructions.buildBr(builder, finish);
+
+    builder.positionAtEnd(finish);
     instructions.buildRet(builder, memory.buildLoad(builder, runtime.pointerType, best, ""));
     traceruntime.finishBody(runtime, saved);
 }
@@ -223,16 +239,27 @@ public defineResolveLine(Runtime runtime) {
 // ens_resolve_lineentry as every module declares it.
 public lineResolver(Runtime runtime) -> RuntimeFunction {
     let resolver = runtime.libc("ens_resolve_lineentry",
-        runtime.pointerType.functionType([runtime.int64Type, runtime.int64Type]));
+        runtime.pointerType.functionType([runtime.int64Type, runtime.int64Type,
+            runtime.pointerType]));
     return resolver;
 }
 
 // The line marker of the call site 'address' comes back to, among the call sites of the function
-// 'entry' records, or null when none of them precedes it.
-public markerFor(Runtime runtime, Value entry, Value address) -> Value {
+// 'entry' records, or null when none of them precedes it. The chunk holding the marker is written
+// into 'chunk', a slot of the caller's, unless that is the null pointer.
+public markerFor(Runtime runtime, Value entry, Value address, Value chunk) -> Value {
     let builder = runtime.builder;
     let start = instructions.buildPtrToInt(builder, memory.buildLoad(builder, runtime.pointerType,
         memory.buildStructGEP(builder, traceshapes.symbolEntryType(runtime), entry, 0, ""),
         "function"), runtime.int64Type, "function.start");
-    return runtime.call(lineResolver(runtime), [address, start], "marker");
+    return runtime.call(lineResolver(runtime), [address, start, chunk], "marker");
+}
+
+// The inline frame at 'index' in the table of the chunk 'chunk' names.
+public inlineFrameAt(Runtime runtime, Value chunk, Value index) -> Value {
+    let builder = runtime.builder;
+    let frames = memory.buildLoad(builder, runtime.pointerType,
+        memory.buildStructGEP(builder, traceshapes.chunkType(runtime), chunk, 7, ""), "frames");
+    return memory.buildGEP(builder, traceshapes.inlineFrameType(runtime), frames,
+        [instructions.buildSExt(builder, index, runtime.int64Type, "")], "frame");
 }

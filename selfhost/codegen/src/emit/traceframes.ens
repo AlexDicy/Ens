@@ -1,10 +1,10 @@
 // A captured trace as StackFrame values, so a program can walk a trace instead of printing it. An
 // address the tables cannot resolve is left out rather than counted, because an element nothing
-// wrote is a frame whose fields a program would read through a null.
+// wrote is a frame whose fields a program would read through a null. A function inlined into the
+// one an address resolves to is a frame of its own, ahead of that function's.
 import Value from @ens.llvm.values;
 import TypeRef from @ens.llvm.types;
 import BasicBlock from @ens.llvm.blocks;
-import Builder from @ens.llvm.core;
 import @ens.llvm.globals;
 import @ens.llvm.instructions;
 import @ens.llvm.memory;
@@ -30,111 +30,185 @@ public defineSymbolicate(ModuleEmitter emitter) {
     let layout = emitter.mapType(stackFrame);
     let stride = emitter.dataLayout().abiSizeOfType(layout);
     let elementFinalizer = emitter.finalizers.arrayFinalizer(stackFrame);
-    let entryType = traceshapes.symbolEntryType(runtime);
-    let markerType = traceshapes.markerEntryType(runtime);
-    let resolveAddress = runtime.libc("ens_resolve_addr",
-        runtime.pointerType.functionType([runtime.int64Type]));
-    let lift = runtime.stringFromCString();
-    let allocate = runtime.alloc();
+    let walk = new FrameWalk(runtime, symbolicate);
     let frames = globals.getParam(symbolicate.function, 0);
 
-    let counted = memory.buildAlloca(builder, runtime.int64Type, "count");
-    let index = memory.buildAlloca(builder, runtime.int64Type, "i");
-    let written = memory.buildAlloca(builder, runtime.int64Type, "written");
-    let line = memory.buildAlloca(builder, runtime.int32Type, "line");
+    let addresses = memory.buildAlloca(builder, runtime.int64Type, "addresses");
     let none = traceruntime.block(runtime, symbolicate, "none");
     let some = traceruntime.block(runtime, symbolicate, "some");
-    let alloc = traceruntime.block(runtime, symbolicate, "alloc");
+    let counting = traceruntime.block(runtime, symbolicate, "counting");
     instructions.buildCondBr(builder, runtime.isNull(frames), none, some);
 
     builder.positionAtEnd(none);
-    memory.buildStore(builder, runtime.int64(0), counted);
-    instructions.buildBr(builder, alloc);
+    memory.buildStore(builder, runtime.int64(0), addresses);
+    instructions.buildBr(builder, counting);
 
     builder.positionAtEnd(some);
-    memory.buildStore(builder, runtime.payloadLength(frames), counted);
-    instructions.buildBr(builder, alloc);
+    memory.buildStore(builder, runtime.payloadLength(frames), addresses);
+    instructions.buildBr(builder, counting);
 
-    builder.positionAtEnd(alloc);
-    let count = memory.buildLoad(builder, runtime.int64Type, counted, "n");
+    builder.positionAtEnd(counting);
+    let count = memory.buildLoad(builder, runtime.int64Type, addresses, "n");
+    let total = memory.buildAlloca(builder, runtime.int64Type, "total");
+    memory.buildStore(builder, runtime.int64(0), total);
+    walk.run(frames, count, new FrameCounter(total));
+
+    let allocated = memory.buildLoad(builder, runtime.int64Type, total, "frames");
     let bytes = instructions.buildAdd(builder, runtime.int64(8),
-        instructions.buildMul(builder, count, runtime.int64(stride as long), ""), "bytes");
-    let result = runtime.call(allocate, [bytes, elementFinalizer, runtime.nullPointer()],
+        instructions.buildMul(builder, allocated, runtime.int64(stride as long), ""), "bytes");
+    let result = runtime.call(runtime.alloc(), [bytes, elementFinalizer, runtime.nullPointer()],
         "result");
     memory.buildStore(builder, runtime.int64(0), result);
-    let resultData = runtime.payloadData(result);
-    memory.buildStore(builder, runtime.int64(0), index);
+    let written = memory.buildAlloca(builder, runtime.int64Type, "written");
     memory.buildStore(builder, runtime.int64(0), written);
+    walk.run(frames, count, new FrameWriter(layout, runtime.payloadData(result), written));
 
-    let fillTest = traceruntime.block(runtime, symbolicate, "fill.test");
-    let fillBody = traceruntime.block(runtime, symbolicate, "fill.body");
-    let fromMarker = traceruntime.block(runtime, symbolicate, "fill.markedline");
-    let build = traceruntime.block(runtime, symbolicate, "fill.build");
-    let fillNext = traceruntime.block(runtime, symbolicate, "fill.next");
-    let done = traceruntime.block(runtime, symbolicate, "done");
-    instructions.buildBr(builder, fillTest);
-
-    builder.positionAtEnd(fillTest);
-    let position = memory.buildLoad(builder, runtime.int64Type, index, "i.cur");
-    instructions.buildCondBr(builder,
-        instructions.buildICmpSLT(builder, position, count, ""), fillBody, done);
-
-    builder.positionAtEnd(fillBody);
-    let sourceData = runtime.payloadData(frames);
-    let address = memory.buildLoad(builder, runtime.int64Type,
-        memory.buildGEP(builder, runtime.int64Type, sourceData, [position], ""), "address");
-    let entry = runtime.call(resolveAddress, [address], "entry");
-    let setup = symbolicateSetup(runtime, symbolicate, builder, entryType, entry, address, line,
-        fromMarker, build);
-    instructions.buildCondBr(builder, runtime.isNull(entry), fillNext, setup);
-
-    builder.positionAtEnd(fromMarker);
-    let marker = traceresolvers.markerFor(runtime, entry, address);
-    memory.buildStore(builder, memory.buildLoad(builder, runtime.int32Type,
-        memory.buildStructGEP(builder, markerType, marker, 1, ""), ""), line);
-    instructions.buildBr(builder, build);
-
-    builder.positionAtEnd(build);
-    let name = runtime.call(lift, [memory.buildLoad(builder, runtime.pointerType,
-        memory.buildStructGEP(builder, entryType, entry, 1, ""), "")], "name");
-    let file = runtime.call(lift, [memory.buildLoad(builder, runtime.pointerType,
-        memory.buildStructGEP(builder, entryType, entry, 2, ""), "")], "file");
-    let filled = memory.buildLoad(builder, runtime.int64Type, written, "w.cur");
-    let frame = memory.buildGEP(builder, layout, resultData, [filled], "frame");
-    memory.buildStore(builder, name, memory.buildStructGEP(builder, layout, frame, 0, ""));
-    memory.buildStore(builder, file, memory.buildStructGEP(builder, layout, frame, 1, ""));
-    memory.buildStore(builder, memory.buildLoad(builder, runtime.int32Type, line, ""),
-        memory.buildStructGEP(builder, layout, frame, 2, ""));
-    memory.buildStore(builder, instructions.buildAdd(builder, filled, runtime.int64(1), ""),
-        written);
-    instructions.buildBr(builder, fillNext);
-
-    builder.positionAtEnd(fillNext);
-    memory.buildStore(builder, instructions.buildAdd(builder, position, runtime.int64(1), ""),
-        index);
-    instructions.buildBr(builder, fillTest);
-
-    builder.positionAtEnd(done);
     memory.buildStore(builder,
         memory.buildLoad(builder, runtime.int64Type, written, "w.total"), result);
     instructions.buildRet(builder, result);
     traceruntime.finishBody(runtime, saved);
 }
 
-// The symbolicate walk's per-frame setup: seeds the line from the declaration and routes to the
-// marker's line when one covers the address.
-symbolicateSetup(Runtime runtime, RuntimeFunction symbolicate, Builder builder,
-                 TypeRef entryType, Value entry, Value address, Value line,
-                 BasicBlock fromMarker, BasicBlock build) -> BasicBlock {
-    let setup = traceruntime.block(runtime, symbolicate, "fill.setup");
-    let held = builder.insertBlock();
-    builder.positionAtEnd(setup);
-    memory.buildStore(builder, memory.buildLoad(builder, runtime.int32Type,
-        memory.buildStructGEP(builder, entryType, entry, 3, ""), ""), line);
-    let marker = traceresolvers.markerFor(runtime, entry, address);
-    instructions.buildCondBr(builder, runtime.isNull(marker), build, fromMarker);
-    if (held != null) {
-        builder.positionAtEnd(held);
+// What a walk does with each frame it finds, in order: the inlined ones of an address first, then
+// the frame of the function the address resolves to.
+interface FrameVisitor {
+    visit(Runtime runtime, Value name, Value file, Value line);
+}
+
+// Counts the frames a walk finds.
+final class FrameCounter implements FrameVisitor {
+    Value total;
+
+    protected constructor(this.total);
+
+    override visit(Runtime runtime, Value name, Value file, Value line) {
+        let builder = runtime.builder;
+        memory.buildStore(builder, instructions.buildAdd(builder,
+            memory.buildLoad(builder, runtime.int64Type, this.total, ""), runtime.int64(1), ""),
+            this.total);
     }
-    return setup;
+}
+
+// Writes each frame a walk finds into the next element of the result array.
+final class FrameWriter implements FrameVisitor {
+    TypeRef layout;
+    Value data;
+    Value written;
+
+    protected constructor(this.layout, this.data, this.written);
+
+    override visit(Runtime runtime, Value name, Value file, Value line) {
+        let builder = runtime.builder;
+        let lift = runtime.stringFromCString();
+        let filled = memory.buildLoad(builder, runtime.int64Type, this.written, "w.cur");
+        let frame = memory.buildGEP(builder, this.layout, this.data, [filled], "frame");
+        memory.buildStore(builder, runtime.call(lift, [name], "name"),
+            memory.buildStructGEP(builder, this.layout, frame, 0, ""));
+        memory.buildStore(builder, runtime.call(lift, [file], "file"),
+            memory.buildStructGEP(builder, this.layout, frame, 1, ""));
+        memory.buildStore(builder, line, memory.buildStructGEP(builder, this.layout, frame, 2, ""));
+        memory.buildStore(builder, instructions.buildAdd(builder, filled, runtime.int64(1), ""),
+            this.written);
+    }
+}
+
+// One pass over the captured addresses, resolving each through the tables and handing every frame
+// it finds to a visitor. The symbolicate body runs it twice, once to size the array and once to
+// fill it, so both passes find the same frames.
+final class FrameWalk {
+    Runtime runtime;
+    RuntimeFunction owner;
+
+    protected constructor(this.runtime, this.owner);
+
+    protected run(Value frames, Value count, FrameVisitor visitor) {
+        let runtime = this.runtime;
+        let builder = runtime.builder;
+        let entryType = traceshapes.symbolEntryType(runtime);
+        let markerType = traceshapes.markerEntryType(runtime);
+        let inlineFrame = traceshapes.inlineFrameType(runtime);
+        let resolveAddress = runtime.libc("ens_resolve_addr",
+            runtime.pointerType.functionType([runtime.int64Type]));
+        let index = memory.buildAlloca(builder, runtime.int64Type, "i");
+        let line = memory.buildAlloca(builder, runtime.int32Type, "line");
+        let inlined = memory.buildAlloca(builder, runtime.int32Type, "inlined");
+        let chunk = memory.buildAlloca(builder, runtime.pointerType, "chunk");
+        memory.buildStore(builder, runtime.int64(0), index);
+
+        let test = this.block("walk.test");
+        let body = this.block("walk.body");
+        let resolved = this.block("walk.resolved");
+        let fromMarker = this.block("walk.markedline");
+        let inlineTest = this.block("walk.inline.test");
+        let inlineBody = this.block("walk.inline.body");
+        let own = this.block("walk.own");
+        let next = this.block("walk.next");
+        let done = this.block("walk.done");
+        instructions.buildBr(builder, test);
+
+        builder.positionAtEnd(test);
+        let position = memory.buildLoad(builder, runtime.int64Type, index, "i.cur");
+        instructions.buildCondBr(builder,
+            instructions.buildICmpSLT(builder, position, count, ""), body, done);
+
+        builder.positionAtEnd(body);
+        let address = memory.buildLoad(builder, runtime.int64Type,
+            memory.buildGEP(builder, runtime.int64Type, runtime.payloadData(frames), [position],
+                ""), "address");
+        let entry = runtime.call(resolveAddress, [address], "entry");
+        instructions.buildCondBr(builder, runtime.isNull(entry), next, resolved);
+
+        builder.positionAtEnd(resolved);
+        memory.buildStore(builder, memory.buildLoad(builder, runtime.int32Type,
+            memory.buildStructGEP(builder, entryType, entry, 3, ""), ""), line);
+        let marker = traceresolvers.markerFor(runtime, entry, address, chunk);
+        instructions.buildCondBr(builder, runtime.isNull(marker), own, fromMarker);
+
+        builder.positionAtEnd(fromMarker);
+        memory.buildStore(builder, memory.buildLoad(builder, runtime.int32Type,
+            memory.buildStructGEP(builder, markerType, marker, 1, ""), ""), line);
+        memory.buildStore(builder, memory.buildLoad(builder, runtime.int32Type,
+            memory.buildStructGEP(builder, markerType, marker, 2, ""), ""), inlined);
+        instructions.buildBr(builder, inlineTest);
+
+        builder.positionAtEnd(inlineTest);
+        let frameIndex = memory.buildLoad(builder, runtime.int32Type, inlined, "frame.index");
+        instructions.buildCondBr(builder,
+            instructions.buildICmpSLT(builder, frameIndex, runtime.int32(0), ""), own, inlineBody);
+
+        builder.positionAtEnd(inlineBody);
+        let frame = traceresolvers.inlineFrameAt(runtime,
+            memory.buildLoad(builder, runtime.pointerType, chunk, ""), frameIndex);
+        visitor.visit(runtime,
+            memory.buildLoad(builder, runtime.pointerType,
+                memory.buildStructGEP(builder, inlineFrame, frame, 0, ""), "inlined.name"),
+            memory.buildLoad(builder, runtime.pointerType,
+                memory.buildStructGEP(builder, inlineFrame, frame, 1, ""), "inlined.file"),
+            memory.buildLoad(builder, runtime.int32Type, line, ""));
+        memory.buildStore(builder, memory.buildLoad(builder, runtime.int32Type,
+            memory.buildStructGEP(builder, inlineFrame, frame, 2, ""), "call.line"), line);
+        memory.buildStore(builder, memory.buildLoad(builder, runtime.int32Type,
+            memory.buildStructGEP(builder, inlineFrame, frame, 3, ""), "caller"), inlined);
+        instructions.buildBr(builder, inlineTest);
+
+        builder.positionAtEnd(own);
+        visitor.visit(runtime,
+            memory.buildLoad(builder, runtime.pointerType,
+                memory.buildStructGEP(builder, entryType, entry, 1, ""), "name"),
+            memory.buildLoad(builder, runtime.pointerType,
+                memory.buildStructGEP(builder, entryType, entry, 2, ""), "file"),
+            memory.buildLoad(builder, runtime.int32Type, line, ""));
+        instructions.buildBr(builder, next);
+
+        builder.positionAtEnd(next);
+        memory.buildStore(builder, instructions.buildAdd(builder, position, runtime.int64(1), ""),
+            index);
+        instructions.buildBr(builder, test);
+
+        builder.positionAtEnd(done);
+    }
+
+    block(string name) -> BasicBlock {
+        return traceruntime.block(this.runtime, this.owner, name);
+    }
 }
