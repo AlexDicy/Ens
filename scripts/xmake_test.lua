@@ -11,6 +11,16 @@
 -- and @stderr-contains each name a substring the stream must contain. Both streams are captured
 -- separately, so what the runtime reports on stderr - a panic, an unhandled exception - is
 -- asserted with the @stderr directives and never appears in stdout.
+-- each of the four can be scoped to one optimization level by writing it with '-at' and the level,
+-- for output that differs between the levels the suite builds fixtures at, such as a stack trace
+-- naming a frame that was inlined. A scoped pin applies only at its level and an unscoped one at
+-- every level, and the lines of an exact pin keep their order across both kinds:
+--     // @stderr-at O0   at helper (main.ens:4)
+--     // @stderr-at O2   at helper (main.ens:4, inlined)
+--     // @stdout-contains-at O2 inlined
+-- this job builds fixtures at O2 and codegencheck_unoptimized at O0, so a pin scoped to any other
+-- level is refused as a fixture error, and so are a scoped pin with no line after its level and
+-- '-at' written on any other directive.
 -- use @expect-error instead to assert the compiler reports a specific diagnostic. These accumulate:
 -- every one of them names a substring the compiler's output must contain, so a file whose problems
 -- are reported together says so by listing them all.
@@ -3350,6 +3360,8 @@ task("test")
             local expected_contains = {}    -- substrings that must each appear in stdout
             local expected_stderr   = nil   -- the same, for the standard error stream
             local expected_stderr_contains = {}
+            local scope_problem     = nil   -- why a directive's '-at' cannot be read, if it cannot
+            local fixture_level     = "O2"  -- the level this job builds every fixture at
             local expected_errors   = {}
             local expected_notes    = {}    -- @expect-note: note lines the diagnostics point with
             local ens_test_args     = job.ens_test_args   -- @ens-test: run `ens test` on the folder instead
@@ -3389,6 +3401,45 @@ task("test")
                     if expected_stderr == nil then expected_stderr = {} end
                     table.insert(expected_stderr, stderr_str)
                 end
+                -- a pin scoped to a level counts here only when it names the level this job
+                -- builds at; '@expect-error-at' names a phase and is semacheck's
+                local kind, scope = line:match("^%s*//%s*@([%a%-]-)%-at(.*)$")
+                local level, scoped = nil, nil
+                if scope then
+                    level, scoped = scope:match("^ (%S+) (.*)$")
+                end
+                if kind == nil or kind == "expect-error" then
+                    -- not a scoped directive
+                elseif kind ~= "stdout" and kind ~= "stderr" and kind ~= "stdout-contains"
+                        and kind ~= "stderr-contains" then
+                    scope_problem = scope_problem or {short = "'-at' on a directive that takes "
+                        .. "no level", full = string.format("'@%s-at' scopes a directive no "
+                        .. "level can scope. Only '@stdout', '@stderr', '@stdout-contains' and "
+                        .. "'@stderr-contains' take '-at'", kind)}
+                elseif level == nil then
+                    scope_problem = scope_problem or {short = "a scoped pin has no line",
+                        full = string.format("'@%s-at' needs a level and then the line it pins, "
+                            .. "as in '// @%s-at O2 <line>'", kind, kind)}
+                elseif level ~= "O0" and level ~= "O2" then
+                    scope_problem = scope_problem or {
+                        short = "a pin is scoped to a level no fixture is built at",
+                        full = string.format("a pin is scoped to '%s', and fixtures are built "
+                            .. "only at 'O0' and 'O2'. Write '-at O0' or '-at O2' instead", level)}
+                else
+                    if level == fixture_level then
+                        if kind == "stdout" then
+                            expected_stdout = expected_stdout or {}
+                            table.insert(expected_stdout, scoped)
+                        elseif kind == "stderr" then
+                            expected_stderr = expected_stderr or {}
+                            table.insert(expected_stderr, scoped)
+                        elseif kind == "stdout-contains" then
+                            table.insert(expected_contains, scoped)
+                        else
+                            table.insert(expected_stderr_contains, scoped)
+                        end
+                    end
+                end
                 local error_str = line:match("^%s*//%s*@expect%-error%s+(.*)$")
                 if error_str then table.insert(expected_errors, error_str) end
                 local note_str = line:match("^%s*//%s*@expect%-note%s+(.*)$")
@@ -3400,6 +3451,11 @@ task("test")
                         table.insert(ens_test_args, token)
                     end
                 end
+            end
+
+            if scope_problem then
+                return {name = name, ok = false, short = scope_problem.short,
+                    full = string.format("%s: %s", name, scope_problem.full)}
             end
 
             -- a note is one diagnostic's second location, so it is only ever asserted beside the

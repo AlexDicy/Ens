@@ -89,6 +89,10 @@ If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surf
   The directive accumulates: a fixture whose problems are reported together lists all of them, and `@expect-error build failed with N problems` pins the count, which is how a fixture holds the compiler to reporting nothing extra.
   `@expect-note <substring>` pins the note line of a diagnostic that points at a second place, and is held to the same wording bar.
   Both directives match the whole log, so a note is not tied to the error it was written beside, and a fixture carrying `@expect-note` without `@expect-error` is refused as a fixture error.
+- A stream pin whose output differs between optimization levels, such as a stack trace naming a frame that was inlined, is scoped to one level with `-at`: `// @stderr-at O2   at helper (main.ens:4, inlined)`.
+  `@stdout`, `@stderr`, `@stdout-contains` and `@stderr-contains` all take the suffix, as in `@stdout-contains-at O0 ...`.
+  A scoped pin applies only at its level, and an unscoped pin at every level.
+  Fixtures are built at `O2` and `O0`, so a pin scoped to any other level is refused as a fixture error.
 - Group related scenarios into one or two files (happy paths vs errors), not one file per scenario.
 - Unit test coverage matters: new code ships with tests for its own logic (the self-hosted packages keep unit tests in their `tests/` folders), not just end-to-end fixtures.
 - A package's `tests/` folder mirrors the grouping of its `src/` folder; put new tests in the subfolder matching the code under test.
