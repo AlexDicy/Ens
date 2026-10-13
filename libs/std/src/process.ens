@@ -4,6 +4,7 @@ import Environment from @std.environment;
 import @std.environment;
 import Path from @std.fs;
 import BufferedReader from @std.io.buffered;
+import BytesReader from @std.io.memory;
 import BytesWriter from @std.io.memory;
 import ErrorKind as IoErrorKind from @std.io.streams;
 import IoError from @std.io.streams;
@@ -137,12 +138,15 @@ export runShell(string commandLine, Path? workingDirectory = null,
 // never in the current directory, and on Windows as `name.exe` unless the name has an extension,
 // so a `.cmd` or `.bat` file is run through `runShell`. A relative path with a separator is read
 // against this process's directory. `environment` gives the child exactly those variables, and
-// null hands this process's own on unchanged. Failing to start is an error.
+// null hands this process's own on unchanged. With `mergeOutput` the child writes its standard
+// error into the same pipe as its standard output, so `stdout()` reads both in the order the
+// child wrote them and `stderr()` has ended before anything is read. Failing to start is an error.
 export spawn(Path program, string[] arguments = [], Path? workingDirectory = null,
-             Environment? environment = null) -> ChildProcess throws ProcessError {
+             Environment? environment = null, bool mergeOutput = false)
+        -> ChildProcess throws ProcessError {
     let invocation = try programInvocation(program, arguments, environment);
     return try start(invocation, workingDirectory, environment, StreamMode.pipe, StreamMode.pipe,
-        StreamMode.pipe);
+        mergeOutput ? StreamMode.merged : StreamMode.pipe);
 }
 
 // A program this one started and is still running, with a pipe on each of its three streams. One
@@ -151,6 +155,7 @@ export spawn(Path program, string[] arguments = [], Path? workingDirectory = nul
 export final class ChildProcess {
     const Child child;
     const string program;
+    const bool outputMerged;
     BufferedReader? outputReader;
     BufferedReader? errorsReader;
     Writer? inputWriter;
@@ -160,9 +165,10 @@ export final class ChildProcess {
 
     // Each stream's wrapper is made on first use, so a run whose streams are inherited pays for
     // none of them.
-    protected constructor(Child child, string program) {
+    protected constructor(Child child, string program, bool outputMerged) {
         this.child = child;
         this.program = program;
+        this.outputMerged = outputMerged;
         this.outputReader = null;
         this.errorsReader = null;
         this.inputWriter = null;
@@ -171,10 +177,11 @@ export final class ChildProcess {
         this.errorsDrained = false;
     }
 
-    // What the child writes to its standard output, read as it is written. Until threads land,
-    // draining one stream to its end while the child fills the other can leave both sides waiting,
-    // since a full pipe stops the child; reading the stream the child actually writes to, or
-    // capturing through `run`, avoids that.
+    // What the child writes to its standard output, read as it is written, and what it writes to
+    // its standard error as well when the two were merged. Until threads land, draining one stream
+    // to its end while the child fills the other can leave both sides waiting, since a full pipe
+    // stops the child; reading the stream the child actually writes to, or capturing through
+    // `run`, avoids that.
     export stdout() -> BufferedReader {
         BufferedReader? held = this.outputReader;
         if (held != null) {
@@ -189,14 +196,19 @@ export final class ChildProcess {
     // What the child writes to its standard error, read as it is written. Until threads land,
     // draining one stream to its end while the child fills the other can leave both sides waiting,
     // since a full pipe stops the child; reading the stream the child actually writes to, or
-    // capturing through `run`, avoids that.
+    // capturing through `run`, avoids that. When the two output streams were merged, everything
+    // the child writes to its standard error arrives through `stdout()`, and this reader has ended.
     export stderr() -> BufferedReader {
         BufferedReader? held = this.errorsReader;
         if (held != null) {
             return held;
         }
-        let reader = new BufferedReader(new PipeReader(this, Stream.errors, this.program,
-            streamName(Stream.errors)));
+        Reader source = new PipeReader(this, Stream.errors, this.program,
+            streamName(Stream.errors));
+        if (this.outputMerged) {
+            source = new BytesReader(new byte[0]);
+        }
+        let reader = new BufferedReader(source);
         this.errorsReader = reader;
         return reader;
     }
@@ -457,10 +469,12 @@ struct Invocation {
     protected const string commandLine;
 }
 
-// What a start does with one of the child's streams.
+// What a start does with one of the child's streams. Merged is for the errors stream alone, and
+// makes the child write it into the output pipe.
 final class StreamMode {
     protected static const int inherit = 0;
     protected static const int pipe = 1;
+    protected static const int merged = 2;
 }
 
 // The child's output streams as a read names them.
@@ -605,7 +619,7 @@ start(Invocation invocation, Path? workingDirectory, Environment? given, int std
             stdinMode, stdoutMode, stderrMode);
         Child? child = started.child;
         if (child != null) {
-            return new ChildProcess(child, invocation.program);
+            return new ChildProcess(child, invocation.program, stderrMode == StreamMode.merged);
         }
         let failure = failedStart(invocation.program, path, directory, started.code);
         if (failure.kind != ErrorKind.PermissionDenied) {

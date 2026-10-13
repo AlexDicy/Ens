@@ -2063,10 +2063,12 @@ An `ExitStatus` is a struct holding a `code` and a `signal`, of which exactly on
 `succeeded()` reports whether the program exited by itself with a code of `0`.
 Windows has no signals, so a child that crashed there reports its own status as a negative code, while one ended by this library's `kill()` reports signal `9` and code `0`, the numbers a POSIX system reports for the same act, so one check distinguishes a landed kill from an exit on every platform.
 
-`process.spawn(program, arguments, workingDirectory, environment)` starts a program and hands it back as a `ChildProcess` while it is still running, with a pipe on each of its three streams, so this process writes what the child reads and reads what it writes.
+`process.spawn(program, arguments, workingDirectory, environment, mergeOutput)` starts a program and hands it back as a `ChildProcess` while it is still running, with a pipe on each of its three streams, so this process writes what the child reads and reads what it writes.
 `stdout()` and `stderr()` return a `BufferedReader` over one of the child's output streams, `input()` returns a `Writer` onto its input, and `closeInput()` ends the child's input.
 Each of the three returns the same value every call, as `io.in()` does and for the same reason.
 Draining one of the output streams to its end while the child fills the other can leave both sides waiting, since a full pipe stops the child, so a program reads the stream the child actually writes to, or captures through `run`.
+With `mergeOutput`, which defaults to `false`, the child writes its standard error into the same pipe as its standard output, so `stdout()` reads both streams in the order the child wrote them, and `stderr()` returns a reader that has already ended.
+A merged child leaves no second stream for this process to drain, which is the shape for a program whose two streams are one account of what it is doing, such as a build tool whose lines are shown as they arrive.
 `waitForOutput(timeoutMillis)` reports whether reading can go ahead without waiting for the child: `true` when either stream has bytes or has ended, and `false` when that many milliseconds went by with neither, where a bound of `0` checks this moment alone.
 Reading itself waits as long as the child takes, so a program that can wait never needs to call `waitForOutput`.
 `wait()` returns the exit status, waiting for the child to finish first and reading and throwing away output nobody read meanwhile, because a child whose output nobody reads is stopped by a full pipe.
