@@ -3345,8 +3345,8 @@ task("test")
                 elseif kind ~= "stdout" and kind ~= "stderr" and kind ~= "stdout-contains"
                         and kind ~= "stderr-contains" then
                     scope_problem = scope_problem or {short = "'-at' on a directive that takes "
-                        .. "no level", full = string.format("'@%s-at' scopes a directive no "
-                        .. "level can scope. Only '@stdout', '@stderr', '@stdout-contains' and "
+                        .. "no level", full = string.format("'@%s' cannot be scoped to a "
+                        .. "level. Only '@stdout', '@stderr', '@stdout-contains' and "
                         .. "'@stderr-contains' take '-at'", kind)}
                 elseif level == nil then
                     scope_problem = scope_problem or {short = "a scoped pin has no line",
