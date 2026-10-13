@@ -1,0 +1,326 @@
+// Inlining: a call to a small function that is not recursive is replaced by a copy of its body,
+// directly or through a dispatch whose receiver is proven, and the copy keeps every frame a trace
+// prints. A call that would recurse, a callee too large to copy, and a result with no way out of
+// the copy stay calls.
+import @std.testing;
+import TestFailure from @std.testing;
+import List from @std.collections.list;
+import EirFunction from eir.model;
+import eir.dump;
+import passes.inlining;
+import support;
+import LoweredProgram from support;
+
+test "a call to a small function is replaced by its body" {
+    let program = try support.lowerWholeProgram(
+        "helper(int a) -> int \{\n"
+        + "    return a + 1;\n"
+        + "\}\n"
+        + "caller(int x) -> int \{\n"
+        + "    return helper(x) * 2;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return caller(1) - 4;\n"
+        + "\}\n");
+    let after = try inlinedFunction(program, "main$caller");
+    try support.assertOptimized(after, "caller");
+    string text = dump.dumpFunction(after);
+    try testing.assertTrue(text.indexOf("call @main$helper") < 0, "the call is gone: {text}");
+    try testing.assertTrue(text.indexOf("#0 inlined helper (") >= 0 && text.indexOf(" at line 5")
+        >= 0, "the copy's frame names the helper and the line it was called at: {text}");
+    try testing.assertTrue(text.indexOf("trace_site") < 0,
+        "a copy no destructor or dispatch can run from needs no trace site: {text}");
+    let helper = try inlinedFunction(program, "main$helper");
+    try testing.assertTrue(dump.dumpFunction(helper).indexOf("inlined") < 0,
+        "the helper itself is left as it was");
+}
+
+// A destructor runs from a release, which marks no call site of its own, so the copy starts with a
+// site naming the callee's frame and the code after it carries on at the call's own line.
+test "a copy that releases an object keeps the trace sites a destructor's trace needs" {
+    let program = try support.lowerWholeProgram(
+        "class Holder \{\n"
+        + "    int[] items = [0];\n"
+        + "    destructor() \{\n"
+        + "        print(\"\{this.items[5]\}\");\n"
+        + "    \}\n"
+        + "\}\n"
+        + "consume(Holder holder) \{\n"
+        + "    let kept = holder;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    consume(new Holder());\n"
+        + "    let h = new Holder();\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let after = try inlinedFunction(program, "ens.main");
+    try support.assertOptimized(after, "main");
+    string text = dump.dumpFunction(after);
+    try testing.assertTrue(text.indexOf("trace_site line 7  in #0") >= 0,
+        "the copy starts at consume's line in its own frame: {text}");
+    try testing.assertTrue(text.indexOf("trace_site line 11\n") >= 0,
+        "the code after the copy carries on at the call's line: {text}");
+}
+
+test "a copy of a function holding a copy keeps both frames, the inner one under the outer" {
+    let program = try support.lowerWholeProgram(
+        "inner(int a) -> int \{\n"
+        + "    return a + 1;\n"
+        + "\}\n"
+        + "outer(int a) -> int \{\n"
+        + "    return inner(a) * 3;\n"
+        + "\}\n"
+        + "caller(int x) -> int \{\n"
+        + "    return outer(x) - 1;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return caller(1) - 5;\n"
+        + "\}\n");
+    let after = try inlinedFunction(program, "main$caller");
+    try support.assertOptimized(after, "caller");
+    string text = dump.dumpFunction(after);
+    try testing.assertTrue(text.indexOf("call @main$outer") < 0
+        && text.indexOf("call @main$inner") < 0, "both calls are gone: {text}");
+    try testing.assertTrue(text.indexOf("#0 inlined outer (") >= 0
+        && text.indexOf("#1 inlined inner (") >= 0 && text.indexOf(" at line 5 of #0") >= 0,
+        "the inner frame is called from the outer one at line 5: {text}");
+}
+
+test "a recursive function stays a call wherever it is called from" {
+    let program = try support.lowerWholeProgram(
+        "count(int n) -> int \{\n"
+        + "    if (n == 0) \{\n"
+        + "        return 0;\n"
+        + "    \}\n"
+        + "    return count(n - 1) + 1;\n"
+        + "\}\n"
+        + "even(int n) -> bool \{\n"
+        + "    if (n == 0) \{\n"
+        + "        return true;\n"
+        + "    \}\n"
+        + "    return odd(n - 1);\n"
+        + "\}\n"
+        + "odd(int n) -> bool \{\n"
+        + "    if (n == 0) \{\n"
+        + "        return false;\n"
+        + "    \}\n"
+        + "    return even(n - 1);\n"
+        + "\}\n"
+        + "caller(int n) -> int \{\n"
+        + "    if (even(n)) \{\n"
+        + "        return count(n);\n"
+        + "    \}\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return caller(2) - 2;\n"
+        + "\}\n");
+    string caller = dump.dumpFunction(try inlinedFunction(program, "main$caller"));
+    try testing.assertTrue(caller.indexOf("call @main$count") >= 0,
+        "a function calling itself stays a call: {caller}");
+    try testing.assertTrue(caller.indexOf("call @main$even") >= 0,
+        "a function in a group calling each other stays a call: {caller}");
+    string even = dump.dumpFunction(try inlinedFunction(program, "main$even"));
+    try testing.assertTrue(even.indexOf("call @main$odd") >= 0,
+        "a member of the group is not copied into another: {even}");
+}
+
+test "a function too large to copy stays a call" {
+    let program = try support.lowerWholeProgram(
+        "large(int a) -> int \{\n"
+        + "    int b = a * 3 + a * 5 + a * 7 + a * 11 + a * 13;\n"
+        + "    int c = b * 3 + b * 5 + b * 7 + b * 11 + b * 13;\n"
+        + "    int d = c * 3 + c * 5 + c * 7 + c * 11 + c * 13;\n"
+        + "    return d + c + b;\n"
+        + "\}\n"
+        + "caller(int x) -> int \{\n"
+        + "    return large(x);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return caller(0);\n"
+        + "\}\n");
+    string text = dump.dumpFunction(try inlinedFunction(program, "main$caller"));
+    try testing.assertTrue(text.indexOf("call @main$large") >= 0, "the call stays: {text}");
+}
+
+// The copy reads each reference it was passed through a borrowing slot, so a parameter it retains
+// and stores balances exactly as it did in the callee, whatever the caller owns.
+test "a reference passed to a copy is borrowed inside it" {
+    let program = try support.lowerWholeProgram(
+        "class Box \{\n"
+        + "    protected string label;\n"
+        + "\n"
+        + "    protected constructor(this.label);\n"
+        + "\}\n"
+        + "relabel(Box box, string label) \{\n"
+        + "    box.label = label;\n"
+        + "\}\n"
+        + "caller(string label) -> long \{\n"
+        + "    let box = new Box(\"first\");\n"
+        + "    relabel(box, label + \"!\");\n"
+        + "    return box.label.length;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return (caller(\"x\") - 2) as int;\n"
+        + "\}\n");
+    let after = try inlinedFunction(program, "main$caller");
+    try support.assertOptimized(after, "caller");
+    string text = dump.dumpFunction(after);
+    try testing.assertTrue(text.indexOf("call @main$relabel") < 0, "the call is gone: {text}");
+    try testing.assertTrue(text.indexOf("inlined.argument") >= 0,
+        "the references pass through borrowing slots: {text}");
+}
+
+test "a copy of a function that throws goes on to the try call's own edges" {
+    let program = try support.lowerWholeProgram(
+        "class Failure extends Error \{\n"
+        + "    protected constructor() \{\n"
+        + "        super(\"failed\");\n"
+        + "    \}\n"
+        + "\}\n"
+        + "checked(int n, Failure failure) -> int throws Failure \{\n"
+        + "    if (n < 0) \{\n"
+        + "        throw failure;\n"
+        + "    \}\n"
+        + "    return n;\n"
+        + "\}\n"
+        + "passed(int n) -> int throws \{\n"
+        + "    return try checked(n, new Failure()) + 1;\n"
+        + "\}\n"
+        + "caught(int n) -> int \{\n"
+        + "    return try checked(n, new Failure());\n"
+        + "\} catch (Failure e) \{\n"
+        + "    return -1;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return caught(1) - 1;\n"
+        + "\}\n");
+    for (let symbol in ["main$passed", "main$caught"]) {
+        let after = try inlinedFunction(program, symbol);
+        try support.assertOptimized(after, symbol);
+        string text = dump.dumpFunction(after);
+        try testing.assertTrue(text.indexOf("@main$checked") < 0, "the try call is gone: {text}");
+        try testing.assertTrue(text.indexOf("inlined checked (") >= 0
+            && text.indexOf("capture_trace") >= 0 && text.indexOf(", line 8  in #") >= 0,
+            "the throw's capture keeps its line in the copy's frame: {text}");
+    }
+}
+
+test "a dispatched call on a receiver of a proven class is replaced by that class's method" {
+    let program = try support.lowerWholeProgram(
+        "class Animal \{\n"
+        + "    protected constructor();\n"
+        + "    protected speak() -> int \{\n"
+        + "        return 1;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "class Dog extends Animal \{\n"
+        + "    protected constructor();\n"
+        + "    protected override speak() -> int \{\n"
+        + "        return 2;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "call() -> int \{\n"
+        + "    Animal a = new Dog();\n"
+        + "    return a.speak();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return call() - 2;\n"
+        + "\}\n");
+    let after = try inlinedFunction(program, "main$call");
+    try support.assertOptimized(after, "call");
+    string text = dump.dumpFunction(after);
+    try testing.assertTrue(text.indexOf("vtable[") < 0 && text.indexOf("@main$Dog$speak") < 0,
+        "the dispatch is replaced by Dog's method: {text}");
+    try testing.assertTrue(text.indexOf("inlined Dog.speak (") >= 0, "the frame is Dog's: {text}");
+}
+
+// A callee with more than one return hands its result over through a slot: a reference is taken
+// out of it, which moves the reference the return stored.
+test "a result returned from more than one place reaches the caller through a slot" {
+    let program = try support.lowerWholeProgram(
+        "pick(bool first, string a, string b) -> string \{\n"
+        + "    if (first) \{\n"
+        + "        return a;\n"
+        + "    \}\n"
+        + "    return b;\n"
+        + "\}\n"
+        + "caller(bool first) -> long \{\n"
+        + "    return pick(first, \"one\", \"three\").length;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return (caller(true) - 3) as int;\n"
+        + "\}\n");
+    let after = try inlinedFunction(program, "main$caller");
+    try support.assertOptimized(after, "caller");
+    string text = dump.dumpFunction(after);
+    try testing.assertTrue(text.indexOf("call @main$pick") < 0, "the call is gone: {text}");
+    try testing.assertTrue(text.indexOf("take $") >= 0 && text.indexOf("inlined.result") >= 0,
+        "the result is taken out of the slot the returns store into: {text}");
+}
+
+// A struct holding a reference has no slot it can pass through without changing who owns what it
+// holds, so a callee returning one from more than one place stays a call.
+test "a struct holding a reference returned from more than one place stays a call" {
+    let program = try support.lowerWholeProgram(
+        "struct Named \{\n"
+        + "    protected string name = \"\";\n"
+        + "\}\n"
+        + "choose(bool first, Named a, Named b) -> Named \{\n"
+        + "    if (first) \{\n"
+        + "        return a;\n"
+        + "    \}\n"
+        + "    return b;\n"
+        + "\}\n"
+        + "caller(bool first) -> long \{\n"
+        + "    Named a = \{name: \"one\"\};\n"
+        + "    Named b = \{name: \"three\"\};\n"
+        + "    return choose(first, a, b).name.length;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return (caller(true) - 3) as int;\n"
+        + "\}\n");
+    string text = dump.dumpFunction(try inlinedFunction(program, "main$caller"));
+    try testing.assertTrue(text.indexOf("call @main$choose") >= 0, "the call stays: {text}");
+}
+
+test "every module keeps its functions, in their order" {
+    let program = try support.lowerWholeProgram(
+        "helper(int a) -> int \{\n"
+        + "    return a + 1;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return helper(1) - 2;\n"
+        + "\}\n");
+    let modules = grouped(program);
+    let rewritten = inlining.inlineProgram(modules, program.plans);
+    try testing.assertEqual(rewritten.length(), modules.length());
+    for (long m = 0; m < modules.length(); m++) {
+        try testing.assertEqual(rewritten.get(m).length(), modules.get(m).length());
+        for (long f = 0; f < modules.get(m).length(); f++) {
+            try testing.assertEqual(rewritten.get(m).get(f).symbol(),
+                modules.get(m).get(f).symbol());
+        }
+    }
+}
+
+// The program's functions grouped the way the driver hands them over, module by module.
+grouped(LoweredProgram program) -> List<List<EirFunction>> {
+    let modules = new List<List<EirFunction>>();
+    for (let module in program.modules) {
+        modules.push(module.bodies());
+    }
+    return modules;
+}
+
+// One function of the program after the whole program was inlined.
+inlinedFunction(LoweredProgram program, string symbol) -> EirFunction throws {
+    for (let module in inlining.inlineProgram(grouped(program), program.plans)) {
+        for (let function in module) {
+            if (function.symbol() == symbol) {
+                return function;
+            }
+        }
+    }
+    throw new TestFailure("no function with symbol '{symbol}'");
+}

@@ -930,6 +930,10 @@ A handler can read the trace from a caught error, either preformatted or as stru
 
 `stackTrace() -> string` returns the same text shown for an unhandled exception. `stackFrames() -> StackFrame[]` returns the frames as values, each a `StackFrame` with `function`, `file`, and `line`; `frames[0]` is the throw site.
 
+At `-O2` and `-O3` a small function may be copied into the function that calls it.
+Its frame is still in the trace, with `inlined` after its line, as in `at helper (math.ens:4, inlined)`, ahead of the frame of the function it was copied into.
+`stackFrames()` lists it as an ordinary `StackFrame`, so the frames of a trace are the same at every level and only the text marks the copy.
+
 ---
 
 Tests are declared with the `test` keyword, a description string, and a body.

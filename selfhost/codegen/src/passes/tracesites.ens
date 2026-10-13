@@ -1,0 +1,183 @@
+// The trace sites a rewritten function keeps. A site only decides the line of a call address that
+// no call site of its own marks, which is the program code a release, a dynamic dispatch or an
+// unlined call runs. A site the code after it reaches no such call from before the next site is
+// idle, and it is dropped, since every site splits a block the optimizer could otherwise join.
+import EirBlock from eir.model;
+import EirInstruction from eir.model;
+import EirTerminator from eir.model;
+import EirCall from eir.model;
+import EirClosureCall from eir.model;
+import EirCaptureTrace from eir.model;
+import EirTraceSite from eir.model;
+import EirRelease from eir.model;
+import EirReleasePtr from eir.model;
+import EirDynamicEquals from eir.model;
+import EirDynamicHash from eir.model;
+import EirDynamicToString from eir.model;
+import EirTryCall from eir.model;
+import EirTryClosureCall from eir.model;
+import EirJump from eir.model;
+import EirReturn from eir.model;
+import EirPropagate from eir.model;
+import EirUnreachable from eir.model;
+import Type from @ens.sema.model.types;
+import @ens.sema.model.typemembers;
+import support.primitives;
+import List from @std.collections.list;
+
+// The blocks with every idle trace site left out, each block's other instructions as they were.
+public withoutIdleSites(List<EirBlock> blocks, List<Type> temps) -> List<EirBlock> {
+    let kept = new List<EirBlock>();
+    for (long b = 0; b < blocks.length(); b++) {
+        let source = blocks.get(b);
+        let block = new EirBlock(source.label());
+        let instructions = source.instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            let instruction = instructions.get(i);
+            if (instruction is EirTraceSite && !needed(blocks, temps, b, i)) {
+                continue;
+            }
+            block.instructions().push(instruction);
+        }
+        let terminator = source.terminator();
+        if (terminator != null) {
+            block.setTerminator(terminator);
+        }
+        kept.push(block);
+    }
+    return kept;
+}
+
+// Whether the code after the site at 'index' of block 'start' can reach a call no site marks
+// before it reaches a marked one. The walk follows plain jumps and assumes the worst at a branch.
+needed(List<EirBlock> blocks, List<Type> temps, long start, long index) -> bool {
+    let site = blocks.get(start).instructions().get(index);
+    if (site is EirTraceSite && site.line < 0) {
+        return false;
+    }
+    bool[] visited = new bool[blocks.length()];
+    long block = start;
+    long from = index + 1;
+    while (!visited[block]) {
+        visited[block] = true;
+        let instructions = blocks.get(block).instructions();
+        for (long i = from; i < instructions.length(); i++) {
+            let instruction = instructions.get(i);
+            if (marksSite(instruction)) {
+                return false;
+            }
+            if (runsUnmarked(instruction, temps)) {
+                return true;
+            }
+        }
+        let terminator = blocks.get(block).terminator();
+        if (terminator == null || ends(terminator)) {
+            return false;
+        }
+        if (terminator is EirTryCall) {
+            return terminator.line < 0;
+        }
+        if (terminator is EirTryClosureCall) {
+            return terminator.line < 0;
+        }
+        if (!(terminator is EirJump)) {
+            return true;
+        }
+        block = terminator.target;
+        from = 0;
+    }
+    return false;
+}
+
+// Whether the instruction marks a site of its own on the path the code takes, which every call with
+// a line does. A bounds check marks its failing branch alone, so it marks nothing here.
+marksSite(EirInstruction instruction) -> bool {
+    switch (instruction) {
+        is EirCall call -> {
+            return call.line >= 0;
+        },
+        is EirClosureCall call -> {
+            return call.line >= 0;
+        },
+        is EirCaptureTrace captured -> {
+            return captured.line >= 0;
+        },
+        is EirTraceSite site -> {
+            return site.line >= 0;
+        },
+        default -> {
+            return false;
+        },
+    }
+}
+
+// Whether the instruction can run program code at a call address no site of its own marks: a
+// release that can reach a destructor, a comparison, hash or text a type declares, or a call made
+// with no line.
+runsUnmarked(EirInstruction instruction, List<Type> temps) -> bool {
+    switch (instruction) {
+        is EirRelease release -> {
+            return reachesDestructor(temps.get(release.value));
+        },
+        is EirReleasePtr release -> {
+            return reachesDestructor(temps.get(release.address));
+        },
+        is EirDynamicEquals ignored -> {
+            return true;
+        },
+        is EirDynamicHash ignored -> {
+            return true;
+        },
+        is EirDynamicToString ignored -> {
+            return true;
+        },
+        is EirCall call -> {
+            return call.line < 0;
+        },
+        is EirClosureCall call -> {
+            return call.line < 0;
+        },
+        default -> {
+            return false;
+        },
+    }
+}
+
+// Whether the code after the terminator is outside this function: a return, a propagate, or
+// nothing at all.
+ends(EirTerminator terminator) -> bool {
+    return terminator is EirReturn || terminator is EirPropagate || terminator is EirUnreachable;
+}
+
+// Whether releasing a value of this type can run a destructor the program declares: an object or a
+// function value, or an array, optional or struct holding one. A string or a number never can.
+reachesDestructor(Type type) -> bool {
+    if (primitives.stringOf(type) != null) {
+        return false;
+    }
+    let array = primitives.arrayOf(type);
+    if (array != null) {
+        return reachesDestructor(array.element());
+    }
+    if (primitives.isReferenceType(type)) {
+        return true;
+    }
+    let payload = primitives.taggedPayloadOf(type);
+    if (payload != null) {
+        return reachesDestructor(payload);
+    }
+    let struck = primitives.structOf(type);
+    if (struck == null) {
+        return false;
+    }
+    let fields = typemembers.fieldsOf(struck);
+    if (fields == null) {
+        return false;
+    }
+    for (long i = 0; i < fields.length(); i++) {
+        if (reachesDestructor(fields.get(i).type())) {
+            return true;
+        }
+    }
+    return false;
+}

@@ -1,0 +1,918 @@
+// Inlining, the stage ahead of the optimization pipeline and the one pass that reads the whole
+// program at once. A call to a small function that is not recursive, made directly or dispatched
+// on a receiver whose class is proven, is replaced by a copy of that function's body, so the passes
+// after it see across what was a call boundary. A function is recursive when a chain of its own
+// calls leads back to it. Functions are rewritten callees first, so every copy is of a body that is
+// already final, and a rewrite reads nothing but its own function and those finished bodies.
+import EirFunction from eir.model;
+import EirBlock from eir.model;
+import EirInstruction from eir.model;
+import EirTerminator from eir.model;
+import EirCall from eir.model;
+import EirTryCall from eir.model;
+import EirCallee from eir.model;
+import EirSlot from eir.model;
+import EirInlineFrame from eir.model;
+import EirLoadSlot from eir.model;
+import EirCast from eir.model;
+import EirCastOp from eir.model;
+import EirStoreSlot from eir.model;
+import EirTakeSlot from eir.model;
+import EirGlobalAddress from eir.model;
+import EirReturn from eir.model;
+import EirPropagate from eir.model;
+import EirJump from eir.model;
+import EirTraceSite from eir.model;
+import EirBranch from eir.model;
+import EirSwitch from eir.model;
+import EirTryClosureCall from eir.model;
+import Type from @ens.sema.model.types;
+import @ens.sema.model.types;
+import DescriptorPlans from layout.descriptors;
+import InlineRemap from passes.inlineremap;
+import passes.inlinecopy;
+import passes.tracesites;
+import passes.devirtualize;
+import passes.scan;
+import eir.walk;
+import support.primitives;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+
+// The fixed size limits, counted in instructions and terminators.
+final class InlineLimits {
+    // The largest body copied in place of a call.
+    protected static const long callee = 12;
+
+    // The size a caller stops taking copies at; its calls after that point stay calls.
+    protected static const long caller = 2000;
+}
+
+// Every module's functions with the small calls in them inlined, each module's list in its own
+// order, so what emission writes depends on the program and nothing else.
+public inlineProgram(List<List<EirFunction>> modules, DescriptorPlans plans)
+        -> List<List<EirFunction>> {
+    let program = new ProgramBodies(modules);
+    let finished = new Inliner(program, plans).run();
+    let rewritten = new List<List<EirFunction>>();
+    long next = 0;
+    for (let module in modules) {
+        let functions = new List<EirFunction>();
+        for (long f = 0; f < module.length(); f++) {
+            functions.push(finished.get(next));
+            next++;
+        }
+        rewritten.push(functions);
+    }
+    return rewritten;
+}
+
+// The program's functions in one list, module by module, with the module each one is in and where
+// to find each by its linker symbol.
+final class ProgramBodies {
+    protected List<EirFunction> functions;
+    protected List<long> modules;
+    protected Map<string, long> bySymbol;
+    // The module of every function that is internal to its module's object.
+    protected Map<string, long> internalModules;
+
+    protected constructor(List<List<EirFunction>> grouped) {
+        this.functions = new List<EirFunction>();
+        this.modules = new List<long>();
+        this.bySymbol = new Map<string, long>();
+        this.internalModules = new Map<string, long>();
+        for (long m = 0; m < grouped.length(); m++) {
+            for (let function in grouped.get(m)) {
+                this.bySymbol.set(function.symbol(), this.functions.length());
+                this.functions.push(function);
+                this.modules.push(m);
+                if (function.internalLinkage()) {
+                    this.internalModules.set(function.symbol(), m);
+                }
+            }
+        }
+    }
+}
+
+// What a finished body offers the callers that may copy it.
+final class Finished {
+    protected EirFunction body;
+    protected long size;
+    // The module whose internal functions the body names, -1 for none, or -2 for several.
+    protected long internalModule;
+    // Whether the body defines a global's storage, which only one function of the program may.
+    protected bool definesGlobal;
+
+    protected constructor(this.body, this.size, this.internalModule, this.definesGlobal);
+}
+
+final class Inliner {
+    ProgramBodies program;
+    DescriptorPlans plans;
+    Finished?[] finished;
+    bool[] recursive;
+
+    protected constructor(this.program, this.plans) {
+        this.finished = new Finished?[program.functions.length()];
+        this.recursive = new bool[program.functions.length()];
+    }
+
+    // Rewrites every function, the members of each group of mutually recursive functions after
+    // every group they call.
+    protected run() -> List<EirFunction> {
+        let callees = this.calleesOfAll();
+        let groups = componentsOf(callees);
+        for (long g = 0; g < groups.length(); g++) {
+            for (let member in groups.get(g)) {
+                this.recursive[member] = groups.get(g).length() > 1
+                    || callees.get(member).contains(member);
+            }
+        }
+        for (long g = 0; g < groups.length(); g++) {
+            for (let member in groups.get(g)) {
+                let body = this.rewritten(member);
+                this.finished[member] = finishedOf(body, this.program);
+            }
+        }
+        let bodies = new List<EirFunction>();
+        for (long i = 0; i < this.finished.length; i++) {
+            let done = this.finished[i];
+            if (done == null) {
+                bodies.push(this.program.functions.get(i));
+            } else {
+                bodies.push(done.body);
+            }
+        }
+        return bodies;
+    }
+
+    // Each function's callees, by index, in the order its calls appear.
+    calleesOfAll() -> List<List<long>> {
+        let all = new List<List<long>>();
+        for (let function in this.program.functions) {
+            let callees = new List<long>();
+            let targets = new CallTargets(function, this.plans);
+            for (let block in function.blocks()) {
+                for (let instruction in block.instructions()) {
+                    this.addCallee(callees, targets.ofInstruction(instruction));
+                }
+                let terminator = block.terminator();
+                if (terminator != null) {
+                    this.addCallee(callees, targets.ofTerminator(terminator));
+                }
+            }
+            all.push(callees);
+        }
+        return all;
+    }
+
+    addCallee(List<long> callees, string symbol) {
+        if (symbol.length == 0) {
+            return;
+        }
+        let index = this.program.bySymbol.get(symbol);
+        if (index != null) {
+            callees.push(index);
+        }
+    }
+
+    // The function at 'index' with every call worth inlining replaced by a copy of its target.
+    rewritten(long index) -> EirFunction {
+        let function = this.program.functions.get(index);
+        let targets = new CallTargets(function, this.plans);
+        let rewrite = new CallerRewrite(function);
+        let original = function.blocks();
+        for (long b = 0; b < original.length(); b++) {
+            rewrite.beginBlock(b);
+            long current = b;
+            for (let instruction in original.get(b).instructions()) {
+                if (instruction is EirCall) {
+                    let target = this.copyable(index, rewrite, targets.ofInstruction(instruction),
+                        siteOf(instruction), false);
+                    if (target != null) {
+                        current = rewrite.inlineCall(current, instruction, target);
+                        continue;
+                    }
+                }
+                rewrite.block(current).instructions().push(instruction);
+            }
+            let terminator = original.get(b).terminator();
+            if (terminator == null) {
+                continue;
+            }
+            if (terminator is EirTryCall) {
+                let target = this.copyable(index, rewrite, targets.ofTerminator(terminator),
+                    trySiteOf(terminator), true);
+                if (target != null) {
+                    rewrite.inlineTryCall(current, terminator, target);
+                    continue;
+                }
+            }
+            rewrite.block(current).setTerminator(terminator);
+        }
+        return rewrite.finish();
+    }
+
+    // The finished body of the function a call reaches, when copying it in place of the call is
+    // allowed and worth it, or null. 'tryCall' says the call is a try call, which ends its block.
+    copyable(long caller, CallerRewrite rewrite, string symbol, CallSite site, bool tryCall)
+            -> Finished? {
+        if (symbol.length == 0) {
+            return null;
+        }
+        let index = this.program.bySymbol.get(symbol);
+        if (index == null || this.recursive[index]) {
+            return null;
+        }
+        let target = this.finished[index];
+        if (target == null || target.size > InlineLimits.callee || target.definesGlobal
+                || target.body.isEntryPoint()) {
+            return null;
+        }
+        if (rewrite.size + target.size > InlineLimits.caller) {
+            return null;
+        }
+        let callerFunction = this.program.functions.get(caller);
+        long callerModule = this.program.modules.get(caller);
+        if (target.internalModule == -2
+                || (target.internalModule >= 0 && target.internalModule != callerModule)) {
+            return null;
+        }
+        if (!accepts(callerFunction, target.body, site, tryCall)) {
+            return null;
+        }
+        return target;
+    }
+}
+
+// The functions a call can reach without a table read: its own symbol when it is direct, or the
+// one implementation a dispatched call's receiver is proven to run.
+final class CallTargets {
+    EirFunction function;
+    DescriptorPlans plans;
+    ScanTables? scanned;
+
+    protected constructor(this.function, this.plans) {
+        this.scanned = null;
+    }
+
+    protected ofInstruction(EirInstruction instruction) -> string {
+        if (!(instruction is EirCall)) {
+            return "";
+        }
+        return this.resolved(instruction.callee, instruction.receiver, instruction.dispatchSlot,
+            instruction.dispatchInterface);
+    }
+
+    protected ofTerminator(EirTerminator terminator) -> string {
+        if (!(terminator is EirTryCall)) {
+            return "";
+        }
+        return this.resolved(terminator.callee, terminator.receiver, terminator.dispatchSlot,
+            terminator.dispatchInterface);
+    }
+
+    resolved(EirCallee callee, long receiver, long dispatchSlot, Type? dispatchInterface)
+            -> string {
+        if (dispatchSlot < 0) {
+            return callee.symbol();
+        }
+        let tables = this.tables();
+        return devirtualize.singleTarget(this.function, this.plans, tables.definitions,
+            tables.users, receiver, dispatchSlot, dispatchInterface);
+    }
+
+    // The function's definition and use tables, scanned the first time a dispatched call asks.
+    tables() -> ScanTables {
+        let known = this.scanned;
+        if (known != null) {
+            return known;
+        }
+        let scanned = new ScanTables(scan.definitionsOf(this.function), scan.usersOf(this.function));
+        this.scanned = scanned;
+        return scanned;
+    }
+}
+
+final class ScanTables {
+    protected EirInstruction?[] definitions;
+    protected List<List<EirInstruction>> users;
+
+    protected constructor(this.definitions, this.users);
+}
+
+// One caller as it is rewritten: its blocks, slots, temps and inline frames, the copies appended
+// after its own.
+final class CallerRewrite {
+    EirFunction function;
+    List<EirBlock> blocks;
+    // What each added block is labeled after, and the caller's block it was added for.
+    List<string> hints;
+    List<long> addedFor;
+    long processing;
+    List<EirSlot> slots;
+    List<Type> temps;
+    List<EirInlineFrame> frames;
+    protected long size;
+    bool changed;
+
+    protected constructor(EirFunction function) {
+        this.function = function;
+        this.blocks = new List<EirBlock>();
+        this.hints = new List<string>();
+        this.addedFor = new List<long>();
+        this.processing = 0;
+        for (let block in function.blocks()) {
+            this.blocks.push(new EirBlock(block.label()));
+            this.hints.push("");
+            this.addedFor.push(-1);
+        }
+        this.slots = function.slots().copy();
+        this.temps = function.tempTypes().copy();
+        this.frames = function.inlineFrames().copy();
+        this.size = sizeOf(function);
+        this.changed = false;
+    }
+
+    protected block(long index) -> EirBlock {
+        return this.blocks.get(index);
+    }
+
+    // Starts on the caller's block 'index'; the blocks added from here on are laid out after it.
+    protected beginBlock(long index) {
+        this.processing = index;
+    }
+
+    // Copies 'target' in place of an instruction call, and returns the block code continues in
+    // after it, which holds the rest of the caller's block.
+    protected inlineCall(long current, EirCall call, Finished target) -> long {
+        return this.splice(current, siteOf(call), target.body, target.size, -1, -1, -1);
+    }
+
+    // Copies 'target' in place of the try call that ends block 'current'.
+    protected inlineTryCall(long current, EirTryCall call, Finished target) {
+        let ignored = this.splice(current, trySiteOf(call), target.body, target.size,
+            call.errorResult, call.normalTarget, call.unwindTarget);
+    }
+
+    // Copies 'callee' in place of the call that ends block 'current' so far. A try call names
+    // where its two edges go, and an instruction call continues in a fresh block, which is
+    // returned.
+    splice(long current, CallSite site, EirFunction callee, long calleeSize, long errorResult,
+           long normalTarget, long unwindTarget) -> long {
+        this.changed = true;
+        this.size = this.size + calleeSize;
+        let tempMap = new long[callee.tempTypes().length()];
+        for (long t = 0; t < tempMap.length; t++) {
+            tempMap[t] = -1;
+        }
+        let entering = this.block(current);
+        this.bindEntryTemps(entering, site, callee, tempMap);
+
+        long resultTarget = -1;
+        if (!types.isVoidType(callee.returnType())) {
+            resultTarget = site.result;
+        }
+        let result = this.handover(callee, endsOf(callee, true), resultTarget, tempMap,
+            "inlined.result");
+        let error = this.handover(callee, endsOf(callee, false), errorResult, tempMap,
+            "inlined.error");
+        for (long t = 0; t < tempMap.length; t++) {
+            if (tempMap[t] < 0) {
+                this.temps.push(callee.tempTypes().get(t));
+                tempMap[t] = this.temps.length() - 1;
+            }
+        }
+
+        long slotBase = this.slots.length();
+        for (let slot in callee.slots()) {
+            this.slots.push(slot);
+        }
+        let remap = this.frameRemap(site, callee, tempMap, slotBase);
+        this.reserveBlocks(callee);
+
+        // A trace resolves the copy's code without a site of its own to the callee's frame, and
+        // the code after the copy to the call, as it did while the call was a call. The sites
+        // nothing needs are dropped once the whole caller is rewritten.
+        bool marked = site.line >= 0;
+        if (marked) {
+            entering.instructions().push(new EirTraceSite(remap.line(callee.traceLine(), -1),
+                remap.frame(-1)));
+        }
+        long continuation = -1;
+        long returned = normalTarget;
+        if (normalTarget < 0) {
+            continuation = this.addBlock("after.inlined");
+            returned = continuation;
+        } else if (result.slot >= 0 || marked) {
+            returned = this.addBlock("inlined.returned");
+            this.block(returned).setTerminator(new EirJump(normalTarget));
+        }
+        if (returned != normalTarget) {
+            this.land(this.block(returned), site, marked, result);
+        }
+        long unwound = unwindTarget;
+        if (error.target >= 0 && (error.slot >= 0 || marked)) {
+            unwound = this.addBlock("inlined.unwound");
+            this.block(unwound).setTerminator(new EirJump(unwindTarget));
+            this.land(this.block(unwound), site, marked, error);
+        }
+
+        this.fillBlocks(callee, remap, new InlineEnds(returned, result, unwound, error));
+        entering.setTerminator(new EirJump(remap.block(0)));
+        return continuation;
+    }
+
+    // Opens the block code reaches from the copy's returns or propagates: the call's own site
+    // first, then the value handed over through a slot.
+    land(EirBlock block, CallSite site, bool marked, Handover handover) {
+        if (marked) {
+            block.instructions().push(new EirTraceSite(site.line, site.inlinedAt));
+        }
+        if (handover.slot >= 0) {
+            block.instructions().push(handover.definition());
+        }
+    }
+
+    // How the values 'ends' names, one per return or per propagate of the callee, reach 'target',
+    // the temp the call defines with them, or nothing when the call defines none. A single value
+    // the callee's body defined becomes the target itself, or the target is cast from it when the
+    // call declares another type; anything else passes through a slot.
+    handover(EirFunction callee, List<long> ends, long target, long[] tempMap, string slotName)
+            -> Handover {
+        if (target < 0 || ends.length() == 0) {
+            return new Handover(-1, callee.returnType(), -1, false);
+        }
+        Type type = this.temps.get(target);
+        if (ends.length() == 1 && ends.get(0) >= callee.entryTempCount()) {
+            if (callee.tempTypes().get(ends.get(0)) == type) {
+                tempMap[ends.get(0)] = target;
+                return new Handover(target, type, -1, true);
+            }
+            return new Handover(target, type, -1, false);
+        }
+        return new Handover(target, type, this.addSlotFor(slotName, type), false);
+    }
+
+    // Hands 'value', which a copied return or propagate ends with, over as 'handover' says.
+    handOver(EirBlock block, Handover handover, long value) {
+        if (handover.target < 0 || handover.renamed) {
+            return;
+        }
+        long handed = value;
+        if (this.temps.get(value) != handover.type) {
+            handed = handover.target;
+            if (handover.slot >= 0) {
+                handed = this.newTemp(handover.type);
+            }
+            block.instructions().push(new EirCast(handed, handover.type, EirCastOp.Reinterpret,
+                value));
+        }
+        if (handover.slot >= 0) {
+            block.instructions().push(new EirStoreSlot(handover.slot, handed));
+        }
+    }
+
+    // The terminator a copied block ends with: a return or a propagate hands its value over and
+    // jumps to where the call goes on, and anything else is copied.
+    copiedEnd(EirBlock block, EirTerminator terminator, InlineRemap remap, InlineEnds ends)
+            -> EirTerminator {
+        switch (terminator) {
+            is EirReturn returned -> {
+                this.handOver(block, ends.result, remap.temp(returned.value));
+                return new EirJump(ends.returned);
+            },
+            is EirPropagate propagated -> {
+                this.handOver(block, ends.error, remap.temp(propagated.error));
+                return new EirJump(ends.unwound);
+            },
+            default -> {
+                let copied = inlinecopy.copiedTerminator(terminator, remap);
+                if (copied == null) {
+                    return terminator;
+                }
+                return copied;
+            },
+        }
+    }
+
+    // Binds each incoming temp of the callee to what the call passed. A reference reaches the copy
+    // through a borrowing slot, so inside it the value is borrowed exactly as a parameter is,
+    // whether or not the caller owns the temp it passed, and a subclass the caller passed is
+    // renamed to the type the callee declares.
+    bindEntryTemps(EirBlock entering, CallSite site, EirFunction callee, long[] tempMap) {
+        long offset = 0;
+        if (callee.receiverType() != null) {
+            tempMap[0] = this.boundEntry(entering, site.receiver, callee, 0, false);
+            offset = 1;
+        }
+        let parameters = callee.parameters();
+        for (long p = 0; p < parameters.length; p++) {
+            tempMap[p + offset] = this.boundEntry(entering, site.arguments[p], callee, p + offset,
+                parameters[p].byAddress());
+        }
+    }
+
+    boundEntry(EirBlock entering, long passed, EirFunction callee, long temp, bool byAddress)
+            -> long {
+        Type type = callee.tempTypes().get(temp);
+        if (byAddress || !primitives.isReferenceType(type)
+                || (temp == 0 && callee.receiverType() != null
+                    && primitives.receiverIsAddress(type))) {
+            return passed;
+        }
+        Type passedType = this.temps.get(passed);
+        this.slots.push(new EirSlot("inlined.argument", passedType, false, true));
+        long slot = this.slots.length() - 1;
+        long alias = this.newTemp(passedType);
+        entering.instructions().push(new EirStoreSlot(slot, passed));
+        entering.instructions().push(new EirLoadSlot(alias, passedType, slot));
+        if (passedType == type) {
+            return alias;
+        }
+        long renamed = this.newTemp(type);
+        entering.instructions().push(new EirCast(renamed, type, EirCastOp.Reinterpret, alias));
+        return renamed;
+    }
+
+    newTemp(Type type) -> long {
+        this.temps.push(type);
+        return this.temps.length() - 1;
+    }
+
+    // The remap of one copy, after adding the callee's inline frames to the caller's table: the
+    // callee's own frame first when a trace prints it, then the frames inlined into it.
+    frameRemap(CallSite site, EirFunction callee, long[] tempMap, long slotBase)
+            -> InlineRemap {
+        bool traced = callee.traceName().length > 0;
+        long ownFrame = site.inlinedAt;
+        if (traced) {
+            this.frames.push(new EirInlineFrame(callee.traceName(), callee.traceFile(), site.line,
+                site.inlinedAt));
+            ownFrame = this.frames.length() - 1;
+        }
+        long frameBase = this.frames.length();
+        for (let frame in callee.inlineFrames()) {
+            if (frame.parent() >= 0) {
+                this.frames.push(new EirInlineFrame(frame.name(), frame.file(), frame.callLine(),
+                    frameBase + frame.parent()));
+            } else if (traced) {
+                this.frames.push(new EirInlineFrame(frame.name(), frame.file(), frame.callLine(),
+                    ownFrame));
+            } else {
+                this.frames.push(new EirInlineFrame(frame.name(), frame.file(), site.line,
+                    site.inlinedAt));
+            }
+        }
+        return new InlineRemap(tempMap, slotBase, this.blocks.length(), frameBase, ownFrame,
+            site.line, traced);
+    }
+
+    // Appends one empty block for each of the callee's, so the copy's blocks are numbered from
+    // where the remap starts them.
+    reserveBlocks(EirFunction callee) {
+        for (let block in callee.blocks()) {
+            let ignored = this.addBlock("inlined.{labelHint(block.label())}");
+        }
+    }
+
+    // Fills the reserved blocks with the callee's, each return and propagate turned into a jump to
+    // where the call goes on from, through the slot that carries the value when one is needed.
+    fillBlocks(EirFunction callee, InlineRemap remap, InlineEnds ends) {
+        let source = callee.blocks();
+        for (long b = 0; b < source.length(); b++) {
+            let block = this.blocks.get(remap.block(b));
+            for (let instruction in source.get(b).instructions()) {
+                block.instructions().push(inlinecopy.copiedInstruction(instruction, remap));
+            }
+            let terminator = source.get(b).terminator();
+            if (terminator != null) {
+                block.setTerminator(this.copiedEnd(block, terminator, remap, ends));
+            }
+        }
+    }
+
+    addSlotFor(string name, Type type) -> long {
+        bool reference = primitives.isReferenceType(type);
+        bool zeroed = reference || primitives.structOf(type) != null;
+        this.slots.push(new EirSlot(name, type, zeroed, false));
+        return this.slots.length() - 1;
+    }
+
+    addBlock(string hint) -> long {
+        long index = this.blocks.length();
+        this.blocks.push(new EirBlock(hint));
+        this.hints.push(hint);
+        this.addedFor.push(this.processing);
+        return index;
+    }
+
+    protected finish() -> EirFunction {
+        if (!this.changed) {
+            return this.function;
+        }
+        return this.function.withInlinedBody(this.function.parameters(), this.slots,
+            tracesites.withoutIdleSites(this.laidOut(), this.temps), this.temps, this.frames);
+    }
+
+    // The blocks in emission order: each of the caller's own, then the ones added for it in the
+    // order they were added. Every jump is renumbered to match.
+    laidOut() -> List<EirBlock> {
+        long original = this.function.blocks().length();
+        let order = new List<long>();
+        for (long b = 0; b < original; b++) {
+            order.push(b);
+            for (long added = original; added < this.blocks.length(); added++) {
+                if (this.addedFor.get(added) == b) {
+                    order.push(added);
+                }
+            }
+        }
+        long[] position = new long[this.blocks.length()];
+        for (long i = 0; i < order.length(); i++) {
+            position[order.get(i)] = i;
+        }
+        let laid = new List<EirBlock>();
+        for (long i = 0; i < order.length(); i++) {
+            long index = order.get(i);
+            let source = this.blocks.get(index);
+            string label = source.label();
+            if (index >= original) {
+                label = "b{i}.{this.hints.get(index)}";
+            }
+            let block = new EirBlock(label);
+            for (let instruction in source.instructions()) {
+                block.instructions().push(instruction);
+            }
+            let terminator = source.terminator();
+            if (terminator != null) {
+                block.setTerminator(retargeted(terminator, position));
+            }
+            laid.push(block);
+        }
+        return laid;
+    }
+}
+
+// The call a copy stands in for: what it defines and what it passes, and its trace site.
+final class CallSite {
+    protected long result;
+    protected Type type;
+    protected long receiver;
+    protected long[] arguments;
+    protected long line;
+    protected long inlinedAt;
+
+    protected constructor(this.result, this.type, this.receiver, this.arguments, this.line,
+                this.inlinedAt);
+}
+
+// Where a copy's returns and propagates go, the block the call continues in or returns to and the
+// block its unwind edge leads to, and how each hands its value over.
+final class InlineEnds {
+    protected long returned;
+    protected Handover result;
+    protected long unwound;
+    protected Handover error;
+
+    protected constructor(this.returned, this.result, this.unwound, this.error);
+}
+
+// How the values a copy ends with reach 'target', the temp the call defines with them: the copy
+// defines it itself when 'renamed' says so, and otherwise each end casts its value to 'type', or
+// stores it into 'slot', where the call's continuation defines the target from it.
+final class Handover {
+    protected long target;
+    protected Type type;
+    protected long slot;
+    protected bool renamed;
+
+    protected constructor(this.target, this.type, this.slot, this.renamed);
+
+    // The target defined out of the slot: a take for a reference, which moves the +1 the slot was
+    // handed, and a load for anything else.
+    protected definition() -> EirInstruction {
+        if (primitives.isReferenceType(this.type)) {
+            return new EirTakeSlot(this.target, this.type, this.slot);
+        }
+        return new EirLoadSlot(this.target, this.type, this.slot);
+    }
+}
+
+// Whether a value of this type can pass from the copy's returns to the call's result through a
+// slot: a reference, whose +1 a take moves, or a value holding none.
+movesThroughSlot(Type type) -> bool {
+    return primitives.isReferenceType(type) || !primitives.hasArcContent(type);
+}
+
+// The temps the function returns, or propagates when 'returns' is false, one per terminator.
+endsOf(EirFunction function, bool returns) -> List<long> {
+    let ends = new List<long>();
+    for (let block in function.blocks()) {
+        let terminator = block.terminator();
+        if (returns && terminator is EirReturn) {
+            ends.push(terminator.value);
+        } else if (!returns && terminator is EirPropagate) {
+            ends.push(terminator.error);
+        }
+    }
+    return ends;
+}
+
+// A finished body with what its callers ask of it.
+finishedOf(EirFunction body, ProgramBodies program) -> Finished {
+    long internalModule = -1;
+    bool definesGlobal = false;
+    for (let block in body.blocks()) {
+        for (let instruction in block.instructions()) {
+            if (instruction is EirGlobalAddress && instruction.defines) {
+                definesGlobal = true;
+            }
+            for (let symbol in walk.symbolsOf(instruction)) {
+                internalModule = withInternal(internalModule, program, symbol);
+            }
+        }
+        let terminator = block.terminator();
+        if (terminator != null) {
+            for (let symbol in walk.terminatorSymbolsOf(terminator)) {
+                internalModule = withInternal(internalModule, program, symbol);
+            }
+        }
+    }
+    return new Finished(body, sizeOf(body), internalModule, definesGlobal);
+}
+
+withInternal(long known, ProgramBodies program, string symbol) -> long {
+    let module = program.internalModules.get(symbol);
+    if (module == null || module == known) {
+        return known;
+    }
+    if (known == -1) {
+        return module;
+    }
+    return -2;
+}
+
+// The terminator with every block it can go to renumbered through 'position'.
+retargeted(EirTerminator terminator, long[] position) -> EirTerminator {
+    switch (terminator) {
+        is EirJump jump -> {
+            return new EirJump(position[jump.target]);
+        },
+        is EirBranch branch -> {
+            return new EirBranch(branch.condition, position[branch.thenTarget],
+                position[branch.elseTarget]);
+        },
+        is EirSwitch choice -> {
+            long[] targets = new long[choice.caseTargets.length];
+            for (long i = 0; i < targets.length; i++) {
+                targets[i] = position[choice.caseTargets[i]];
+            }
+            return new EirSwitch(choice.value, choice.caseValues, targets,
+                position[choice.defaultTarget]);
+        },
+        is EirTryCall call -> {
+            return new EirTryCall(call.result, call.type, call.callee, call.receiver,
+                call.arguments, call.dispatchSlot, call.dispatchInterface, call.errorResult,
+                position[call.normalTarget], position[call.unwindTarget], call.line,
+                call.inlinedAt);
+        },
+        is EirTryClosureCall call -> {
+            return new EirTryClosureCall(call.result, call.type, call.closure, call.arguments,
+                call.parameterTypes, call.errorResult, position[call.normalTarget],
+                position[call.unwindTarget], call.line, call.inlinedAt);
+        },
+        default -> {
+            return terminator;
+        },
+    }
+}
+
+// The instructions and terminators of a body.
+sizeOf(EirFunction function) -> long {
+    long size = 0;
+    for (let block in function.blocks()) {
+        size = size + block.instructions().length();
+        if (block.terminator() != null) {
+            size++;
+        }
+    }
+    return size;
+}
+
+// A block label without the 'b<number>.' its function's numbering put in front of it.
+labelHint(string label) -> string {
+    long dot = label.indexOf(".");
+    if (label.startsWith("b") && dot > 1) {
+        return label.substring(dot + 1);
+    }
+    return label;
+}
+
+// Whether a copy of 'callee' can stand in for a call at 'site': a trace still finds every frame
+// it would have printed, and every value the call hands over has somewhere to go. Only a try call
+// has an edge a propagate can take.
+accepts(EirFunction caller, EirFunction callee, CallSite site, bool tryCall) -> bool {
+    if (site.arguments.length != callee.parameters().length
+            || (site.receiver >= 0) != (callee.receiverType() != null)) {
+        return false;
+    }
+    bool calleeTraced = callee.traceName().length > 0;
+    if (calleeTraced && (caller.traceName().length == 0 || site.line < 0)) {
+        return false;
+    }
+    if (!tryCall && endsOf(callee, false).length() > 0) {
+        return false;
+    }
+    if (types.isVoidType(callee.returnType())) {
+        return true;
+    }
+    if (site.result < 0) {
+        return false;
+    }
+    let returns = endsOf(callee, true);
+    if (returns.length() == 1 && returns.get(0) >= callee.entryTempCount()) {
+        return true;
+    }
+    return movesThroughSlot(callee.returnType());
+}
+
+siteOf(EirCall call) -> CallSite {
+    return new CallSite(call.result, call.type, call.receiver, call.arguments, call.line,
+        call.inlinedAt);
+}
+
+trySiteOf(EirTryCall call) -> CallSite {
+    return new CallSite(call.result, call.type, call.receiver, call.arguments, call.line,
+        call.inlinedAt);
+}
+
+// The groups of mutually recursive functions, each group after every group its members call, by
+// Tarjan's algorithm. A function calling no group but its own is a group of one.
+componentsOf(List<List<long>> callees) -> List<List<long>> {
+    long count = callees.length();
+    long[] order = new long[count];
+    long[] low = new long[count];
+    bool[] onStack = new bool[count];
+    for (long i = 0; i < count; i++) {
+        order[i] = -1;
+    }
+    let stack = new List<long>();
+    let groups = new List<List<long>>();
+    long visited = 0;
+    for (long root = 0; root < count; root++) {
+        if (order[root] >= 0) {
+            continue;
+        }
+        let path = new List<long>();
+        let next = new List<long>();
+        path.push(root);
+        next.push(0);
+        order[root] = visited;
+        low[root] = visited;
+        visited++;
+        stack.push(root);
+        onStack[root] = true;
+        while (path.length() > 0) {
+            long top = path.length() - 1;
+            long node = path.get(top);
+            long edge = next.get(top);
+            let edges = callees.get(node);
+            if (edge < edges.length()) {
+                next.set(top, edge + 1);
+                long callee = edges.get(edge);
+                if (order[callee] < 0) {
+                    order[callee] = visited;
+                    low[callee] = visited;
+                    visited++;
+                    stack.push(callee);
+                    onStack[callee] = true;
+                    path.push(callee);
+                    next.push(0);
+                } else if (onStack[callee] && order[callee] < low[node]) {
+                    low[node] = order[callee];
+                }
+                continue;
+            }
+            if (low[node] == order[node]) {
+                let group = new List<long>();
+                long member = -1;
+                while (member != node) {
+                    member = stack.pop();
+                    onStack[member] = false;
+                    group.push(member);
+                }
+                groups.push(group);
+            }
+            let ignored = path.pop();
+            let ignoredEdge = next.pop();
+            if (path.length() > 0) {
+                long parent = path.get(path.length() - 1);
+                if (low[node] < low[parent]) {
+                    low[parent] = low[node];
+                }
+            }
+        }
+    }
+    return groups;
+}
