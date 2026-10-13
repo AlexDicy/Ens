@@ -137,9 +137,11 @@ A seed goes stale when the sources start using something it cannot compile: a ne
 The symptom is always the same, and it is loud: `xmake test` stops before any job runs, naming the platform and quoting the build it could not finish.
 It never shows up as a test that starts passing or failing differently.
 
-A refresh is one dispatch of the `release` workflow: it builds `ens` on all three hosts, publishes them as a release, and opens a pull request moving `seed/seed.json` to that tag.
-Merging that pull request is what makes the new seed the one every run bootstraps from, so the suite has to be green on all three hosts against it first.
+A refresh is one dispatch of the `release` workflow: it builds `ens` on every host, publishes them as a release, and opens a pull request moving `seed/seed.json` to that tag.
+Merging that pull request is what makes the new seed the one every run bootstraps from, so the suite has to be green on every host against it first.
 Each binary is built on its own platform because seeds are not cross-compiled, and there is no C++ compiler to fall back on any more.
+A host the pin names no seed for gets its first one from a dispatch with `first_seed_host` set to it: the linux-x64 seed builds this tree's compiler, which emits the driver's objects for that host with `--no-link`, and the host links them into a stage 1 that its suite bootstraps from through `ENS_SEEDS`.
+The release publishes that host's stage 2, built natively like every other host's.
 
 By hand, the same thing is `ens build selfhost/driver --output ens --stdlib libs`, run on the platform being refreshed.
 `--stdlib libs` is what makes it this tree's standard library rather than the one belonging to whatever `ens` is doing the building.

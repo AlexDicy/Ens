@@ -6,6 +6,12 @@
 #
 # The release is created as a draft first and each host uploads straight into it, instead of passing
 # through the artifact store.
+#
+# A host the pin names no seed for yet gets its first one through `first_seed_host`. Seeds are not
+# cross-compiled, so only a stage 1 is: the linux-x64 seed builds this tree's compiler, which emits
+# the driver's objects for that host, and the host links them into the stage 1 its suite then
+# bootstraps from. What the release publishes for it is the stage 2 that host builds natively, as
+# for every other host.
 name: release
 
 on:
@@ -22,6 +28,10 @@ on:
         description: Mark the release as a pre-release
         type: boolean
         default: false
+      first_seed_host:
+        description: A host seed/seed.json pins no seed for yet, such as linux-arm64, whose first seed this run makes
+        type: string
+        default: ''
 
 permissions:
   contents: write
@@ -47,14 +57,106 @@ jobs:
           fi
           gh release create "v${{ inputs.version }}" "${flags[@]}"
 
+  # The driver's objects for the host that gets its first seed, emitted by the compiler this tree
+  # builds on linux-x64 and linked on that host. The build stops before the link, since nothing here
+  # can link for another system.
+  first-seed-objects:
+    if: ${{ inputs.first_seed_host != '' }}
+    runs-on: ubuntu-22.04
+    env:
+      XMAKE_VERSION: '3.0.8'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: ${{ env.XMAKE_VERSION }}
+          actions-cache-folder: .xmake-install
+          actions-cache-key: linux-x64-${{ env.XMAKE_VERSION }}
+
+      - name: Resolve the cache key and the package folder
+        id: packages
+        shell: bash
+        run: |
+          folder="$(xmake l -c 'import("core.base.global"); print(global.directory())' | tr -d '\r')"
+          echo "folder=${folder}/packages" >> "$GITHUB_OUTPUT"
+          grep -E '^\s*add_requires' xmake.lua > requires.txt
+          key="$(xmake l -c "print(hash.sha256('requires.txt'))" | tr -d '\r\n' | cut -c1-16)"
+          test -n "$key" || { echo "could not hash the add_requires lines"; exit 1; }
+          echo "key=packages-linux-x64-${key}" >> "$GITHUB_OUTPUT"
+          rm requires.txt
+
+      - name: Restore the LLVM packages
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.packages.outputs.folder }}
+          key: ${{ steps.packages.outputs.key }}
+
+      - name: Cache the bootstrap seed
+        uses: actions/cache@v4
+        with:
+          path: ~/.ens/seeds
+          key: seeds-linux-x64-${{ hashFiles('seed/seed.json') }}
+
+      - name: Install the LLVM build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            binutils-dev zlib1g-dev libzstd-dev libedit-dev libffi-dev libxml2-dev pkg-config
+
+      - name: Resolve packages
+        run: xmake f -y -m release -p linux -a x64
+
+      - name: Put the LLVM package on PATH
+        shell: bash
+        run: |
+          clang="$(find "${{ steps.packages.outputs.folder }}/l/llvm" \
+            \( -type f -o -type l \) -name 'clang++' -print -quit)"
+          test -n "$clang" || { echo "no clang++ in the llvm package"; exit 1; }
+          dirname "$clang" >> "$GITHUB_PATH"
+
+      - name: Configure
+        run: xmake f -c -y -m release -p linux -a x64
+
+      - name: Build the linker bridge
+        run: xmake build ens-lld
+
+      # the suite builds build/host/ens out of this tree from the pinned linux-x64 seed before any
+      # job starts, and one quick job is all that needs to run after it.
+      - name: Build this tree's compiler
+        run: xmake test hello
+
+      - name: Emit the driver for the new host
+        shell: bash
+        run: |
+          case "${{ inputs.first_seed_host }}" in
+            linux-arm64) triple=aarch64-unknown-linux-gnu ;;
+            *) echo "no target triple is known for '${{ inputs.first_seed_host }}'"; exit 1 ;;
+          esac
+          llvm="$(find "${{ steps.packages.outputs.folder }}/l/llvm" -name 'libLLVM*.so*' -print -quit)"
+          bridge="$(find build -name 'libens-lld.so' -print -quit)"
+          test -n "$llvm" && test -n "$bridge" || { echo "no libLLVM or libens-lld to run with"; exit 1; }
+          export LD_LIBRARY_PATH="$(dirname "$llvm"):$(dirname "$bridge")"
+          build/host/ens build selfhost/driver --target "$triple" --stdlib libs --no-link \
+            --objects first-seed-objects
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: first-seed-objects
+          path: first-seed-objects/
+          if-no-files-found: error
+          retention-days: 1
+
   build:
-    needs: draft
+    needs: [draft, first-seed-objects]
+    if: ${{ !cancelled() && needs.draft.result == 'success'
+      && contains(fromJSON('["success", "skipped"]'), needs.first-seed-objects.result) }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - { os: windows-2022, host: windows-x64,  plat: windows, arch: x64,   suffix: .exe }
           - { os: ubuntu-22.04, host: linux-x64,    plat: linux,   arch: x64,   suffix: '' }
+          - { os: ubuntu-22.04-arm, host: linux-arm64, plat: linux, arch: arm64, suffix: '' }
           - { os: macos-15,     host: macos-arm64,  plat: macosx,  arch: arm64, suffix: '' }
     runs-on: ${{ matrix.os }}
     env:
@@ -120,6 +222,30 @@ jobs:
 
       - name: Build the linker bridge
         run: xmake build ens-lld
+
+      - name: Fetch the objects of the first seed
+        if: ${{ matrix.host == inputs.first_seed_host }}
+        uses: actions/download-artifact@v4
+        with:
+          name: first-seed-objects
+          path: first-seed-objects
+
+      # stage 1: the driver objects linked here the way ens links an ELF program, against this
+      # host's LLVM and linker bridge. ENS_SEEDS then hands it to the suite as the seed for the tag
+      # the pin names, which is how a host with no pinned seed bootstraps.
+      - name: Link the first seed
+        if: ${{ matrix.host == inputs.first_seed_host }}
+        shell: bash
+        run: |
+          llvm="$(find "${{ steps.packages.outputs.folder }}/l/llvm" -name 'libLLVM*.so*' -print -quit)"
+          bridge="$(find build -name 'libens-lld.so' -print -quit)"
+          test -n "$llvm" && test -n "$bridge" || { echo "no libLLVM or libens-lld to link with"; exit 1; }
+          seeds="$RUNNER_TEMP/first-seed"
+          tag="$(jq -r .tag seed/seed.json)"
+          mkdir -p "$seeds/$tag"
+          cc -no-pie -o "$seeds/$tag/ens" first-seed-objects/*.o \
+            -L"$(dirname "$llvm")" -lLLVM -L"$(dirname "$bridge")" -lens-lld -lgcc_s
+          echo "ENS_SEEDS=$seeds" >> "$GITHUB_ENV"
 
       # a release is only ever cut from a tree that is green on the host it is cut for. This also
       # leaves the bootstrap stages behind, which is where the published binary comes from.
@@ -230,7 +356,7 @@ jobs:
             hosts="$(jq --arg h "$host" --arg s "$(cat "$file")" '.[$h] = $s' <<<"$hosts")"
           done
           # every host is refreshed together.
-          expected='["linux-x64","macos-arm64","windows-x64"]'
+          expected='["linux-arm64","linux-x64","macos-arm64","windows-x64"]'
           found="$(jq -c 'keys' <<<"$hosts")"
           test "$found" = "$expected" || {
             echo "the digests name $found, expected $expected"; exit 1; }
@@ -267,7 +393,7 @@ jobs:
 
   # Cleanup in case of failure, only a draft is deleted
   cleanup:
-    needs: [draft, build, publish]
+    needs: [draft, first-seed-objects, build, publish]
     if: ${{ (failure() || cancelled()) && !inputs.dry_run }}
     runs-on: ubuntu-latest
     steps:
