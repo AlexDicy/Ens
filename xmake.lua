@@ -95,14 +95,38 @@ target("ens-lld")
     -- would resolve to this copy's own registries instead of that LLVM's. Windows exports only what
     -- the source marks, so this says the same thing for the platforms that would otherwise export
     -- everything.
-    if is_plat("macosx") then
-        add_shflags("-Wl,-exported_symbol,_ens_lld_link",
-            "-Wl,-exported_symbol,_ens_lld_link_program", "-Wl,-exported_symbol,_ens_lld_free",
-            "-Wl,-exported_symbol,_ens_lld_shutdown", { force = true })
-    elseif not is_plat("windows") then
+    if not is_plat("windows", "macosx") then
         add_shflags("-Wl,--exclude-libs,ALL", { force = true })
         add_cxxflags("-fvisibility=hidden")
     end
+    -- The macOS linker can only be given the names, so they are read from the functions the
+    -- sources mark ENS_LLD_EXPORT. The names are read on every platform, so a marked line with no
+    -- function name on it stops every configuration, not only a macOS one.
+    on_config(function (target)
+        local names = {}
+        for _, sourcefile in ipairs(target:sourcefiles()) do
+            for line in io.readfile(sourcefile):gmatch("[^\r\n]+") do
+                if line:match("^%s*ENS_LLD_EXPORT%f[^%w_]") then
+                    local name = line:match("^%s*ENS_LLD_EXPORT%s+[^%(]-([%a_][%w_]*)%s*%(")
+                    if not name then
+                        raise("%s: no function name follows 'ENS_LLD_EXPORT' in '%s'. Write the "
+                            .. "marker, the return type and the function's name on one line",
+                            sourcefile, line)
+                    end
+                    table.insert(names, name)
+                end
+            end
+        end
+        if #names == 0 then
+            raise("no source file of 'ens-lld' marks a function with 'ENS_LLD_EXPORT', so the "
+                .. "library would export no function")
+        end
+        if target:is_plat("macosx") then
+            for _, name in ipairs(names) do
+                target:add("shflags", "-Wl,-exported_symbol,_" .. name, { force = true })
+            end
+        end
+    end)
 
 
 -- The language server. `xmake test` never builds it, so a change anywhere under lsp/ is gated by
