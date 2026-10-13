@@ -2536,6 +2536,22 @@ task("test")
                 table.insert(failures, "the cache holds no tree under alex.json's digest")
             end
 
+            -- a single file of the package is built under the package's manifest, so it fetches
+            -- the package's git dependencies into a cache of its own, as the package build did,
+            -- and so does a check of it
+            local single_cache = path.join(root, "single-cache")
+            local in_app_single = {curdir = app, envs = withCache(single_cache)}
+            local single = path.join(app, "single" .. exe_suffix)
+            run({"build", path.join("src", "main.ens"), "--output", single}, in_app_single, 0,
+                "!only a build downloads")
+            run_program(single, 0, "json 1.0 | tools(utils 1.1)")
+            run({"check", path.join("src", "main.ens")}, in_app_single, 0, "nothing to report",
+                "!only a build downloads")
+            if lock_text() ~= locked then
+                table.insert(failures, "building a single file of the package changed its lock\n"
+                    .. lock_text())
+            end
+
             -- a locked build asks the network nothing: the repositories are gone and it still
             -- reproduces, with the lock untouched
             os.mv(repos, repos .. ".away")
