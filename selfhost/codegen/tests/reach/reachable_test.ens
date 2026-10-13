@@ -6,18 +6,21 @@ import TestFailure from @std.testing;
 import PrimitiveKind from @ens.sema.model.types;
 import Type from @ens.sema.model.types;
 import EirDynamicEquals from eir.model;
+import EirFunction from eir.model;
 import EirDynamicHash from eir.model;
 import EirDynamicToString from eir.model;
 import EirInstruction from eir.model;
 import EirRuntimeTypeName from eir.model;
 import eir.walk;
 import DescriptorPlan from layout.descriptors;
+import ModuleBodies from reach.reachable;
 import ReachedProgram from reach.reachable;
 import SlotKind from reach.reachable;
 import reach.reachable;
 import LoweredProgram from support;
 import MemoryFileLoader from support;
 import support;
+import List from @std.collections.list;
 
 test "a call names its callee and a call nothing makes names nobody" {
     let program = try support.lowerWholeProgram(
@@ -454,6 +457,106 @@ test "a library keeps every descriptor and every slot" {
     try testing.assertTrue(reached.keepsSlot(tool, SlotKind.ToString, null, 0),
         "its 'toString' slot is kept");
     try testing.assertTrue(reached.reaches("main$Tool$toString"), "and what the slot holds");
+}
+
+// The entry calls 'helper', and 'inlined' is the entry's body as an inliner would leave it once the
+// call is replaced by what 'helper' does.
+test "retaining after inlining drops a callee whose every call was inlined" {
+    let program = try support.lowerWholeProgram(
+        "helper() -> int \{\n"
+        + "    return 1;\n"
+        + "\}\n"
+        + "inlined() -> int \{\n"
+        + "    return 1;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return helper();\n"
+        + "\}\n");
+    let decided = walked(program);
+    try testing.assertTrue(decided.reaches("main$helper"), "the entry calls 'helper'");
+    let retained = reachable.retainFrom(decided, try replaced(program, "ens.main", "main$inlined"));
+    try testing.assertTrue(retained.reaches("ens.main"), "the entry is a root");
+    try testing.assertFalse(retained.reaches("main$helper"), "nothing calls 'helper' any more");
+    try testing.assertEqual(retained.order().length(), 1);
+}
+
+// A rewritten body that names a function the first walk never reached does not reach it: the
+// first walk decided what the program holds, and the dangling-reference check reports the rest.
+test "retaining reaches nothing the first walk did not" {
+    let program = try support.lowerWholeProgram(
+        "unused() -> int \{\n"
+        + "    return 2;\n"
+        + "\}\n"
+        + "calling() -> int \{\n"
+        + "    return unused();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let decided = walked(program);
+    let retained = reachable.retainFrom(decided, try replaced(program, "ens.main", "main$calling"));
+    try testing.assertTrue(retained.reaches("ens.main"), "the entry is a root");
+    try testing.assertFalse(retained.reaches("main$unused"), "the first walk never reached it");
+}
+
+// The entry's only dispatch is gone from its rewritten body, and Square's descriptor still holds
+// its 'area', so the slot stays kept and the body it holds stays reached.
+test "retaining keeps the descriptors and slots as decided and what each kept slot holds" {
+    let program = try support.lowerWholeProgram(
+        "abstract class Shape \{\n"
+        + "    protected constructor();\n"
+        + "    protected abstract area() -> int;\n"
+        + "\}\n"
+        + "class Square extends Shape \{\n"
+        + "    protected constructor();\n"
+        + "\n"
+        + "    protected override area() -> int \{\n"
+        + "        return 4;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "pick() -> Shape \{\n"
+        + "    return new Square();\n"
+        + "\}\n"
+        + "constant() -> int \{\n"
+        + "    return 4;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return pick().area();\n"
+        + "\}\n");
+    let decided = walked(program);
+    let retained = reachable.retainFrom(decided, try replaced(program, "ens.main", "main$constant"));
+    let square = try planOf(program, "Square");
+    try testing.assertTrue(retained.namedPlans() == decided.namedPlans(),
+        "the named descriptors are the ones the first walk named");
+    try testing.assertTrue(retained.namesDescriptor(square.type()), "Square's descriptor is kept");
+    try testing.assertTrue(retained.keepsSlot(square, SlotKind.Method, null, 0),
+        "Square's 'area' slot is kept");
+    try testing.assertTrue(retained.reaches("main$Square$area"), "and what the slot holds");
+    try testing.assertFalse(retained.reaches("main$pick"), "nothing calls 'pick' any more");
+    try testing.assertEqual(retained.roots().length(), decided.roots().length());
+}
+
+// The program's modules with the body under `symbol` replaced by the body under `replacement`,
+// renamed to `symbol`, the way an inliner hands back a rewritten body.
+replaced(LoweredProgram program, string symbol, string replacement) -> List<ModuleBodies> throws {
+    let source = try support.functionBySymbol(program, replacement);
+    let rewritten = new EirFunction(symbol, source.internalLinkage(), source.receiverType(),
+        source.parameters(), source.returnType(), source.slots(), source.blocks(),
+        source.tempTypes(), source.throwing(), source.traceName(), source.traceFile(),
+        source.traceLine(), source.isEntryPoint());
+    let modules = new List<ModuleBodies>();
+    for (let unit in program.modules) {
+        let bodies = new List<EirFunction>();
+        for (let body in unit.bodies()) {
+            if (body.symbol() == symbol) {
+                bodies.push(rewritten);
+            } else {
+                bodies.push(body);
+            }
+        }
+        modules.push(new ModuleBodies(unit.modulePath(), bodies));
+    }
+    return modules;
 }
 
 // The walk over a program lowered the way the driver lowers it.

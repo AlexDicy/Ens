@@ -65,18 +65,20 @@ public enum SlotKind {
 }
 
 // What one walk found: the bodies its roots reach, the descriptors the reached bodies name, the
-// slots a reached call reads, and the roots it started from.
+// slots a reached call reads with the implementations they hold, and the roots it started from.
 public final class ReachedProgram {
     Set<string> reachedSymbols;
     List<string> reachedInOrder;
     Set<Type> namedDescriptors;
     DescriptorPlans namedInOrder;
     Set<string> keptSlots;
+    List<string> keptImplementations;
     bool keepsEverySlot;
     List<Root> startingRoots;
 
     protected constructor(this.reachedSymbols, this.reachedInOrder, this.namedDescriptors,
-                this.namedInOrder, this.keptSlots, this.keepsEverySlot, this.startingRoots);
+                this.namedInOrder, this.keptSlots, this.keptImplementations, this.keepsEverySlot,
+                this.startingRoots);
 
     // Whether the roots reach the body defined under this symbol. False for a symbol no lowered
     // body defines, such as a foreign C name.
@@ -117,6 +119,17 @@ public final class ReachedProgram {
 
     public roots() -> List<Root> {
         return this.startingRoots;
+    }
+
+    // The implementation every kept slot holds, in the order the walk kept the slots.
+    public slotImplementations() -> List<string> {
+        return this.keptImplementations;
+    }
+
+    // The same descriptors, slots and roots with a different reached set and order.
+    protected withReached(Set<string> symbols, List<string> order) -> ReachedProgram {
+        return new ReachedProgram(symbols, order, this.namedDescriptors, this.namedInOrder,
+            this.keptSlots, this.keptImplementations, this.keepsEverySlot, this.startingRoots);
     }
 }
 
@@ -179,6 +192,64 @@ public analyzeSource(ProgramIndex index, ProgramSource source) -> ReachedProgram
 public analyzeFrom(DescriptorPlans plans, List<ModuleBodies> modules, List<Root> started,
                    List<Type>? libraryTypes = null) -> ReachedProgram {
     return walkFrom(new LoweredSource(plans, modules), started, libraryTypes);
+}
+
+// Walks the bodies an inliner rewrote with everything `decided` kept held fixed: its descriptors,
+// its kept slots and its roots. Only direct references are followed, from the roots and from the
+// implementation every kept slot holds, because a descriptor still holds that address. A body whose
+// every use was inlined is left out, nothing `decided` did not reach is reached, and what is
+// reached keeps the order `decided` reached it in.
+public retainFrom(ReachedProgram decided, List<ModuleBodies> inlined) -> ReachedProgram {
+    let bodies = new Map<string, EirFunction>();
+    for (long m = 0; m < inlined.length(); m++) {
+        let unit = inlined.get(m).bodies();
+        for (long b = 0; b < unit.length(); b++) {
+            bodies.set(unit.get(b).symbol(), unit.get(b));
+        }
+    }
+    let retained = new Set<string>();
+    let pending = new List<string>();
+    for (let root in decided.roots()) {
+        retain(root.symbol(), decided, bodies, retained, pending);
+    }
+    for (let implementation in decided.slotImplementations()) {
+        retain(implementation, decided, bodies, retained, pending);
+    }
+    while (!pending.isEmpty()) {
+        let body = bodies.get(pending.pop());
+        if (body == null) {
+            continue;
+        }
+        for (let block in body.blocks()) {
+            for (let instruction in block.instructions()) {
+                for (let named in walk.symbolsOf(instruction)) {
+                    retain(named, decided, bodies, retained, pending);
+                }
+            }
+            let terminator = block.terminator();
+            if (terminator != null) {
+                for (let named in walk.terminatorSymbolsOf(terminator)) {
+                    retain(named, decided, bodies, retained, pending);
+                }
+            }
+        }
+    }
+    let order = new List<string>();
+    for (let symbol in decided.order()) {
+        if (retained.contains(symbol)) {
+            order.push(symbol);
+        }
+    }
+    return decided.withReached(retained, order);
+}
+
+// Keeps one symbol the rewritten bodies name when `decided` reached it and a body defines it.
+retain(string symbol, ReachedProgram decided, Map<string, EirFunction> bodies,
+       Set<string> retained, List<string> pending) {
+    if (!decided.reaches(symbol) || bodies.get(symbol) == null || !retained.add(symbol)) {
+        return;
+    }
+    pending.push(symbol);
 }
 
 walkFrom(ProgramSource source, List<Root> started, List<Type>? libraryTypes) -> ReachedProgram {
@@ -253,6 +324,7 @@ final class Walk {
     Set<Dispatch> dispatched;
     List<Dispatch> dispatchedInOrder;
     Set<string> keptSlots;
+    List<string> keptImplementations;
     bool library;
 
     protected constructor(ProgramSource source, bool library) {
@@ -268,6 +340,7 @@ final class Walk {
         this.dispatched = new Set<Dispatch>();
         this.dispatchedInOrder = new List<Dispatch>();
         this.keptSlots = new Set<string>();
+        this.keptImplementations = new List<string>();
         this.library = library;
     }
 
@@ -282,7 +355,7 @@ final class Walk {
             this.scan(this.pending.pop());
         }
         return new ReachedProgram(this.reached, this.reachedInOrder, this.descriptors,
-            this.namedPlans, this.keptSlots, this.library, started);
+            this.namedPlans, this.keptSlots, this.keptImplementations, this.library, started);
     }
 
     // Marks the body under one symbol reached and queues it for scanning. A symbol the program
@@ -401,7 +474,9 @@ final class Walk {
         if (implementation == null) {
             return;
         }
-        let added = this.keptSlots.add(slotKey(plan, call.kind, conformed, call.index));
+        if (this.keptSlots.add(slotKey(plan, call.kind, conformed, call.index))) {
+            this.keptImplementations.push(implementation.symbol());
+        }
         this.reach(implementation.symbol());
     }
 
@@ -474,6 +549,7 @@ final class Walk {
 
     reachImplementation(FunctionInfo? implementation) {
         if (implementation != null) {
+            this.keptImplementations.push(implementation.symbol());
             this.reach(implementation.symbol());
         }
     }
