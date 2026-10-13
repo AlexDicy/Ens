@@ -361,25 +361,14 @@ public final class ThrowValidation {
             is TryExpressionNode tried -> {
                 let operand = tried.operand();
                 if (operand is CallExpressionNode) {
-                    this.noteLambdaArguments(operand);
-                    let misplaced = this.misplacedTryTargets(operand);
-                    if (misplaced.length() > 0) {
-                        for (let inner in misplaced) {
-                            this.misplacedTries.set(inner.green(), operand);
-                            this.misplacedTrySpans.set(inner.green(), tried.tryKeyword().span());
-                        }
-                        this.misplacedGroups.set(misplaced.get(0).green(), misplaced);
-                    } else {
-                        this.validateCall(operand, true, tried.tryKeyword().span(), site, lambda);
-                    }
-                    this.validateChildren(operand, site, lambda);
+                    this.validateTriedChain(operand, tried.tryKeyword().span(), site, lambda);
                 } else {
                     this.validateExpressions(operand, site, lambda);
                 }
             },
             is CallExpressionNode call -> {
                 this.noteLambdaArguments(call);
-                this.validateCall(call, false, call.span(), site, lambda);
+                this.validateCall(call, site, lambda);
                 this.validateChildren(call, site, lambda);
             },
             is LambdaExpressionNode inner -> {
@@ -399,11 +388,48 @@ public final class ThrowValidation {
         }
     }
 
-    validateCall(CallExpressionNode call, bool tried, Span triedAt, CallSite site,
-                 LambdaExpressionNode? lambda) {
+    // Checks the calls a 'try' before 'call' covers, which are the calls of the chain 'call' ends,
+    // and what their arguments call. Where none of the covered calls can throw, the 'try' is refused,
+    // or moved to the calls in their arguments that need it.
+    validateTriedChain(CallExpressionNode call, Span triedAt, CallSite site, LambdaExpressionNode? lambda) {
+        let chain = exceptions.triedChain(call);
+        bool raises = false;
+        for (let covered in chain) {
+            this.noteLambdaArguments(covered);
+            let contract = this.module.callContract(covered);
+            if (this.module.requiresTry(covered, contract) || !contract.raisesNothing()) {
+                raises = true;
+            }
+        }
+        let misplaced = new List<CallExpressionNode>();
+        if (!raises) {
+            misplaced = this.misplacedTryTargets(chain);
+        }
+        if (misplaced.length() > 0) {
+            for (let inner in misplaced) {
+                this.misplacedTries.set(inner.green(), call);
+                this.misplacedTrySpans.set(inner.green(), triedAt);
+            }
+            this.misplacedGroups.set(misplaced.get(0).green(), misplaced);
+        } else if (!raises) {
+            this.reporter.report("'try' is not needed here: {coveredCannotThrow(call)}. Remove 'try'.",
+                triedAt);
+        }
+        for (long i = 0; i < chain.length(); i++) {
+            let covered = chain.get(i);
+            if (i == chain.length() - 1) {
+                this.validateChildren(covered, site, lambda);
+            } else {
+                this.validateExpressions(covered.arguments(), site, lambda);
+            }
+        }
+    }
+
+    // Refuses the call when it can throw and no 'try' covers it.
+    validateCall(CallExpressionNode call, CallSite site, LambdaExpressionNode? lambda) {
         let contract = this.module.callContract(call);
         bool required = this.module.requiresTry(call, contract);
-        if (required && !tried) {
+        if (required) {
             string raised = "can throw, because it is marked 'throws'.";
             if (!contract.isEmpty()) {
                 raised = "can throw {nameList(contract, this.names)}.";
@@ -427,26 +453,20 @@ public final class ThrowValidation {
                 return;
             }
             if (outer != null && triedSpan != null) {
-                this.reporter.report("'try' is not needed here: {calleePhrase(outer)} cannot throw. Remove "
+                this.reporter.report("'try' is not needed here: {coveredCannotThrow(outer)}. Remove "
                     + "'try'.", triedSpan);
             }
             this.reporter.report("Call to {calleePhrase(call)} {raised} {fix}", call.span());
         }
-        if (!required && contract.raisesNothing() && tried) {
-            this.reporter.report("'try' is not needed here: {calleePhrase(call)} cannot throw. Remove 'try'.",
-                triedAt);
-        }
     }
 
-    // The calls inside the arguments of 'tried' that need a 'try' where 'tried' itself cannot throw,
-    // which is where the 'try' written before 'tried' belongs, and none where 'tried' can throw.
-    misplacedTryTargets(CallExpressionNode tried) -> List<CallExpressionNode> {
+    // The calls inside the arguments of the calls of 'chain' that need a 'try', which is where the
+    // 'try' written before the chain belongs when none of the calls of the chain can throw.
+    misplacedTryTargets(List<CallExpressionNode> chain) -> List<CallExpressionNode> {
         let needing = new List<CallExpressionNode>();
-        let contract = this.module.callContract(tried);
-        if (this.module.requiresTry(tried, contract) || !contract.raisesNothing()) {
-            return needing;
+        for (let covered in chain) {
+            this.collectUncoveredCalls(covered.arguments(), needing);
         }
-        this.collectUncoveredCalls(tried.arguments(), needing);
         return needing;
     }
 
@@ -497,7 +517,7 @@ public final class ThrowValidation {
         }
         return "{diagnostics.andJoined(clauses.toArray())}, and the 'try' before {calleePhrase(outer)} "
             + "does not cover them: a call inside an argument needs its own 'try', and "
-            + "{calleePhrase(outer)} cannot throw. {written}" + fix.substring(movableFix().length);
+            + "{coveredCannotThrow(outer)}. {written}" + fix.substring(movableFix().length);
     }
 
     // What the calls of 'group' to 'callee' can throw, as a clause naming the callee, or the number
@@ -549,8 +569,8 @@ public final class ThrowValidation {
         }
         string rest = fix.substring(movableFix().length);
         return "Call to {calleePhrase(call)} {raised}, and the 'try' before {calleePhrase(outer)} does "
-            + "not cover it: a call inside an argument needs its own 'try', and {calleePhrase(outer)} "
-            + "cannot throw. {moved}{rest}";
+            + "not cover it: a call inside an argument needs its own 'try', and {coveredCannotThrow(outer)}. "
+            + "{moved}{rest}";
     }
 
     // The fix for a call that can throw and has no 'try', as its position allows. A test may throw
@@ -1041,6 +1061,14 @@ initializerReason(TypeItem item, FieldDeclarationNode member, TypeNames names) -
         return "A lazy const is read without 'try', so its initializer must not throw.";
     }
     return "A field default runs as each object is built, where no 'try' can be written.";
+}
+
+// What a 'try' before 'call' covers that cannot throw: 'call' itself, or every call of its chain.
+coveredCannotThrow(CallExpressionNode call) -> string {
+    if (exceptions.triedChain(call).length() > 1) {
+        return "none of the calls it covers can throw";
+    }
+    return "{calleePhrase(call)} cannot throw";
 }
 
 // 'outer' as written on one line with a 'try' before each call of 'group', or null where it is not

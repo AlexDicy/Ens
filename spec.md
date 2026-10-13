@@ -856,6 +856,7 @@ If any exception is not handled and the method is not marked as `throws`, this s
 These exceptions are always checked. The user can use `panic()` to stop execution, which doesn’t require the use of the `throws` or `throw` keyword.
 
 Methods that throw must be called with `try` as a prefix, even if caught. `Catch` can be added as an additional block of a method.
+A `try` written before a chain of calls covers every call in the chain, so `try folder.join(name).writeTextAtomic(text)` needs only that one `try` whichever of its calls can throw, while a call inside an argument needs a `try` of its own.
 
 ```ens
 class TestRepository {
