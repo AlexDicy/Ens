@@ -1,7 +1,11 @@
 // Escape analysis, the read-only prepass of the optimization pipeline. It iterates the
 // per-function scans to a fixpoint, so a fact established in a callee sharpens every caller. The
-// call graph is complete after monomorphization, so the fixpoint starts optimistic.
+// call graph is complete after monomorphization, so the fixpoint starts optimistic. A scan reads
+// only the facts of the functions its direct calls name, so a function is scanned again only when
+// one of those changed. Facts only ever turn true, so the order of the scans cannot change them.
 import EirFunction from eir.model;
+import EirCall from eir.model;
+import EirTryCall from eir.model;
 import Type from @ens.sema.model.types;
 import DescriptorPlans from layout.descriptors;
 import FunctionFacts from passes.facts;
@@ -11,6 +15,7 @@ import eir.place;
 import passes.roots;
 import support.primitives;
 import List from @std.collections.list;
+import Map from @std.collections.map;
 
 // The facts of the whole lowered program.
 public analyze(List<EirFunction> functions, DescriptorPlans plans) -> ProgramFacts {
@@ -18,16 +23,64 @@ public analyze(List<EirFunction> functions, DescriptorPlans plans) -> ProgramFac
     for (long i = 0; i < functions.length(); i++) {
         facts.add(new FunctionFacts(functions.get(i)));
     }
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        for (long i = 0; i < functions.length(); i++) {
-            if (analyzeFunction(functions.get(i), facts)) {
-                changed = true;
+    let callers = directCallers(functions);
+    bool[] queued = new bool[functions.length()];
+    let pending = new List<long>();
+    for (long i = functions.length() - 1; i >= 0; i--) {
+        pending.push(i);
+        queued[i] = true;
+    }
+    while (!pending.isEmpty()) {
+        long next = pending.pop();
+        queued[next] = false;
+        let function = functions.get(next);
+        if (!analyzeFunction(function, facts)) {
+            continue;
+        }
+        let affected = callers.get(function.symbol());
+        if (affected == null) {
+            continue;
+        }
+        for (let caller in affected) {
+            if (!queued[caller]) {
+                queued[caller] = true;
+                pending.push(caller);
             }
         }
     }
     return facts;
+}
+
+// The indexes of the functions that call each symbol directly.
+directCallers(List<EirFunction> functions) -> Map<string, List<long>> {
+    let callers = new Map<string, List<long>>();
+    for (long i = 0; i < functions.length(); i++) {
+        for (let block in functions.get(i).blocks()) {
+            for (let instruction in block.instructions()) {
+                if (instruction is EirCall && instruction.dispatchSlot < 0) {
+                    addCaller(callers, instruction.callee.symbol(), i);
+                }
+            }
+            let terminator = block.terminator();
+            if (terminator is EirTryCall && terminator.dispatchSlot < 0) {
+                addCaller(callers, terminator.callee.symbol(), i);
+            }
+        }
+    }
+    return callers;
+}
+
+addCaller(Map<string, List<long>> callers, string callee, long caller) {
+    let known = callers.get(callee);
+    if (known == null) {
+        let listed = new List<long>();
+        listed.push(caller);
+        callers.set(callee, listed);
+        return;
+    }
+    if (known.last() != caller) {
+        known.push(caller);
+    }
 }
 
 // Rescans one function's positions; true when a fact changed. Positions whose type carries no
