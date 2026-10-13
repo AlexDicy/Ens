@@ -95,6 +95,8 @@ If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surf
   Fixtures are built at `O2` and `O0`, so a pin scoped to any other level is refused as a fixture error.
 - Group related scenarios into one or two files (happy paths vs errors), not one file per scenario.
 - Unit test coverage matters: new code ships with tests for its own logic (the self-hosted packages keep unit tests in their `tests/` folders), not just end-to-end fixtures.
+- A behavior a unit test pins gets no end-to-end test that depends on timing or stops a process it started; the test runner never kills a child, and a scenario that needs one is pinned in the package that owns it instead.
+- A change moves every pin it invalidates, the `cli_*` object and module counts included, in the same patch; the person landing it never adjusts a pin.
 - A package's `tests/` folder mirrors the grouping of its `src/` folder; put new tests in the subfolder matching the code under test.
 - `corpus_roundtrip` asserts the self-hosted front end parses the whole repo byte-exact with no unexpected diagnostics.
 - `semacheck` is a bidirectional gate: every accepted program must produce zero self-hosted sema diagnostics, and every `@expect-error` fixture must be rejected by sema.
@@ -177,7 +179,7 @@ What a message contains:
 2. It says what happened, why, and what to do next, in that order, and stops after the why when nothing further can honestly be suggested.
 3. The fix names the exact token to write, remove or change, with a concrete example where one helps: "Remove 'out' from the argument", "use 'E?[]' so a slot can start as null".
 4. It is true for every case it covers; a code path with a different cause gets its own text.
-5. A suggested fix compiles when pasted into the file it is read in, spelled with that file's own names for types.
+5. A suggested fix compiles when pasted into the file it is read in, spelled with that file's own names for types; a type the file has no name for is imported by its plain name, and aliased only when that name would clash with one the file already has.
 6. A failure inside a library generic is reported where the user wrote the instantiation, names what they wrote, and points at the library line as a note.
 
 Who understands it:
@@ -205,8 +207,10 @@ How a check runs:
 18. Every message is rendered with a representative value and read as text, in every combination its helpers produce.
 19. A changed message moves its pin, an `@expect-error` or `@expect-note` line or an exact-text assertion, and never weakens it to a substring a worse message would satisfy; a message with no pin gains one.
 20. Every message is read once, the way a newcomer reads it: one idea per sentence, concrete verbs such as throw, call, declare, remove and write, and none of 'answers to', 'stands for', 'reaches', 'holds', 'in place of' or 'governs'; a sentence that needs a second reading is rewritten.
+21. The fix is the one a careful programmer would make, decided before the rules above are applied to its wording: a text that meets every rule but suggests what nobody would write, such as replacing a test that is always true with the literal 'true', is wrong, and where the honest advice is to look again at the types, the message stops after the why (rule 2).
 
 Never copy a weak message for parity with anything; write the good version.
+A review names the message a good compiler would print before it checks the rules, and a finding cites the rule only after that comparison.
 
 ## Code style
 
@@ -217,6 +221,8 @@ Ens code (selfhost, libs, tests):
 - Group related fields with no blank lines inside a group, one blank line between groups.
 - Soft 100-column limit; prefer `switch` over if/else chains when dispatching on one value.
 - Full words for identifiers; American English everywhere.
+- One concept has one declaration: a constraint such as a module that has to stay a leaf is met by moving the declaration or restructuring the modules, never by a second type that mirrors the first.
+- A number that crosses a boundary, such as a code a bridge reports, is carried by a numeric enum whose members declare their values, and converted with `as?`; a hand-written switch from an integer to an enum is refused in review.
 - No `get` prefix on a method that always returns a value: `stackTrace()`, not `getStackTrace()`.
   Keep the prefix only where the thing asked for may legitimately not be there, which the return type shows: `Environment.get(name) -> string?`.
   The `ens.llvm` binding is exempt because its names mirror the C API it wraps.
@@ -235,6 +241,8 @@ A comment only states what the code cannot; never phase tags, decision rationale
 - When opening a pull request, prefer small diffs a human can actually review over one huge drop; split large efforts into a sequence of reviewable changes.
 - Spec changes are user-facing only and written one sentence per line.
 - In reports and reviews, label behavioral claims as verified (you ran it) or inferred (you reasoned from code); do not present inference as established fact.
+- A change whose behavior differs by host, in `runtime/lld/`, `selfhost/link/`, `xmake.lua`, `scripts/` or `.github/`, says in its report which hosts ran it and which were only read; what was only read is watched in CI's run on those hosts after the push, and a Linux run under WSL is made when the change is to the bridge's exports or the runner's process handling.
+- A cost a change exposes, in build time, binary size or run time, is fixed at its cause before the change lands; a limit or cap is tuned only on measurements taken after that fix, because a knob turned to hide a known cause is a workaround.
 
 ### Open work
 
