@@ -5,6 +5,7 @@
 import @std.testing;
 import TestFailure from @std.testing;
 import List from @std.collections.list;
+import Set from @std.collections.set;
 import EirFunction from eir.model;
 import eir.dump;
 import passes.inlining;
@@ -125,7 +126,7 @@ test "a recursive function stays a call wherever it is called from" {
         "a member of the group is not copied into another: {even}");
 }
 
-test "a function too large to copy stays a call" {
+test "a function too large to copy and called from two places stays a call" {
     let program = try support.lowerWholeProgram(
         "large(int a) -> int \{\n"
         + "    int b = a * 3 + a * 5 + a * 7 + a * 11 + a * 13;\n"
@@ -137,7 +138,7 @@ test "a function too large to copy stays a call" {
         + "    return large(x);\n"
         + "\}\n"
         + "main() -> int \{\n"
-        + "    return caller(0);\n"
+        + "    return caller(0) + large(1);\n"
         + "\}\n");
     string text = dump.dumpFunction(try inlinedFunction(program, "main$caller"));
     try testing.assertTrue(text.indexOf("call @main$large") >= 0, "the call stays: {text}");
@@ -284,6 +285,52 @@ test "a struct holding a reference returned from more than one place stays a cal
     try testing.assertTrue(text.indexOf("call @main$choose") >= 0, "the call stays: {text}");
 }
 
+test "a function called from one place is copied there whatever its size, and from two it is not" {
+    let program = try support.lowerWholeProgram(
+        "large(int a) -> int \{\n"
+        + "    int b = a * 3 + a * 5 + a * 7 + a * 11 + a * 13;\n"
+        + "    int c = b * 3 + b * 5 + b * 7 + b * 11 + b * 13;\n"
+        + "    int d = c * 3 + c * 5 + c * 7 + c * 11 + c * 13;\n"
+        + "    return d + c + b;\n"
+        + "\}\n"
+        + "shared(int a) -> int \{\n"
+        + "    int b = a * 3 + a * 5 + a * 7 + a * 11 + a * 13;\n"
+        + "    int c = b * 3 + b * 5 + b * 7 + b * 11 + b * 13;\n"
+        + "    int d = c * 3 + c * 5 + c * 7 + c * 11 + c * 13;\n"
+        + "    return d + c + b;\n"
+        + "\}\n"
+        + "caller(int x) -> int \{\n"
+        + "    return large(x) + shared(x);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return caller(0) + shared(0);\n"
+        + "\}\n");
+    let caller = try inlinedFunction(program, "main$caller");
+    try support.assertOptimized(caller, "caller");
+    string text = dump.dumpFunction(caller);
+    try testing.assertTrue(text.indexOf("call @main$large") < 0, "the only call is copied: {text}");
+    try testing.assertTrue(text.indexOf("call @main$shared") >= 0,
+        "a function called from two places stays a call: {text}");
+}
+
+test "a function the program holds whatever its calls do is not copied for its one call" {
+    let program = try support.lowerWholeProgram(
+        "large(int a) -> int \{\n"
+        + "    int b = a * 3 + a * 5 + a * 7 + a * 11 + a * 13;\n"
+        + "    int c = b * 3 + b * 5 + b * 7 + b * 11 + b * 13;\n"
+        + "    int d = c * 3 + c * 5 + c * 7 + c * 11 + c * 13;\n"
+        + "    return d + c + b;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return large(0);\n"
+        + "\}\n");
+    let kept = new Set<string>();
+    let ignored = kept.add("main$large");
+    string text = dump.dumpFunction(try inlinedFunctionKeeping(program, "ens.main", kept));
+    try testing.assertTrue(text.indexOf("call @main$large") >= 0,
+        "a kept function's one call is not its only use: {text}");
+}
+
 test "every module keeps its functions, in their order" {
     let program = try support.lowerWholeProgram(
         "helper(int a) -> int \{\n"
@@ -293,7 +340,7 @@ test "every module keeps its functions, in their order" {
         + "    return helper(1) - 2;\n"
         + "\}\n");
     let modules = grouped(program);
-    let rewritten = inlining.inlineProgram(modules, program.plans);
+    let rewritten = inlining.inlineProgram(modules, program.plans, new Set<string>());
     try testing.assertEqual(rewritten.length(), modules.length());
     for (long m = 0; m < modules.length(); m++) {
         try testing.assertEqual(rewritten.get(m).length(), modules.get(m).length());
@@ -315,7 +362,13 @@ grouped(LoweredProgram program) -> List<List<EirFunction>> {
 
 // One function of the program after the whole program was inlined.
 inlinedFunction(LoweredProgram program, string symbol) -> EirFunction throws {
-    for (let module in inlining.inlineProgram(grouped(program), program.plans)) {
+    return try inlinedFunctionKeeping(program, symbol, new Set<string>());
+}
+
+// inlinedFunction, with 'kept' naming the functions the program holds whatever its calls do.
+inlinedFunctionKeeping(LoweredProgram program, string symbol, Set<string> kept)
+        -> EirFunction throws {
+    for (let module in inlining.inlineProgram(grouped(program), program.plans, kept)) {
         for (let function in module) {
             if (function.symbol() == symbol) {
                 return function;

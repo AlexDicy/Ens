@@ -121,20 +121,20 @@ export emitProgram(ProgramAnalysis analysis, string outputFolder, string filePre
     let lowered = walked.lowered;
     let reachability = reachabilityAccount(programIndex, lowered, reached, settings);
     let kept = reachedModules(lowered, reached);
-    let inlined = inlineModules(kept, reached.namedPlans(), settings);
-    let pipeline = optimizeModules(programIndex, inlined, reached.namedPlans(), settings);
+    let inlined = inlineModules(kept, reached, settings);
+    let pipeline = optimizeModules(programIndex, inlined.modules, reached.namedPlans(), settings);
     let optimizationProblems = gathered(pipeline.modules);
     if (optimizationProblems.length() > 0) {
         return new EmitResult(new List<string>(), optimizationProblems.toArray());
     }
-    let dangling = danglingReferences(programIndex, pipeline.modules, lowered, reached);
+    let dangling = danglingReferences(programIndex, pipeline.modules, lowered, inlined.reached);
     if (dangling.length() > 0) {
         return new EmitResult(new List<string>(), dangling.toArray());
     }
     let stackFrame = analysis.store().findDeclared(StandardLibrary.coreModule, "StackFrame");
     let errorClass = analysis.store().findDeclared(StandardLibrary.coreModule, "Error");
-    let emitted = emitModules(pipeline.modules, reached, stackFrame, errorClass, outputFolder,
-        filePrefix, settings);
+    let emitted = emitModules(pipeline.modules, inlined.reached, stackFrame, errorClass,
+        outputFolder, filePrefix, settings);
     return new EmitResult(emitted.paths, emitted.problems.toArray(),
         combinedAccount(reachability, pipeline.account));
 }
@@ -251,26 +251,50 @@ reachedModules(List<LoweredModule> lowered, ReachedProgram reached) -> List<Lowe
     return kept;
 }
 
-// Every kept module with the small calls the program makes replaced by copies of what they call,
-// at the levels that inline. Each module keeps its functions in the order emission writes
-// them, and no function is added or dropped.
-inlineModules(List<LoweredModule> kept, DescriptorPlans plans, CodegenSettings settings)
-        -> List<LoweredModule> {
+// The program after inlining: every module emission writes, and what the program reaches once the
+// bodies whose every use was copied are left out.
+final class InlinedProgram {
+    protected List<LoweredModule> modules;
+    protected ReachedProgram reached;
+
+    protected constructor(this.modules, this.reached);
+}
+
+// Every kept module with the small calls the program makes, and the calls that are a function's
+// only use, replaced by copies of what they call, at the levels that inline. The descriptors and
+// slots the walk kept stay as they are, so the reach is walked again only to leave out the bodies
+// nothing names any more, and each module keeps the rest in the order emission writes them.
+inlineModules(List<LoweredModule> kept, ReachedProgram reached, CodegenSettings settings)
+        -> InlinedProgram {
     if (!settings.inlines() || !settings.runsPass("inlining")) {
-        return kept;
+        return new InlinedProgram(kept, reached);
     }
     let grouped = new List<List<EirFunction>>();
     for (long m = 0; m < kept.length(); m++) {
         grouped.push(kept.get(m).functions);
     }
-    let rewritten = inlining.inlineProgram(grouped, plans);
+    let rewritten = inlining.inlineProgram(grouped, reached.namedPlans(), keptWhatever(reached));
     let modules = new List<LoweredModule>();
     for (long m = 0; m < kept.length(); m++) {
         let unit = kept.get(m);
         modules.push(new LoweredModule(unit.definitions, rewritten.get(m), unit.entry,
             unit.problems));
     }
-    return modules;
+    let retained = reachable.retainFrom(reached, moduleBodies(modules));
+    return new InlinedProgram(reachedModules(modules, retained), retained);
+}
+
+// The functions the program holds whatever its calls do: its roots, and the implementation every
+// slot a descriptor keeps holds.
+keptWhatever(ReachedProgram reached) -> Set<string> {
+    let symbols = new Set<string>();
+    for (let root in reached.roots()) {
+        let ignored = symbols.add(root.symbol());
+    }
+    for (let implementation in reached.slotImplementations()) {
+        let ignored = symbols.add(implementation);
+    }
+    return symbols;
 }
 
 // The modules emission writes an object for, which is what decides where a descriptor owned by a

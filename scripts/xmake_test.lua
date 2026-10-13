@@ -1406,7 +1406,7 @@ task("test")
                 table.insert(failures, string.format("ens build -q said %q", quiet_out))
             end
             run({"build", hello, "--output", path.join(root, "loud.exe"), "-v"}, nil, 0,
-                "Emitted 4 object files from 14 modules")
+                "Emitted 2 object files from 14 modules")
             run({"build", hello, "--output", path.join(root, "arc.exe"), "--explain-arc"}, nil, 0,
                 "removed in the whole program")
 
@@ -1437,8 +1437,8 @@ task("test")
             local unlinked = path.join(root, "unlinked")
             os.tryrm(path.join(work, "hello" .. exe_suffix))
             run({"build", hello, "--no-link", "--objects", unlinked}, in_work, 0,
-                "hello: Emitted 4 object files from 14 modules into '", "', and linked nothing")
-            if #os.files(path.join(unlinked, "*" .. obj_suffix)) ~= 4 then
+                "hello: Emitted 2 object files from 14 modules into '", "', and linked nothing")
+            if #os.files(path.join(unlinked, "*" .. obj_suffix)) ~= 2 then
                 table.insert(failures, string.format("a build that links nothing left %d object "
                     .. "files", #os.files(path.join(unlinked, "*" .. obj_suffix))))
             end

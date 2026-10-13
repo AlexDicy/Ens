@@ -1,9 +1,11 @@
 // Inlining, the stage ahead of the optimization pipeline and the one pass that reads the whole
 // program at once. A call to a small function that is not recursive, made directly or dispatched
 // on a receiver whose class is proven, is replaced by a copy of that function's body, so the passes
-// after it see across what was a call boundary. A function is recursive when a chain of its own
-// calls leads back to it. Functions are rewritten callees first, so every copy is of a body that is
-// already final, and a rewrite reads nothing but its own function and those finished bodies.
+// after it see across what was a call boundary. A function the program calls from one place and
+// names nowhere else is copied there even when it is larger, since the copy is then the only one.
+// A function is recursive when a chain of its own calls leads back to it. Functions are rewritten
+// callees first, so every copy is of a body that is already final, and a rewrite reads nothing but
+// its own function and those finished bodies.
 import EirFunction from eir.model;
 import EirBlock from eir.model;
 import EirInstruction from eir.model;
@@ -38,21 +40,27 @@ import eir.walk;
 import support.primitives;
 import List from @std.collections.list;
 import Map from @std.collections.map;
+import Set from @std.collections.set;
 
 // The fixed size limits, counted in instructions and terminators.
 final class InlineLimits {
     // The largest body copied in place of a call.
     protected static const long callee = 12;
 
+    // The largest body copied in place of the one call the program makes to it.
+    protected static const long onlyCall = 100;
+
     // The size a caller stops taking copies at; its calls after that point stay calls.
     protected static const long caller = 2000;
 }
 
 // Every module's functions with the small calls in them inlined, each module's list in its own
-// order, so what emission writes depends on the program and nothing else.
-public inlineProgram(List<List<EirFunction>> modules, DescriptorPlans plans)
+// order, so what emission writes depends on the program and nothing else. 'kept' names the functions
+// the program holds whatever its calls do, its roots and what a descriptor's slots hold, which no
+// single call is the only use of.
+public inlineProgram(List<List<EirFunction>> modules, DescriptorPlans plans, Set<string> kept)
         -> List<List<EirFunction>> {
-    let program = new ProgramBodies(modules);
+    let program = new ProgramBodies(modules, kept);
     let finished = new Inliner(program, plans).run();
     let rewritten = new List<List<EirFunction>>();
     long next = 0;
@@ -75,12 +83,18 @@ final class ProgramBodies {
     protected Map<string, long> bySymbol;
     // The module of every function that is internal to its module's object.
     protected Map<string, long> internalModules;
+    // How many times the bodies name each symbol, and how many of those namings are direct calls.
+    Map<string, long> namings;
+    Map<string, long> directCalls;
+    Set<string> kept;
 
-    protected constructor(List<List<EirFunction>> grouped) {
+    protected constructor(List<List<EirFunction>> grouped, this.kept) {
         this.functions = new List<EirFunction>();
         this.modules = new List<long>();
         this.bySymbol = new Map<string, long>();
         this.internalModules = new Map<string, long>();
+        this.namings = new Map<string, long>();
+        this.directCalls = new Map<string, long>();
         for (long m = 0; m < grouped.length(); m++) {
             for (let function in grouped.get(m)) {
                 this.bySymbol.set(function.symbol(), this.functions.length());
@@ -89,8 +103,43 @@ final class ProgramBodies {
                 if (function.internalLinkage()) {
                     this.internalModules.set(function.symbol(), m);
                 }
+                this.count(function);
             }
         }
+    }
+
+    // Whether the program uses the function under 'symbol' only through one direct call, so a copy
+    // there leaves the function itself unused.
+    protected calledOnce(string symbol) -> bool {
+        return !this.kept.contains(symbol) && (this.namings.get(symbol) ?? 0) == 1
+            && (this.directCalls.get(symbol) ?? 0) == 1;
+    }
+
+    count(EirFunction function) {
+        for (let block in function.blocks()) {
+            for (let instruction in block.instructions()) {
+                for (let symbol in walk.symbolsOf(instruction)) {
+                    this.namings.set(symbol, (this.namings.get(symbol) ?? 0) + 1);
+                }
+                if (instruction is EirCall && instruction.dispatchSlot < 0) {
+                    this.countCall(instruction.callee.symbol());
+                }
+            }
+            let terminator = block.terminator();
+            if (terminator == null) {
+                continue;
+            }
+            for (let symbol in walk.terminatorSymbolsOf(terminator)) {
+                this.namings.set(symbol, (this.namings.get(symbol) ?? 0) + 1);
+            }
+            if (terminator is EirTryCall && terminator.dispatchSlot < 0) {
+                this.countCall(terminator.callee.symbol());
+            }
+        }
+    }
+
+    countCall(string symbol) {
+        this.directCalls.set(symbol, (this.directCalls.get(symbol) ?? 0) + 1);
     }
 }
 
@@ -225,8 +274,11 @@ final class Inliner {
             return null;
         }
         let target = this.finished[index];
-        if (target == null || target.size > InlineLimits.callee || target.definesGlobal
-                || target.body.isEntryPoint()) {
+        if (target == null || target.definesGlobal || target.body.isEntryPoint()) {
+            return null;
+        }
+        if (target.size > InlineLimits.callee
+                && (target.size > InlineLimits.onlyCall || !this.program.calledOnce(symbol))) {
             return null;
         }
         if (rewrite.size + target.size > InlineLimits.caller) {
