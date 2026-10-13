@@ -11,26 +11,34 @@ import @ens.llvm.memory;
 import DescriptorPlan from layout.descriptors;
 import DescriptorPlans from layout.descriptors;
 import ConformancePlan from layout.descriptors;
+import layout.descriptors;
 import FunctionInfo from lower.index;
 import EirCallee from eir.model;
 import Runtime from emit.runtime;
 import RuntimeFunction from emit.runtime;
 import ModuleEmitter from emit.context;
+import emit.droppedslots;
 import emit.rtti;
 import emit.signatures;
+import ReachedProgram from reach.reachable;
+import SlotKind from reach.reachable;
 import List from @std.collections.list;
 import Map from @std.collections.map;
 
+// What one module's descriptors hold. `reached` decides which slots a reached call reads, and a slot
+// it drops points at a thunk naming the slot; without a walk to read, every slot is kept.
 public final class Descriptors {
     Runtime runtime;
     DescriptorPlans plans;
+    ReachedProgram? reached;
     Map<Type, Value> globals;
     TypeRef? cachedDescriptorType;
     TypeRef? cachedEntryType;
 
-    public constructor(Runtime runtime, DescriptorPlans plans) {
+    public constructor(Runtime runtime, DescriptorPlans plans, ReachedProgram? reached) {
         this.runtime = runtime;
         this.plans = plans;
+        this.reached = reached;
         this.globals = new Map<Type, Value>();
         this.cachedDescriptorType = null;
         this.cachedEntryType = null;
@@ -135,9 +143,10 @@ public final class Descriptors {
         let vtable = this.vtableConstant(emitter, plan);
         let itables = this.conformancesConstant(emitter, plan);
         globals.setInitializer(global, this.descriptorType().constNamedStruct([name, parent,
-            typeId, vtable, itables, this.implementationPointer(emitter, plan.hashSlot()),
-            this.implementationPointer(emitter, plan.equalsSlot()),
-            this.implementationPointer(emitter, plan.toStringSlot())]));
+            typeId, vtable, itables,
+            this.slotPointer(emitter, plan, plan.hashSlot(), SlotKind.Hash, null, 0),
+            this.slotPointer(emitter, plan, plan.equalsSlot(), SlotKind.Equals, null, 0),
+            this.slotPointer(emitter, plan, plan.toStringSlot(), SlotKind.ToString, null, 0)]));
     }
 
     // The type's name as a private NUL-terminated byte global.
@@ -165,7 +174,7 @@ public final class Descriptors {
         }
         let values = new Value[entries.length];
         for (long i = 0; i < values.length; i++) {
-            values[i] = this.implementationPointer(emitter, entries[i]);
+            values[i] = this.slotPointer(emitter, plan, entries[i], SlotKind.Method, null, i);
         }
         return this.pointerTable("_vtable" + plan.symbol(), values);
     }
@@ -210,16 +219,32 @@ public final class Descriptors {
         let implementations = conformance.implementations();
         let values = new Value[implementations.length];
         for (long i = 0; i < values.length; i++) {
-            values[i] = this.implementationPointer(emitter, implementations[i]);
+            values[i] = this.slotPointer(emitter, plan, implementations[i], SlotKind.Interface,
+                conformance.interfaceType(), i);
         }
         return this.pointerTable("_itable{position}" + plan.symbol(), values);
     }
 
-    implementationPointer(ModuleEmitter emitter, FunctionInfo? implementation) -> Value {
+    // What one slot holds: null where the type has nothing there, the implementation where a
+    // reached call can read the slot, and the thunk of a dropped slot otherwise.
+    slotPointer(ModuleEmitter emitter, DescriptorPlan plan, FunctionInfo? implementation,
+                SlotKind kind, Type? conformed, long index) -> Value {
         if (implementation == null) {
             return this.runtime.nullPointer();
         }
-        return functionPointer(emitter, implementation);
+        let selected = this.reached;
+        if (selected == null || selected.keepsSlot(plan, kind, conformed, index)) {
+            return functionPointer(emitter, implementation);
+        }
+        Value conformedValue = this.runtime.nullPointer();
+        string conformedName = "";
+        if (conformed != null) {
+            conformedValue = this.descriptorValue(conformed);
+            conformedName = "." + descriptors.descriptorSymbol(conformed);
+        }
+        return droppedslots.thunk(this.runtime, "_dropped{plan.symbol()}{conformedName}"
+            + ".{kind as int}.{index}", this.descriptorValue(plan.type()), kind,
+            conformedValue, index);
     }
 
     pointerTable(string name, Value[] values) -> Value {

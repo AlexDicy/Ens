@@ -4,13 +4,33 @@
 // instruction, the ones lowering introduces included, so the walk reads the bodies rather than the
 // declarations they came from.
 //
-// The result is a set of symbols, and nothing here changes what a build emits.
+// A call through a descriptor slot names no body. The walk records the type the receiver is known
+// as and the slot, and every class a reached body allocates below that type has its
+// implementation of the slot reached and the slot kept, which is rapid type analysis run to its
+// fixed point. A slot that no reached call reads that way is dropped, and a descriptor is written
+// only for a type a reached body names. A library has no entry point, and a program that links it
+// may dispatch anywhere, so a library keeps every descriptor and every slot.
+//
+// The result is a set of symbols, descriptors and slots, and nothing here changes what a build
+// emits.
 import EirFunction from eir.model;
+import EirInstruction from eir.model;
+import EirTerminator from eir.model;
+import EirCall from eir.model;
+import EirTryCall from eir.model;
+import EirClassNew from eir.model;
+import EirDynamicEquals from eir.model;
+import EirDynamicHash from eir.model;
+import EirDynamicToString from eir.model;
 import eir.walk;
+import DescriptorPlan from layout.descriptors;
 import DescriptorPlans from layout.descriptors;
+import layout.descriptors;
+import FunctionInfo from lower.index;
 import ProgramIndex from lower.index;
 import Root from reach.roots;
 import reach.roots;
+import OptionalType from @ens.sema.model.types;
 import Type from @ens.sema.model.types;
 import List from @std.collections.list;
 import Map from @std.collections.map;
@@ -32,14 +52,27 @@ public final class ModuleBodies {
     }
 }
 
-// What one walk found: the bodies its roots reach, the descriptors the reached bodies name, and
-// the roots it started from.
+// The kinds of descriptor slot a call reads: a class's method slot, a method slot of an interface
+// the class conforms to, and the three the language calls.
+public enum SlotKind {
+    Method = 0,
+    Interface = 1,
+    Hash = 2,
+    Equals = 3,
+    ToString = 4,
+}
+
+// What one walk found: the bodies its roots reach, the descriptors the reached bodies name, the
+// slots a reached call reads, and the roots it started from.
 public final class ReachedProgram {
     Set<string> reachedSymbols;
     Set<Type> namedDescriptors;
+    Set<string> keptSlots;
+    bool keepsEverySlot;
     List<Root> startingRoots;
 
-    protected constructor(this.reachedSymbols, this.namedDescriptors, this.startingRoots);
+    protected constructor(this.reachedSymbols, this.namedDescriptors, this.keptSlots,
+                this.keepsEverySlot, this.startingRoots);
 
     // Whether the roots reach the body defined under this symbol. False for a symbol no lowered
     // body defines, such as a foreign C name.
@@ -62,6 +95,12 @@ public final class ReachedProgram {
         return this.namedDescriptors.contains(described);
     }
 
+    // Whether a reached call can read this slot of the planned descriptor. `conformed` is the
+    // interface whose method table holds an interface slot, and null for every other kind.
+    public keepsSlot(DescriptorPlan plan, SlotKind kind, Type? conformed, long index) -> bool {
+        return this.keepsEverySlot || this.keptSlots.contains(slotKey(plan, kind, conformed, index));
+    }
+
     public roots() -> List<Root> {
         return this.startingRoots;
     }
@@ -71,32 +110,79 @@ public final class ReachedProgram {
 // dropped here; the result is a set the caller reads.
 public analyze(ProgramIndex index, DescriptorPlans plans,
                List<ModuleBodies> modules) -> ReachedProgram {
-    return analyzeFrom(plans, modules, roots.collect(index, plans));
+    return analyzeFrom(plans, modules, roots.collect(index), index.entryFunction() == null);
 }
 
 // Walks the lowered program from a root list a caller chose, which is how a test walks from an
-// incomplete one.
-public analyzeFrom(DescriptorPlans plans, List<ModuleBodies> modules,
-                   List<Root> started) -> ReachedProgram {
-    let walked = new Walk(plans, modules);
+// incomplete one. A library keeps every descriptor and every slot.
+public analyzeFrom(DescriptorPlans plans, List<ModuleBodies> modules, List<Root> started,
+                   bool library = false) -> ReachedProgram {
+    let walked = new Walk(plans, modules, library);
     return walked.run(started);
+}
+
+// The key a kept slot is recorded under: the descriptor's symbol, the kind, the interface's
+// descriptor for an interface slot, and the index.
+slotKey(DescriptorPlan plan, SlotKind kind, Type? conformed, long index) -> string {
+    string interfaceName = "";
+    if (conformed != null) {
+        interfaceName = descriptors.descriptorSymbol(conformed);
+    }
+    return "{plan.symbol()}|{kind as int}|{interfaceName}|{index}";
+}
+
+// A call that reads a slot of whatever its receiver's runtime type is: the type the receiver is
+// known as, null when it could be any class, the kind of slot and its index.
+final class Dispatch {
+    protected Type? through;
+    protected SlotKind kind;
+    protected long index;
+
+    protected constructor(this.through, this.kind, this.index);
+
+    override hash() -> long {
+        long combined = (this.kind as long) * 31 + this.index;
+        let known = this.through;
+        if (known != null) {
+            combined = combined * 31 + known.hash();
+        }
+        return combined;
+    }
+
+    override equals(Dispatch other) -> bool {
+        return this.through == other.through && this.kind == other.kind
+            && this.index == other.index;
+    }
 }
 
 // One walk in progress: the bodies keyed by symbol, what it has reached, and the symbols it still
 // has to scan. It lives no longer than the analyze call that made it, so two walks share nothing.
+// The lists keep the order things were found in, so the walk visits them the same way every run.
 final class Walk {
     DescriptorPlans plans;
     Map<string, EirFunction> bodyBySymbol;
     Set<string> reached;
     Set<Type> descriptors;
     List<string> pending;
+    Set<Type> instantiated;
+    List<Type> instantiatedInOrder;
+    Set<Dispatch> dispatched;
+    List<Dispatch> dispatchedInOrder;
+    Set<string> keptSlots;
+    bool library;
 
-    protected constructor(DescriptorPlans plans, List<ModuleBodies> modules) {
+    protected constructor(DescriptorPlans plans, List<ModuleBodies> modules, bool library) {
         this.plans = plans;
         this.bodyBySymbol = new Map<string, EirFunction>();
         this.reached = new Set<string>();
         this.descriptors = new Set<Type>();
         this.pending = new List<string>();
+        this.instantiated = new Set<Type>();
+        this.instantiatedInOrder = new List<Type>();
+        this.dispatched = new Set<Dispatch>();
+        this.dispatchedInOrder = new List<Dispatch>();
+        this.keptSlots = new Set<string>();
+        this.library = library;
         for (long m = 0; m < modules.length(); m++) {
             let bodies = modules.get(m).bodies();
             for (long b = 0; b < bodies.length(); b++) {
@@ -106,13 +192,19 @@ final class Walk {
     }
 
     protected run(List<Root> started) -> ReachedProgram {
+        if (this.library) {
+            for (let plan in this.plans.all()) {
+                this.nameDescriptor(plan.type());
+            }
+        }
         for (long i = 0; i < started.length(); i++) {
             this.reach(started.get(i).symbol());
         }
         while (!this.pending.isEmpty()) {
             this.scan(this.pending.pop());
         }
-        return new ReachedProgram(this.reached, this.descriptors, started);
+        return new ReachedProgram(this.reached, this.descriptors, this.keptSlots, this.library,
+            started);
     }
 
     // Marks the body under one symbol reached and queues it for scanning. A symbol the lowered
@@ -146,6 +238,7 @@ final class Walk {
                 for (let described in walk.descriptorTypesOf(instruction)) {
                     this.nameDescriptor(described);
                 }
+                this.followDispatch(body, instruction);
             }
             let terminator = block.terminator();
             if (terminator == null) {
@@ -157,12 +250,109 @@ final class Walk {
             for (let described in walk.terminatorDescriptorTypesOf(terminator)) {
                 this.nameDescriptor(described);
             }
+            if (terminator is EirTryCall && terminator.dispatchSlot >= 0) {
+                this.dispatch(slotCall(terminator.callee.receiverType(),
+                    terminator.dispatchInterface, terminator.dispatchSlot));
+            }
         }
     }
 
+    // What one instruction allocates or reads a descriptor slot of.
+    followDispatch(EirFunction body, EirInstruction instruction) {
+        switch (instruction) {
+            is EirClassNew allocation -> {
+                this.instantiate(allocation.type);
+            },
+            is EirCall call -> {
+                if (call.dispatchSlot >= 0) {
+                    this.dispatch(slotCall(call.callee.receiverType(), call.dispatchInterface,
+                        call.dispatchSlot));
+                }
+            },
+            is EirDynamicEquals equality -> {
+                this.dispatch(new Dispatch(knownAs(body, equality.left), SlotKind.Equals, 0));
+            },
+            is EirDynamicHash hashed -> {
+                this.dispatch(new Dispatch(knownAs(body, hashed.value), SlotKind.Hash, 0));
+            },
+            is EirDynamicToString shown -> {
+                this.dispatch(new Dispatch(knownAs(body, shown.value), SlotKind.ToString, 0));
+            },
+            default -> { },
+        }
+    }
+
+    // A class some reached body allocates, whose slots every recorded call reaching it keeps.
+    instantiate(Type allocated) {
+        if (!this.instantiated.add(allocated)) {
+            return;
+        }
+        this.instantiatedInOrder.push(allocated);
+        for (long d = 0; d < this.dispatchedInOrder.length(); d++) {
+            this.select(allocated, this.dispatchedInOrder.get(d));
+        }
+    }
+
+    // A call through a slot, which keeps that slot of every allocated class it can reach.
+    dispatch(Dispatch call) {
+        if (!this.dispatched.add(call)) {
+            return;
+        }
+        this.dispatchedInOrder.push(call);
+        for (long t = 0; t < this.instantiatedInOrder.length(); t++) {
+            this.select(this.instantiatedInOrder.get(t), call);
+        }
+    }
+
+    // Keeps the slot `call` reads in the descriptor of `allocated`, and reaches what it holds, when
+    // an object of that class can be the receiver.
+    select(Type allocated, Dispatch call) {
+        let plan = this.plans.planFor(allocated);
+        if (plan == null || !this.isBelow(plan, call.through, call.kind)) {
+            return;
+        }
+        Type? conformed = null;
+        if (call.kind == SlotKind.Interface) {
+            conformed = call.through;
+        }
+        let implementation = slotOf(plan, call.kind, conformed, call.index);
+        if (implementation == null) {
+            return;
+        }
+        let added = this.keptSlots.add(slotKey(plan, call.kind, conformed, call.index));
+        this.reach(implementation.symbol());
+    }
+
+    // Whether a class with this plan is the type a receiver is known as or below it. An interface
+    // slot needs the class to conform to that interface.
+    isBelow(DescriptorPlan plan, Type? through, SlotKind kind) -> bool {
+        if (through == null) {
+            return true;
+        }
+        for (let conformance in plan.conformances()) {
+            if (conformance.interfaceType() == through) {
+                return true;
+            }
+        }
+        if (kind == SlotKind.Interface) {
+            return false;
+        }
+        DescriptorPlan? current = plan;
+        while (current != null) {
+            if (current.type() == through) {
+                return true;
+            }
+            let parent = current.parent();
+            if (parent == null) {
+                return false;
+            }
+            current = this.plans.planFor(parent);
+        }
+        return false;
+    }
+
     // Records one descriptor a body names, with the parent and interface descriptors that
-    // descriptor's own initializer names. Every descriptor slot is a root, so a named descriptor
-    // adds no body to the walk.
+    // descriptor's own initializer names.
     nameDescriptor(Type described) {
         if (!this.descriptors.add(described)) {
             return;
@@ -171,6 +361,9 @@ final class Walk {
         if (plan == null) {
             return;
         }
+        if (this.library) {
+            this.keepEverySlot(plan);
+        }
         let parent = plan.parent();
         if (parent != null) {
             this.nameDescriptor(parent);
@@ -178,5 +371,84 @@ final class Walk {
         for (let conformance in plan.conformances()) {
             this.nameDescriptor(conformance.interfaceType());
         }
+    }
+
+    // A library's descriptor: every implementation it holds is reached, as every slot was a root
+    // before the walk read dispatches.
+    keepEverySlot(DescriptorPlan plan) {
+        for (let implementation in plan.vtable()) {
+            this.reachImplementation(implementation);
+        }
+        for (let conformance in plan.conformances()) {
+            for (let implementation in conformance.implementations()) {
+                this.reachImplementation(implementation);
+            }
+        }
+        this.reachImplementation(plan.hashSlot());
+        this.reachImplementation(plan.equalsSlot());
+        this.reachImplementation(plan.toStringSlot());
+    }
+
+    reachImplementation(FunctionInfo? implementation) {
+        if (implementation != null) {
+            this.reach(implementation.symbol());
+        }
+    }
+}
+
+// The slot a dispatched call reads: an interface's when it names one, and otherwise the method
+// slot of the class its receiver is known as.
+slotCall(Type? receiverType, Type? dispatchInterface, long slot) -> Dispatch {
+    if (dispatchInterface != null) {
+        return new Dispatch(dispatchInterface, SlotKind.Interface, slot);
+    }
+    return new Dispatch(receiverType, SlotKind.Method, slot);
+}
+
+// The type a temp is known as, without the optional around it, which is the type a dynamic
+// dispatch reads the runtime type below.
+knownAs(EirFunction body, long temp) -> Type? {
+    let types = body.tempTypes();
+    if (temp < 0 || temp >= types.length()) {
+        return null;
+    }
+    let type = types.get(temp);
+    while (type is OptionalType) {
+        type = type.inner();
+    }
+    return type;
+}
+
+// What the descriptor of this plan holds at one slot, or null where it holds nothing.
+slotOf(DescriptorPlan plan, SlotKind kind, Type? conformed, long index) -> FunctionInfo? {
+    switch (kind) {
+        SlotKind.Method -> {
+            let vtable = plan.vtable();
+            if (index >= vtable.length) {
+                return null;
+            }
+            return vtable[index];
+        },
+        SlotKind.Interface -> {
+            for (let conformance in plan.conformances()) {
+                if (conformance.interfaceType() == conformed) {
+                    let implementations = conformance.implementations();
+                    if (index >= implementations.length) {
+                        return null;
+                    }
+                    return implementations[index];
+                }
+            }
+            return null;
+        },
+        SlotKind.Hash -> {
+            return plan.hashSlot();
+        },
+        SlotKind.Equals -> {
+            return plan.equalsSlot();
+        },
+        SlotKind.ToString -> {
+            return plan.toStringSlot();
+        },
     }
 }

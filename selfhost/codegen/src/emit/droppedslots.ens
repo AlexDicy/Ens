@@ -1,0 +1,120 @@
+// The descriptor slots a program drops. A dropped slot holds an implementation no reached call
+// reads it through, so the reachability walk leaves that body out, and the slot points at a thunk
+// of the module defining the descriptor instead. The thunk names the type and the slot to one stub
+// the core module defines for the whole program, which panics with an Internal text: a call that
+// gets there is a compiler bug, and the panic says where it went rather than jumping to address
+// zero. The thunk reads none of the arguments it is called with, so it serves a slot of any
+// signature.
+import Value from @ens.llvm.values;
+import @ens.llvm.globals;
+import @ens.llvm.instructions;
+import @ens.llvm.memory;
+import Runtime from emit.runtime;
+import RuntimeFunction from emit.runtime;
+import emit.traceruntime;
+import SlotKind from reach.reachable;
+
+// void ens_dropped_slot(ptr descriptor, i32 kind, ptr conformed, i64 index): the stub a thunk
+// calls with the descriptor holding the slot, its kind, the interface whose method table holds an
+// interface slot or null, and the slot's index.
+public stub(Runtime runtime) -> RuntimeFunction {
+    return runtime.libc("ens_dropped_slot", runtime.voidType.functionType([runtime.pointerType,
+        runtime.int32Type, runtime.pointerType, runtime.int64Type]));
+}
+
+// The thunk one dropped slot points at, defined in this module the first time it is asked for.
+public thunk(Runtime runtime, string name, Value descriptor, SlotKind kind, Value conformed,
+             long index) -> Value {
+    let type = runtime.voidType.functionType([]);
+    let known = runtime.existing(name, type);
+    if (known != null) {
+        return known.function;
+    }
+    let called = stub(runtime);
+    let definition = runtime.beginDefinition(name, type);
+    globals.addFunctionAttribute(runtime.context, definition.function, "noreturn");
+    runtime.call(called, [descriptor, runtime.int32(kind as int), conformed,
+        runtime.int64(index)], "");
+    instructions.buildUnreachable(runtime.builder);
+    return runtime.endDefinition(definition).function;
+}
+
+// Defines the stub into the core module's object, which every program writes. The message names
+// the type from the descriptor's own name field and the slot from what the thunk passed.
+public defineStub(Runtime runtime) {
+    let defined = stub(runtime);
+    let saved = traceruntime.beginExportedBody(runtime, defined);
+    globals.addFunctionAttribute(runtime.context, defined.function, "noreturn");
+    let builder = runtime.builder;
+    let descriptor = globals.getParam(defined.function, 0);
+    let kind = globals.getParam(defined.function, 1);
+    let conformed = globals.getParam(defined.function, 2);
+    let index = globals.getParam(defined.function, 3);
+    let lift = runtime.stringFromCString();
+    let concat = runtime.stringConcat();
+    let number = runtime.intToString();
+    let typeName = runtime.call(lift, [memory.buildLoad(builder, runtime.pointerType, descriptor,
+        "type.name.text")], "type.name");
+    let indexText = runtime.call(number, [index, runtime.int1Type.constInt(1, false)],
+        "index.text");
+    let slotText = memory.buildAlloca(builder, runtime.pointerType, "slot.text");
+
+    let methodBlock = traceruntime.block(runtime, defined, "slot.method");
+    let interfaceBlock = traceruntime.block(runtime, defined, "slot.interface");
+    let hashBlock = traceruntime.block(runtime, defined, "slot.hash");
+    let equalsBlock = traceruntime.block(runtime, defined, "slot.equals");
+    let textBlock = traceruntime.block(runtime, defined, "slot.tostring");
+    let reportBlock = traceruntime.block(runtime, defined, "report");
+    let chosen = instructions.buildSwitch(builder, kind, textBlock, 4);
+    instructions.addCase(chosen, runtime.int32(SlotKind.Method as int), methodBlock);
+    instructions.addCase(chosen, runtime.int32(SlotKind.Interface as int), interfaceBlock);
+    instructions.addCase(chosen, runtime.int32(SlotKind.Hash as int), hashBlock);
+    instructions.addCase(chosen, runtime.int32(SlotKind.Equals as int), equalsBlock);
+
+    builder.positionAtEnd(methodBlock);
+    memory.buildStore(builder, joined(runtime, concat, [literal(runtime, "method slot "),
+        indexText]), slotText);
+    instructions.buildBr(builder, reportBlock);
+
+    builder.positionAtEnd(interfaceBlock);
+    let interfaceName = runtime.call(lift, [memory.buildLoad(builder, runtime.pointerType,
+        conformed, "interface.name.text")], "interface.name");
+    memory.buildStore(builder, joined(runtime, concat, [literal(runtime, "slot "), indexText,
+        literal(runtime, " of the method table for '"), interfaceName, literal(runtime, "'")]),
+        slotText);
+    instructions.buildBr(builder, reportBlock);
+
+    builder.positionAtEnd(hashBlock);
+    memory.buildStore(builder, literal(runtime, "the 'hash' slot"), slotText);
+    instructions.buildBr(builder, reportBlock);
+
+    builder.positionAtEnd(equalsBlock);
+    memory.buildStore(builder, literal(runtime, "the 'equals' slot"), slotText);
+    instructions.buildBr(builder, reportBlock);
+
+    builder.positionAtEnd(textBlock);
+    memory.buildStore(builder, literal(runtime, "the 'toString' slot"), slotText);
+    instructions.buildBr(builder, reportBlock);
+
+    builder.positionAtEnd(reportBlock);
+    let slot = memory.buildLoad(builder, runtime.pointerType, slotText, "slot");
+    let message = joined(runtime, concat, [literal(runtime, "Internal: a call reached "), slot,
+        literal(runtime, " of '"), typeName, literal(runtime, "', which no reached call "
+        + "dispatches through, so the compiler dropped it")]);
+    runtime.call(runtime.panic(), [message], "");
+    instructions.buildUnreachable(builder);
+    traceruntime.finishBody(runtime, saved);
+}
+
+literal(Runtime runtime, string text) -> Value {
+    return runtime.stringLiteral(text.toBytes());
+}
+
+// The texts one after another, as one string.
+joined(Runtime runtime, RuntimeFunction concat, Value[] parts) -> Value {
+    Value combined = parts[0];
+    for (long i = 1; i < parts.length; i++) {
+        combined = runtime.call(concat, [combined, parts[i]], "");
+    }
+    return combined;
+}

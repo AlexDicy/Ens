@@ -73,9 +73,9 @@ test "a program walked from its own roots names nothing outside the reached set"
     try testing.assertTrue(found.length() == 0, "unexpected: " + firstMessage(found));
 }
 
-// A root set without the descriptor slots leaves one body unreached per slot, and each report says
-// which slot still holds its address: the three kinds are collected from three different places.
-test "a root set without the descriptor slots names the slot each body sits in" {
+// A walk that never sees the bodies a kept slot holds cannot reach them, and each report says which
+// slot still holds the address: a method slot and an interface slot are collected from two places.
+test "a kept slot whose body the walk never saw names the slot it sits in" {
     let program = try support.lowerWholeProgram(
         "interface Speaker \{\n"
         + "    speak() -> string;\n"
@@ -110,21 +110,20 @@ test "a root set without the descriptor slots names the slot each body sits in" 
         + "pick() -> Shape \{\n"
         + "    return new Square();\n"
         + "\}\n"
+        + "say(Speaker who) -> int \{\n"
+        + "    return who.speak().length as int;\n"
+        + "\}\n"
         + "main() -> int \{\n"
-        + "    return pick().area() - 4;\n"
+        + "    return pick().area() + say(new Square()) - 5;\n"
         + "\}\n");
-    let found = checked(program, entryOnly(program));
-    try testing.assertEqual(found.length(), 5);
+    let unseen = withoutBodies(program, ["main$Square$area", "main$Square$speak"]);
+    let reached = reachable.analyzeFrom(program.plans, unseen, ownRoots(program));
+    let found = references.check(program.modules, program.modules, program.plans, reached);
+    try testing.assertEqual(found.length(), 2);
     try assertReported(found, "main$Square$area",
         "which the descriptor of 'Square' in module 'main' references from method slot 0");
     try assertReported(found, "main$Square$speak",
         "which the descriptor of 'Square' in module 'main' references from 'Speaker' slot 0");
-    try assertReported(found, "main$Square$hash",
-        "which the descriptor of 'Square' in module 'main' references from the 'hash' slot");
-    try assertReported(found, "main$Square$equals",
-        "which the descriptor of 'Square' in module 'main' references from the 'equals' slot");
-    try assertReported(found, "main$Square$toString",
-        "which the descriptor of 'Square' in module 'main' references from the 'toString' slot");
     try assertMentions(found.get(0).message(), "the root set is not closed");
 }
 
@@ -162,9 +161,7 @@ test "a call naming a body the walk never saw is caught at the call" {
 // value names the initializer that defines the storage, so reaching the read reaches it too.
 test "a foreign name is no reference out of the set, and a lazy read reaches its storage" {
     let program = try support.lowerWholeProgram(richProgram());
-    let reached = reachable.analyzeFrom(program.plans, program.modules, entryOnly(program));
-    try testing.assertFalse(reached.reaches("main$Square$area"),
-        "this root set is meant to leave bodies unreached");
+    let reached = reachable.analyzeFrom(program.plans, program.modules, ownRoots(program));
     try testing.assertTrue(reached.reaches("_lazyinit$main$Holder$value"),
         "the read of 'Holder.value' names the initializer its storage is defined by");
     let found = references.check(program.modules, program.modules, program.plans, reached);
@@ -258,7 +255,7 @@ test "what an unreached body names is not checked" {
 
 // Devirtualization retargets a dispatched call, which names a symbol the dispatched form named
 // nowhere. The check reads the bodies the pipeline produced for exactly that reason, and the
-// retargeted symbol is reached because it sits in a descriptor slot.
+// retargeted symbol is reached because the dispatched call reads the slot of the Dog it allocates.
 test "a symbol devirtualization introduces is inside the reached set" {
     let program = try support.lowerWholeProgram(
         "class Animal \{\n"
@@ -334,18 +331,30 @@ checked(LoweredProgram program, List<Root> started) -> List<DanglingReference> {
 }
 
 ownRoots(LoweredProgram program) -> List<Root> {
-    return roots.collect(program.index, program.plans);
+    return roots.collect(program.index);
 }
 
-// The entry point alone, which is the root set with every descriptor slot left out of it.
-entryOnly(LoweredProgram program) -> List<Root> {
-    let started = new List<Root>();
-    for (let root in ownRoots(program)) {
-        if (root.origin() == "the program entry") {
-            started.push(root);
+// The program's modules without the named bodies, for a walk that never sees them.
+withoutBodies(LoweredProgram program, string[] symbols) -> List<ModuleBodies> {
+    let kept = new List<ModuleBodies>();
+    for (long m = 0; m < program.modules.length(); m++) {
+        let unit = program.modules.get(m);
+        let bodies = new List<EirFunction>();
+        for (long b = 0; b < unit.bodies().length(); b++) {
+            let body = unit.bodies().get(b);
+            bool left = false;
+            for (let symbol in symbols) {
+                if (body.symbol() == symbol) {
+                    left = true;
+                }
+            }
+            if (!left) {
+                bodies.push(body);
+            }
         }
+        kept.push(new ModuleBodies(unit.modulePath(), bodies));
     }
-    return started;
+    return kept;
 }
 
 // The program's modules holding the bodies one walk reached, the way emission is handed them.

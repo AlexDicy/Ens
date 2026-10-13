@@ -1,0 +1,99 @@
+// Tests for the dropped-slot stub and the thunks a dropped slot points at, each checked with the
+// real LLVM verifier: the stub names the type and the slot, and a thunk passes it both.
+import @std.testing;
+import @ens.llvm.analysis;
+import @ens.llvm.globals;
+import @ens.llvm.target;
+import ModuleEmitter from emit.context;
+import EmissionHost from support;
+import emit.droppedslots;
+import SlotKind from reach.reachable;
+import reach.reachable;
+import support;
+
+// The text the stub panics with is built out of these literals, the type's own name and the
+// index, so each kind of slot reads as itself.
+test "the stub panics with an Internal text naming the type and the slot" {
+    let host = new EmissionHost("dropped_stub");
+    droppedslots.defineStub(host.runtime);
+    string text = host.text();
+    try testing.assertTrue(text.indexOf("define void @ens_dropped_slot(ptr ") >= 0,
+        "the stub is defined with external linkage: {text}");
+    for (let piece in ["Internal: a call reached ", "method slot ", "slot ",
+            " of the method table for '", "the 'hash' slot", "the 'equals' slot",
+            "the 'toString' slot", "', which no reached call dispatches through, so the "
+            + "compiler dropped it"]) {
+        try testing.assertTrue(text.indexOf(piece) >= 0, "the stub has no '{piece}': {text}");
+    }
+    try testing.assertTrue(text.indexOf("call void @ens_panic(") >= 0,
+        "the stub panics: {text}");
+    try host.finish();
+}
+
+// A thunk reads none of the arguments the slot is called with, so it serves a slot of any
+// signature, and it passes the stub the descriptor, the kind and the index.
+test "a thunk passes the stub its descriptor, its kind and its index" {
+    let host = new EmissionHost("dropped_thunk");
+    let descriptor = host.runtime.nullPointer();
+    let thunk = droppedslots.thunk(host.runtime, "_dropped.example", descriptor, SlotKind.Hash,
+        host.runtime.nullPointer(), 0);
+    let again = droppedslots.thunk(host.runtime, "_dropped.example", descriptor, SlotKind.Hash,
+        host.runtime.nullPointer(), 0);
+    string text = host.text();
+    try testing.assertTrue(text.indexOf("define internal void @_dropped.example()") >= 0,
+        "the thunk takes nothing: {text}");
+    try testing.assertTrue(text.indexOf("call void @ens_dropped_slot(ptr null, i32 2, ptr null, "
+        + "i64 0)") >= 0, "the thunk names the slot to the stub: {text}");
+    try testing.assertTrue(text.indexOf("declare void @ens_dropped_slot(") >= 0,
+        "a module other than the core one only declares the stub: {text}");
+    try testing.assertTrue(thunk == again, "the second request redefined the thunk");
+    try host.finish();
+}
+
+// Circle is only tested against, so no reached call reads its 'area' slot, and the descriptor
+// holds that slot's thunk rather than the address of a body the program leaves out.
+test "a descriptor points a slot no reached call reads at its thunk" {
+    let program = try support.lowerWholeProgram(
+        "abstract class Shape \{\n"
+        + "    protected constructor();\n"
+        + "    protected abstract area() -> int;\n"
+        + "\}\n"
+        + "class Square extends Shape \{\n"
+        + "    protected constructor();\n"
+        + "\n"
+        + "    protected override area() -> int \{\n"
+        + "        return 4;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "class Circle extends Shape \{\n"
+        + "    protected constructor();\n"
+        + "\n"
+        + "    protected override area() -> int \{\n"
+        + "        return 3;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "pick() -> Shape \{\n"
+        + "    return new Square();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    if (pick() is Circle) \{\n"
+        + "        return 1;\n"
+        + "    \}\n"
+        + "    return pick().area();\n"
+        + "\}\n");
+    let reached = reachable.analyze(program.index, program.plans, program.modules);
+    let emitter = new ModuleEmitter("main", program.plans, target.hostTargetTriple(), reached);
+    emitter.descriptors.defineModuleDescriptors(emitter, program.plans.ownedBy("main"));
+    string emitted = analysis.moduleText(emitter.module);
+    try testing.assertTrue(globals.getNamedFunction(emitter.module,
+        "_dropped_typedesc$main$Circle.0.0") != null, "Circle's 'area' slot has no thunk");
+    try testing.assertTrue(globals.getNamedFunction(emitter.module,
+        "_dropped_typedesc$main$Square.0.0") == null, "Square's 'area' slot is read and kept");
+    try testing.assertTrue(emitted.indexOf("@\"main$Square$area\"") >= 0,
+        "Square's vtable holds its 'area': {emitted}");
+    try testing.assertTrue(emitted.indexOf("@\"main$Circle$area\"") < 0,
+        "Circle's vtable names its 'area': {emitted}");
+    string verdict = analysis.verify(emitter.module);
+    emitter.dispose();
+    try testing.assertTrue(verdict.length == 0, "verification failed: {verdict}");
+}

@@ -11,9 +11,12 @@ import EirDynamicToString from eir.model;
 import EirInstruction from eir.model;
 import EirRuntimeTypeName from eir.model;
 import eir.walk;
+import DescriptorPlan from layout.descriptors;
 import ReachedProgram from reach.reachable;
+import SlotKind from reach.reachable;
 import reach.reachable;
 import LoweredProgram from support;
+import MemoryFileLoader from support;
 import support;
 
 test "a call names its callee and a call nothing makes names nobody" {
@@ -264,8 +267,8 @@ test "a named descriptor drags the descriptors its own initializer names" {
 }
 
 // The plan behind this work lists these four beside the nodes that name a symbol. They name none:
-// each one calls a runtime helper that reads the descriptor the value itself carries, which is
-// what makes the language-called slots of every emitted descriptor roots.
+// each one calls a runtime helper that reads the descriptor the value itself carries, so the walk
+// follows them as reads of a slot rather than as names.
 test "the runtime-type instructions name no symbol and no descriptor" {
     let program = try support.lowerWholeProgram("main() \{\}\n");
     let store = program.analysis.store();
@@ -276,6 +279,181 @@ test "the runtime-type instructions name no symbol and no descriptor" {
     try assertNamesNothing(new EirDynamicHash(1, longType, 0), "dynamic_hash");
     try assertNamesNothing(new EirDynamicToString(1, text, 0), "dynamic_to_string");
     try assertNamesNothing(new EirRuntimeTypeName(1, text, 0), "runtime_type_name");
+}
+
+// A dispatched call reads the slot of whatever class its receiver is at run time, which can only be
+// one the program allocates, so a sibling nothing allocates keeps neither its slot nor its body.
+test "a dispatched call reaches the slot of each allocated class below the receiver" {
+    let program = try support.lowerWholeProgram(
+        "abstract class Shape \{\n"
+        + "    protected constructor();\n"
+        + "    protected abstract area() -> int;\n"
+        + "\}\n"
+        + "class Square extends Shape \{\n"
+        + "    protected constructor();\n"
+        + "\n"
+        + "    protected override area() -> int \{\n"
+        + "        return 4;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "class Circle extends Shape \{\n"
+        + "    protected constructor();\n"
+        + "\n"
+        + "    protected override area() -> int \{\n"
+        + "        return 3;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "pick() -> Shape \{\n"
+        + "    return new Square();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return pick().area();\n"
+        + "\}\n");
+    let reached = walked(program);
+    try testing.assertTrue(reached.reaches("main$Square$area"),
+        "Square is allocated, so the call can run its 'area'");
+    try testing.assertFalse(reached.reaches("main$Circle$area"),
+        "nothing allocates a Circle, so the call can never run its 'area'");
+    try testing.assertTrue(reached.keepsSlot(try planOf(program, "Square"), SlotKind.Method,
+        null, 0), "Square's slot holds what the call runs");
+}
+
+// The interface's method table of each allocated class that conforms is what such a call reads.
+test "a call through an interface reaches the slot of each allocated class conforming to it" {
+    let program = try support.lowerWholeProgram(
+        "interface Speaker \{\n"
+        + "    speak() -> string;\n"
+        + "\}\n"
+        + "class Animal implements Speaker \{\n"
+        + "    protected constructor();\n"
+        + "\n"
+        + "    protected override speak() -> string \{\n"
+        + "        return \"...\";\n"
+        + "    \}\n"
+        + "\}\n"
+        + "class Robot implements Speaker \{\n"
+        + "    protected constructor();\n"
+        + "\n"
+        + "    protected override speak() -> string \{\n"
+        + "        return \"beep\";\n"
+        + "    \}\n"
+        + "\}\n"
+        + "say(Speaker who) -> string \{\n"
+        + "    return who.speak();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let said = say(new Animal());\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reached = walked(program);
+    try testing.assertTrue(reached.reaches("main$Animal$speak"),
+        "the implementation sits in Animal's Speaker table and in no vtable");
+    try testing.assertFalse(reached.reaches("main$Robot$speak"), "nothing allocates a Robot");
+    try testing.assertTrue(reached.keepsSlot(try planOf(program, "Animal"), SlotKind.Interface,
+        try declaredType(program, "Speaker"), 0), "Animal's Speaker slot is kept");
+}
+
+// Allocating a class reads none of the slots the language calls. A text form of a value that can
+// hold more than one class reads the 'toString' slot, and only that one.
+test "the built-in behaviors are reached by the calls that read them" {
+    let program = try support.lowerWholeProgram(
+        "class Base \{\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "class Widget extends Base \{\n"
+        + "    protected constructor();\n"
+        + "\n"
+        + "    override hash() -> long \{\n"
+        + "        return 1L;\n"
+        + "    \}\n"
+        + "\n"
+        + "    override equals(Widget other) -> bool \{\n"
+        + "        return true;\n"
+        + "    \}\n"
+        + "\n"
+        + "    override toString() -> string \{\n"
+        + "        return \"widget\";\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    Base made = new Widget();\n"
+        + "    string text = \"\{made\}\";\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reached = walked(program);
+    let widget = try planOf(program, "Widget");
+    try testing.assertTrue(reached.reaches("main$Widget$toString"),
+        "the text form of a Base reads the slot of the Widget it holds");
+    try testing.assertTrue(reached.keepsSlot(widget, SlotKind.ToString, null, 0),
+        "the 'toString' slot is kept");
+    try testing.assertFalse(reached.reaches("main$Widget$hash"), "nothing hashes a Widget");
+    try testing.assertFalse(reached.keepsSlot(widget, SlotKind.Hash, null, 0),
+        "the 'hash' slot is dropped");
+    try testing.assertFalse(reached.keepsSlot(widget, SlotKind.Equals, null, 0),
+        "the 'equals' slot is dropped");
+}
+
+// A type test reads the target's descriptor and calls nothing through it, so the descriptor is
+// written and every slot of it is dropped.
+test "a class only tested against keeps its descriptor and none of its slots" {
+    let program = try support.lowerWholeProgram(
+        "abstract class Shape \{\n"
+        + "    protected constructor();\n"
+        + "    protected abstract area() -> int;\n"
+        + "\}\n"
+        + "class Square extends Shape \{\n"
+        + "    protected constructor();\n"
+        + "\n"
+        + "    protected override area() -> int \{\n"
+        + "        return 4;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "class Circle extends Shape \{\n"
+        + "    protected constructor();\n"
+        + "\n"
+        + "    protected override area() -> int \{\n"
+        + "        return 3;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "pick() -> Shape \{\n"
+        + "    return new Square();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    if (pick() is Circle) \{\n"
+        + "        return 1;\n"
+        + "    \}\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reached = walked(program);
+    try testing.assertTrue(reached.namesDescriptor(try declaredType(program, "Circle")),
+        "the test reads Circle's descriptor");
+    try testing.assertFalse(reached.keepsSlot(try planOf(program, "Circle"), SlotKind.Method,
+        null, 0), "no call reads a slot of a Circle");
+    try testing.assertFalse(reached.reaches("main$Circle$area"), "nor runs its 'area'");
+}
+
+// A program that links a library may dispatch through any of its descriptors, so a library keeps
+// them all and every slot in them.
+test "a library keeps every descriptor and every slot" {
+    let loader = new MemoryFileLoader();
+    loader.add("/src/main.ens",
+        "export class Tool \{\n"
+        + "    export constructor();\n"
+        + "\n"
+        + "    export override toString() -> string \{\n"
+        + "        return \"tool\";\n"
+        + "    \}\n"
+        + "\}\n"
+        + "export offered() -> int \{\n"
+        + "    return 1;\n"
+        + "\}\n");
+    let program = try support.lowerLoadedProgram(try support.analyzeLoaded(loader));
+    let reached = walked(program);
+    let tool = try planOf(program, "Tool");
+    try testing.assertTrue(reached.namesDescriptor(tool.type()), "the descriptor is written");
+    try testing.assertTrue(reached.keepsSlot(tool, SlotKind.ToString, null, 0),
+        "its 'toString' slot is kept");
+    try testing.assertTrue(reached.reaches("main$Tool$toString"), "and what the slot holds");
 }
 
 // The walk over a program lowered the way the driver lowers it.
@@ -316,6 +494,15 @@ assertNamesNothing(EirInstruction instruction, string described) throws {
         "{described} names a symbol");
     try testing.assertTrue(walk.descriptorTypesOf(instruction).length == 0,
         "{described} names a descriptor");
+}
+
+// The descriptor plan of one of the test program's own types.
+planOf(LoweredProgram program, string name) -> DescriptorPlan throws {
+    let plan = program.plans.planFor(try declaredType(program, name));
+    if (plan == null) {
+        throw new TestFailure("no descriptor is planned for '{name}'");
+    }
+    return plan;
 }
 
 // The type one of the test program's own declarations names, class or interface alike.
