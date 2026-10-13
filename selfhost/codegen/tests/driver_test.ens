@@ -4,6 +4,7 @@
 import @std.testing;
 import Path from @std.fs;
 import FileDiagnostic from @ens.sema.support.diagnostics;
+import ProgramAnalysis from @ens.sema.pipeline;
 import StandardLibrary from @ens.sema.program.implicit;
 import @ens.llvm.target;
 import CodegenSettings from settings;
@@ -163,6 +164,117 @@ test "the account of an explained build closes with the program's total" {
     try testing.assertTrue(account[account.length - 1].endsWith(" removed in the whole program"),
         "unexpected closing line: {account[account.length - 1]}");
     try emptyFolder(Path(folder));
+}
+
+// A build that lowers every body verifies more than one that lowers what it reaches, and writes
+// the same objects byte for byte, so what codegencheck verifies is what every build emits.
+test "lowering every body emits the same objects as lowering what is reached" {
+    let analysis = try support.analyzeLoaded(bothModesProgram());
+    for (let level in [OptimizationLevel.None, OptimizationLevel.Default]) {
+        string[] everyPass = [];
+        let reached = try emittedBytes(analysis, new CodegenSettings(level, hostTriple()));
+        let everything = try emittedBytes(analysis, new CodegenSettings(level, hostTriple(),
+            everyPass, false, false, false, true));
+        try testing.assertEqual(everything.length(), reached.length());
+        for (long i = 0; i < reached.length(); i++) {
+            try testing.assertEqual(everything.get(i).name, reached.get(i).name);
+            try testing.assertTrue(everything.get(i).bytes == reached.get(i).bytes,
+                "'{reached.get(i).name}' differs between the two modes");
+        }
+    }
+}
+
+// A program with what reachability decides about: a class hierarchy dispatched through, an
+// interface, the built-in behaviors, a generic class and a generic function, a closure, and a
+// function, a class and a generic instance nothing reaches.
+bothModesProgram() -> MemoryFileLoader {
+    let loader = new MemoryFileLoader();
+    loader.add("/src/lib/shapes.ens",
+        "public interface Measured \{\n"
+        + "    measure() -> int;\n"
+        + "\}\n"
+        + "public class Shape implements Measured \{\n"
+        + "    public int side;\n"
+        + "    public constructor(this.side);\n"
+        + "    public override measure() -> int \{\n"
+        + "        return this.side;\n"
+        + "    \}\n"
+        + "    public area() -> int \{\n"
+        + "        return this.side * this.side;\n"
+        + "    \}\n"
+        + "    public override hash() -> long \{\n"
+        + "        return this.side;\n"
+        + "    \}\n"
+        + "    public override equals(Shape other) -> bool \{\n"
+        + "        return this.side == other.side;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class Square extends Shape \{\n"
+        + "    public constructor(int side) \{\n"
+        + "        super(side);\n"
+        + "    \}\n"
+        + "    public override area() -> int \{\n"
+        + "        return this.side * this.side + 1;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class Unused \{\n"
+        + "    public constructor();\n"
+        + "    public value() -> int \{\n"
+        + "        return 7;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class Box<T> \{\n"
+        + "    public T held;\n"
+        + "    public constructor(this.held);\n"
+        + "    public get() -> T \{\n"
+        + "        return this.held;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public first<T>(T[] items) -> T \{\n"
+        + "    return items[0];\n"
+        + "\}\n"
+        + "public unreached() -> int \{\n"
+        + "    let box = new Box<string>(\"never\");\n"
+        + "    return first<int>([new Unused().value()]) + (box.get().length as int);\n"
+        + "\}\n");
+    loader.add("/src/main.ens",
+        "import lib.shapes;\n"
+        + "import Shape from lib.shapes;\n"
+        + "import Square from lib.shapes;\n"
+        + "import Measured from lib.shapes;\n"
+        + "import Box from lib.shapes;\n"
+        + "main() -> int \{\n"
+        + "    Shape shape = new Square(3);\n"
+        + "    Measured measured = shape;\n"
+        + "    let box = new Box<int>(shape.area());\n"
+        + "    (int) -> int add = (n) -> n + measured.measure();\n"
+        + "    return add(box.get()) + shapes.first<int>([1, 2]) + (shape.hash() as int);\n"
+        + "\}\n");
+    return loader;
+}
+
+// One object file a build wrote: its name without the folder, and its bytes.
+final class EmittedFile {
+    protected string name;
+    protected byte[] bytes;
+
+    protected constructor(this.name, this.bytes);
+}
+
+// The object files one build of the program writes, in the order it reports them, with the folder
+// removed again afterwards.
+emittedBytes(ProgramAnalysis analysis, CodegenSettings settings) -> List<EmittedFile> throws {
+    string folder = try scratchFolder();
+    let emitted = driver.emitProgram(analysis, folder, "modes.", settings);
+    try testing.assertTrue(emitted.succeeded(),
+        "the program must emit: {describe(emitted.diagnostics())}");
+    let files = new List<EmittedFile>();
+    for (let object in emitted.objects()) {
+        Path path = Path(object);
+        files.push(new EmittedFile(path.fileName(), try path.readBytes()));
+    }
+    try emptyFolder(Path(folder));
+    return files;
 }
 
 // A two-module program whose 'lib.spare' module declares one function and no type, with what
