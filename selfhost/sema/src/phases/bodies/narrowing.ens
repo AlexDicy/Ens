@@ -14,6 +14,7 @@ import SubscriptExpressionNode from @ens.frontend.syntax.generated.nodes;
 import CastExpressionNode from @ens.frontend.syntax.generated.nodes;
 import CheckedCastExpressionNode from @ens.frontend.syntax.generated.nodes;
 import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
+import NullCoalesceExpressionNode from @ens.frontend.syntax.generated.nodes;
 import TypeTestExpressionNode from @ens.frontend.syntax.generated.nodes;
 import AssignmentExpressionNode from @ens.frontend.syntax.generated.nodes;
 import ParenthesizedExpressionNode from @ens.frontend.syntax.generated.nodes;
@@ -696,6 +697,99 @@ checkedCharCast(BodyChecker checker, CheckedCastExpressionNode node, Type source
     return checker.store().optionalOf(target);
 }
 
+// The 'as?' cast 'value' is, or null where it is not one.
+castIn(Expression value) -> CheckedCastExpressionNode? {
+    Expression core = syntax.unwrapParentheses(value);
+    if (core is CheckedCastExpressionNode) {
+        return core;
+    }
+    return null;
+}
+
+// The fix 'fix' after what keeps what the value 'cast' checks does, where that value does something.
+keptBefore(CheckedCastExpressionNode cast, string fix) -> string {
+    string kept = keptEvaluation(cast.value(), "as?");
+    if (kept.length == 0) {
+        return fix;
+    }
+    return "{kept}, and {fix.substring(0, 1).toLowerAscii()}{fix.substring(1)}";
+}
+
+// Notes the initializer of 'name', a local declared without a type, which a cast that always gives
+// null leaves with no type: the fix declares the local with the cast's type instead.
+public noteUntypedInitializer(BodyChecker checker, Expression value, string name, bool isConst) {
+    let cast = castIn(value);
+    if (cast == null) {
+        return;
+    }
+    string keyword = isConst ? "const " : "";
+    checker.markCastFix(cast, keptBefore(cast, "Write '{keyword}"
+        + "{wording.greenSpelling(cast.target().green())}? {name} = null;'."));
+}
+
+// Notes the left side of 'node', where a cast that always gives null makes the '??' always give
+// its fallback.
+public noteFallbackLeft(BodyChecker checker, NullCoalesceExpressionNode node) {
+    let cast = castIn(node.left());
+    if (cast == null) {
+        return;
+    }
+    let whole = wording.shortSpelling(node);
+    let fallback = wording.shortSpelling(node.right());
+    string fix = "The '??' therefore always gives the value after it. "
+        + keptBefore(cast, "Replace the whole '??' expression with that value.");
+    if (whole != null && fallback != null) {
+        fix = "'{whole}' therefore always gives '{fallback}'. "
+            + keptBefore(cast, "Replace the '??' expression with '{fallback}'.");
+        if (keptEvaluation(cast.value(), "as?").length == 0) {
+            fix = "'{whole}' therefore always gives '{fallback}'. Replace it with '{fallback}'.";
+        }
+    }
+    checker.markCastFix(cast, fix);
+}
+
+// Notes the side of 'node' compared with 'null', where a cast that always gives null makes the
+// comparison always give one outcome, fixed as a test with that outcome is.
+public noteComparedWithNull(BodyChecker checker, BinaryExpressionNode node) {
+    SyntaxKind operator = node.operator().kind();
+    if (operator != SyntaxKind.EqualsEquals && operator != SyntaxKind.NotEquals) {
+        return;
+    }
+    Expression compared = node.left();
+    if (wording.isNullLiteral(syntax.unwrapParentheses(node.left()))) {
+        compared = node.right();
+    } else if (!wording.isNullLiteral(syntax.unwrapParentheses(node.right()))) {
+        return;
+    }
+    let cast = castIn(compared);
+    if (cast == null) {
+        return;
+    }
+    bool outcome = operator == SyntaxKind.EqualsEquals;
+    string kept = keptEvaluation(cast.value(), "as?");
+    let hasElse = checker.ifConditionHasElse(node);
+    let place = capabilities.valuePlace(kept.length > 0 ? "the comparison" : "it", kept);
+    if (hasElse != null) {
+        place = capabilities.ifConditionPlace(hasElse, kept);
+    }
+    string subject = wording.sideNamed(node, "The comparison with null");
+    checker.markCastFix(cast, "{subject} is therefore always '{outcome}'. {place.fixFor(outcome)}");
+}
+
+// Notes 'value', written as a statement of its own, where a cast that always gives null is removed,
+// and only the cast where the value it checks does something.
+public noteStatementValue(BodyChecker checker, Expression value) {
+    let cast = castIn(value);
+    if (cast == null) {
+        return;
+    }
+    string fix = "Remove this statement.";
+    if (keptEvaluation(cast.value(), "as?").length > 0) {
+        fix = "Remove 'as? {wording.greenSpelling(cast.target().green())}'.";
+    }
+    checker.markCastFix(cast, fix);
+}
+
 // What a fix that drops the value an 'is' test or an 'as?' cast checks writes to keep what the value
 // does, as in "Call 'makeDog()' on its own line", or empty where the value is a name or a chain of
 // field reads, which reading does nothing with. 'operator' is the 'is' or 'as?' after the value.
@@ -768,7 +862,13 @@ checkClassTypeTest(BodyChecker checker, Expression test, Expression value, Type 
     let hasElse = checker.ifConditionHasElse(test);
     string replaced = kept.length > 0 ? "the test" : wording.sideNamed(test, "the test");
     let place = capabilities.valuePlace(replaced, kept);
-    if (hasElse != null) {
+    if (isCast) {
+        string replacing = "Replace {wording.sideNamed(test, "the cast")} with 'null'.";
+        if (kept.length > 0) {
+            replacing = "{kept}, and replace the cast with 'null'.";
+        }
+        place = capabilities.castPlace(checker.castFixAt(test) ?? replacing);
+    } else if (hasElse != null) {
         place = capabilities.ifConditionPlace(hasElse, kept);
     }
     let issue = capabilities.typeTestIssue(source, target, isCast, place, checker.names(),
