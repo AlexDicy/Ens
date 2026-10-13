@@ -2070,6 +2070,7 @@ Draining one of the output streams to its end while the child fills the other ca
 With `mergeOutput`, which defaults to `false`, the child writes its standard error into the same pipe as its standard output, so `stdout()` reads both streams in the order the child wrote them, and `stderr()` returns a reader that has already ended.
 A merged child leaves no second stream for this process to drain, which is the shape for a program whose two streams are one account of what it is doing, such as a build tool whose lines are shown as they arrive.
 `waitForOutput(timeoutMillis)` reports whether reading can go ahead without waiting for the child: `true` when either stream has bytes or has ended, and `false` when that many milliseconds went by with neither, where a bound of `0` checks this moment alone.
+Bytes that `stdout()` or `stderr()` has already taken from its pipe count as well, so a second line that arrived together with the first is reported without asking the system.
 Reading itself waits as long as the child takes, so a program that can wait never needs to call `waitForOutput`.
 `wait()` returns the exit status, waiting for the child to finish first and reading and throwing away output nobody read meanwhile, because a child whose output nobody reads is stopped by a full pipe.
 `wait(timeoutMillis)` is the same call bounded, returning `null` once that many milliseconds have passed with the child still running.
