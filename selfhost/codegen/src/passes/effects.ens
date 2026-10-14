@@ -1,0 +1,1002 @@
+// Write effects, the second read-only prepass of the optimization pipeline. For every function of
+// the lowered program it computes the shared places the function can write while it runs: one
+// field of one class, which every subclass inherits, or an element of an array of one type. A
+// function writes what its own stores and releases write, plus what everything it can run writes:
+// the callee of a direct call, every override a dispatched call can reach, every closure body a
+// function value of the called type was made over, and the destructor of every class a reference
+// it releases can hold. A foreign call, and a call nothing here can name, writes everything. The
+// effects are iterated to a fixpoint over the call graph the way the escape facts are, and they
+// are read-only values once computed, so the passes reading them stay pure.
+import EirFunction from eir.model;
+import EirInstruction from eir.model;
+import EirTerminator from eir.model;
+import EirCallee from eir.model;
+import EirCall from eir.model;
+import EirTryCall from eir.model;
+import EirClosureCall from eir.model;
+import EirTryClosureCall from eir.model;
+import EirClosureNew from eir.model;
+import EirClosureCapture from eir.model;
+import EirClassNew from eir.model;
+import EirGlobalAddress from eir.model;
+import EirStorePtr from eir.model;
+import EirReleasePtr from eir.model;
+import EirRelease from eir.model;
+import EirWeakStore from eir.model;
+import EirWeakRelease from eir.model;
+import EirForeignCall from eir.model;
+import EirDynamicEquals from eir.model;
+import EirDynamicHash from eir.model;
+import EirDynamicToString from eir.model;
+import Type from @ens.sema.model.types;
+import @ens.sema.model.typemembers;
+import @ens.sema.model.typenames;
+import DescriptorPlan from layout.descriptors;
+import DescriptorPlans from layout.descriptors;
+import FunctionInfo from lower.index;
+import layout.vtables;
+import Place from eir.place;
+import PlaceRoot from eir.place;
+import AddressPlaces from eir.place;
+import eir.place;
+import passes.devirtualize;
+import passes.scan;
+import support.primitives;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+import Set from @std.collections.set;
+
+// The places the program writes, each interned as a small integer the first time a write names
+// it: field i of the class that declares it, so a write through a subclass reference and a read
+// through the base agree, or an element of an array of one type. A place no write ever named has
+// no number, which is what tells a reader nothing writes it.
+public final class WritePlaces {
+    Map<Type, long[]> fieldPlaces;
+    Map<Type, long> elementPlaces;
+    List<string> descriptions;
+
+    public constructor() {
+        this.fieldPlaces = new Map<Type, long[]>();
+        this.elementPlaces = new Map<Type, long>();
+        this.descriptions = new List<string>();
+    }
+
+    public count() -> long {
+        return this.descriptions.length();
+    }
+
+    // The place of the field at `fieldIndex`, counted over the flattened fields of an object of
+    // `classType`, or -1 when no write named it.
+    public fieldPlace(Type classType, long fieldIndex) -> long {
+        let declaring = declaringClassOf(classType, fieldIndex);
+        if (declaring == null) {
+            return -1;
+        }
+        let known = this.fieldPlaces.get(declaring);
+        if (known == null || fieldIndex < 0 || fieldIndex >= known.length) {
+            return -1;
+        }
+        return known[fieldIndex];
+    }
+
+    // The place of the elements of arrays of `arrayType`, or -1 when no write named it.
+    public elementPlace(Type arrayType) -> long {
+        return this.elementPlaces.get(arrayType) ?? -1;
+    }
+
+    // What a place is, as "Holder.held" or "Child[] element", for the account and the tests.
+    public describe(long place) -> string {
+        return this.descriptions.get(place);
+    }
+
+    // The place of a field, numbered now when it was not yet. -1 when `classType` names no class
+    // code generation lays out, which no lowered write reaches.
+    protected internField(Type classType, long fieldIndex) -> long {
+        let declaring = declaringClassOf(classType, fieldIndex);
+        if (declaring == null) {
+            return -1;
+        }
+        let fields = typemembers.fieldsOf(declaring);
+        if (fields == null) {
+            return -1;
+        }
+        let known = this.fieldPlaces.get(declaring);
+        if (known == null) {
+            known = new long[fields.length()];
+            for (long i = 0; i < known.length; i++) {
+                known[i] = -1;
+            }
+            this.fieldPlaces.set(declaring, known);
+        }
+        if (known[fieldIndex] < 0) {
+            known[fieldIndex] = this.descriptions.length();
+            this.descriptions.push(typenames.display(declaring) + "."
+                + fields.get(fieldIndex).name());
+        }
+        return known[fieldIndex];
+    }
+
+    protected internElement(Type arrayType) -> long {
+        let known = this.elementPlaces.get(arrayType);
+        if (known != null) {
+            return known;
+        }
+        long place = this.descriptions.length();
+        this.descriptions.push(typenames.display(arrayType) + " element");
+        this.elementPlaces.set(arrayType, place);
+        return place;
+    }
+}
+
+// The class up the chain from `classType` that declares the field at a flattened index, which is
+// the highest base whose own flattened fields still reach the index. Null when `classType` is no
+// class or the index is outside its fields.
+declaringClassOf(Type classType, long fieldIndex) -> Type? {
+    let current = primitives.classOf(primitives.underOptionals(classType));
+    if (current == null) {
+        return null;
+    }
+    let fields = typemembers.fieldsOf(current);
+    if (fields == null || fieldIndex < 0 || fieldIndex >= fields.length()) {
+        return null;
+    }
+    Type declaring = current;
+    let base = vtables.baseClassOf(current);
+    while (base != null) {
+        let baseFields = typemembers.fieldsOf(base);
+        if (baseFields == null || baseFields.length() <= fieldIndex) {
+            break;
+        }
+        declaring = base;
+        base = vtables.baseClassOf(base);
+    }
+    return declaring;
+}
+
+// A set of places: a bitset over the interned places, or every place at once.
+public final class WriteSet {
+    long[] words;
+    bool everything;
+
+    public constructor(long placeCount) {
+        this.words = new long[(placeCount + 63) / 64];
+        this.everything = false;
+    }
+
+    public writesEverything() -> bool {
+        return this.everything;
+    }
+
+    public contains(long place) -> bool {
+        if (this.everything) {
+            return true;
+        }
+        if (place < 0 || place / 64 >= this.words.length) {
+            return false;
+        }
+        return (this.words[place / 64] & (1L << (place % 64))) != 0;
+    }
+
+    // Adds one place; true when the set grew.
+    public add(long place) -> bool {
+        if (this.everything || this.contains(place)) {
+            return false;
+        }
+        if (place / 64 >= this.words.length) {
+            this.words = grown(this.words, place / 64 + 1);
+        }
+        this.words[place / 64] = this.words[place / 64] | (1L << (place % 64));
+        return true;
+    }
+
+    public addEverything() -> bool {
+        if (this.everything) {
+            return false;
+        }
+        this.everything = true;
+        return true;
+    }
+
+    public addAll(WriteSet other) -> bool {
+        if (other.everything) {
+            return this.addEverything();
+        }
+        if (this.everything) {
+            return false;
+        }
+        if (other.words.length > this.words.length) {
+            this.words = grown(this.words, other.words.length);
+        }
+        bool grew = false;
+        for (long i = 0; i < other.words.length; i++) {
+            long joined = this.words[i] | other.words[i];
+            if (joined != this.words[i]) {
+                this.words[i] = joined;
+                grew = true;
+            }
+        }
+        return grew;
+    }
+}
+
+grown(long[] words, long length) -> long[] {
+    long[] copy = new long[length];
+    for (long i = 0; i < words.length; i++) {
+        copy[i] = words[i];
+    }
+    return copy;
+}
+
+// What one function can write while it runs: the shared places, and which of its entry temps
+// that arrive as addresses - a struct receiver, a parameter passed by address - it writes
+// through, which a caller resolves to the storage it passed there.
+public final class FunctionEffects {
+    WriteSet placesWritten;
+    bool[] positionsWritten;
+
+    public constructor(long placeCount, long positionCount) {
+        this.placesWritten = new WriteSet(placeCount);
+        this.positionsWritten = new bool[positionCount];
+    }
+
+    public writes() -> WriteSet {
+        return this.placesWritten;
+    }
+
+    public writesThrough(long position) -> bool {
+        return position >= 0 && position < this.positionsWritten.length
+            && this.positionsWritten[position];
+    }
+
+    public positionCount() -> long {
+        return this.positionsWritten.length;
+    }
+
+    // Grows these effects by what a span of the function's code was found to do; true when
+    // anything was new.
+    protected absorb(SpanEffect found) -> bool {
+        bool grew = this.placesWritten.addAll(found.writes());
+        for (long i = 0; i < this.positionsWritten.length && i < found.positions.length; i++) {
+            if (found.positions[i] && !this.positionsWritten[i]) {
+                this.positionsWritten[i] = true;
+                grew = true;
+            }
+        }
+        return grew;
+    }
+}
+
+// The functions one instruction can run, or that nothing here can name them.
+final class Targets {
+    protected List<long> functions;
+    protected bool unknown;
+
+    protected constructor() {
+        this.functions = new List<long>();
+        this.unknown = false;
+    }
+}
+
+// The address an operand passes to a callee position that may write through it, as the caller
+// sees it: a slot of its own, one of its own address positions, or a shared place, which is -1
+// when the write cannot be placed.
+final class AddressOperand {
+    protected PlaceRoot root;
+    protected long id;
+
+    protected constructor(this.root, this.id);
+}
+
+// One call a span of code makes: the functions it can run, and per position of those functions
+// the address operand passed there, null for a value operand.
+final class CallSite {
+    protected Targets targets;
+    protected AddressOperand?[] operands;
+
+    protected constructor(this.targets, this.operands);
+}
+
+// What a span of one function's code does, before the effects of what it calls are known: the
+// places its own stores and releases write, the address positions of the function it writes
+// through itself, and the calls it makes.
+public final class SpanSummary {
+    protected List<long> places;
+    protected List<long> positions;
+    protected bool everything;
+    protected List<CallSite> sites;
+
+    protected constructor() {
+        this.places = new List<long>();
+        this.positions = new List<long>();
+        this.everything = false;
+        this.sites = new List<CallSite>();
+    }
+}
+
+// What a span of one function's code can write, its calls resolved: the shared places, the
+// function's own address positions written through, and the function's own slots whose storage
+// a callee can write through an address it was passed.
+public final class SpanEffect {
+    protected WriteSet placesWritten;
+    protected bool[] positions;
+    protected bool[] slots;
+
+    protected constructor(long placeCount, long positionCount, long slotCount) {
+        this.placesWritten = new WriteSet(placeCount);
+        this.positions = new bool[positionCount];
+        this.slots = new bool[slotCount];
+    }
+
+    public writes() -> WriteSet {
+        return this.placesWritten;
+    }
+
+    public writesThroughAnyPosition() -> bool {
+        for (long i = 0; i < this.positions.length; i++) {
+            if (this.positions[i]) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public writesSlot(long slot) -> bool {
+        return slot >= 0 && slot < this.slots.length && this.slots[slot];
+    }
+}
+
+// The effects of every function of the lowered program, keyed by linker symbol, and the way to
+// ask the same question of one span of a function's code against them.
+public final class ProgramEffects {
+    WritePlaces interned;
+    Program program;
+    List<FunctionEffects> table;
+
+    protected constructor(this.interned, this.program, this.table);
+
+    public places() -> WritePlaces {
+        return this.interned;
+    }
+
+    public effectsOf(string symbol) -> FunctionEffects? {
+        let index = this.program.indexOf(symbol);
+        if (index < 0) {
+            return null;
+        }
+        return this.table.get(index);
+    }
+
+    // What a span of one function's code does on its own and whom it calls. `defs` and `users`
+    // are the function's definition and use tables, which is how a dispatched call on a receiver
+    // of a proven class is resolved to that class's method.
+    public summarize(EirFunction function, AddressPlaces places, EirInstruction?[] defs,
+                     List<List<EirInstruction>> users, List<EirInstruction> instructions,
+                     List<EirTerminator> terminators) -> SpanSummary {
+        let scanner = new Scanner(function, places, defs, users, this.program, this.interned);
+        for (let instruction in instructions) {
+            scanner.scanInstruction(instruction);
+        }
+        for (let terminator in terminators) {
+            scanner.scanTerminator(terminator);
+        }
+        return scanner.summary;
+    }
+
+    // What a summarized span can write, with every call resolved through the functions' effects.
+    public evaluate(EirFunction function, SpanSummary summary) -> SpanEffect {
+        return evaluateSpan(function, summary, this.interned.count(), this.table);
+    }
+}
+
+// The effects of the whole lowered program.
+public analyze(List<EirFunction> functions, DescriptorPlans plans) -> ProgramEffects {
+    let interned = new WritePlaces();
+    let program = new Program(functions, plans);
+    let summaries = new List<SpanSummary>();
+    for (long i = 0; i < functions.length(); i++) {
+        summaries.push(summarizeFunction(functions.get(i), program, interned));
+    }
+    let table = new List<FunctionEffects>();
+    for (long i = 0; i < functions.length(); i++) {
+        table.push(new FunctionEffects(interned.count(), functions.get(i).entryTempCount()));
+    }
+    let callers = callersOf(summaries, functions.length());
+    bool[] queued = new bool[functions.length()];
+    let pending = new List<long>();
+    for (long i = functions.length() - 1; i >= 0; i--) {
+        pending.push(i);
+        queued[i] = true;
+    }
+    while (!pending.isEmpty()) {
+        long next = pending.pop();
+        queued[next] = false;
+        let found = evaluateSpan(functions.get(next), summaries.get(next), interned.count(),
+            table);
+        if (!table.get(next).absorb(found)) {
+            continue;
+        }
+        for (let caller in callers.get(next)) {
+            if (!queued[caller]) {
+                queued[caller] = true;
+                pending.push(caller);
+            }
+        }
+    }
+    return new ProgramEffects(interned, program, table);
+}
+
+summarizeFunction(EirFunction function, Program program, WritePlaces interned) -> SpanSummary {
+    let scanner = new Scanner(function, place.addressPlaces(function), scan.definitionsOf(function),
+        scan.usersOf(function), program, interned);
+    for (let block in function.blocks()) {
+        for (let instruction in block.instructions()) {
+            scanner.scanInstruction(instruction);
+        }
+        let terminator = block.terminator();
+        if (terminator != null) {
+            scanner.scanTerminator(terminator);
+        }
+    }
+    return scanner.summary;
+}
+
+// The functions whose summary runs each function, so a function whose effects grew is followed
+// by another look at each of them.
+callersOf(List<SpanSummary> summaries, long count) -> List<List<long>> {
+    let callers = new List<List<long>>();
+    for (long i = 0; i < count; i++) {
+        callers.push(new List<long>());
+    }
+    for (long caller = 0; caller < count; caller++) {
+        for (let site in summaries.get(caller).sites) {
+            for (let target in site.targets.functions) {
+                let known = callers.get(target);
+                if (known.isEmpty() || known.last() != caller) {
+                    known.push(caller);
+                }
+            }
+        }
+    }
+    return callers;
+}
+
+// A summarized span's effect against the functions' effects as they stand.
+evaluateSpan(EirFunction function, SpanSummary summary, long placeCount,
+             List<FunctionEffects> table) -> SpanEffect {
+    let effect = new SpanEffect(placeCount, function.entryTempCount(), function.slots().length());
+    if (summary.everything) {
+        let ignored = effect.placesWritten.addEverything();
+    }
+    for (let place in summary.places) {
+        let ignored = effect.placesWritten.add(place);
+    }
+    for (let position in summary.positions) {
+        effect.positions[position] = true;
+    }
+    for (let site in summary.sites) {
+        if (site.targets.unknown) {
+            let ignored = effect.placesWritten.addEverything();
+        }
+        for (let target in site.targets.functions) {
+            let callee = table.get(target);
+            let ignored = effect.placesWritten.addAll(callee.writes());
+            for (long position = 0; position < callee.positionCount(); position++) {
+                if (callee.writesThrough(position)) {
+                    writeThroughOperand(effect, operandAt(site, position));
+                }
+            }
+        }
+    }
+    return effect;
+}
+
+operandAt(CallSite site, long position) -> AddressOperand? {
+    if (position < 0 || position >= site.operands.length) {
+        return null;
+    }
+    return site.operands[position];
+}
+
+// A callee writes through the address passed at one position: that is a write to whatever the
+// caller passed, and a write nothing here can place is a write to everything.
+writeThroughOperand(SpanEffect effect, AddressOperand? operand) {
+    if (operand == null) {
+        let ignored = effect.placesWritten.addEverything();
+        return;
+    }
+    switch (operand.root) {
+        PlaceRoot.Slot -> {
+            effect.slots[operand.id] = true;
+        },
+        PlaceRoot.Receiver -> {
+            effect.positions[operand.id] = true;
+        },
+        default -> {
+            if (operand.id < 0) {
+                let ignored = effect.placesWritten.addEverything();
+            } else {
+                let ignored = effect.placesWritten.add(operand.id);
+            }
+        },
+    }
+}
+
+// The lowered program as the summaries read it: its functions by symbol, the classes below each
+// type and the destructor each allocated class carries, the bodies and destructors of the closures
+// made over each function type, and the implementations the language-called slots hold.
+final class Program {
+    protected DescriptorPlans plans;
+    Map<string, long> indexBySymbol;
+    Map<Type, List<Type>> descendants;
+    Map<Type, List<Type>> conformers;
+    Map<Type, DescriptorPlan> planByType;
+    Map<Type, string> destructorByClass;
+    Map<Type, List<string>> closureBodies;
+    Map<Type, List<string>> closureDestructors;
+    Set<string> destructorSymbols;
+    protected List<string> hashes;
+    protected List<string> equalities;
+    protected List<string> texts;
+
+    protected constructor(List<EirFunction> functions, DescriptorPlans plans) {
+        this.plans = plans;
+        this.indexBySymbol = new Map<string, long>();
+        for (long i = 0; i < functions.length(); i++) {
+            this.indexBySymbol.set(functions.get(i).symbol(), i);
+        }
+        this.descendants = new Map<Type, List<Type>>();
+        this.conformers = new Map<Type, List<Type>>();
+        this.planByType = new Map<Type, DescriptorPlan>();
+        this.hashes = new List<string>();
+        this.equalities = new List<string>();
+        this.texts = new List<string>();
+        for (let plan in plans.all()) {
+            this.indexPlan(plan);
+        }
+        this.destructorByClass = new Map<Type, string>();
+        this.closureBodies = new Map<Type, List<string>>();
+        this.closureDestructors = new Map<Type, List<string>>();
+        this.destructorSymbols = new Set<string>();
+        for (let function in functions) {
+            this.indexAllocations(function);
+        }
+    }
+
+    protected indexOf(string symbol) -> long {
+        return this.indexBySymbol.get(symbol) ?? -1;
+    }
+
+    // Records one class's plan under itself and every type above it, and the implementations it
+    // declares for the slots the language calls.
+    indexPlan(DescriptorPlan plan) {
+        this.planByType.set(plan.type(), plan);
+        if (primitives.classOf(plan.type()) == null) {
+            return;
+        }
+        Type? ancestor = plan.type();
+        while (ancestor != null) {
+            listed(this.descendants, ancestor).push(plan.type());
+            ancestor = vtables.baseClassOf(ancestor);
+        }
+        for (let conformance in plan.conformances()) {
+            listed(this.conformers, conformance.interfaceType()).push(plan.type());
+        }
+        pushSymbol(this.hashes, plan.hashSlot());
+        pushSymbol(this.equalities, plan.equalsSlot());
+        pushSymbol(this.texts, plan.toStringSlot());
+    }
+
+    // Records what one function allocates: the destructor each class it instantiates carries,
+    // and the body and destructor behind each function value it makes.
+    indexAllocations(EirFunction function) {
+        for (let block in function.blocks()) {
+            for (let instruction in block.instructions()) {
+                if (instruction is EirClassNew) {
+                    this.destructorByClass.set(instruction.type, instruction.destructorSymbol);
+                    let ignored = this.destructorSymbols.add(instruction.destructorSymbol);
+                } else if (instruction is EirClosureNew) {
+                    Type made = primitives.underOptionals(instruction.type);
+                    pushUnique(listed(this.closureBodies, made), instruction.targetSymbol);
+                    if (instruction.destructorSymbol.length > 0) {
+                        pushUnique(listed(this.closureDestructors, made),
+                            instruction.destructorSymbol);
+                        let ignored = this.destructorSymbols.add(instruction.destructorSymbol);
+                    }
+                }
+            }
+        }
+    }
+
+    protected isDestructor(string symbol) -> bool {
+        return this.destructorSymbols.contains(symbol);
+    }
+
+    // The function a symbol defines, into `targets`; a symbol no function defines is unknown.
+    protected addSymbol(Targets targets, string symbol) {
+        long index = this.indexOf(symbol);
+        if (index < 0) {
+            targets.unknown = true;
+            return;
+        }
+        pushUnique(targets.functions, index);
+    }
+
+    // Every implementation a dispatched call on a receiver known as `through` can reach at one
+    // slot: of the class method slot for every allocated class at or below `through`, or of the
+    // interface's slot for every allocated class conforming to it.
+    protected addImplementations(Targets targets, Type? receiverType, Type? dispatchInterface,
+                                 long slot) {
+        if (dispatchInterface != null) {
+            for (let conformer in this.conformers.get(dispatchInterface) ?? new List<Type>()) {
+                this.addInterfaceSlot(targets, conformer, dispatchInterface, slot);
+            }
+            return;
+        }
+        if (receiverType == null) {
+            targets.unknown = true;
+            return;
+        }
+        Type through = primitives.underOptionals(receiverType);
+        for (let descendant in this.descendants.get(through) ?? new List<Type>()) {
+            let plan = this.planByType.get(descendant);
+            if (plan == null) {
+                continue;
+            }
+            let table = plan.vtable();
+            if (slot >= 0 && slot < table.length) {
+                this.addImplementation(targets, table[slot]);
+            }
+        }
+    }
+
+    addInterfaceSlot(Targets targets, Type conformer, Type dispatchInterface, long slot) {
+        let plan = this.planByType.get(conformer);
+        if (plan == null) {
+            return;
+        }
+        for (let conformance in plan.conformances()) {
+            if (conformance.interfaceType() != dispatchInterface) {
+                continue;
+            }
+            let implementations = conformance.implementations();
+            if (slot >= 0 && slot < implementations.length) {
+                this.addImplementation(targets, implementations[slot]);
+            }
+        }
+    }
+
+    // An abstract slot holds no implementation, and a class whose slot is abstract is never the
+    // runtime type of a value.
+    addImplementation(Targets targets, FunctionInfo? implementation) {
+        if (implementation != null) {
+            this.addSymbol(targets, implementation.symbol());
+        }
+    }
+
+    // Every body a call through a function value of `functionType` can run. A type no closure was
+    // made over leaves the call unknown.
+    protected addClosureBodies(Targets targets, Type functionType) {
+        let bodies = this.closureBodies.get(primitives.underOptionals(functionType));
+        if (bodies == null) {
+            targets.unknown = true;
+            return;
+        }
+        for (let body in bodies) {
+            this.addSymbol(targets, body);
+        }
+    }
+
+    // Every destructor releasing the last reference to a value of `type` can run: of each allocated
+    // class at or below a class, or conforming to an interface; of each closure made over a
+    // function type; and of whatever an array's elements, a struct's fields and an optional's
+    // payload hold, each type looked at once, since a struct may hold an array of itself. A class
+    // never allocated and a function type no closure was made over are never the runtime type of
+    // a value, so they run nothing.
+    protected addDestructors(Targets targets, Type type) {
+        let seen = new Set<Type>();
+        let pending = new List<Type>();
+        pending.push(type);
+        while (!pending.isEmpty()) {
+            Type released = primitives.underOptionals(pending.pop());
+            if (!seen.add(released)) {
+                continue;
+            }
+            let array = primitives.arrayOf(released);
+            if (primitives.classOf(released) != null) {
+                for (let descendant in this.descendants.get(released) ?? new List<Type>()) {
+                    this.addClassDestructor(targets, descendant);
+                }
+            } else if (primitives.interfaceOf(released) != null) {
+                for (let conformer in this.conformers.get(released) ?? new List<Type>()) {
+                    this.addClassDestructor(targets, conformer);
+                }
+            } else if (primitives.functionOf(released) != null) {
+                for (let finalizer in this.closureDestructors.get(released) ?? new List<string>()) {
+                    this.addSymbol(targets, finalizer);
+                }
+            } else if (array != null) {
+                pending.push(array.element());
+            } else {
+                this.pushArcFields(pending, released);
+            }
+        }
+    }
+
+    pushArcFields(List<Type> pending, Type released) {
+        let structType = primitives.structOf(released);
+        if (structType == null) {
+            return;
+        }
+        let fields = typemembers.fieldsOf(structType);
+        if (fields == null) {
+            return;
+        }
+        for (let field in fields) {
+            if (primitives.hasArcContent(field.type())) {
+                pending.push(field.type());
+            }
+        }
+    }
+
+    addClassDestructor(Targets targets, Type classType) {
+        let finalizer = this.destructorByClass.get(classType);
+        if (finalizer != null) {
+            this.addSymbol(targets, finalizer);
+        }
+    }
+
+    protected addBehaviors(Targets targets, List<string> implementations) {
+        for (let symbol in implementations) {
+            this.addSymbol(targets, symbol);
+        }
+    }
+}
+
+listed(Map<Type, List<Type>> map, Type key) -> List<Type> {
+    let known = map.get(key);
+    if (known != null) {
+        return known;
+    }
+    let made = new List<Type>();
+    map.set(key, made);
+    return made;
+}
+
+listed(Map<Type, List<string>> map, Type key) -> List<string> {
+    let known = map.get(key);
+    if (known != null) {
+        return known;
+    }
+    let made = new List<string>();
+    map.set(key, made);
+    return made;
+}
+
+pushSymbol(List<string> symbols, FunctionInfo? implementation) {
+    if (implementation != null) {
+        symbols.push(implementation.symbol());
+    }
+}
+
+pushUnique(List<string> symbols, string symbol) {
+    for (long i = 0; i < symbols.length(); i++) {
+        if (symbols.get(i) == symbol) {
+            return;
+        }
+    }
+    symbols.push(symbol);
+}
+
+pushUnique(List<long> values, long value) {
+    for (long i = 0; i < values.length(); i++) {
+        if (values.get(i) == value) {
+            return;
+        }
+    }
+    values.push(value);
+}
+
+// One span of one function being summarized. It lives no longer than the summary it builds.
+final class Scanner {
+    EirFunction function;
+    AddressPlaces places;
+    EirInstruction?[] defs;
+    List<List<EirInstruction>> users;
+    Program program;
+    WritePlaces interned;
+    bool inDestructor;
+    protected SpanSummary summary;
+
+    protected constructor(EirFunction function, AddressPlaces places, EirInstruction?[] defs,
+                          List<List<EirInstruction>> users, Program program, WritePlaces interned) {
+        this.function = function;
+        this.places = places;
+        this.defs = defs;
+        this.users = users;
+        this.program = program;
+        this.interned = interned;
+        this.inDestructor = program.isDestructor(function.symbol());
+        this.summary = new SpanSummary();
+    }
+
+    protected scanInstruction(EirInstruction instruction) {
+        switch (instruction) {
+            is EirStorePtr store -> {
+                this.writeAddress(store.address);
+            },
+            is EirReleasePtr release -> {
+                this.releaseStorage(release.address, true);
+            },
+            is EirWeakStore store -> {
+                this.writeAddress(store.address);
+            },
+            is EirWeakRelease release -> {
+                this.releaseStorage(release.address, false);
+            },
+            is EirRelease release -> {
+                this.releaseValue(release.value);
+            },
+            is EirCall call -> {
+                this.call(call.callee, call.receiver, call.arguments, call.dispatchSlot,
+                    call.dispatchInterface);
+            },
+            is EirClosureCall call -> {
+                this.closureCall(call.closure);
+            },
+            is EirForeignCall call -> {
+                this.summary.everything = true;
+            },
+            is EirDynamicEquals equality -> {
+                this.behaviors(this.program.equalities);
+            },
+            is EirDynamicHash hashed -> {
+                this.behaviors(this.program.hashes);
+            },
+            is EirDynamicToString text -> {
+                this.behaviors(this.program.texts);
+            },
+            default -> { },
+        }
+    }
+
+    protected scanTerminator(EirTerminator terminator) {
+        switch (terminator) {
+            is EirTryCall call -> {
+                this.call(call.callee, call.receiver, call.arguments, call.dispatchSlot,
+                    call.dispatchInterface);
+            },
+            is EirTryClosureCall call -> {
+                this.closureCall(call.closure);
+            },
+            default -> { },
+        }
+    }
+
+    // A store through an address writes the place the address names. A slot is this function's
+    // own; an address the function was passed is written through that position; the storage of
+    // a closure object is written only where the object is made and read only by its own body,
+    // and a lazy constant's storage is read by nothing a shared place covers.
+    writeAddress(long address) {
+        let named = this.places.placeOf(address);
+        if (named == null) {
+            let definition = this.defs[address];
+            if (definition is EirClosureCapture || definition is EirGlobalAddress) {
+                return;
+            }
+            this.summary.everything = true;
+            return;
+        }
+        switch (named.root()) {
+            PlaceRoot.Slot -> { },
+            PlaceRoot.Receiver -> {
+                this.summary.positions.push(named.rootId());
+            },
+            default -> {
+                long place = this.internPlace(named);
+                if (place < 0) {
+                    this.summary.everything = true;
+                } else {
+                    this.summary.places.push(place);
+                }
+            },
+        }
+    }
+
+    // The place an object- or array-rooted address names, numbered: the field the chain starts
+    // at, whatever it goes on to inside a struct, or the element.
+    internPlace(Place named) -> long {
+        Type rootType = this.function.tempTypes().get(named.rootId());
+        if (named.root() == PlaceRoot.Array) {
+            return this.interned.internElement(primitives.underOptionals(rootType));
+        }
+        return this.interned.internField(rootType, named.steps().get(0).value());
+    }
+
+    // Releasing storage empties it, so it is a write, and releasing a strong reference may run
+    // the destructor of what it held, where a weak one only stops watching. A destructor emptying
+    // its own object's fields writes storage nothing else reads any more, so only the
+    // destructors it runs count.
+    releaseStorage(long address, bool frees) {
+        let named = this.places.placeOf(address);
+        bool ownObject = this.inDestructor && named != null && named.root() == PlaceRoot.Object
+            && named.rootId() == 0;
+        if (!ownObject) {
+            this.writeAddress(address);
+        }
+        if (frees) {
+            this.releaseValue(address);
+        }
+    }
+
+    releaseValue(long temp) {
+        let targets = new Targets();
+        this.program.addDestructors(targets, this.function.tempTypes().get(temp));
+        this.summary.sites.push(new CallSite(targets, []));
+    }
+
+    // One call: its callee, or every implementation a dispatched one can reach, with a receiver
+    // of a proven class narrowing that to one. The operands passed as addresses are recorded per
+    // position, so a callee writing through one is a write to what was passed there.
+    call(EirCallee callee, long receiver, long[] arguments, long dispatchSlot,
+         Type? dispatchInterface) {
+        let targets = new Targets();
+        if (dispatchSlot < 0) {
+            this.program.addSymbol(targets, callee.symbol());
+        } else {
+            string exact = devirtualize.singleTarget(this.function, this.program.plans, this.defs,
+                this.users, receiver, dispatchSlot, dispatchInterface);
+            if (exact.length > 0) {
+                this.program.addSymbol(targets, exact);
+            } else {
+                this.program.addImplementations(targets, callee.receiverType(), dispatchInterface,
+                    dispatchSlot);
+            }
+        }
+        long offset = 0;
+        let receiverType = callee.receiverType();
+        let operands = new AddressOperand?[arguments.length + (receiverType == null ? 0 : 1)];
+        if (receiverType != null) {
+            offset = 1;
+            if (primitives.receiverIsAddress(receiverType)) {
+                operands[0] = this.addressOperand(receiver);
+            }
+        }
+        for (long i = 0; i < arguments.length; i++) {
+            if (callee.passesByAddress(i)) {
+                operands[i + offset] = this.addressOperand(arguments[i]);
+            }
+        }
+        this.summary.sites.push(new CallSite(targets, operands));
+    }
+
+    // What an address operand names in this function.
+    addressOperand(long address) -> AddressOperand? {
+        let named = this.places.placeOf(address);
+        if (named == null) {
+            return null;
+        }
+        switch (named.root()) {
+            PlaceRoot.Slot -> {
+                return new AddressOperand(PlaceRoot.Slot, named.rootId());
+            },
+            PlaceRoot.Receiver -> {
+                return new AddressOperand(PlaceRoot.Receiver, named.rootId());
+            },
+            default -> {
+                return new AddressOperand(named.root(), this.internPlace(named));
+            },
+        }
+    }
+
+    closureCall(long closure) {
+        let targets = new Targets();
+        this.program.addClosureBodies(targets, this.function.tempTypes().get(closure));
+        this.summary.sites.push(new CallSite(targets, []));
+    }
+
+    behaviors(List<string> implementations) {
+        let targets = new Targets();
+        this.program.addBehaviors(targets, implementations);
+        this.summary.sites.push(new CallSite(targets, []));
+    }
+}

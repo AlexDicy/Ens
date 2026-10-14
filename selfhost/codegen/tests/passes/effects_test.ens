@@ -1,0 +1,355 @@
+// The write-effects prepass: for every lowered function, the shared places it can write while it
+// runs. Each test pins one way a place gets in, or provably stays out.
+import @std.testing;
+import TestFailure from @std.testing;
+import List from @std.collections.list;
+import ProgramEffects from passes.effects;
+import support;
+
+test "a store into a field names that field, and a function that only reads names nothing" {
+    let program = try support.lowerWholeProgram(
+        "class Box \{\n"
+        + "    protected int v;\n"
+        + "    protected constructor(this.v);\n"
+        + "\}\n"
+        + "class Holder \{\n"
+        + "    protected Box? kept;\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "keep(Holder h, Box b) \{\n"
+        + "    h.kept = b;\n"
+        + "\}\n"
+        + "read(Holder h) -> int \{\n"
+        + "    let kept = h.kept;\n"
+        + "    if (kept == null) \{\n"
+        + "        return 0;\n"
+        + "    \}\n"
+        + "    return kept.v;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let h = new Holder();\n"
+        + "    keep(h, new Box(3));\n"
+        + "    return read(h);\n"
+        + "\}\n");
+    let effects = support.passContext(program).effects();
+    try assertWrites(effects, "main$keep", ["Holder.kept"]);
+    try assertWrites(effects, "main$read", []);
+}
+
+test "a field written through a subclass and through its base is one place" {
+    let program = try support.lowerWholeProgram(
+        "class Box \{\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "class Base \{\n"
+        + "    protected Box? kept;\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "class Derived extends Base \{\n"
+        + "    protected Box? own;\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "viaBase(Base b) \{\n"
+        + "    b.kept = null;\n"
+        + "\}\n"
+        + "viaDerived(Derived d) \{\n"
+        + "    d.kept = null;\n"
+        + "    d.own = new Box();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    viaBase(new Derived());\n"
+        + "    viaDerived(new Derived());\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let effects = support.passContext(program).effects();
+    try assertWrites(effects, "main$viaBase", ["Base.kept"]);
+    try assertWrites(effects, "main$viaDerived", ["Base.kept", "Derived.own"]);
+}
+
+test "a store into an element names the elements of arrays of that type" {
+    let program = try support.lowerWholeProgram(
+        "class Box \{\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "fill(Box[] items, Box b) \{\n"
+        + "    items[0] = b;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    fill([new Box()], new Box());\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let effects = support.passContext(program).effects();
+    try assertWrites(effects, "main$fill", ["Box[] element"]);
+}
+
+test "a callee's writes reach every caller up a chain of throwing and recursive calls" {
+    let program = try support.lowerWholeProgram(
+        "class Failure extends Error \{\n"
+        + "    protected constructor(string message) \{\n"
+        + "        super(message);\n"
+        + "    \}\n"
+        + "\}\n"
+        + "class Box \{\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "class Holder \{\n"
+        + "    protected Box? kept;\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "start(Holder h, Box b) throws \{\n"
+        + "    try bounce(h, b, 3);\n"
+        + "\}\n"
+        + "bounce(Holder h, Box b, int n) throws \{\n"
+        + "    try relay(h, b, n);\n"
+        + "\}\n"
+        + "relay(Holder h, Box b, int n) throws \{\n"
+        + "    if (n < 0) \{\n"
+        + "        throw new Failure(\"negative\");\n"
+        + "    \}\n"
+        + "    if (n > 0) \{\n"
+        + "        try bounce(h, b, n - 1);\n"
+        + "        return;\n"
+        + "    \}\n"
+        + "    keep(h, b);\n"
+        + "\}\n"
+        + "keep(Holder h, Box b) \{\n"
+        + "    h.kept = b;\n"
+        + "\}\n"
+        + "main() -> int throws \{\n"
+        + "    try start(new Holder(), new Box());\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let effects = support.passContext(program).effects();
+    for (let symbol in ["main$start", "main$bounce", "main$relay"]) {
+        try assertWrites(effects, symbol, ["Holder.kept", "Error.message"]);
+    }
+    try assertWrites(effects, "main$keep", ["Holder.kept"]);
+}
+
+test "a dispatched call writes what every override writes, a proven receiver only its class's" {
+    let program = try support.lowerWholeProgram(
+        "class Box \{\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "class Holder \{\n"
+        + "    protected Box? kept;\n"
+        + "    protected Box? other;\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "class Animal \{\n"
+        + "    protected constructor();\n"
+        + "    protected visit(Holder h) -> int \{\n"
+        + "        return 0;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "class Dog extends Animal \{\n"
+        + "    protected constructor();\n"
+        + "    protected override visit(Holder h) -> int \{\n"
+        + "        h.kept = new Box();\n"
+        + "        return 1;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "class Cat extends Animal \{\n"
+        + "    protected constructor();\n"
+        + "    protected override visit(Holder h) -> int \{\n"
+        + "        h.other = new Box();\n"
+        + "        return 2;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "poke(Animal a, Holder h) -> int \{\n"
+        + "    return a.visit(h);\n"
+        + "\}\n"
+        + "pokeCat(Holder h) -> int \{\n"
+        + "    let c = new Cat();\n"
+        + "    return c.visit(h);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let h = new Holder();\n"
+        + "    return poke(new Dog(), h) + poke(new Cat(), h) + pokeCat(h);\n"
+        + "\}\n");
+    let effects = support.passContext(program).effects();
+    try assertWrites(effects, "main$poke", ["Holder.kept", "Holder.other"]);
+    try assertWrites(effects, "main$pokeCat", ["Holder.other"]);
+}
+
+test "a call through a function value writes what every closure of its type writes" {
+    let program = try support.lowerWholeProgram(
+        "class Box \{\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "class Holder \{\n"
+        + "    protected Box? kept;\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "apply((Holder) -> int f, Holder h) -> int \{\n"
+        + "    return f(h);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let h = new Holder();\n"
+        + "    int first = apply((Holder x) -> \{\n"
+        + "        x.kept = new Box();\n"
+        + "        return 1;\n"
+        + "    \}, h);\n"
+        + "    return first + apply((Holder x) -> 0, h);\n"
+        + "\}\n");
+    let effects = support.passContext(program).effects();
+    try assertWrites(effects, "main$apply", ["Holder.kept"]);
+}
+
+test "a release runs the destructors of the classes it can free, whose own fields count for nothing" {
+    let program = try support.lowerWholeProgram(
+        "class Log \{\n"
+        + "    protected int count;\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "class Tracker \{\n"
+        + "    protected Log log;\n"
+        + "    protected constructor(this.log);\n"
+        + "    destructor() \{\n"
+        + "        this.log.count = this.log.count + 1;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "class Box \{\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "class Plain \{\n"
+        + "    protected Box inner;\n"
+        + "    protected constructor(this.inner);\n"
+        + "\}\n"
+        + "dropTracker(Tracker? t) \{\n"
+        + "    t = null;\n"
+        + "\}\n"
+        + "dropPlain(Plain? p) \{\n"
+        + "    p = null;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    dropTracker(new Tracker(new Log()));\n"
+        + "    dropPlain(new Plain(new Box()));\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let effects = support.passContext(program).effects();
+    try assertWrites(effects, "main$dropTracker", ["Log.count"]);
+    try assertWrites(effects, "main$dropPlain", []);
+}
+
+test "releasing a struct that holds an array of itself runs the destructors of what it holds" {
+    let program = try support.lowerWholeProgram(
+        "class Log \{\n"
+        + "    protected int count;\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "class Tracker \{\n"
+        + "    protected Log log;\n"
+        + "    protected constructor(this.log);\n"
+        + "    destructor() \{\n"
+        + "        this.log.count = this.log.count + 1;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "struct Node \{\n"
+        + "    protected Node[] children;\n"
+        + "    protected Tracker? tracker;\n"
+        + "\}\n"
+        + "drop(Node[]? nodes) \{\n"
+        + "    nodes = null;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    Node leaf = \{children: [], tracker: new Tracker(new Log())\};\n"
+        + "    drop([leaf]);\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let effects = support.passContext(program).effects();
+    try assertWrites(effects, "main$drop", ["Log.count"]);
+}
+
+test "a foreign call writes everything" {
+    let program = try support.lowerWholeProgram(
+        "external from libc \{\n"
+        + "    strlen(byte[] s) -> int;\n"
+        + "\}\n"
+        + "measure(byte[] s) -> int \{\n"
+        + "    return strlen(s);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return measure(new byte[4]);\n"
+        + "\}\n");
+    let effects = support.passContext(program).effects();
+    let found = effects.effectsOf("main$measure");
+    if (found == null) {
+        throw new TestFailure("no effects for 'main$measure'");
+    }
+    try testing.assertTrue(found.writes().writesEverything(),
+        "a foreign call can write anything");
+}
+
+test "a struct method writing through its receiver writes the storage the caller passed" {
+    let program = try support.lowerWholeProgram(
+        "struct Counter \{\n"
+        + "    protected string label;\n"
+        + "    protected int n;\n"
+        + "    protected mutating rename() \{\n"
+        + "        this.label = \"x\";\n"
+        + "    \}\n"
+        + "    protected peek() -> int \{\n"
+        + "        return this.n;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "class Holder \{\n"
+        + "    protected Counter counter;\n"
+        + "    protected constructor(this.counter);\n"
+        + "\}\n"
+        + "renameHeld(Holder h) \{\n"
+        + "    h.counter.rename();\n"
+        + "\}\n"
+        + "peekHeld(Holder h) -> int \{\n"
+        + "    return h.counter.peek();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    Counter c = \{label: \"a\", n: 1\};\n"
+        + "    let h = new Holder(c);\n"
+        + "    renameHeld(h);\n"
+        + "    return peekHeld(h);\n"
+        + "\}\n");
+    let effects = support.passContext(program).effects();
+    try assertWrites(effects, "main$renameHeld", ["Holder.counter"]);
+    try assertWrites(effects, "main$peekHeld", []);
+    let rename = effects.effectsOf("main$Counter$rename");
+    let peek = effects.effectsOf("main$Counter$peek");
+    if (rename == null || peek == null) {
+        throw new TestFailure("no effects for the struct methods");
+    }
+    try testing.assertTrue(rename.writesThrough(0), "'rename' writes through 'this'");
+    try testing.assertFalse(peek.writesThrough(0), "'peek' only reads through 'this'");
+}
+
+// Asserts a function writes exactly the named places, and not everything.
+assertWrites(ProgramEffects effects, string symbol, string[] expected) throws {
+    let found = effects.effectsOf(symbol);
+    if (found == null) {
+        throw new TestFailure("no effects for '{symbol}'");
+    }
+    try testing.assertFalse(found.writes().writesEverything(),
+        "'{symbol}' must write only named places");
+    let written = new List<string>();
+    for (long place = 0; place < effects.places().count(); place++) {
+        if (found.writes().contains(place)) {
+            written.push(effects.places().describe(place));
+        }
+    }
+    for (let name in expected) {
+        try testing.assertTrue(written.contains(name),
+            "'{symbol}' must write {name}; it writes {joined(written)}");
+    }
+    try testing.assertTrue(written.length() == expected.length,
+        "'{symbol}' must write {expected.length} place(s); it writes {joined(written)}");
+}
+
+joined(List<string> names) -> string {
+    string text = "";
+    for (long i = 0; i < names.length(); i++) {
+        if (i > 0) {
+            text = text + ", ";
+        }
+        text = text + names.get(i);
+    }
+    return text;
+}
