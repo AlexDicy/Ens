@@ -2,6 +2,9 @@
 // into a per-module name table. Each stage completes for all modules before the next starts, so
 // circular imports link cleanly.
 import Module from program.graph;
+import GraphResult from program.graph;
+import UnloadedTypes from program.unloaded;
+import program.unloaded;
 import FileDeclarations from phases.declare;
 import ImportRecord from phases.declare;
 import phases.declare;
@@ -133,9 +136,31 @@ public class LinkResult {
     }
 }
 
-// declarations aligns with modules by index.
-public linkProgram(Module[] modules, FileDeclarations[] declarations, TypeStore store)
+// The types of the modules the graph did not load, read when the first refused import is reported
+// and kept for the rest of the link, because the scan parses every such file.
+class UnloadedScan {
+    GraphResult graph;
+    UnloadedTypes? scanned;
+
+    protected constructor(GraphResult graph) {
+        this.graph = graph;
+        this.scanned = null;
+    }
+
+    protected types() -> UnloadedTypes {
+        let ready = this.scanned;
+        if (ready == null) {
+            ready = unloaded.scan(this.graph);
+            this.scanned = ready;
+        }
+        return ready;
+    }
+}
+
+// declarations aligns with the graph's modules by index.
+public linkProgram(GraphResult graph, FileDeclarations[] declarations, TypeStore store)
         -> LinkResult {
+    Module[] modules = graph.modules();
     if (modules.length != declarations.length) {
         panic("Internal: link needs one FileDeclarations per module, got {declarations.length} "
             + "for {modules.length} modules");
@@ -156,9 +181,10 @@ public linkProgram(Module[] modules, FileDeclarations[] declarations, TypeStore 
     for (long i = 0; i < modules.length; i++) {
         registerPrimitiveBindings(store, modules[i], declarations[i], collected, boundPlaces);
     }
+    let unloadedScan = new UnloadedScan(graph);
     for (long i = 0; i < modules.length; i++) {
         tables.push(bindModuleImports(store, modules[i], declarations[i], declarationsByPath,
-            collected));
+            collected, unloadedScan));
     }
     return new LinkResult(tables.toArray(), diagnostics.sorted(collected), store);
 }
@@ -266,7 +292,8 @@ registerModuleTypes(TypeStore store, Module module, FileDeclarations declaration
 // failures of its other imports, exactly as signature resolution will read it.
 bindModuleImports(TypeStore store, Module module, FileDeclarations declarations,
                           Map<string, FileDeclarations> declarationsByPath,
-                          List<FileDiagnostic> collected) -> ModuleLinkTable {
+                          List<FileDiagnostic> collected, UnloadedScan unloadedScan)
+        -> ModuleLinkTable {
     ImportRecord[] records = declarations.imports();
     string?[] targets = module.importTargets();
     if (records.length != targets.length) {
@@ -330,7 +357,8 @@ bindModuleImports(TypeStore store, Module module, FileDeclarations declarations,
                 + "'{record.name()}' is a function. Write 'import {record.importPath()};' and call "
                 + "it as '{record.namespaceName()}.{record.name()}(...)'.");
         } else {
-            report(collected, module, record, missingTypeMessage(record, names));
+            report(collected, module, record, missingTypeMessage(record, module, names,
+                unloadedScan));
         }
         refused.push(record.boundName());
     }
@@ -411,9 +439,11 @@ repeatedImportMessage(ImportRecord record) -> string {
 }
 
 // The refusal of a named import whose module declares no type under the name: the import to
-// write where another module this file may name declares one, the import to remove where the
-// name needs none, or why the modules that do declare one keep it out of this file's reach.
-missingTypeMessage(ImportRecord record, TypeNames names) -> string {
+// write where another module this file may name declares one, loaded or not, the import to
+// remove where the name needs none, or why the modules that do declare one keep it out of this
+// file's reach.
+missingTypeMessage(ImportRecord record, Module module, TypeNames names,
+                   UnloadedScan unloadedScan) -> string {
     string name = record.name();
     string refusal = "Module '{diagnostics.sourceText(record.importPath())}' has no type named "
         + "'{name}'.";
@@ -421,28 +451,64 @@ missingTypeMessage(ImportRecord record, TypeNames names) -> string {
         return "{refusal} '{name}' is available in every file without an import, so remove this "
             + "import.";
     }
-    let declaring = names.importableTypesNamed(name);
-    if (declaring.length > 0) {
+    let scanned = unloadedScan.types();
+    let paths = new List<string>();
+    for (let declared in names.importableTypesNamed(name)) {
+        if (scanned.mayImport(module, declared.packagePrefix())) {
+            paths.push(names.importPathOf(declared));
+        }
+    }
+    for (let found in scanned.importableNamed(name, module)) {
+        paths.push(names.importPathTo(found.modulePath, found.packagePrefix));
+    }
+    if (paths.length() > 0) {
+        paths.sort();
         let imports = new List<string>();
-        for (let declared in declaring) {
-            imports.push("'{namedImport(record, names.importPathOf(declared))}'");
+        for (let path in paths) {
+            imports.push("'{namedImport(record, path)}'");
         }
         return "{refusal} Write {diagnostics.andJoined(imports.toArray(), "or")} instead.";
     }
-    let hidden = names.unreachableTypesNamed(name);
-    if (hidden.length == 0) {
+    let hidden = new List<HiddenOffer>();
+    for (let declared in names.unreachableTypesNamed(name)) {
+        if (scanned.mayImport(module, declared.packagePrefix())) {
+            hidden.push(new HiddenOffer(names.importPathOf(declared),
+                typenames.hiddenTypeReason(declared, names),
+                typenames.hiddenTypeFix(declared, names)));
+        }
+    }
+    for (let found in scanned.hiddenNamed(name, module)) {
+        string path = names.importPathTo(found.modulePath, found.packagePrefix);
+        string? fix = null;
+        if (found.editable) {
+            fix = typenames.hiddenFix(path, names.isOwnPackage(found.packagePrefix));
+        }
+        hidden.push(new HiddenOffer(path,
+            typenames.hiddenReason(name, path, found.packagePrefix, found.visibility), fix));
+    }
+    if (hidden.length() == 0) {
         return "{refusal} Check the spelling, or import '{name}' from the module that declares it.";
     }
+    hidden.sort((a, b) -> a.path.compareTo(b.path));
     string message = refusal;
-    for (let declared in hidden) {
-        message = "{message} {typenames.hiddenTypeReason(declared, names)}";
-        let fix = typenames.hiddenTypeFix(declared, names);
+    for (let offer in hidden) {
+        message = "{message} {offer.reason}";
+        let fix = offer.fix;
         if (fix != null) {
-            message = "{message} {fix}, then write "
-                + "'{namedImport(record, names.importPathOf(declared))}' instead.";
+            message = "{message} {fix}, then write '{namedImport(record, offer.path)}' instead.";
         }
     }
     return message;
+}
+
+// One module that declares the type a refused import named but keeps it out of the file's reach:
+// the path its import would spell, why the type cannot be imported, and the fix where there is one.
+class HiddenOffer {
+    protected string path;
+    protected string reason;
+    protected string? fix;
+
+    protected constructor(this.path, this.reason, this.fix);
 }
 
 // This named import written against another module path, keeping the name it binds.

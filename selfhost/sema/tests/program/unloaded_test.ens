@@ -1,0 +1,98 @@
+import Path from @std.fs;
+import @std.testing;
+import program.graph;
+import program.unloaded;
+import Visibility from model.types;
+import FakeFileLoader from sema_support;
+import sema_support;
+
+test "the scan lists the types of the module files the graph did not load" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/tool.ens", "import helper;\npublic class Tool \{ \}\n");
+    loader.add("/proj/src/helper.ens", "public class Helper \{ \}\n");
+    loader.add("/proj/src/lib/spare.ens", "class Spare \{ \}\nexport struct Bolt \{ \}\n");
+    loader.add("/proj/src/notes.txt", "class Note \{ \}\n");
+    loader.add("/proj/src/broken.ens", "public class Nut \{\n");
+    let result = graph.buildFileProgram(loader, Path("/proj/src"), Path(""), Path("/stdlib"),
+        "tool.ens");
+    try sema_support.assertNoDiagnostics(result.diagnostics());
+
+    let types = unloaded.scan(result).types();
+    try testing.assertEqual(types.length, 2L);
+    try testing.assertEqual(types[0].name, "Spare");
+    try testing.assertEqual(types[0].modulePath, "lib.spare");
+    try testing.assertEqual(types[0].packagePrefix, "");
+    try testing.assertTrue(types[0].visibility == Visibility.Private, "a plain class is private");
+    try testing.assertTrue(types[0].editable, "the program's own sources are the user's to edit");
+    try testing.assertEqual(types[1].name, "Bolt");
+    try testing.assertEqual(types[1].modulePath, "lib.spare");
+    try testing.assertTrue(types[1].visibility == Visibility.Export, "an exported struct");
+}
+
+test "the scan reads the tests root as modules of the program" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/main.ens", "");
+    loader.add("/proj/tests/main_test.ens", "test \"one\" \{ \}\n");
+    loader.add("/proj/tests/fixtures/samples.ens", "public class Sample \{ \}\n");
+    let result = graph.buildGraph(loader, Path("/proj/src"), Path("/proj/tests"),
+        Path("/stdlib"), ["main_test.ens"]);
+    try sema_support.assertNoDiagnostics(result.diagnostics());
+
+    let types = unloaded.scan(result).types();
+    try testing.assertEqual(types.length, 1L);
+    try testing.assertEqual(types[0].name, "Sample");
+    try testing.assertEqual(types[0].modulePath, "fixtures.samples");
+    try testing.assertEqual(types[0].packagePrefix, "");
+}
+
+// The packages a file may import from are its own, the ones its package declares as
+// dependencies, and the standard library; a dependency's own dependency is out of its reach.
+test "a package's files may import from its dependencies and the standard library" {
+    let loader = new FakeFileLoader();
+    loader.addCollections();
+    loader.add("/ens.package", "workspace \{\n"
+        + "    member \"proj\";\n"
+        + "    member \"proj/vendor/acme\";\n"
+        + "    member \"proj/vendor/util\";\n"
+        + "\}\n");
+    loader.add("/proj/ens.package", "package demo.app \{\n    ens \"0.1\";\n    dependency acme;\n\}\n");
+    loader.add("/proj/vendor/acme/ens.package",
+        "package acme \{\n    ens \"0.1\";\n    dependency util;\n\}\n");
+    loader.add("/proj/vendor/util/ens.package", "package util \{ ens \"0.1\"; \}\n");
+    loader.add("/proj/vendor/acme/src/tools.ens", "export class Wrench \{ \}\n");
+    loader.add("/proj/vendor/acme/src/parts.ens", "export class Gear \{ \}\npublic class Motor \{ \}\n");
+    loader.add("/proj/vendor/util/src/motors.ens", "export class Motor \{ \}\n");
+    loader.add("/proj/src/main.ens", "import @acme.tools;\n");
+    let result = graph.buildGraph(loader, Path("/proj/src"), Path(""), Path("/stdlib"),
+        ["main.ens"]);
+    try sema_support.assertNoDiagnostics(result.diagnostics());
+    let main = try sema_support.moduleWithPath(result, "main");
+    let tools = try sema_support.moduleWithPath(result, "acme.tools");
+
+    let scanned = unloaded.scan(result);
+    try testing.assertTrue(scanned.mayImport(main, ""), "a file may import its own package");
+    try testing.assertTrue(scanned.mayImport(main, "acme"), "a file may import a dependency");
+    try testing.assertTrue(scanned.mayImport(main, "std"), "every file may import '@std'");
+    try testing.assertFalse(scanned.mayImport(main, "util"), "'util' is not a dependency of 'demo.app'");
+    try testing.assertTrue(scanned.mayImport(tools, "util"), "'util' is a dependency of 'acme'");
+
+    let gears = scanned.importableNamed("Gear", main);
+    try testing.assertEqual(gears.length, 1L);
+    try testing.assertEqual(gears[0].modulePath, "acme.parts");
+    try testing.assertEqual(gears[0].packagePrefix, "acme");
+    try testing.assertEqual(scanned.importableNamed("Motor", main).length, 0L);
+    let hiddenMotors = scanned.hiddenNamed("Motor", main);
+    try testing.assertEqual(hiddenMotors.length, 1L);
+    try testing.assertEqual(hiddenMotors[0].modulePath, "acme.parts");
+    try testing.assertTrue(hiddenMotors[0].editable, "a workspace member is the user's to edit");
+    try testing.assertEqual(scanned.hiddenNamed("Motor", tools).length, 0L);
+    let motors = scanned.importableNamed("Motor", tools);
+    try testing.assertEqual(motors.length, 2L);
+    try testing.assertEqual(motors[0].modulePath, "acme.parts");
+    try testing.assertEqual(motors[1].modulePath, "util.motors");
+    let lists = scanned.importableNamed("List", main);
+    try testing.assertEqual(lists.length, 1L);
+    try testing.assertEqual(lists[0].modulePath, "std.collections.list");
+    try testing.assertEqual(lists[0].packagePrefix, "std");
+    try testing.assertFalse(lists[0].editable, "the standard library is not the user's to edit");
+}

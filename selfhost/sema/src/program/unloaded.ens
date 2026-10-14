@@ -1,0 +1,217 @@
+// The types declared by the modules of the program's packages that the graph did not load. Nothing
+// imports those modules, so the type store has no type of theirs, and a diagnostic that offers an
+// import to write reads them from here. The scan parses every unloaded file, so it runs only when
+// such a diagnostic is about to be reported, and nothing it reads is kept past its result.
+import Source from @ens.frontend.support.source;
+import @ens.frontend.parse.parser;
+import @ens.frontend.syntax.generated.factory;
+import SourceFileNode from @ens.frontend.syntax.generated.nodes;
+import FileError from support.loader;
+import GraphResult from program.graph;
+import ProgramSources from program.graph;
+import Module from program.graph;
+import program.graph;
+import Workspace from program.workspace;
+import WorkspaceLoader from program.workspace;
+import StandardLibrary from program.implicit;
+import phases.declare;
+import Visibility from model.types;
+import model.types;
+import Path from @std.fs;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+import Set from @std.collections.set;
+
+// One type an unloaded module declares, with what an import of it has to know. 'editable' says
+// whether the user can change its declaration, which the standard library's and a fetched
+// package's are not.
+export final class UnloadedType {
+    export const string name;
+    export const string modulePath;
+    export const string packagePrefix;
+    export const Visibility visibility;
+    export const bool editable;
+
+    protected constructor(this.name, this.modulePath, this.packagePrefix, this.visibility,
+                this.editable);
+}
+
+// What one scan found: the types, and the packages each package's files may import from.
+export final class UnloadedTypes {
+    UnloadedType[] found;
+    Map<string, Set<string>> dependenciesByPrefix;
+
+    protected constructor(UnloadedType[] found, Map<string, Set<string>> dependenciesByPrefix) {
+        this.found = found;
+        this.dependenciesByPrefix = dependenciesByPrefix;
+    }
+
+    // Every type the scan found, in the order its files were read.
+    export types() -> UnloadedType[] {
+        return this.found;
+    }
+
+    // The unloaded types under the name that an import written in 'importer' could bind: those of
+    // a package it may import from, where the type is visible from the importer.
+    export importableNamed(string name, Module importer) -> UnloadedType[] {
+        return this.named(name, importer, true);
+    }
+
+    // The unloaded types under the name that a package the importer may import from declares, but
+    // keeps out of the importer's reach by the visibility each was declared with.
+    export hiddenNamed(string name, Module importer) -> UnloadedType[] {
+        return this.named(name, importer, false);
+    }
+
+    named(string name, Module importer, bool visible) -> UnloadedType[] {
+        let kept = new List<UnloadedType>();
+        for (let type in this.found) {
+            if (type.name == name && this.mayImport(importer, type.packagePrefix)
+                    && types.isVisibleFrom(type.visibility, type.modulePath, type.packagePrefix,
+                        importer.canonicalPath(), importer.packagePrefix()) == visible) {
+                kept.push(type);
+            }
+        }
+        return kept.toArray();
+    }
+
+    // Whether a file of the importer's package may import a module of the package addressed by
+    // 'packagePrefix': its own, one it declares as a dependency, or the standard library.
+    export mayImport(Module importer, string packagePrefix) -> bool {
+        if (packagePrefix == importer.packagePrefix()
+                || packagePrefix == StandardLibrary.packagePrefix) {
+            return true;
+        }
+        let dependencies = this.dependenciesByPrefix.get(importer.packagePrefix());
+        return dependencies != null && dependencies.contains(packagePrefix);
+    }
+}
+
+// Reads the program's packages from the folders the graph read them from, and parses every module
+// file under them the graph did not load. A file that does not parse cleanly is skipped: the build
+// reports it where it is loaded, and a declaration the parser guessed at is not offered.
+export scan(GraphResult graph) -> UnloadedTypes {
+    let scanner = new Scanner(graph);
+    return scanner.run();
+}
+
+class Scanner {
+    ProgramSources sources;
+    WorkspaceLoader workspaceLoader;
+    Set<string> loadedFiles;
+    Set<string> loadedPaths;
+    Set<string> loadedPrefixes;
+    Set<string> visitedFolders;
+    List<UnloadedType> found;
+    Map<string, Set<string>> dependenciesByPrefix;
+
+    protected constructor(GraphResult graph) {
+        this.sources = graph.sources();
+        this.workspaceLoader = new WorkspaceLoader(this.sources.loader, this.sources.fetched,
+            this.standardLibraryFolder());
+        this.loadedFiles = new Set<string>();
+        this.loadedPaths = new Set<string>();
+        this.loadedPrefixes = new Set<string>();
+        for (let module in graph.modules()) {
+            this.loadedFiles.add(module.filePath());
+            this.loadedPaths.add(module.canonicalPath());
+            this.loadedPrefixes.add(module.packagePrefix());
+        }
+        this.visitedFolders = new Set<string>();
+        this.found = new List<UnloadedType>();
+        this.dependenciesByPrefix = new Map<string, Set<string>>();
+    }
+
+    standardLibraryFolder() -> Path {
+        return this.sources.stdlibRoot.normalize().join("std");
+    }
+
+    // The root's own folders first, then its dependencies, then the standard library, which every
+    // package may import from. A root that is the standard library itself is read once, as the root.
+    protected run() -> UnloadedTypes {
+        let root = this.workspaceLoader.loadRoot(this.sources.sourceRoot, this.sources.testsRoot,
+            this.sources.overridesFolder);
+        this.visitedFolders.add(this.sources.loader.folderKey(root.root()));
+        this.scanFolder(root.sourceRoot(), root.testsRoot(), "", root.isEditable());
+        if (root.hasTestsRoot()) {
+            this.scanFolder(root.testsRoot(), Path(""), "", root.isEditable());
+        }
+        this.visitDependencies(root, "");
+        Path standard = this.standardLibraryFolder();
+        if (this.visitedFolders.add(this.sources.loader.folderKey(standard))) {
+            let library = this.workspaceLoader.loadPackage(standard, StandardLibrary.packagePrefix,
+                false);
+            this.scanFolder(library.sourceRoot(), Path(""), StandardLibrary.packagePrefix,
+                library.isEditable());
+        }
+        return new UnloadedTypes(this.found.toArray(), this.dependenciesByPrefix);
+    }
+
+    // The dependencies of 'owner' are the packages its files may import from. Only a package with a
+    // loaded module has files that import, so only its dependencies are read, each package once.
+    visitDependencies(Workspace owner, string prefix) {
+        let names = new Set<string>();
+        for (let name in owner.dependencyNames()) {
+            names.add(name);
+            let match = owner.matchPackage([name]);
+            if (match == null
+                    || !this.visitedFolders.add(this.sources.loader.folderKey(match.folder()))) {
+                continue;
+            }
+            let dependency = this.workspaceLoader.loadPackage(match.folder(), name,
+                !match.isFetched());
+            this.scanFolder(dependency.sourceRoot(), Path(""), name, dependency.isEditable());
+            if (this.loadedPrefixes.contains(name)) {
+                this.visitDependencies(dependency, name);
+            }
+        }
+        this.dependenciesByPrefix.set(prefix, names);
+    }
+
+    // Every module file under the folder that the graph did not load, under the module paths an
+    // import from the package addressed by 'prefix' reaches them by. Files under 'excluded', the
+    // tests root when it is inside the source root, belong to that root's own scan.
+    scanFolder(Path folder, Path excluded, string prefix, bool editable) {
+        for (let file in try this.sources.loader.filesUnder(folder)) {
+            if (!file.toString().endsWith(".ens") || this.loadedFiles.contains(file.toString())) {
+                continue;
+            }
+            if (!excluded.isEmpty() && file.relativeTo(excluded) != null) {
+                continue;
+            }
+            let relative = file.relativeTo(folder);
+            if (relative == null) {
+                continue;
+            }
+            string modulePath = graph.modulePathOfRelative(relative.toString());
+            if (prefix.length > 0) {
+                modulePath = prefix + "." + modulePath;
+            }
+            if (!this.loadedPaths.contains(modulePath)) {
+                this.scanFile(file, modulePath, prefix, editable);
+            }
+        }
+    } catch (FileError unreadable) {
+    }
+
+    scanFile(Path file, string modulePath, string prefix, bool editable) {
+        string text = try this.sources.loader.readText(file);
+        let parsed = parser.parse(new Source(file.toString(), text));
+        if (parsed.diagnostics().length > 0) {
+            return;
+        }
+        let root = factory.createRoot(parsed.root());
+        if (!(root is SourceFileNode)) {
+            return;
+        }
+        let declared = declare.declareFile(root, file.toString()).declarations();
+        let seen = new Set<string>();
+        for (let type in declared.types()) {
+            if (seen.add(type.name())) {
+                this.found.push(new UnloadedType(type.name(), modulePath, prefix,
+                    type.visibility(), editable));
+            }
+        }
+    } catch (FileError unreadable) {
+    }
+}

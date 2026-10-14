@@ -456,3 +456,138 @@ test "an aliased import of a name every file has is fixed with the module that d
             + "as Failure from @std.core;' instead.");
     try testing.assertEqual(pipeline.linkResult().diagnostics().length, 1L);
 }
+
+// A module nothing imports is never loaded, so the modules of the file's own package, of the
+// packages it depends on and of the standard library are read for the type as well, under the
+// visibility a loaded module's type is offered with.
+test "a missing type exported by an unloaded module of a dependency is fixed with its import" {
+    let loader = new FakeFileLoader();
+    let fetched = sema_support.fetchedAcme(loader,
+        "export class Gear \{ \}\npublic class Motor \{ \}\n");
+    loader.add("/store/acme/src/tools.ens", "export class Wrench \{ \}\n");
+    loader.add("/proj/src/main.ens", "import Gear from @acme.tools;\nimport Motor from @acme.tools;\n");
+    let analysis = sema_support.analyzeWithFetched(loader, "/proj/src", ["main.ens"], fetched);
+
+    let diagnostics = analysis.linkDiagnostics();
+    try sema_support.assertDiagnostic(diagnostics, 0, "/proj/src/main.ens",
+        "Module '@acme.tools' has no type named 'Gear'. Write 'import Gear from @acme.parts;' "
+            + "instead.");
+    try sema_support.assertDiagnostic(diagnostics, 1, "/proj/src/main.ens",
+        "Module '@acme.tools' has no type named 'Motor'. Module '@acme.parts' declares 'Motor', "
+            + "which is public inside package 'acme' but not exported, so another package cannot "
+            + "import it.");
+    try testing.assertEqual(diagnostics.length, 2L);
+}
+
+// A file that does not parse is left out, so a type the parser would have guessed at in it is
+// not offered; the build reports that file where it is loaded.
+test "a missing type declared by an unloaded module of this package is fixed with its import" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/lib/parts.ens", "public class Bolt \{ \}\n");
+    loader.add("/proj/src/lib/tools.ens", "public class Gadget \{ \}\n");
+    loader.add("/proj/src/lib/hidden.ens", "class Gadget \{ \}\n");
+    loader.add("/proj/src/lib/broken.ens", "public class Nut \{\n");
+    loader.add("/proj/src/main.ens", "import Gadget from lib.parts;\nimport Nut from lib.parts;\n");
+    let pipeline = sema_support.analyze(loader, "/proj/src", ["main.ens"]);
+
+    let diagnostics = pipeline.linkResult().diagnostics();
+    try sema_support.assertDiagnostic(diagnostics, 0, "/proj/src/main.ens",
+        "Module 'lib.parts' has no type named 'Gadget'. Write 'import Gadget from lib.tools;' "
+            + "instead.");
+    try sema_support.assertDiagnostic(diagnostics, 1, "/proj/src/main.ens",
+        "Module 'lib.parts' has no type named 'Nut'. Check the spelling, or import 'Nut' from the "
+            + "module that declares it.");
+    try testing.assertEqual(diagnostics.length, 2L);
+}
+
+test "loaded and unloaded modules declaring a missing type are offered together, by path" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/lib/parts.ens", "import lib.sizes;\n");
+    loader.add("/proj/src/lib/sizes.ens", "public enum Kind \{ Small \}\n");
+    loader.add("/proj/src/lib/colors.ens", "public enum Kind \{ Red \}\n");
+    loader.add("/proj/src/shapes.ens", "public enum Kind \{ Round \}\n");
+    loader.add("/proj/src/main.ens", "import Kind from lib.parts;\n");
+    let pipeline = sema_support.analyze(loader, "/proj/src", ["main.ens"]);
+
+    try sema_support.assertDiagnostic(pipeline.linkResult().diagnostics(), 0,
+        "/proj/src/main.ens", "Module 'lib.parts' has no type named 'Kind'. Write 'import Kind "
+            + "from lib.colors;', 'import Kind from lib.sizes;' or 'import Kind from shapes;' "
+            + "instead.");
+    try testing.assertEqual(pipeline.linkResult().diagnostics().length, 1L);
+}
+
+test "a missing type the standard library declares is fixed with its '@std' import" {
+    let loader = new FakeFileLoader();
+    loader.addCollections();
+    loader.add("/proj/src/lib/parts.ens", "");
+    loader.add("/proj/src/main.ens", "import List from lib.parts;\n");
+    let pipeline = sema_support.analyze(loader, "/proj/src", ["main.ens"]);
+
+    try sema_support.assertDiagnostic(pipeline.linkResult().diagnostics(), 0,
+        "/proj/src/main.ens", "Module 'lib.parts' has no type named 'List'. Write 'import List "
+            + "from @std.collections.list;' instead.");
+    try testing.assertEqual(pipeline.linkResult().diagnostics().length, 1L);
+}
+
+// An import a file writes resolves against the dependencies of its own package, so a type of a
+// package it does not depend on is not offered, whether another package loaded that module or not.
+test "a type of a package the file's package does not depend on is not offered" {
+    let loader = new FakeFileLoader();
+    loader.add("/ens.package", "workspace \{\n"
+        + "    member \"proj\";\n"
+        + "    member \"proj/vendor/acme\";\n"
+        + "    member \"proj/vendor/util\";\n"
+        + "\}\n");
+    loader.add("/proj/ens.package", "package demo.app \{\n    ens \"0.1\";\n    dependency acme;\n\}\n");
+    loader.add("/proj/vendor/acme/ens.package",
+        "package acme \{\n    ens \"0.1\";\n    dependency util;\n\}\n");
+    loader.add("/proj/vendor/util/ens.package", "package util \{ ens \"0.1\"; \}\n");
+    loader.add("/proj/vendor/acme/src/tools.ens",
+        "import @util.gears;\nimport Motor from @util.gears;\nexport class Wrench \{ \}\n");
+    loader.add("/proj/vendor/util/src/gears.ens", "export class Gear \{ \}\n");
+    loader.add("/proj/vendor/util/src/motors.ens", "export class Motor \{ \}\n");
+    loader.add("/proj/src/main.ens", "import Gear from @acme.tools;\nimport Motor from @acme.tools;\n");
+    let pipeline = sema_support.analyze(loader, "/proj/src", ["main.ens"]);
+
+    let diagnostics = pipeline.linkResult().diagnostics();
+    try sema_support.assertDiagnostic(diagnostics, 0, "/proj/src/main.ens",
+        "Module '@acme.tools' has no type named 'Gear'. Check the spelling, or import 'Gear' from "
+            + "the module that declares it.");
+    try sema_support.assertDiagnostic(diagnostics, 1, "/proj/src/main.ens",
+        "Module '@acme.tools' has no type named 'Motor'. Check the spelling, or import 'Motor' from "
+            + "the module that declares it.");
+    try sema_support.assertDiagnostic(diagnostics, 2, "/proj/vendor/acme/src/tools.ens",
+        "Module '@util.gears' has no type named 'Motor'. Write 'import Motor from @util.motors;' "
+            + "instead.");
+    try testing.assertEqual(diagnostics.length, 3L);
+}
+
+// A module the graph did not load that keeps the type out of reach is explained like a loaded
+// one, with the modifier to write where its package is the user's, every module in path order.
+test "a missing type unloaded modules keep out of reach is explained with each module's fix" {
+    let loader = new FakeFileLoader();
+    loader.add("/ens.package", "workspace \{\n"
+        + "    member \"proj\";\n"
+        + "    member \"proj/vendor/acme\";\n"
+        + "\}\n");
+    loader.add("/proj/ens.package", "package demo.app \{\n    ens \"0.1\";\n    dependency acme;\n\}\n");
+    loader.add("/proj/vendor/acme/ens.package", "package acme \{ ens \"0.1\"; \}\n");
+    loader.add("/proj/vendor/acme/src/parts.ens", "public class Gadget \{ \}\n");
+    loader.add("/proj/src/lib/parts.ens", "import lib.hidden;\n");
+    loader.add("/proj/src/lib/hidden.ens", "class Gadget \{ \}\n");
+    loader.add("/proj/src/secret.ens", "class Gadget \{ \}\n");
+    loader.add("/proj/src/main.ens", "import Gadget from lib.parts;\n");
+    let pipeline = sema_support.analyze(loader, "/proj/src", ["main.ens"]);
+
+    try sema_support.assertDiagnostic(pipeline.linkResult().diagnostics(), 0,
+        "/proj/src/main.ens", "Module 'lib.parts' has no type named 'Gadget'. Module '@acme.parts' "
+            + "declares 'Gadget', which is public inside package 'acme' but not exported, so "
+            + "another package cannot import it. Mark it 'export' in module '@acme.parts', then "
+            + "write 'import Gadget from @acme.parts;' instead. Module 'lib.hidden' declares "
+            + "'Gadget', but it is private to that module, so only that file can use it. Mark it "
+            + "'public' in module 'lib.hidden', then write 'import Gadget from lib.hidden;' "
+            + "instead. Module 'secret' declares 'Gadget', but it is private to that module, so "
+            + "only that file can use it. Mark it 'public' in module 'secret', then write 'import "
+            + "Gadget from secret;' instead.");
+    try testing.assertEqual(pipeline.linkResult().diagnostics().length, 1L);
+}
