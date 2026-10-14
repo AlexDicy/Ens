@@ -575,7 +575,7 @@ task("test")
         end
 
         -- what the tree pins the seed to: the release tag it was published under and the sha256 of
-        -- each host's binary. One file covers all three hosts, because a refresh replaces every one
+        -- each host's binary. One file covers every host, because a refresh replaces every one
         -- of them together and a per-host pin would let one host bootstrap from a seed the others
         -- have already moved past.
         local function seedPin()

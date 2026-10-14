@@ -53,7 +53,7 @@ If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surf
 - `seed/seed.json` - which published release every host's bootstrap seed is downloaded from, and the sha256 of each; see The bootstrap seed.
 - `scripts/xmake_test.lua` - the test runner; read its header comment for the fixture directives.
 - `scripts/xmake_packages.lua` - local overrides of xmake-repo package definitions, each one a workaround for an upstream bug and each carrying the condition for deleting it.
-- `.github/workflows/` - `test.yml` runs the suite on all three hosts; `release.yml` is dispatch-only and publishes a release plus the pull request that repins the seed.
+- `.github/workflows/` - `test.yml` runs the suite on every host; `release.yml` is dispatch-only and publishes a release plus the pull request that repins the seed.
 
 ## Building and testing
 
