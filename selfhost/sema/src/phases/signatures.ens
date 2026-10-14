@@ -20,7 +20,6 @@ import support.diagnostics;
 import support.paths;
 import BuiltinFunction from context;
 import ModuleContext from context;
-import ImportSite from program.imports;
 import ClassItem from context;
 import FunctionEntry from context;
 import ImportedNamespace from phases.link;
@@ -45,7 +44,6 @@ import ClassType from model.types;
 import InterfaceType from model.types;
 import Visibility from model.types;
 import List from @std.collections.list;
-import Map from @std.collections.map;
 import Set from @std.collections.set;
 import StringBuilder from @std.text.stringbuilder;
 
@@ -327,28 +325,32 @@ public final class SignatureCollector {
     // Null where no import in the user's modules loads this module, or where one that does is
     // not written on one line.
     loadingImportsPhrase() -> string? {
-        let sites = this.moduleContext.programImports().loading(this.canonicalPath);
-        if (sites.length() == 0) {
-            return null;
-        }
-        let importers = new List<string>();
-        let sitesByImporter = new Map<string, List<ImportSite>>();
-        for (let site in sites) {
-            if (site.written == null) {
+        let groups = new List<ModuleImports>();
+        for (let site in this.moduleContext.programImports().loading(this.canonicalPath)) {
+            let written = site.written;
+            if (written == null) {
                 return null;
             }
-            if (sitesByImporter.get(site.importerPath) == null) {
-                importers.push(site.importerPath);
+            long index = groups.indexWhere((group) -> group.modulePath == site.importerPath);
+            if (index < 0) {
+                groups.push(new ModuleImports(site.importerPath, site.importerPackagePrefix));
+                index = groups.length() - 1;
             }
-            sitesByImporter.getOrInsert(site.importerPath, () -> new List<ImportSite>()).push(site);
+            groups.get(index).texts.push(written);
+        }
+        if (groups.length() == 0) {
+            return null;
         }
         let removals = new List<string>();
-        for (let importer in importers) {
-            let group = sitesByImporter.get(importer) ?? new List<ImportSite>();
-            string module = this.names().modulePhrase(importer, group.get(0).importerPackagePrefix);
-            removals.push("{removedImportsPhrase(group)} from {module}");
+        bool removalsAreLists = false;
+        for (let group in groups) {
+            string module = this.names().modulePhrase(group.modulePath, group.packagePrefix);
+            removals.push("{group.removalPhrase()} from {module}");
+            if (group.writesSeveralImports()) {
+                removalsAreLists = true;
+            }
         }
-        return diagnostics.serialJoined(removals.toArray());
+        return diagnostics.serialJoined(removals.toArray(), removalsAreLists);
     }
 
     collectFunctions() {
@@ -772,31 +774,53 @@ extendedAuthority(InterfaceType interfaceType) -> InterfaceType? {
     return null;
 }
 
-// The imports of one module a fix removes, each written once: "'import @acme.parts;'", or "both
-// 'import @acme.parts;' lines" for one the module writes twice.
-removedImportsPhrase(List<ImportSite> group) -> string {
-    let texts = new List<string>();
-    let counts = new Map<string, long>();
-    for (let site in group) {
-        string text = diagnostics.sourceText(site.written ?? "");
-        long count = counts.get(text) ?? 0L;
-        if (count == 0) {
-            texts.push(text);
-        }
-        counts.set(text, count + 1);
+// The imports one module writes that load a module, each by its text on one line, in the order
+// the module writes them.
+final class ModuleImports {
+    string modulePath;
+    string packagePrefix;
+    List<string> texts;
+
+    constructor(this.modulePath, this.packagePrefix) {
+        this.texts = new List<string>();
     }
-    let phrases = new List<string>();
-    for (let text in texts) {
-        long count = counts.get(text) ?? 1L;
-        if (count == 1) {
-            phrases.push("'{text}'");
-        } else if (count == 2) {
-            phrases.push("both '{text}' lines");
-        } else {
-            phrases.push("all {count} '{text}' lines");
+
+    // These imports as a fix removes them, each text once: "'import @acme.parts;'", or "both
+    // 'import @acme.parts;' lines" for one the module writes twice.
+    removalPhrase() -> string {
+        let phrases = new List<string>();
+        for (let text in this.distinctTexts()) {
+            long count = 0;
+            for (let other in this.texts) {
+                if (other == text) {
+                    count++;
+                }
+            }
+            string quoted = diagnostics.sourceText(text);
+            phrases.push(switch (count) {
+                1 -> "'{quoted}'",
+                2 -> "both '{quoted}' lines",
+                default -> "all {count} '{quoted}' lines",
+            });
         }
+        return diagnostics.andJoined(phrases.toArray());
     }
-    return diagnostics.andJoined(phrases.toArray());
+
+    // Whether the module writes more than one import text, so that the phrase is a list.
+    writesSeveralImports() -> bool {
+        return this.distinctTexts().length() > 1;
+    }
+
+    // Each text once, in the order the module first writes it.
+    distinctTexts() -> List<string> {
+        let distinct = new List<string>();
+        for (let text in this.texts) {
+            if (distinct.indexOf(text) < 0) {
+                distinct.push(text);
+            }
+        }
+        return distinct;
+    }
 }
 
 // The provided function is nowhere in the author's source, so a collision with it names it
