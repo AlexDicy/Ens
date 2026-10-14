@@ -46,11 +46,12 @@ public moduleQualifiedTypeMessage(string spelling, DeclaredType found, TypeNames
 }
 
 // The same refusal where the module 'importPath', as the file's import writes it, declares no type
-// named 'name': the fix names the type the way the file can name it from another module.
+// named 'name': the fix names the type the way the file can name it from another module, one of
+// 'candidates'.
 public moduleQualifiedMissingTypeMessage(string spelling, string importPath, string name,
-                                         TypeNames names) -> string {
+                                         TypeCandidates candidates, TypeNames names) -> string {
     return "{moduleQualifiedRefusal(spelling)} Module '{diagnostics.sourceText(importPath)}' has no "
-        + "type named '{name}'. {missingTypeFix(name, "", names)}";
+        + "type named '{name}'. {missingTypeFix(name, "", candidates, names)}";
 }
 
 moduleQualifiedRefusal(string spelling) -> string {
@@ -77,20 +78,22 @@ public importWritten(string name, string bound, string path) -> string {
 // The fix where the module a type name was written through declares no type under 'name', for
 // code that writes the type as the name followed by 'use', such as '.limit' for a static const
 // read through it: the name this file already has for the type, the import that gives it one, or
-// why the modules that declare one keep it out of this file's reach.
-public missingTypeFix(string name, string use, TypeNames names) -> string {
+// why the modules that declare one keep it out of this file's reach. 'candidates' are the types
+// other modules declare under the name, loaded or not.
+public missingTypeFix(string name, string use, TypeCandidates candidates, TypeNames names)
+        -> string {
     let implicit = names.implicitlyImportedType(name);
     if (implicit != null && names.nameFor(implicit) == name) {
         return "'{name}' is available in every file without an import, so write '{name}{use}'.";
     }
-    let declaring = names.importableTypesNamed(name);
     let imported = new List<string>();
     let written = new List<string>();
-    for (let declared in declaring) {
-        let already = names.nameFor(declared);
+    for (let offer in candidates.importable()) {
+        let declared = offer.declared();
+        let already = declared == null ? null : names.nameFor(declared);
         if (already != null) {
             string alias = already == name ? "" : " as '{already}'";
-            imported.push("'{name}' from '{names.importPathOf(declared)}'{alias}");
+            imported.push("'{name}' from '{offer.path()}'{alias}");
             written.push("'{already}{use}'");
         }
     }
@@ -98,33 +101,28 @@ public missingTypeFix(string name, string use, TypeNames names) -> string {
         return "This file already imports {diagnostics.andJoined(imported.toArray())}, so write "
             + "{diagnostics.andJoined(written.toArray(), "or")}.";
     }
-    if (declaring.length > 0) {
-        return importedTypesFix(declaring, use, names);
+    if (candidates.importable().length > 0) {
+        return importedTypesFix(candidates.importable(), use, names);
     }
-    let hidden = new List<TypeOffer>();
-    for (let declared in names.unreachableTypesNamed(name)) {
-        hidden.push(offerOf(declared, names));
-    }
-    if (hidden.isEmpty()) {
+    if (candidates.hidden().length == 0) {
         return "Check the spelling, or import '{name}' from the module that declares it.";
     }
-    return hiddenTypesMessage(hidden.toArray(),
-        (offer) -> importWritten(offer.name(), freeNameFor(offer.name(), offer.modulePath(), names),
-            offer.path()),
-        (offer) -> "{freeNameFor(offer.name(), offer.modulePath(), names)}{use}");
+    return hiddenTypesMessage(candidates.hidden(),
+        (offer) -> importWritten(offer.name(), offer.freeName(names), offer.path()),
+        (offer) -> "{offer.freeName(names)}{use}");
 }
 
 // The imports that would give this file a name for one of 'declaring', the types other modules
 // declare under one name, and the code that then writes it: one sentence where every import
 // binds the same name, otherwise the code after each import.
-importedTypesFix(DeclaredType[] declaring, string use, TypeNames names) -> string {
-    string first = freeNameFor(declaring[0], names);
+importedTypesFix(TypeOffer[] declaring, string use, TypeNames names) -> string {
+    string first = declaring[0].freeName(names);
     let imports = new List<string>();
     string clauses = "";
     bool oneName = true;
-    for (let declared in declaring) {
-        string bound = freeNameFor(declared, names);
-        string importLine = "'{importWritten(declared, bound, names)}'";
+    for (let offer in declaring) {
+        string bound = offer.freeName(names);
+        string importLine = "'{importWritten(offer.name(), bound, offer.path())}'";
         imports.push(importLine);
         string clause = "{importLine} and then '{bound}{use}'";
         clauses = clauses.length == 0 ? clause : "{clauses}, or {clause}";
@@ -161,7 +159,8 @@ public freeNameFor(string name, string modulePath, TypeNames names) -> string {
 }
 
 // A type another module declares under a name this file wrote, as a fix offers it: the module as
-// an import here writes it, where the type is declared, and how.
+// an import here writes it, where the type is declared, and how. 'declared' is the type where the
+// program loaded its module, and null for a module only the scan of unloaded files read.
 public final class TypeOffer {
     protected string offerPath;
     protected string offerName;
@@ -170,10 +169,11 @@ public final class TypeOffer {
     protected Visibility offerVisibility;
     protected bool offerEditable;
     protected bool offerSamePackage;
+    protected DeclaredType? offerDeclared;
 
     public constructor(this.offerPath, this.offerName, this.offerModulePath,
                 this.offerPackagePrefix, this.offerVisibility, this.offerEditable,
-                this.offerSamePackage);
+                this.offerSamePackage, this.offerDeclared);
 
     public path() -> string {
         return this.offerPath;
@@ -183,12 +183,17 @@ public final class TypeOffer {
         return this.offerName;
     }
 
-    public modulePath() -> string {
-        return this.offerModulePath;
+    public declared() -> DeclaredType? {
+        return this.offerDeclared;
     }
 
     public isEditable() -> bool {
         return this.offerEditable;
+    }
+
+    // The name an import of the type binds in the file 'names' belongs to, as freeNameFor says.
+    protected freeName(TypeNames names) -> string {
+        return freeNameFor(this.offerName, this.offerModulePath, names);
     }
 
     // Why the type stays out of this file's reach, after the sentence has named its module and
@@ -221,7 +226,25 @@ public final class TypeOffer {
 public offerOf(DeclaredType declared, TypeNames names) -> TypeOffer {
     return new TypeOffer(names.importPathOf(declared), declared.name(), declared.modulePath(),
         declared.packagePrefix(), declared.visibility(), declared.isEditable(),
-        names.sharesPackage(declared));
+        names.sharesPackage(declared), declared);
+}
+
+// The types other modules declare under one name, as one file sees them: those it could import,
+// and those their modules keep out of its reach, each in the order of the paths their imports
+// spell.
+public final class TypeCandidates {
+    TypeOffer[] importableOffers;
+    TypeOffer[] hiddenOffers;
+
+    public constructor(this.importableOffers, this.hiddenOffers);
+
+    public importable() -> TypeOffer[] {
+        return this.importableOffers;
+    }
+
+    public hidden() -> TypeOffer[] {
+        return this.hiddenOffers;
+    }
 }
 
 // The sentences that explain why the modules declaring 'hidden', the types under one name that
