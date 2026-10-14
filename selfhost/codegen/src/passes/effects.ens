@@ -279,7 +279,7 @@ final class Targets {
 
 // The address an operand passes to a callee position that may write through it, as the caller
 // sees it: a slot of its own, one of its own address positions, or a shared place, which is -1
-// when the write cannot be placed.
+// when no write anywhere named the place.
 final class AddressOperand {
     protected PlaceRoot root;
     protected long id;
@@ -368,11 +368,14 @@ public final class ProgramEffects {
 
     // What a span of one function's code does on its own and whom it calls. `defs` and `users`
     // are the function's definition and use tables, which is how a dispatched call on a receiver
-    // of a proven class is resolved to that class's method.
+    // of a proven class is resolved to that class's method. The places are read as the analysis
+    // numbered them and never added to, so a pass may ask this of any function at any time: a
+    // place no write named is one no code writes.
     public summarize(EirFunction function, AddressPlaces places, EirInstruction?[] defs,
                      List<List<EirInstruction>> users, List<EirInstruction> instructions,
                      List<EirTerminator> terminators) -> SpanSummary {
-        let scanner = new Scanner(function, places, defs, users, this.program, this.interned);
+        let scanner = new Scanner(function, places, defs, users, this.program, this.interned,
+            false);
         for (let instruction in instructions) {
             scanner.scanInstruction(instruction);
         }
@@ -427,7 +430,7 @@ public analyze(List<EirFunction> functions, DescriptorPlans plans) -> ProgramEff
 
 summarizeFunction(EirFunction function, Program program, WritePlaces interned) -> SpanSummary {
     let scanner = new Scanner(function, place.addressPlaces(function), scan.definitionsOf(function),
-        scan.usersOf(function), program, interned);
+        scan.usersOf(function), program, interned, true);
     for (let block in function.blocks()) {
         for (let instruction in block.instructions()) {
             scanner.scanInstruction(instruction);
@@ -498,7 +501,8 @@ operandAt(CallSite site, long position) -> AddressOperand? {
 }
 
 // A callee writes through the address passed at one position: that is a write to whatever the
-// caller passed, and a write nothing here can place is a write to everything.
+// caller passed, a write nothing here can place is a write to everything, and a write to a place
+// no store ever named is a write to nothing.
 writeThroughOperand(SpanEffect effect, AddressOperand? operand) {
     if (operand == null) {
         let ignored = effect.placesWritten.addEverything();
@@ -512,9 +516,7 @@ writeThroughOperand(SpanEffect effect, AddressOperand? operand) {
             effect.positions[operand.id] = true;
         },
         default -> {
-            if (operand.id < 0) {
-                let ignored = effect.placesWritten.addEverything();
-            } else {
+            if (operand.id >= 0) {
                 let ignored = effect.placesWritten.add(operand.id);
             }
         },
@@ -796,7 +798,8 @@ pushUnique(List<long> values, long value) {
     values.push(value);
 }
 
-// One span of one function being summarized. It lives no longer than the summary it builds.
+// One span of one function being summarized. It lives no longer than the summary it builds. The
+// analysis numbers the places it meets; every other scan only reads the numbers.
 final class Scanner {
     EirFunction function;
     AddressPlaces places;
@@ -804,17 +807,20 @@ final class Scanner {
     List<List<EirInstruction>> users;
     Program program;
     WritePlaces interned;
+    bool numbering;
     bool inDestructor;
     protected SpanSummary summary;
 
     protected constructor(EirFunction function, AddressPlaces places, EirInstruction?[] defs,
-                          List<List<EirInstruction>> users, Program program, WritePlaces interned) {
+                          List<List<EirInstruction>> users, Program program, WritePlaces interned,
+                          bool numbering) {
         this.function = function;
         this.places = places;
         this.defs = defs;
         this.users = users;
         this.program = program;
         this.interned = interned;
+        this.numbering = numbering;
         this.inDestructor = program.isDestructor(function.symbol());
         this.summary = new SpanSummary();
     }
@@ -892,24 +898,46 @@ final class Scanner {
                 this.summary.positions.push(named.rootId());
             },
             default -> {
-                long place = this.internPlace(named);
-                if (place < 0) {
+                if (!this.placeable(named)) {
                     this.summary.everything = true;
-                } else {
+                    return;
+                }
+                long place = this.placeOf(named);
+                if (place >= 0) {
                     this.summary.places.push(place);
                 }
             },
         }
     }
 
-    // The place an object- or array-rooted address names, numbered: the field the chain starts
-    // at, whatever it goes on to inside a struct, or the element.
-    internPlace(Place named) -> long {
-        Type rootType = this.function.tempTypes().get(named.rootId());
+    // Whether an object- or array-rooted address names a place at all: an array's element, or a
+    // field of a class code generation lays out.
+    placeable(Place named) -> bool {
+        return named.root() == PlaceRoot.Array
+            || declaringClassOf(this.rootType(named), named.steps().get(0).value()) != null;
+    }
+
+    // The place an object- or array-rooted address names, the field the chain starts at or the
+    // element: numbered now when this scan numbers the program, and otherwise as the analysis
+    // numbered it, -1 when no write named it.
+    placeOf(Place named) -> long {
+        Type rootType = this.rootType(named);
         if (named.root() == PlaceRoot.Array) {
-            return this.interned.internElement(primitives.underOptionals(rootType));
+            Type arrayType = primitives.underOptionals(rootType);
+            if (this.numbering) {
+                return this.interned.internElement(arrayType);
+            }
+            return this.interned.elementPlace(arrayType);
         }
-        return this.interned.internField(rootType, named.steps().get(0).value());
+        long fieldIndex = named.steps().get(0).value();
+        if (this.numbering) {
+            return this.interned.internField(rootType, fieldIndex);
+        }
+        return this.interned.fieldPlace(rootType, fieldIndex);
+    }
+
+    rootType(Place named) -> Type {
+        return this.function.tempTypes().get(named.rootId());
     }
 
     // Releasing storage empties it, so it is a write, and releasing a strong reference may run
@@ -969,7 +997,7 @@ final class Scanner {
         this.summary.sites.push(new CallSite(targets, operands));
     }
 
-    // What an address operand names in this function.
+    // What an address operand names in this function, or null for one that names no place.
     addressOperand(long address) -> AddressOperand? {
         let named = this.places.placeOf(address);
         if (named == null) {
@@ -983,7 +1011,10 @@ final class Scanner {
                 return new AddressOperand(PlaceRoot.Receiver, named.rootId());
             },
             default -> {
-                return new AddressOperand(named.root(), this.internPlace(named));
+                if (!this.placeable(named)) {
+                    return null;
+                }
+                return new AddressOperand(named.root(), this.placeOf(named));
             },
         }
     }
