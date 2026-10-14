@@ -1840,7 +1840,7 @@ The library is a set of module families under `@std`, and an import names a modu
 `@std.core` and `@std.io.print` are the two modules the compiler imports for every program.
 The families are `@std.collections` for the walking contracts and the containers, `@std.text` for the members of `string` together with `StringBuilder` and the parsers, `@std.io` for byte streams and the streams a program starts with, `@std.fs` for paths and files, `@std.environment` for what surrounds a running program, `@std.process` for starting other programs, `@std.platform` for `Platform`, `@std.thread` for a wait, `@std.testing` for what a test throws, and `@std.ffi` for reading a C string.
 A family's own name is a module too where one type stands at its head, which is why `@std.fs` is where `Path` lives while `@std.collections` is a prefix alone.
-`@std.system` holds the library's own calls into the operating system, which are internal to the library rather than part of what a program writes.
+`@std.system` exports nothing: it holds the library's own calls into the operating system, which are internal to the library rather than part of what a program writes.
 
 ---
 

@@ -1,7 +1,7 @@
 // @exit 0
 // @stdout silent: every bounded wait gave up true, ended true, code 0
 // @stdout silent: stopping a finished child ok true, code still 0
-// @stdout stalled: spoke true, said 'one line, then nothing for a while', quiet true, code 137
+// @stdout stalled: spoke true, said 'one line, then nothing for a while', quiet true, code 0, signal 9
 // @stdout buffered: ready with no bound true, second line 'second', nothing more with no bound true
 // The program starts itself as the child, so one fixture covers both sides, and a child that is
 // busy says nothing. Nothing here is measured against the clock: a child stays busy until the
@@ -11,8 +11,9 @@ import IoError from @std.io.streams;
 import Environment from @std.environment;
 import @std.environment;
 import Path from @std.fs;
-import @std.system;
-import ChildProcess from @std.system;
+import ChildProcess from @std.process;
+import ProcessError from @std.process;
+import @std.process;
 
 main() -> int {
     string[] arguments = environment.arguments();
@@ -21,7 +22,7 @@ main() -> int {
     }
     return try parent();
 } catch (Error e) {
-    eprint("std_system_start_timeout: {e.message}");
+    eprint("process_spawn_merged_timeout: {e.message}");
     return 1;
 }
 
@@ -65,10 +66,10 @@ flushOutput() {
 }
 
 // Busy until the parent leaves the file that ends this child, which is what makes the parent rather
-// than the clock decide how long the child stays busy. Answers `released` once the file is there, and
-// 99 when it gave up asking: a correct run never reaches that, and it is there so a wait that never
-// answers or a kill that did nothing ends in a code the parent reports rather than in a child nobody
-// ever hears from again.
+// than the clock decide how long the child stays busy. Returns `released` once the file is there,
+// and 99 when it gave up asking: a correct run never reaches that, and it is there so a wait that
+// never returns or a kill that did nothing ends in a code the parent reports rather than in a child
+// nobody ever hears from again.
 busyUntilReleased(string ending, int released) -> int {
     for (long i = 0; i < probes(); i++) {
         if (Path(ending).isFile()) {
@@ -99,14 +100,14 @@ parent() -> int throws {
         eprint("this system would not report the path of this program");
         return 1;
     }
-    string self = found.toString();
-    string ending = self + ".release";
+    Path self = found;
+    string ending = self.toString() + ".release";
     try take(ending);
 
     // A child that says nothing: every bounded wait gives up, because the child is still running and
     // has written nothing. It is let go only once those waits are done, and the read after that ends,
     // because a child that has gone leaves nothing holding the pipe.
-    let silent = try system.start(self, ["silent", ending]);
+    let silent = try spawnMerged(self, ["silent", ending]);
     bool gaveUpEveryTime = true;
     for (long i = 0; i < waits(); i++) {
         if (try silent.waitForOutput(bound())) {
@@ -114,41 +115,46 @@ parent() -> int throws {
         }
     }
     try leave(ending);
-    string? nothing = try silent.readLine();
-    int silentCode = try silent.wait();
+    string? nothing = try silent.stdout().readLine();
+    let silentStatus = try silent.wait();
     print("silent: every bounded wait gave up {gaveUpEveryTime}, ended {nothing == null}, "
-        + "code {silentCode}");
+        + "code {silentStatus.code}");
 
     // Stopping a child that has already finished is nothing to do, and the code it reported stands.
     bool stoppedAgain = try stopping(silent);
-    int codeStill = try silent.wait();
-    print("silent: stopping a finished child ok {stoppedAgain}, code still {codeStill}");
+    let statusStill = try silent.wait();
+    print("silent: stopping a finished child ok {stoppedAgain}, code still {statusStill.code}");
     try take(ending);
 
     // A child that says one thing and then goes quiet: the line arrives after work the parent has to
     // wait through, and the wait after it gives up while the child is still running, which is what a
-    // fetch stops a wedged program on.
-    let stalled = try system.start(self, ["stalled", ending]);
+    // fetch stops a wedged program on. A stopped child reports signal 9 on every system.
+    let stalled = try spawnMerged(self, ["stalled", ending]);
     bool said = try stalled.waitForOutput(patience());
-    string? line = try stalled.readLine();
+    string? line = try stalled.stdout().readLine();
     bool quiet = !(try stalled.waitForOutput(bound()));
     try stalled.kill();
-    int stalledCode = try stalled.wait();
+    let stalledStatus = try stalled.wait();
     print("stalled: spoke {said}, said '" + (line ?? "<nothing>")
-        + "', quiet {quiet}, code {stalledCode}");
+        + "', quiet {quiet}, code {stalledStatus.code}, signal {stalledStatus.signal}");
 
-    // A line already in hand is an answer with no bound at all to spend: nothing is asked of the
-    // system, which is why the same question answers false once that line has been taken.
-    let buffered = try system.start(self, ["buffered", ending]);
-    string? firstLine = try buffered.readLine();
+    // A line already in the reader's hands is reported with no bound at all to spend: nothing is
+    // asked of the system, which is why the same question is false once that line has been taken.
+    let buffered = try spawnMerged(self, ["buffered", ending]);
+    string? firstLine = try buffered.stdout().readLine();
     bool readyAtOnce = try buffered.waitForOutput(0);
-    string? secondLine = try buffered.readLine();
+    string? secondLine = try buffered.stdout().readLine();
     bool nothingMore = !(try buffered.waitForOutput(0));
     try buffered.kill();
-    int bufferedCode = try buffered.wait();
+    let bufferedStatus = try buffered.wait();
     print("buffered: ready with no bound {readyAtOnce}, second line '"
         + (secondLine ?? "<nothing>") + "', nothing more with no bound {nothingMore}");
     return 0;
+}
+
+// This program as the child, with both of its output streams arriving through one pipe.
+spawnMerged(Path program, string[] arguments) -> ChildProcess throws ProcessError {
+    return try process.spawn(program, arguments, mergeOutput: true);
 }
 
 // How long one bounded wait waits for. Short, because every one of them is spent on a child that is
