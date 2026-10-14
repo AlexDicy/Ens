@@ -1469,7 +1469,7 @@ task("test")
             io.writefile(path.join(tested, "tests", "registry_test.ens"),
                 'import Registry from lib;\n\ntest "a registry can be made" {\n'
                 .. '    let registry = new Registry();\n    int wrong = "text";\n}\n')
-            run({"check", tested}, nil, 1, "Mark 'Secret' 'public'. Or mark 'Registry' 'final'.",
+            run({"check", tested}, nil, 1, "Mark 'Secret' as 'public'. Or mark 'Registry' as 'final'.",
                 "!Or remove 'public' from 'Registry'", "registry_test.ens:5:17: error: Variable "
                 .. "'wrong' has type 'int', but its value has type 'string'.", "registry: 2 problems")
 
