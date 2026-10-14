@@ -773,8 +773,9 @@ The toolchain is one command, `ens`, with a subcommand for each thing it does.
 `ens --version` prints the toolchain version, the same as `ens version`.
 
 - `ens build [path]` compiles a program and writes an executable.
-- `ens check [path]` does everything a build does up to code generation and nothing after it: the same problems are reported, and no artifact is produced.
-  It also checks the test files `ens test` reads for the same path, so a problem in a test is reported, and a fix the check suggests keeps the tests compiling.
+- `ens check [path]` does everything a build does up to code generation and nothing after it: it reports every problem a build finds before code generation, and produces no artifact.
+  It also checks the test files `ens test` reads for the same path, which a build leaves out, so it reports a problem in a test, such as a `main()` declared in a test file.
+  A fix the check suggests keeps the tests compiling.
 - `ens run [path] [-- arguments]` builds a program in a folder of its own, runs it, and removes the folder, so the tree it was pointed at is left as it was found.
   Everything written after `--` is passed to the program exactly as written, and `ens run` exits with the program's exit code.
 - `ens test [path]` builds a target's tests together with its sources and runs them, as described in the section on tests.
