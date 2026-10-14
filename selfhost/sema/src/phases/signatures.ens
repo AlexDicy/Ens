@@ -319,34 +319,41 @@ public final class SignatureCollector {
     }
 
     // The imports the user can remove to stop the program from loading this module, as a fix
-    // names them, grouped by the module each is written in: "'import @acme.parts;' and
-    // 'import @acme.relay;' from module 'main' of this program, and 'import parts;' from module
-    // 'helper'".
-    // Null where no import in the user's modules loads this module, or where one that does is
-    // not written on one line.
+    // names them, with the modules that write the same ones named together: "'import @acme.parts;'
+    // and 'import @acme.relay;' from modules 'main' and 'helper' of this program, and
+    // 'import parts;' from module 'relay'". Null where no import in the user's modules loads this
+    // module, or where one that does is not written on one line.
     loadingImportsPhrase() -> string? {
-        let groups = new List<ModuleImports>();
+        let byModule = new List<ImportGroup>();
         for (let site in this.moduleContext.programImports().loading(this.canonicalPath)) {
             let written = site.written;
             if (written == null) {
                 return null;
             }
-            long index = groups.indexWhere((group) -> group.modulePath == site.importerPath);
+            long index = byModule.indexWhere((group) -> group.isWrittenIn(site.importerPath));
             if (index < 0) {
-                groups.push(new ModuleImports(site.importerPath, site.importerPackagePrefix));
-                index = groups.length() - 1;
+                byModule.push(new ImportGroup(site.importerPath, site.importerPackagePrefix));
+                index = byModule.length() - 1;
             }
-            groups.get(index).texts.push(written);
+            byModule.get(index).texts.push(written);
         }
-        if (groups.length() == 0) {
+        if (byModule.length() == 0) {
             return null;
+        }
+        let groups = new List<ImportGroup>();
+        for (let single in byModule) {
+            long index = groups.indexWhere((group) -> group.writesSameAs(single));
+            if (index < 0) {
+                groups.push(single);
+            } else {
+                groups.get(index).modules.pushAll(single.modules);
+            }
         }
         let removals = new List<string>();
         bool removalsAreLists = false;
         for (let group in groups) {
-            string module = this.names().modulePhrase(group.modulePath, group.packagePrefix);
-            removals.push("{group.removalPhrase()} from {module}");
-            if (group.writesSeveralImports()) {
+            removals.push(group.removalPhrase(this.names()));
+            if (group.isList()) {
                 removalsAreLists = true;
             }
         }
@@ -774,20 +781,82 @@ extendedAuthority(InterfaceType interfaceType) -> InterfaceType? {
     return null;
 }
 
-// The imports one module writes that load a module, each by its text on one line, in the order
-// the module writes them.
-final class ModuleImports {
-    string modulePath;
+// A module that writes imports a fix removes.
+final class ImportingModule {
+    string path;
     string packagePrefix;
+
+    constructor(this.path, this.packagePrefix);
+}
+
+// The imports a fix removes from each of its modules, which all write the same ones: each by its
+// text on one line, in the order the first module writes them.
+final class ImportGroup {
+    List<ImportingModule> modules;
     List<string> texts;
 
-    constructor(this.modulePath, this.packagePrefix) {
+    constructor(string modulePath, string packagePrefix) {
+        this.modules = new List<ImportingModule>();
+        this.modules.push(new ImportingModule(modulePath, packagePrefix));
         this.texts = new List<string>();
     }
 
-    // These imports as a fix removes them, each text once: "'import @acme.parts;'", or "both
-    // 'import @acme.parts;' lines" for one the module writes twice.
-    removalPhrase() -> string {
+    isWrittenIn(string modulePath) -> bool {
+        return this.modules.indexWhere((module) -> module.path == modulePath) >= 0;
+    }
+
+    // Whether the other group writes the same imports, each as many times, in any order.
+    writesSameAs(ImportGroup other) -> bool {
+        if (this.texts.length() != other.texts.length()) {
+            return false;
+        }
+        let these = this.texts.sorted((a, b) -> a.compareTo(b));
+        let those = other.texts.sorted((a, b) -> a.compareTo(b));
+        for (long i = 0; i < these.length(); i++) {
+            if (these.get(i) != those.get(i)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Whether the phrase lists more than one import or module, joined with 'and'.
+    isList() -> bool {
+        return this.modules.length() > 1 || this.distinctTexts().length() > 1;
+    }
+
+    // "'import @acme.parts;' from modules 'main' and 'helper' of this program and from module
+    // '@acme.mid.relay'", or "both 'import @acme.parts;' lines from each of the modules 'main' and
+    // 'helper' of this program".
+    removalPhrase(TypeNames names) -> string {
+        let programModules = new List<string>();
+        let packageModules = new List<string>();
+        for (let module in this.modules) {
+            string written = "'{names.importPathTo(module.path, module.packagePrefix)}'";
+            if (module.packagePrefix.length == 0) {
+                programModules.push(written);
+            } else {
+                packageModules.push(written);
+            }
+        }
+        bool repeated = this.distinctTexts().length() < this.texts.length();
+        let places = new List<string>();
+        if (programModules.length() > 0) {
+            string place = modulesPhrase(programModules, repeated);
+            if (!names.isOwnPackage("")) {
+                place = "{place} of this program";
+            }
+            places.push(place);
+        }
+        if (packageModules.length() > 0) {
+            places.push(modulesPhrase(packageModules, repeated));
+        }
+        return "{this.importsPhrase()} from {diagnostics.andJoined(places.toArray(), "and from")}";
+    }
+
+    // "'import @acme.parts;'", or "both 'import @acme.parts;' lines" for one each module writes
+    // twice.
+    importsPhrase() -> string {
         let phrases = new List<string>();
         for (let text in this.distinctTexts()) {
             long count = 0;
@@ -806,12 +875,7 @@ final class ModuleImports {
         return diagnostics.andJoined(phrases.toArray());
     }
 
-    // Whether the module writes more than one import text, so that the phrase is a list.
-    writesSeveralImports() -> bool {
-        return this.distinctTexts().length() > 1;
-    }
-
-    // Each text once, in the order the module first writes it.
+    // Each text once, in the order the first module writes it.
     distinctTexts() -> List<string> {
         let distinct = new List<string>();
         for (let text in this.texts) {
@@ -821,6 +885,19 @@ final class ModuleImports {
         }
         return distinct;
     }
+}
+
+// "module 'main'", or "modules 'main' and 'helper'", and "each of the modules" for imports that
+// each module writes more than once.
+modulesPhrase(List<string> quoted, bool repeated) -> string {
+    if (quoted.length() == 1) {
+        return "module {quoted.get(0)}";
+    }
+    string modules = "modules {diagnostics.andJoined(quoted.toArray())}";
+    if (repeated) {
+        return "each of the {modules}";
+    }
+    return modules;
 }
 
 // The provided function is nowhere in the author's source, so a collision with it names it

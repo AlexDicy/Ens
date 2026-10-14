@@ -4,6 +4,8 @@ import Stage from sema_support;
 import sema_support;
 import FileDiagnostic from support.diagnostics;
 import List from @std.collections.list;
+import Map from @std.collections.map;
+import Path from @std.fs;
 
 test "an external block may only name a native library its manifest declares" {
     let loader = new FakeFileLoader();
@@ -191,6 +193,13 @@ test "a dependency's main offers removing an import only when the program writes
         "import @acme.entry.main as entry;\nimport @acme.mid.relay;\n" + body), "both"),
         rule + "Rename this function, or remove 'import @acme.entry.main as entry;' from module "
         + "'main' of this program and 'import @acme.entry.main;' from module '@acme.mid.relay'.");
+    let loader = entryWorkspace("relays", "import @acme.mid.relay;\nimport @acme.mid.other;\n"
+        + body);
+    loader.add("/ew/mid/src/other.ens", "import @acme.entry.main;\n"
+        + "stop() -> int \{\n    return 0;\n\}\n");
+    try testing.assertEqual(try entryRefusal(loader, "relays"),
+        rule + "Rename this function, or remove 'import @acme.entry.main;' from modules "
+        + "'@acme.mid.relay' and '@acme.mid.other'.");
 }
 
 // The refusal of the 'main' a fetched dependency declares in its module 'parts', which its module
@@ -227,8 +236,25 @@ test "a main in a fetched dependency is fixed by removing every import that load
         rule + " Remove 'import @acme.parts;' and 'import @acme.relay;' from module 'main' of this "
         + "program.");
     try testing.assertEqual(try fetchedMainRefusal("import @acme.parts;\nimport helper;\n",
-        "import @acme.parts;\n"), rule + " Remove 'import @acme.parts;' from module 'main' of this "
-        + "program and 'import @acme.parts;' from module 'helper' of this program.");
+        "import @acme.parts;\n"), rule + " Remove 'import @acme.parts;' from modules 'main' and "
+        + "'helper' of this program.");
+    try testing.assertEqual(try fetchedMainRefusal(
+        "import @acme.parts;\nimport @acme.relay;\nimport helper;\n",
+        "import @acme.relay;\nimport @acme.parts;\n"), rule + " Remove 'import @acme.parts;' and "
+        + "'import @acme.relay;' from modules 'main' and 'helper' of this program.");
+    try testing.assertEqual(try fetchedMainRefusal(
+        "import @acme.parts;\nimport @acme.parts;\nimport helper;\n",
+        "import @acme.parts;\nimport @acme.parts;\n"), rule + " Remove both 'import @acme.parts;' "
+        + "lines from each of the modules 'main' and 'helper' of this program.");
+    try testing.assertEqual(try fetchedMainRefusal(
+        "import @acme.parts;\nimport @acme.parts;\nimport @acme.parts;\nimport helper;\n",
+        "import @acme.parts;\nimport @acme.parts;\nimport @acme.parts;\n"), rule + " Remove all 3 "
+        + "'import @acme.parts;' lines from each of the modules 'main' and 'helper' of this "
+        + "program.");
+    try testing.assertEqual(try fetchedMainRefusal(
+        "import @acme.parts;\nimport @acme.parts;\nimport helper;\n", "import @acme.parts;\n"),
+        rule + " Remove both 'import @acme.parts;' lines from module 'main' of this program and "
+        + "'import @acme.parts;' from module 'helper' of this program.");
     try testing.assertEqual(try fetchedMainRefusal("import and from @acme.parts;\nimport helper;\n",
         "import @acme.parts;\n", "export class and \{\n\}\n"), rule + " Remove 'import and from "
         + "@acme.parts;' from module 'main' of this program and 'import @acme.parts;' from module "
@@ -268,23 +294,29 @@ test "a main in another module of a dependency names the module as its package i
 }
 
 // The refusal of the 'main' that 'demo.lib' declares in its module 'parts', in a workspace where
-// the program and 'demo.lib' each have a module 'helper' importing 'parts', 'demo.mid' imports it
-// too, and the program's main module opens with the imports 'mainSource' writes.
-sharedNameRefusal(string mainSource) -> string throws {
+// the program and 'demo.lib' each have a module 'helper' importing 'parts', the modules
+// 'demo.mid.relay' and 'demo.far.edge' open with the imports 'otherSource' writes, and the
+// program's main module opens with the imports 'mainSource' writes.
+sharedNameRefusal(string mainSource, string otherSource = "import @demo.lib.parts;\n")
+        -> string throws {
     let loader = new FakeFileLoader();
     loader.add("/sw/ens.package", "workspace \{\n"
         + "    member \"app\";\n"
         + "    member \"lib\";\n"
         + "    member \"mid\";\n"
+        + "    member \"far\";\n"
         + "\}\n");
     loader.add("/sw/app/ens.package", "package demo.app \{\n    ens \"0.1\";\n"
-        + "    dependency demo.lib;\n    dependency demo.mid;\n\}\n");
+        + "    dependency demo.lib;\n    dependency demo.mid;\n    dependency demo.far;\n\}\n");
     loader.add("/sw/lib/ens.package", "package demo.lib \{ ens \"0.1\"; \}\n");
     loader.add("/sw/mid/ens.package",
         "package demo.mid \{\n    ens \"0.1\";\n    dependency demo.lib;\n\}\n");
+    loader.add("/sw/far/ens.package",
+        "package demo.far \{\n    ens \"0.1\";\n    dependency demo.lib;\n\}\n");
     loader.add("/sw/lib/src/parts.ens", "main() -> int \{\n    return 0;\n\}\n");
     loader.add("/sw/lib/src/helper.ens", "import parts;\nexport help() \{\n\}\n");
-    loader.add("/sw/mid/src/relay.ens", "import @demo.lib.parts;\nexport relay() \{\n\}\n");
+    loader.add("/sw/mid/src/relay.ens", otherSource + "export relay() \{\n\}\n");
+    loader.add("/sw/far/src/edge.ens", otherSource + "export edge() \{\n\}\n");
     loader.add("/sw/app/src/helper.ens", "import @demo.lib.parts;\nexport assist() \{\n\}\n");
     loader.add("/sw/app/src/main.ens", mainSource + "main() -> int \{\n    return 0;\n\}\n");
     let analysis = sema_support.analyzeAll(loader, "/sw/app/src", ["main.ens"]);
@@ -309,8 +341,65 @@ test "a fix names a module of the program apart from one of the package it is re
     try testing.assertEqual(try sharedNameRefusal(
         "import helper;\nimport @demo.lib.helper as libHelper;\nimport @demo.mid.relay;\n"),
         rule + "Rename this function, or remove 'import @demo.lib.parts;' from module 'helper' of "
-        + "this program, 'import parts;' from module 'helper', and 'import @demo.lib.parts;' from "
-        + "module '@demo.mid.relay'.");
+        + "this program and from module '@demo.mid.relay', and 'import parts;' from module "
+        + "'helper'.");
+    try testing.assertEqual(try sharedNameRefusal(
+        "import @demo.lib.parts;\nimport @demo.mid.relay;\nimport @demo.far.edge;\n"),
+        rule + "Rename this function, or remove 'import @demo.lib.parts;' from module 'main' of "
+        + "this program and from modules '@demo.mid.relay' and '@demo.far.edge'.");
+    try testing.assertEqual(try sharedNameRefusal(
+        "import @demo.lib.parts;\nimport @demo.lib.parts;\nimport @demo.mid.relay;\n"
+        + "import @demo.far.edge;\n",
+        "import @demo.lib.parts;\nimport @demo.lib.parts;\n"),
+        rule + "Rename this function, or remove both 'import @demo.lib.parts;' lines from module "
+        + "'main' of this program and from each of the modules '@demo.mid.relay' and "
+        + "'@demo.far.edge'.");
+}
+
+// The refusal of the 'main' a fetched 'acme' declares in its module 'parts', which its module
+// 'relay' imports, in a workspace whose program has a module 'helper' and whose members
+// 'demo.mid' and 'demo.far' import 'acme.relay' from their modules 'relay', 'other' and 'edge'.
+fetchedRelayRefusal(string mainSource) -> string throws {
+    let loader = new FakeFileLoader();
+    loader.add("/fw/ens.package", "workspace \{\n"
+        + "    member \"app\";\n"
+        + "    member \"mid\";\n"
+        + "    member \"far\";\n"
+        + "\}\n");
+    loader.add("/fw/app/ens.package", "package demo.app \{\n    ens \"0.1\";\n"
+        + "    dependency acme \"1.0\";\n    dependency demo.mid;\n    dependency demo.far;\n\}\n");
+    loader.add("/fw/mid/ens.package",
+        "package demo.mid \{\n    ens \"0.1\";\n    dependency acme \"1.0\";\n\}\n");
+    loader.add("/fw/far/ens.package",
+        "package demo.far \{\n    ens \"0.1\";\n    dependency acme \"1.0\";\n\}\n");
+    loader.add("/store/acme/ens.package", "package acme \{ ens \"0.1\"; \}\n");
+    loader.add("/store/acme/src/parts.ens", "main() -> int \{\n    return 0;\n\}\n");
+    loader.add("/store/acme/src/relay.ens", "import parts;\nexport start() \{\n\}\n");
+    loader.add("/fw/mid/src/relay.ens", "import @acme.relay;\nexport relay() \{\n\}\n");
+    loader.add("/fw/mid/src/other.ens", "import @acme.relay;\nexport other() \{\n\}\n");
+    loader.add("/fw/far/src/edge.ens", "import @acme.relay;\nexport edge() \{\n\}\n");
+    loader.add("/fw/app/src/helper.ens", "import @acme.relay;\nexport help() \{\n\}\n");
+    loader.add("/fw/app/src/main.ens", mainSource + "main() -> int \{\n    return 0;\n\}\n");
+    let fetched = new Map<string, Path>();
+    fetched.set("acme", Path("/store/acme"));
+    let analysis = sema_support.analyzeWithFetched(loader, "/fw/app/src", ["main.ens"], fetched);
+    let found = new List<FileDiagnostic>();
+    for (let diagnostic in analysis.signatureDiagnostics()) {
+        if (diagnostic.file() == "/store/acme/src/parts.ens") {
+            found.push(diagnostic);
+        }
+    }
+    try testing.assertEqual(found.length(), 1L);
+    return found.get(0).message();
+}
+
+test "a fix names an import once for every module of any package that writes it" {
+    try testing.assertEqual(try fetchedRelayRefusal("import helper;\nimport @acme.relay;\n"
+        + "import @demo.mid.relay;\nimport @demo.mid.other;\nimport @demo.far.edge;\n"),
+        "Function 'main' starts the program, so only the program's main module, 'main.ens', can "
+        + "declare it. This file is module 'parts' of package 'acme', a dependency of this "
+        + "program. Remove 'import @acme.relay;' from modules 'main' and 'helper' of this program "
+        + "and from modules '@demo.mid.relay', '@demo.mid.other' and '@demo.far.edge'.");
 }
 
 test "a function named like an import names the imported module as the import writes it" {
