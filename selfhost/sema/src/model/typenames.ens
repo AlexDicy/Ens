@@ -42,11 +42,17 @@ public moduleQualifiedTypeMessage(string spelling, DeclaredType found, TypeNames
 // The import of 'found' this file would write, binding it under 'bound': 'import Kind as
 // PartsKind from parts;'.
 public importWritten(DeclaredType found, string bound, TypeNames names) -> string {
-    string binding = found.name();
-    if (bound != found.name()) {
-        binding = "{found.name()} as {bound}";
+    return importWritten(found.name(), bound, names.importPathOf(found));
+}
+
+// The import of the type 'name' from the module at 'path', as the import spells it, binding the
+// type under 'bound'.
+public importWritten(string name, string bound, string path) -> string {
+    string binding = name;
+    if (bound != name) {
+        binding = "{name} as {bound}";
     }
-    return "import {binding} from {names.importPathOf(found)};";
+    return "import {binding} from {path};";
 }
 
 // The fix where the module a type name was written through declares no type under 'name', for
@@ -76,22 +82,17 @@ public missingTypeFix(string name, string use, TypeNames names) -> string {
     if (declaring.length > 0) {
         return importedTypesFix(declaring, use, names);
     }
-    let hidden = names.unreachableTypesNamed(name);
-    if (hidden.length == 0) {
+    let hidden = new List<TypeOffer>();
+    for (let declared in names.unreachableTypesNamed(name)) {
+        hidden.push(offerOf(declared, names));
+    }
+    if (hidden.isEmpty()) {
         return "Check the spelling, or import '{name}' from the module that declares it.";
     }
-    string message = "";
-    for (let declared in hidden) {
-        string sentence = hiddenTypeReason(declared, names);
-        let fix = hiddenTypeFix(declared, names);
-        if (fix != null) {
-            string bound = freeNameFor(declared, names);
-            sentence = "{sentence} {fix}, then write '{importWritten(declared, bound, names)}' and "
-                + "then '{bound}{use}'.";
-        }
-        message = message.length == 0 ? sentence : "{message} {sentence}";
-    }
-    return message;
+    return hiddenTypesMessage(hidden.toArray(),
+        (offer) -> importWritten(offer.name(), freeNameFor(offer.name(), offer.modulePath(), names),
+            offer.path()),
+        (offer) -> "{freeNameFor(offer.name(), offer.modulePath(), names)}{use}");
 }
 
 // The imports that would give this file a name for one of 'declaring', the types other modules
@@ -121,11 +122,16 @@ importedTypesFix(DeclaredType[] declaring, string use, TypeNames names) -> strin
 // The name an import of this type binds in the file: the type's own name, or that name behind as
 // much of the module path as it takes for the file not to have the name already.
 public freeNameFor(DeclaredType found, TypeNames names) -> string {
-    if (!names.bindsTypeName(found.name())) {
-        return found.name();
+    return freeNameFor(found.name(), found.modulePath(), names);
+}
+
+// The same name for the type 'name' of the module at 'modulePath', which the store need not hold.
+public freeNameFor(string name, string modulePath, TypeNames names) -> string {
+    if (!names.bindsTypeName(name)) {
+        return name;
     }
-    string[] segments = found.modulePath().split(".");
-    string candidate = found.name();
+    string[] segments = modulePath.split(".");
+    string candidate = name;
     for (long i = segments.length - 1; i >= 0; i--) {
         candidate = capitalizedAscii(segments[i]) + candidate;
         if (!names.bindsTypeName(candidate)) {
@@ -135,40 +141,165 @@ public freeNameFor(DeclaredType found, TypeNames names) -> string {
     return candidate;
 }
 
-// Why the type 'declared', which another module declares under a name this file wrote, cannot be
-// named here: the module that declares it, and the visibility that keeps it there.
-public hiddenTypeReason(DeclaredType declared, TypeNames names) -> string {
-    return hiddenReason(declared.name(), names.importPathOf(declared), declared.packagePrefix(),
-        declared.visibility());
+// A type another module declares under a name this file wrote, as a fix offers it: the module as
+// an import here writes it, where the type is declared, and how.
+public final class TypeOffer {
+    protected string offerPath;
+    protected string offerName;
+    protected string offerModulePath;
+    protected string offerPackagePrefix;
+    protected Visibility offerVisibility;
+    protected bool offerEditable;
+    protected bool offerSamePackage;
+
+    public constructor(this.offerPath, this.offerName, this.offerModulePath,
+                this.offerPackagePrefix, this.offerVisibility, this.offerEditable,
+                this.offerSamePackage);
+
+    public path() -> string {
+        return this.offerPath;
+    }
+
+    public name() -> string {
+        return this.offerName;
+    }
+
+    public modulePath() -> string {
+        return this.offerModulePath;
+    }
+
+    public isEditable() -> bool {
+        return this.offerEditable;
+    }
+
+    // Why the type stays out of this file's reach, after the sentence has named its module and
+    // the type: one text per visibility and package, so types with one reason share a sentence.
+    // 'several' is whether that sentence names more than one module.
+    protected hiddenReason(bool several) -> string {
+        string packagePhrase = types.packagePhrase(this.offerPackagePrefix);
+        if (this.offerVisibility == Visibility.Public && several) {
+            return "and each is public inside {packagePhrase} but not exported, so another package "
+                + "cannot import it.";
+        }
+        if (this.offerVisibility == Visibility.Public) {
+            return "which is public inside {packagePhrase} but not exported, so another package "
+                + "cannot import it.";
+        }
+        if (several) {
+            return "but each is private to its module, so only the file that declares it can use "
+                + "it.";
+        }
+        return "but it is private to that module, so only that file can use it.";
+    }
+
+    // What to write on the declaration so that this file reaches the type.
+    protected declarationFix() -> string {
+        return modifierFix(this.offerName, this.offerVisibility, this.offerSamePackage);
+    }
 }
 
-// The same reason for a type the store does not hold, such as one of a module the program never
-// loaded: 'importPath' is the module as an import in this file writes it.
-public hiddenReason(string name, string importPath, string packagePrefix, Visibility visibility)
-        -> string {
-    string declaring = "Module '{importPath}' declares '{name}',";
-    if (visibility == Visibility.Public) {
-        return "{declaring} which is public inside {types.packagePhrase(packagePrefix)} but not "
-            + "exported, so another package cannot import it.";
-    }
-    return "{declaring} but it is private to that module, so only that file can use it.";
-}
-
-// The modifier that lets this file name the type hiddenTypeReason explains, said where to write
-// it, or null where the declaration is not the user's to edit.
-public hiddenTypeFix(DeclaredType declared, TypeNames names) -> string? {
-    if (!declared.isEditable()) {
-        return null;
-    }
-    return hiddenFix(declared.name(), names.importPathOf(declared), declared.visibility(),
+// The type 'declared' as a fix offers it to the file 'names' belongs to.
+public offerOf(DeclaredType declared, TypeNames names) -> TypeOffer {
+    return new TypeOffer(names.importPathOf(declared), declared.name(), declared.modulePath(),
+        declared.packagePrefix(), declared.visibility(), declared.isEditable(),
         names.sharesPackage(declared));
 }
 
-// The fix hiddenTypeFix gives, for a type that is the user's to edit, declared with 'visibility'
-// in the module 'importPath' of this file's own package or of another one.
-public hiddenFix(string name, string importPath, Visibility visibility, bool samePackage)
-        -> string {
-    return "{modifierFix(name, visibility, samePackage)} in module '{importPath}'";
+// The sentences that explain why the modules declaring 'hidden', the types under one name that
+// this file cannot reach, keep them out of reach, and how the file comes to name one: each reason
+// once, naming every module it covers, then the modifier to write and the import that follows.
+// 'importLine' is the import this file would write for an offer, and 'written' the code it then
+// writes for the type, such as 'Kind' or 'Kind.limit', or null where the import is the whole fix.
+public hiddenTypesMessage(TypeOffer[] hidden, (TypeOffer) -> string importLine,
+                          (TypeOffer) -> string? written) -> string {
+    let grouped = new Map<string, List<TypeOffer>>();
+    let reasons = new List<string>();
+    for (let offer in hidden) {
+        string reason = offer.hiddenReason(false);
+        let group = grouped.get(reason);
+        if (group == null) {
+            group = new List<TypeOffer>();
+            grouped.set(reason, group);
+            reasons.push(reason);
+        }
+        group.push(offer);
+    }
+    let sentences = new List<string>();
+    for (let reason in reasons) {
+        let group = grouped.get(reason);
+        if (group == null) {
+            continue;
+        }
+        sentences.push(hiddenReasonSentence(group));
+        let fix = hiddenFixSentence(group, importLine, written);
+        if (fix != null) {
+            sentences.push(fix);
+        }
+    }
+    return string.joined(sentences.toArray(), " ");
+}
+
+// "Module 'a' declares 'Kind', ..." for one module, and "Modules 'a' and 'b' each declare
+// 'Kind', ..." for several, with the reason the group shares.
+hiddenReasonSentence(List<TypeOffer> group) -> string {
+    let first = group.get(0);
+    if (group.length() == 1) {
+        return "Module '{first.path()}' declares '{first.name()}', {first.hiddenReason(false)}";
+    }
+    return "Modules {diagnostics.andJoined(quotedPaths(group))} each declare '{first.name()}', "
+        + "{first.hiddenReason(true)}";
+}
+
+// The modifier to write and the import that follows, for the offers of the group the user can
+// edit: one sentence for all of them where they take the same modifier, with one import as the
+// example, otherwise one sentence per module. Null where none of them is the user's to edit.
+hiddenFixSentence(List<TypeOffer> group, (TypeOffer) -> string importLine,
+                  (TypeOffer) -> string? written) -> string? {
+    let editable = new List<TypeOffer>();
+    for (let offer in group) {
+        if (offer.isEditable()) {
+            editable.push(offer);
+        }
+    }
+    if (editable.isEmpty()) {
+        return null;
+    }
+    let first = editable.get(0);
+    bool oneModifier = true;
+    for (let offer in editable) {
+        if (offer.declarationFix() != first.declarationFix()) {
+            oneModifier = false;
+        }
+    }
+    if (!oneModifier || editable.length() == 1) {
+        let sentences = new List<string>();
+        for (let offer in editable) {
+            let code = written(offer);
+            string after = code == null ? " instead" : " and then '{code}'";
+            sentences.push("{offer.declarationFix()} in module '{offer.path()}', then write "
+                + "'{importLine(offer)}'{after}.");
+        }
+        return string.joined(sentences.toArray(), " ");
+    }
+    string where = "in one of them";
+    if (editable.length() < group.length()) {
+        where = "in module {diagnostics.andJoined(quotedPaths(editable), "or")}";
+    }
+    let code = written(first);
+    if (code == null) {
+        return "{first.declarationFix()} {where}, then import it from that module instead, as in "
+            + "'{importLine(first)}'.";
+    }
+    return "{first.declarationFix()} {where}, then import it from that module, as in "
+        + "'{importLine(first)}', and write '{code}'.";
+}
+
+quotedPaths(List<TypeOffer> offers) -> string[] {
+    let quoted = new List<string>();
+    for (let offer in offers) {
+        quoted.push("'{offer.path()}'");
+    }
+    return quoted.toArray();
 }
 
 // What to write on the declaration of 'name', declared with 'visibility', so that a file of this
