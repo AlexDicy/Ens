@@ -1780,8 +1780,11 @@ task("test")
             run({"run", hidden}, nil, 1, "Expected '}' to close the block that starts on line 2.",
                 "' was not built, so it was not run", "!does not define main()")
 
-            -- '--target' asks for a machine this command cannot run what it builds on
-            run({"run", echo, "--target", "aarch64-unknown-linux-gnu"}, nil, 2,
+            -- '--target' asks for a machine this command cannot run what it builds on, so the
+            -- triple has to name another architecture than the host's
+            local elsewhere = arch == "arm64" and "x86_64-unknown-linux-gnu"
+                or "aarch64-unknown-linux-gnu"
+            run({"run", echo, "--target", elsewhere}, nil, 2,
                 "runs what it builds", "Remove '--target'")
 
             -- a workspace root runs its one program, and says so when there is none or several
