@@ -1,0 +1,591 @@
+// Hold elision. A reference read out of a field or an array element and handed to a call is
+// retained before the call and released after it, so that code running during the call cannot
+// free it by overwriting that storage. When nothing that runs between the retain and the release
+// writes that storage, nor any storage on the way to it from a slot or a parameter, the storage
+// keeps the reference alive for the whole span and the pair is dropped. A type switch holds the
+// scrutinee it read the same way, in a slot of its own released where the switch ends; that hold
+// is dropped the same way, and the slot borrows from then on.
+import EirFunction from eir.model;
+import EirBlock from eir.model;
+import EirInstruction from eir.model;
+import EirTerminator from eir.model;
+import EirSlot from eir.model;
+import EirRetain from eir.model;
+import EirRelease from eir.model;
+import EirReleasePtr from eir.model;
+import EirStorePtr from eir.model;
+import EirWeakStore from eir.model;
+import EirWeakRelease from eir.model;
+import EirLoadPtr from eir.model;
+import EirLoadSlot from eir.model;
+import EirStoreSlot from eir.model;
+import EirTakeSlot from eir.model;
+import EirSlotAddress from eir.model;
+import EirCast from eir.model;
+import EirCastOp from eir.model;
+import EirCheckedCast from eir.model;
+import EirReturn from eir.model;
+import EirPropagate from eir.model;
+import EirUnreachable from eir.model;
+import Type from @ens.sema.model.types;
+import AddressPlaces from eir.place;
+import PlaceRoot from eir.place;
+import eir.place;
+import eir.walk;
+import ProgramEffects from passes.effects;
+import passes.scan;
+import support.primitives;
+import List from @std.collections.list;
+
+public run(EirFunction function, ProgramEffects effects) -> EirFunction {
+    if (!anyRetain(function)) {
+        return function;
+    }
+    let elision = new Elision(function, effects);
+    elision.planCallHolds();
+    elision.planSlotHolds();
+    return elision.apply();
+}
+
+anyRetain(EirFunction function) -> bool {
+    for (let block in function.blocks()) {
+        for (let instruction in block.instructions()) {
+            if (instruction is EirRetain) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// The storage a held reference was read through: the shared places on the way from a stable root,
+// and the slots of this function the way starts from. The reference stays alive while none of the
+// places is written and none of the slots is written, released or handed out by address.
+final class Chain {
+    protected List<long> places;
+    protected bool[] slots;
+
+    protected constructor(long slotCount) {
+        this.places = new List<long>();
+        this.slots = new bool[slotCount];
+    }
+}
+
+// The code that runs between a hold's retain and its releases: the instructions, the terminators
+// crossed, the releases that end it, and the blocks it runs through.
+final class Region {
+    protected List<EirInstruction> instructions;
+    protected List<EirTerminator> terminators;
+    protected List<EirInstruction> ends;
+    protected bool[] visited;
+
+    protected constructor(long blockCount) {
+        this.instructions = new List<EirInstruction>();
+        this.terminators = new List<EirTerminator>();
+        this.ends = new List<EirInstruction>();
+        this.visited = new bool[blockCount];
+    }
+}
+
+// Where a walk over a region continues: a block, from an instruction index.
+final class Continuation {
+    protected long block;
+    protected long index;
+
+    protected constructor(this.block, this.index);
+}
+
+// One function's holds being planned, then applied. It lives no longer than the run that made it.
+final class Elision {
+    EirFunction function;
+    ProgramEffects effects;
+    EirInstruction?[] defs;
+    List<List<EirInstruction>> users;
+    bool[] terminatorUsed;
+    AddressPlaces places;
+    List<EirInstruction> dropped;
+    bool[] flipped;
+
+    protected constructor(EirFunction function, ProgramEffects effects) {
+        this.function = function;
+        this.effects = effects;
+        this.defs = scan.definitionsOf(function);
+        this.users = scan.usersOf(function);
+        this.terminatorUsed = scan.terminatorUses(function);
+        this.places = place.addressPlaces(function);
+        this.dropped = new List<EirInstruction>();
+        this.flipped = new bool[function.slots().length()];
+    }
+
+    // Every retain that holds a value for the calls up to its releases.
+    protected planCallHolds() {
+        let blocks = this.function.blocks();
+        for (long b = 0; b < blocks.length(); b++) {
+            let instructions = blocks.get(b).instructions();
+            for (long k = 0; k < instructions.length(); k++) {
+                let instruction = instructions.get(k);
+                if (instruction is EirRetain) {
+                    this.planCallHold(instruction, b, k);
+                }
+            }
+        }
+    }
+
+    planCallHold(EirRetain retain, long block, long index) {
+        long value = retain.value;
+        if (!this.isCallHold(value)) {
+            return;
+        }
+        let chain = this.chainOf(value);
+        if (chain == null) {
+            return;
+        }
+        let region = this.walkRegion(block, index + 1,
+            (EirInstruction candidate) -> candidate is EirRelease && candidate.value == value);
+        if (region == null || region.ends.length() != this.releaseCount(value, region.visited)
+                || !this.regionKeepsChain(region, chain)) {
+            return;
+        }
+        this.dropped.push(retain);
+        for (let user in this.users.get(value)) {
+            if (user is EirRelease) {
+                this.dropped.push(user);
+            }
+        }
+    }
+
+    // A value retained once and released, whose reference nothing else takes over: not stored
+    // into a slot that owns it, not stored through an address, not returned or thrown.
+    isCallHold(long value) -> bool {
+        if (this.returnedOrThrown(value)) {
+            return false;
+        }
+        long retains = 0;
+        long releases = 0;
+        for (let user in this.users.get(value)) {
+            switch (user) {
+                is EirRetain retain -> {
+                    retains++;
+                },
+                is EirRelease release -> {
+                    releases++;
+                },
+                is EirStoreSlot store -> {
+                    if (!this.function.slots().get(store.slot).borrows()) {
+                        return false;
+                    }
+                },
+                is EirStorePtr store -> {
+                    if (store.value == value) {
+                        return false;
+                    }
+                },
+                default -> { },
+            }
+        }
+        return retains == 1 && releases > 0;
+    }
+
+    returnedOrThrown(long value) -> bool {
+        for (let block in this.function.blocks()) {
+            let terminator = block.terminator();
+            if (terminator is EirReturn && terminator.value == value) {
+                return true;
+            }
+            if (terminator is EirPropagate && terminator.error == value) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // How many releases of a value are in the blocks a region runs through. A release in a block
+    // it never reaches is dropped with the hold as well, since it releases what the hold retained.
+    releaseCount(long value, bool[] visited) -> long {
+        long count = 0;
+        let blocks = this.function.blocks();
+        for (long b = 0; b < blocks.length(); b++) {
+            if (!visited[b]) {
+                continue;
+            }
+            for (let instruction in blocks.get(b).instructions()) {
+                if (instruction is EirRelease && instruction.value == value) {
+                    count++;
+                }
+            }
+        }
+        return count;
+    }
+
+    // Every slot a statement parked a held value in: stored once, from a value retained just
+    // before, never taken, and reached by address only to be released.
+    protected planSlotHolds() {
+        let slots = this.function.slots();
+        for (long x = 0; x < slots.length(); x++) {
+            let slot = slots.get(x);
+            if (!slot.borrows() && primitives.isReferenceType(slot.type())) {
+                this.planSlotHold(x);
+            }
+        }
+    }
+
+    planSlotHold(long slot) {
+        let releases = new List<EirInstruction>();
+        let releaseBlocks = new List<long>();
+        let blocks = this.function.blocks();
+        long storeBlock = -1;
+        long storeIndex = -1;
+        for (long b = 0; b < blocks.length(); b++) {
+            let instructions = blocks.get(b).instructions();
+            for (long i = 0; i < instructions.length(); i++) {
+                let instruction = instructions.get(i);
+                if (instruction is EirTakeSlot && instruction.slot == slot) {
+                    return;
+                }
+                if (instruction is EirStoreSlot && instruction.slot == slot) {
+                    if (storeBlock >= 0) {
+                        return;
+                    }
+                    storeBlock = b;
+                    storeIndex = i;
+                }
+                if (this.releasesSlot(instruction, slot)) {
+                    releases.push(instruction);
+                    releaseBlocks.push(b);
+                }
+                if (instruction is EirSlotAddress && instruction.slot == slot) {
+                    for (let user in this.users.get(instruction.result)) {
+                        if (!(user is EirReleasePtr)) {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        if (storeBlock < 0) {
+            return;
+        }
+        let instructions = blocks.get(storeBlock).instructions();
+        let store = instructions.get(storeIndex);
+        if (!(store is EirStoreSlot)) {
+            return;
+        }
+        long value = store.value;
+        long retainIndex = this.pairedRetainIndex(instructions, storeIndex, value, slot);
+        if (retainIndex < 0 || !this.isSlotHold(value)) {
+            return;
+        }
+        let chain = this.chainOf(value);
+        if (chain == null) {
+            return;
+        }
+        let region = this.walkRegion(storeBlock, storeIndex + 1,
+            (EirInstruction candidate) -> this.releasesSlot(candidate, slot));
+        if (region == null || !this.regionKeepsChain(region, chain)) {
+            return;
+        }
+        long barriers = 0;
+        for (long i = retainIndex + 1; i < storeIndex; i++) {
+            if (this.releasesSlot(instructions.get(i), slot)) {
+                barriers++;
+            }
+        }
+        long reached = 0;
+        for (long i = 0; i < releases.length(); i++) {
+            if (region.visited[releaseBlocks.get(i)]) {
+                reached++;
+            }
+        }
+        if (region.ends.length() + barriers != reached) {
+            return;
+        }
+        this.flipped[slot] = true;
+        this.dropped.push(instructions.get(retainIndex));
+        for (let block in blocks) {
+            for (let instruction in block.instructions()) {
+                if (instruction is EirSlotAddress && instruction.slot == slot) {
+                    this.dropped.push(instruction);
+                }
+            }
+        }
+        for (let release in releases) {
+            this.dropped.push(release);
+        }
+    }
+
+    // The index of the retain that gave the parking store its +1: back from the store, past only
+    // the address-and-release pairs emptying the slot first. -1 when the store is not that shape.
+    pairedRetainIndex(List<EirInstruction> instructions, long storeIndex, long value,
+                      long slot) -> long {
+        long j = storeIndex - 1;
+        while (j >= 0) {
+            let candidate = instructions.get(j);
+            if (candidate is EirRetain) {
+                if (candidate.value == value) {
+                    return j;
+                }
+                return -1;
+            }
+            bool barrier = (candidate is EirSlotAddress && candidate.slot == slot)
+                || this.releasesSlot(candidate, slot);
+            if (!barrier) {
+                return -1;
+            }
+            j--;
+        }
+        return -1;
+    }
+
+    releasesSlot(EirInstruction instruction, long slot) -> bool {
+        if (!(instruction is EirReleasePtr)) {
+            return false;
+        }
+        let address = this.defs[instruction.address];
+        return address is EirSlotAddress && address.slot == slot;
+    }
+
+    // A parked value is used by its retain and the store that parks it, and by nothing else.
+    isSlotHold(long value) -> bool {
+        if (this.terminatorUsed[value]) {
+            return false;
+        }
+        long retains = 0;
+        long stores = 0;
+        for (let user in this.users.get(value)) {
+            if (user is EirRetain) {
+                retains++;
+            } else if (user is EirStoreSlot) {
+                stores++;
+            } else {
+                return false;
+            }
+        }
+        return retains == 1 && stores == 1;
+    }
+
+    // The storage a value was read through, back to a root that stays alive on its own: a value
+    // parameter or receiver, which the caller keeps alive, or a slot of this function. Null when
+    // the way runs through storage this function cannot name: an address it was passed, a weak
+    // field, a value it owns outright.
+    chainOf(long value) -> Chain? {
+        let chain = new Chain(this.function.slots().length());
+        long current = value;
+        for (long depth = 0; depth < 32; depth++) {
+            if (current < 0 || current >= this.defs.length) {
+                return null;
+            }
+            let definition = this.defs[current];
+            if (definition == null) {
+                if (current < this.function.entryTempCount()
+                        && !place.isOpaqueRoot(this.function, current)) {
+                    return chain;
+                }
+                return null;
+            }
+            switch (definition) {
+                is EirCast cast -> {
+                    if (cast.op != EirCastOp.Reinterpret) {
+                        return null;
+                    }
+                    current = cast.operand;
+                },
+                is EirCheckedCast cast -> {
+                    current = cast.value;
+                },
+                is EirLoadSlot load -> {
+                    chain.slots[load.slot] = true;
+                    return chain;
+                },
+                is EirLoadPtr load -> {
+                    let named = this.places.placeOf(load.address);
+                    if (named == null) {
+                        return null;
+                    }
+                    switch (named.root()) {
+                        PlaceRoot.Slot -> {
+                            chain.slots[named.rootId()] = true;
+                            return chain;
+                        },
+                        PlaceRoot.Receiver -> {
+                            return null;
+                        },
+                        default -> {
+                            if (!this.addSharedPlace(chain, named.root(), named.rootId(),
+                                    named.steps().get(0).value())) {
+                                return null;
+                            }
+                            current = named.rootId();
+                        },
+                    }
+                },
+                default -> {
+                    return null;
+                },
+            }
+        }
+        return null;
+    }
+
+    // The shared place a field or element read goes through, when it is one some write names;
+    // false when the object's class is not one the places are numbered over.
+    addSharedPlace(Chain chain, PlaceRoot root, long rootTemp, long fieldIndex) -> bool {
+        Type rootType = primitives.underOptionals(this.function.tempTypes().get(rootTemp));
+        long shared = -1;
+        if (root == PlaceRoot.Array) {
+            shared = this.effects.places().elementPlace(rootType);
+        } else {
+            if (primitives.classOf(rootType) == null) {
+                return false;
+            }
+            shared = this.effects.places().fieldPlace(rootType, fieldIndex);
+        }
+        if (shared >= 0) {
+            chain.places.push(shared);
+        }
+        return true;
+    }
+
+    // Everything that runs from one point until each path reaches an instruction `ends` accepts,
+    // or null when a path leaves the function or comes back around to the start without one.
+    walkRegion(long startBlock, long startIndex, (EirInstruction) -> bool ends) -> Region? {
+        let blocks = this.function.blocks();
+        let region = new Region(blocks.length());
+        bool[] visited = region.visited;
+        let pending = new List<Continuation>();
+        pending.push(new Continuation(startBlock, startIndex));
+        visited[startBlock] = true;
+        while (!pending.isEmpty()) {
+            let next = pending.pop();
+            let block = blocks.get(next.block);
+            let instructions = block.instructions();
+            bool ended = false;
+            for (long i = next.index; i < instructions.length() && !ended; i++) {
+                let instruction = instructions.get(i);
+                if (ends(instruction)) {
+                    region.ends.push(instruction);
+                    ended = true;
+                } else {
+                    region.instructions.push(instruction);
+                }
+            }
+            if (ended) {
+                continue;
+            }
+            let terminator = block.terminator();
+            if (terminator == null) {
+                return null;
+            }
+            if (terminator is EirUnreachable) {
+                continue;
+            }
+            long[] successors = walk.successorsOf(block);
+            if (successors.length == 0) {
+                return null;
+            }
+            region.terminators.push(terminator);
+            for (let successor in successors) {
+                if (successor == startBlock) {
+                    return null;
+                }
+                if (!visited[successor]) {
+                    visited[successor] = true;
+                    pending.push(new Continuation(successor, 0));
+                }
+            }
+        }
+        return region;
+    }
+
+    // Whether nothing in a region can free what a chain keeps alive: none of its calls and
+    // releases writes a place on the chain or the storage behind an address of this function,
+    // and the region itself leaves the chain's slots alone.
+    regionKeepsChain(Region region, Chain chain) -> bool {
+        let summary = this.effects.summarize(this.function, this.places, this.defs, this.users,
+            region.instructions, region.terminators);
+        let effect = this.effects.evaluate(this.function, summary);
+        if (effect.writes().writesEverything() || effect.writesThroughAnyPosition()) {
+            return false;
+        }
+        for (let shared in chain.places) {
+            if (effect.writes().contains(shared)) {
+                return false;
+            }
+        }
+        for (long slot = 0; slot < chain.slots.length; slot++) {
+            if (chain.slots[slot] && effect.writesSlot(slot)) {
+                return false;
+            }
+        }
+        for (let instruction in region.instructions) {
+            if (this.touchesSlots(instruction, chain.slots)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    touchesSlots(EirInstruction instruction, bool[] slots) -> bool {
+        switch (instruction) {
+            is EirStoreSlot store -> {
+                return slots[store.slot];
+            },
+            is EirTakeSlot taken -> {
+                return slots[taken.slot];
+            },
+            is EirSlotAddress address -> {
+                return slots[address.slot];
+            },
+            is EirStorePtr store -> {
+                return this.addressesSlot(store.address, slots);
+            },
+            is EirReleasePtr release -> {
+                return this.addressesSlot(release.address, slots);
+            },
+            is EirWeakStore store -> {
+                return this.addressesSlot(store.address, slots);
+            },
+            is EirWeakRelease release -> {
+                return this.addressesSlot(release.address, slots);
+            },
+            default -> {
+                return false;
+            },
+        }
+    }
+
+    addressesSlot(long address, bool[] slots) -> bool {
+        let named = this.places.placeOf(address);
+        return named != null && named.root() == PlaceRoot.Slot && slots[named.rootId()];
+    }
+
+    protected apply() -> EirFunction {
+        if (this.dropped.isEmpty()) {
+            return this.function;
+        }
+        let slots = new List<EirSlot>();
+        for (long i = 0; i < this.function.slots().length(); i++) {
+            let slot = this.function.slots().get(i);
+            if (this.flipped[i]) {
+                slots.push(new EirSlot(slot.name(), slot.type(), slot.startsZeroed(), true));
+            } else {
+                slots.push(slot);
+            }
+        }
+        let blocks = new List<EirBlock>();
+        for (let source in this.function.blocks()) {
+            let block = new EirBlock(source.label());
+            for (let instruction in source.instructions()) {
+                if (!scan.contains(this.dropped, instruction)) {
+                    block.instructions().push(instruction);
+                }
+            }
+            let terminator = source.terminator();
+            if (terminator != null) {
+                block.setTerminator(terminator);
+            }
+            blocks.push(block);
+        }
+        return this.function.withBody(this.function.parameters(), slots, blocks,
+            this.function.tempTypes());
+    }
+}

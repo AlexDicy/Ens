@@ -1,0 +1,368 @@
+// Hold elision: the retain and release around a value read out of a field or an element are
+// dropped when nothing running in between can write the storage it was read from, and stay
+// whenever something can: the callee itself, an override reached through dispatch, a closure of
+// the called type, a destructor a release can run, or the span itself writing the way to it.
+import @std.testing;
+import OptimizationLevel from settings;
+import EirFunction from eir.model;
+import eir.dump;
+import passes.holds;
+import support;
+import LoweredProgram from support;
+
+test "a hold around a call that cannot write the field it was read from is dropped" {
+    let program = try support.lowerWholeProgram(holderProgram(
+        "    protected measure() -> int \{\n"
+        + "        return this.size;\n"
+        + "    \}\n",
+        "        return this.held.measure();\n"));
+    let after = try afterHolds(program, "main$Holder$run");
+    try testing.assertEqual(dump.dumpFunction(after),
+        "func @main$Holder$run(%0: Holder) -> int \{\n"
+        + "b0.entry:\n"
+        + "  %1 = object_field_addr %0, 0: &Child  ; %0.held\n"
+        + "  %2 = load_ptr %1: Child\n"
+        + "  %3 = call @main$Child$measure(this %2): int\n"
+        + "  ret %3\n"
+        + "\}\n");
+}
+
+test "a hold stays when the callee writes the field it was read from" {
+    let program = try support.lowerWholeProgram(holderProgram(
+        "    protected replace(Holder owner) -> int \{\n"
+        + "        owner.held = new Child(2);\n"
+        + "        return this.size;\n"
+        + "    \}\n",
+        "        return this.held.replace(this);\n"));
+    try assertUnchanged(program, "main$Holder$run");
+}
+
+test "a hold stays when the callee writes a field earlier on the way to the value" {
+    let program = try support.lowerWholeProgram(
+        "class Child \{\n"
+        + "    protected int size;\n"
+        + "    protected constructor(this.size);\n"
+        + "    protected replaceInner(Outer outer) -> int \{\n"
+        + "        outer.inner = new Holder(new Child(9));\n"
+        + "        return this.size;\n"
+        + "    \}\n"
+        + "    protected count(Outer outer) -> int \{\n"
+        + "        outer.visits = outer.visits + 1;\n"
+        + "        return this.size;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "class Holder \{\n"
+        + "    protected Child held;\n"
+        + "    protected constructor(this.held);\n"
+        + "\}\n"
+        + "class Outer \{\n"
+        + "    protected Holder inner;\n"
+        + "    protected int visits;\n"
+        + "    protected constructor(this.inner);\n"
+        + "    protected replace() -> int \{\n"
+        + "        return this.inner.held.replaceInner(this);\n"
+        + "    \}\n"
+        + "    protected count() -> int \{\n"
+        + "        return this.inner.held.count(this);\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let outer = new Outer(new Holder(new Child(1)));\n"
+        + "    return outer.replace() + outer.count();\n"
+        + "\}\n");
+    try assertUnchanged(program, "main$Outer$replace");
+    try assertDropped(program, "main$Outer$count");
+}
+
+test "a hold stays when an override reached through dispatch writes the field" {
+    let program = try support.lowerWholeProgram(visitorProgram("        h.visitor = new Visitor();\n"));
+    try assertUnchanged(program, "main$Holder$run");
+}
+
+test "a hold is dropped when no override reached through dispatch writes the field" {
+    let program = try support.lowerWholeProgram(visitorProgram("        h.count = h.count + 1;\n"));
+    try assertDropped(program, "main$Holder$run");
+}
+
+test "a hold around a call through a function value stays while a closure of its type writes the field" {
+    let program = try support.lowerWholeProgram(stepProgram(true));
+    try assertUnchanged(program, "main$Holder$run");
+}
+
+test "a hold around a call through a function value is dropped when no closure of its type writes the field" {
+    let program = try support.lowerWholeProgram(stepProgram(false));
+    try assertDropped(program, "main$Holder$run");
+}
+
+test "a hold across a throwing call drops the release on both of its edges" {
+    let program = try support.lowerWholeProgram(
+        "class Failure extends Error \{\n"
+        + "    protected constructor(string message) \{\n"
+        + "        super(message);\n"
+        + "    \}\n"
+        + "\}\n"
+        + holderProgram(
+        "    protected measure() -> int throws \{\n"
+        + "        if (this.size < 0) \{\n"
+        + "            throw new Failure(\"negative\");\n"
+        + "        \}\n"
+        + "        return this.size;\n"
+        + "    \}\n",
+        "        return try this.held.measure();\n", " throws"));
+    let after = try afterHolds(program, "main$Holder$run");
+    string text = dump.dumpFunction(after);
+    try testing.assertTrue(text.indexOf("retain") < 0 && text.indexOf("release") < 0,
+        "both releases go with the retain: {text}");
+    try testing.assertTrue(text.indexOf("try_call") >= 0, "the call keeps its edges: {text}");
+}
+
+test "a hold stays across a release that can run a destructor writing the field" {
+    let program = try support.lowerWholeProgram(
+        "class Tracker \{\n"
+        + "    protected Holder holder;\n"
+        + "    protected constructor(this.holder);\n"
+        + "    destructor() \{\n"
+        + "        this.holder.held = new Child(7);\n"
+        + "    \}\n"
+        + "\}\n"
+        + holderProgram(
+        "    protected measure(Tracker tracker) -> int \{\n"
+        + "        return this.size;\n"
+        + "    \}\n",
+        "        return this.held.measure(new Tracker(this));\n"));
+    try assertUnchanged(program, "main$Holder$run");
+}
+
+test "a hold on an element is dropped unless the call writes elements of arrays of that type" {
+    let program = try support.lowerWholeProgram(
+        "class Child \{\n"
+        + "    protected int size;\n"
+        + "    protected constructor(this.size);\n"
+        + "    protected measure() -> int \{\n"
+        + "        return this.size;\n"
+        + "    \}\n"
+        + "    protected shift(Holder h) -> int \{\n"
+        + "        h.items[0] = new Child(5);\n"
+        + "        return this.size;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "class Holder \{\n"
+        + "    protected Child[] items;\n"
+        + "    protected constructor(this.items);\n"
+        + "    protected measure() -> int \{\n"
+        + "        return this.items[0].measure();\n"
+        + "    \}\n"
+        + "    protected shift() -> int \{\n"
+        + "        return this.items[0].shift(this);\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let holder = new Holder([new Child(1)]);\n"
+        + "    return holder.measure() + holder.shift();\n"
+        + "\}\n");
+    try assertDropped(program, "main$Holder$measure");
+    try assertUnchanged(program, "main$Holder$shift");
+}
+
+test "a type switch's held scrutinee borrows when no arm can write the field" {
+    let program = try support.lowerWholeProgram(switchProgram("", ""));
+    let after = try afterHolds(program, "main$Holder$pick");
+    string text = dump.dumpFunction(after);
+    try testing.assertTrue(text.indexOf("held: Shape borrowed") >= 0,
+        "the parking slot borrows: {text}");
+    try testing.assertTrue(text.indexOf("retain") < 0 && text.indexOf("release_ptr") < 0,
+        "the retain and every release of the slot are gone: {text}");
+}
+
+test "a type switch's held scrutinee stays owned when an arm writes the field" {
+    let program = try support.lowerWholeProgram(switchProgram(
+        "                this.shape = new Shape();\n", ""));
+    try assertUnchanged(program, "main$Holder$pick");
+}
+
+test "a type switch's held scrutinee stays owned when an arm replaces the object it was read from" {
+    let program = try support.lowerWholeProgram(switchProgram("",
+        "                holder = new Holder(new Shape());\n"));
+    try assertUnchanged(program, "main$pickFrom");
+}
+
+test "a local copied out of a field borrows when nothing in its scope can write the field" {
+    let program = try support.lowerWholeProgram(holderProgram(
+        "    protected measure() -> int \{\n"
+        + "        return this.size;\n"
+        + "    \}\n",
+        "        let child = this.held;\n"
+        + "        return child.measure() + child.measure();\n"));
+    let after = try afterHolds(program, "main$Holder$run");
+    string text = dump.dumpFunction(after);
+    try testing.assertTrue(text.indexOf("child: Child borrowed") >= 0,
+        "the local borrows: {text}");
+    try testing.assertTrue(text.indexOf("retain") < 0 && text.indexOf("release") < 0,
+        "nothing is counted: {text}");
+}
+
+test "the account names the pass and what it removed" {
+    let program = try support.lowerWholeProgram(holderProgram(
+        "    protected measure() -> int \{\n"
+        + "        return this.size;\n"
+        + "    \}\n",
+        "        return this.held.measure();\n"));
+    string[] everyPass = [];
+    let outcome = try support.pipelineOutcome(program, "main$Holder$run",
+        support.settingsAt(OptimizationLevel.Default, everyPass, true));
+    bool named = false;
+    for (let line in outcome.account()) {
+        if (line == "  hold-elision removed 2 reference-count updates") {
+            named = true;
+        }
+    }
+    try testing.assertTrue(named, "the account must name the pass: {outcome.account()}");
+}
+
+// A holder reading its child field for a call, with the child's method and the holder's call
+// filled in.
+holderProgram(string childMethod, string runBody, string runThrows = "") -> string {
+    string tried = "";
+    if (runThrows.length > 0) {
+        tried = "try ";
+    }
+    return "class Child \{\n"
+        + "    protected int size;\n"
+        + "    protected constructor(this.size);\n"
+        + childMethod
+        + "\}\n"
+        + "class Holder \{\n"
+        + "    protected Child held;\n"
+        + "    protected constructor(this.held);\n"
+        + "    protected run() -> int" + runThrows + " \{\n"
+        + runBody
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int" + runThrows + " \{\n"
+        + "    return " + tried + "new Holder(new Child(1)).run();\n"
+        + "\}\n";
+}
+
+// A holder calling a visitor it reads out of a field through dispatch, with the override's body
+// filled in.
+visitorProgram(string overrideBody) -> string {
+    return "class Visitor \{\n"
+        + "    protected constructor();\n"
+        + "    protected visit(Holder h) -> int \{\n"
+        + "        return 1;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "class Replacer extends Visitor \{\n"
+        + "    protected constructor();\n"
+        + "    protected override visit(Holder h) -> int \{\n"
+        + overrideBody
+        + "        return 2;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "class Holder \{\n"
+        + "    protected Visitor visitor;\n"
+        + "    protected int count;\n"
+        + "    protected constructor(this.visitor);\n"
+        + "    protected run() -> int \{\n"
+        + "        return this.visitor.visit(this);\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return new Holder(new Replacer()).run() + new Holder(new Visitor()).run();\n"
+        + "\}\n";
+}
+
+// A holder calling the function value it reads out of a field, with or without a closure of
+// that type replacing the field.
+stepProgram(bool swapping) -> string {
+    string swapper = "";
+    string use = "";
+    if (swapping) {
+        swapper = "makeSwapper(Holder h) -> (int) -> int \{\n"
+            + "    return (int v) -> \{\n"
+            + "        h.step = (int w) -> w;\n"
+            + "        return v;\n"
+            + "    \};\n"
+            + "\}\n";
+        use = "    holder.step = makeSwapper(holder);\n";
+    }
+    return "class Holder \{\n"
+        + "    protected (int) -> int step;\n"
+        + "    protected constructor(this.step);\n"
+        + "    protected run(int v) -> int \{\n"
+        + "        return this.step(v);\n"
+        + "    \}\n"
+        + "\}\n"
+        + swapper
+        + "main() -> int \{\n"
+        + "    let holder = new Holder((int v) -> v + 1);\n"
+        + use
+        + "    return holder.run(1);\n"
+        + "\}\n";
+}
+
+// A type switch over a shape read out of a field, with the arm's extra statements filled in: in
+// the holder's own method, and in a function switching over a holder it was passed.
+switchProgram(string methodArm, string functionArm) -> string {
+    return "class Shape \{\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "class Circle extends Shape \{\n"
+        + "    protected int size;\n"
+        + "    protected constructor(this.size);\n"
+        + "\}\n"
+        + "class Holder \{\n"
+        + "    protected Shape shape;\n"
+        + "    protected constructor(this.shape);\n"
+        + "    protected pick() -> int \{\n"
+        + "        switch (this.shape) \{\n"
+        + "            is Circle circle -> \{\n"
+        + methodArm
+        + "                return circle.size;\n"
+        + "            \},\n"
+        + "            default -> \{\n"
+        + "                return 0;\n"
+        + "            \},\n"
+        + "        \}\n"
+        + "    \}\n"
+        + "\}\n"
+        + "pickFrom(Holder holder) -> int \{\n"
+        + "    switch (holder.shape) \{\n"
+        + "        is Circle circle -> \{\n"
+        + functionArm
+        + "            return circle.size;\n"
+        + "        \},\n"
+        + "        default -> \{\n"
+        + "            return 0;\n"
+        + "        \},\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    let holder = new Holder(new Circle(4));\n"
+        + "    return holder.pick() + pickFrom(holder);\n"
+        + "\}\n";
+}
+
+afterHolds(LoweredProgram program, string symbol) -> EirFunction throws {
+    let before = try support.functionBySymbol(program, symbol);
+    let after = holds.run(before, support.passContext(program).effects());
+    try support.assertOptimized(after, symbol);
+    return after;
+}
+
+assertUnchanged(LoweredProgram program, string symbol) throws {
+    let before = try support.functionBySymbol(program, symbol);
+    let after = try afterHolds(program, symbol);
+    try testing.assertEqual(dump.dumpFunction(after), dump.dumpFunction(before));
+}
+
+// Asserts the one hold in the function went, leaving no retain and no release of a value.
+assertDropped(LoweredProgram program, string symbol) throws {
+    let before = try support.functionBySymbol(program, symbol);
+    string beforeText = dump.dumpFunction(before);
+    try testing.assertTrue(beforeText.indexOf("retain") >= 0,
+        "'{symbol}' must hold something before the pass: {beforeText}");
+    string text = dump.dumpFunction(try afterHolds(program, symbol));
+    try testing.assertTrue(text.indexOf("retain") < 0 && text.indexOf("\n  release %") < 0,
+        "the hold must be dropped: {text}");
+}
