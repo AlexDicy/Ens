@@ -1,8 +1,12 @@
 // Running the programs a build needs in order to fetch what it depends on. A command run for
 // its output is read, and a command doing something slow is passed on as it prints, because a line
 // held back until the command finishes is no longer an account of what it is doing.
-import @std.system;
-import SystemError from @std.system;
+import Environment from @std.environment;
+import Path from @std.fs;
+import IoError from @std.io.streams;
+import ExitStatus from @std.process;
+import ProcessError from @std.process;
+import @std.process;
 import List from @std.collections.list;
 import Progress from progress;
 
@@ -95,19 +99,22 @@ export relay(string program, string[] arguments, string[] environmentOverrides,
     return ranWith(program, arguments, environmentOverrides, progress);
 }
 
-// Every line the program writes, until it has printed everything or has printed nothing for so long
-// that it is taken to be wedged. The wait is bounded because the programs' own limits cover a network
-// that has stalled and a prompt nobody can complete, and neither of them covers a program stuck for a
-// reason of its own: without a bound here, that is a build that never finishes.
+// Every line the program writes, both streams in one, until it has printed everything or has
+// printed nothing for so long that it is taken to be wedged. The wait is bounded because the
+// programs' own limits cover a network that has stalled and a prompt nobody can complete, and
+// neither of them covers a program stuck for a reason of its own: without a bound here, that is a
+// build that never finishes.
 ranWith(string program, string[] arguments, string[] environmentOverrides, Progress? progress) -> ToolRun {
     long bound = SilenceLimit.milliseconds;
-    let running = try system.start(program, arguments, environmentOverrides);
+    let running = try process.spawn(Path(program), arguments,
+        environment: childEnvironment(environmentOverrides), mergeOutput: true);
+    let output = running.stdout();
     let collected = new List<string>();
     bool speaking = try running.waitForOutput(bound);
     while (speaking) {
-        string? line = try running.readLine();
+        string? line = try output.readLine();
         if (line == null) {
-            return new ToolRun(true, try running.wait(), collected.toArray(), "", "");
+            return new ToolRun(true, reportedCode(try running.wait()), collected.toArray(), "", "");
         }
         collected.push(line);
         if (progress != null) {
@@ -116,10 +123,47 @@ ranWith(string program, string[] arguments, string[] environmentOverrides, Progr
         speaking = try running.waitForOutput(bound);
     }
     try running.kill();
-    int stopped = try running.wait();
-    return new ToolRun(true, stopped, collected.toArray(), "",
+    let stopped = try running.wait();
+    return new ToolRun(true, reportedCode(stopped), collected.toArray(), "",
         silenceProblem(program, bound));
-} catch (SystemError error) {
+} catch (ProcessError error) {
+    return notRun(error.message);
+} catch (IoError error) {
+    return notRun(error.message);
+}
+
+// A program that could not be run, or could not be read, is reported as not run with the code a
+// shell gives a command it could not start.
+notRun(string problem) -> ToolRun {
     string[] nothing = [];
-    return new ToolRun(false, 127, nothing, error.message, "");
+    return new ToolRun(false, 127, nothing, problem, "");
+}
+
+// The variables the program runs with: this process's own under `overrides`, each a 'NAME=VALUE'
+// entry, so the program keeps every variable it is not given anew. No overrides at all is null,
+// which hands this process's own environment on unchanged.
+public childEnvironment(string[] overrides) -> Environment? {
+    if (overrides.length == 0) {
+        return null;
+    }
+    let variables = Environment.current();
+    for (let entry in overrides) {
+        long separator = entry.indexOf("=");
+        if (separator < 0) {
+            variables.set(entry, "");
+        } else {
+            variables.set(entry.substring(0, separator), entry.substring(separator + 1));
+        }
+    }
+    return variables;
+}
+
+// The one code a run reports for how its program ended: the exit code of a program that exited,
+// and 128 plus the signal for one a signal ended, which is what a shell reports and makes a program
+// this build stopped read as 137 on every system.
+public reportedCode(ExitStatus status) -> int {
+    if (status.signal != 0) {
+        return 128 + status.signal;
+    }
+    return status.code;
 }
