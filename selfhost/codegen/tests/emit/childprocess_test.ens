@@ -10,6 +10,7 @@ import PosixChild from emit.childprocess;
 import WindowsChild from emit.childprocess;
 import emit.childprocess;
 import emit.clock;
+import emit.nativeshapes;
 
 // One call of every child bridge, with the arguments a start takes in the order it takes them.
 callEveryBridge(EmissionHost host) {
@@ -115,9 +116,106 @@ test "a start tells a working directory that is a file from one that is not ther
     try host.finish();
 }
 
+// A failed exec carries what it failed on above errno: 3 for a path naming a directory, 4 for a
+// program image of any system's format the system could not run, 5 for a file that is no program,
+// 6 for a special file such as a named pipe, 8 for a script whose first line names a program that
+// is not there, 9 for a runnable file that starts neither as an image nor as a script, 10 for a
+// refusal on a runnable program image, 11 for a script the system would not start or refused over
+// the program its first line names, and 1 otherwise. A file is opened only once its kind shows it
+// is a regular file, or once the system reported it could not run it, so a pipe that would block
+// the open is never opened. A file that cannot be opened counts as one that may hold a program.
+test "a POSIX start carries the part of the start its exec failed on" {
+    for (let triple in ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin23"]) {
+        let host = new EmissionHost("childprocess_cause_{triple}");
+        host.retarget(triple);
+        childprocess.startRuntime(host.runtime);
+        string text = host.text();
+        let flags = nativeshapes.openFlags(triple);
+        long magicFlags = flags.readOnly | flags.nonBlocking | flags.noControllingTerminal;
+        try assertHolds(triple, text, "@strchr(ptr %0, i32 47)");
+        try assertHolds(triple, text, "label %exec.cause.unrunnable, label %exec.cause.refused");
+        try assertBlockHolds(triple, text, "exec.cause.unrunnable", ["store i32 4, ptr %cause",
+            "label %exec.cause.image, label %exec.cause.done"]);
+        try assertBlockHolds(triple, text, "exec.cause.image",
+            ["@open(ptr %0, i32 {magicFlags})", "label %exec.magic.read, label %exec.magic.done"]);
+        try assertBlockHolds(triple, text, "exec.magic.read", ["@read(", "@close("]);
+        try assertBlockHolds(triple, text, "exec.magic.done", ["%image = or i1",
+            "i1 %script, i32 11, i32 9", "i1 %image, i32 4, i32 %"]);
+        try assertBlockHolds(triple, text, "exec.cause.refused",
+            ["label %exec.cause.kind, label %exec.cause.missing"]);
+        try assertBlockHolds(triple, text, "exec.cause.kind", ["i32 3, i32 %", "i32 10, i32 6",
+            "label %exec.cause.regular, label %exec.cause.done"]);
+        try assertBlockHolds(triple, text, "exec.cause.regular",
+            ["@open(ptr %0, i32 {magicFlags})"]);
+        for (let line in ["xor i1 %magic.opened", "%holds.program = or i1",
+                "%runnable.cause = select i1 %script", ", i32 11, i32 10",
+                "select i1 %runnable, i32 %runnable.cause, i32 1",
+                "select i1 %holds.program, i32 %"]) {
+            try assertHolds(triple, text, line);
+        }
+        try assertBlockHolds(triple, text, "exec.cause.missing",
+            ["label %exec.cause.left, label %exec.cause.done"]);
+        try assertBlockHolds(triple, text, "exec.cause.left", ["i32 8, i32 1"]);
+        try assertBlockHolds(triple, text, "exec.cause.done", ["shl i32 %cause.found, 24",
+            "store i32 %caused"]);
+        try host.finish();
+    }
+}
+
+// A failed CreateProcessW carries what it failed on above its number: 3 for a program path naming
+// a directory, 4 for a file with the 'MZ' header Windows could not run, 5 for one without it, and
+// 1 otherwise. The file system is asked only once the start has failed.
+test "a Windows start carries the part of the start it failed on" {
+    let host = new EmissionHost("childprocess_cause_windows");
+    host.retarget("x86_64-pc-windows-msvc");
+    childprocess.startRuntime(host.runtime);
+    string text = host.text();
+    try assertBlockHolds("windows", text, "start.cause.program",
+        ["store i32 1, ptr %program.cause", ", 5",
+        "label %start.cause.program.directory, label %start.cause.program.format"]);
+    try assertBlockHolds("windows", text, "start.cause.program.directory",
+        ["@GetFileAttributesW(ptr %program)", "select i1 %directory", ", i32 3, i32 1"]);
+    try assertBlockHolds("windows", text, "start.cause.program.format", [", 193", ", 216",
+        "%unrunnable = or i1",
+        "label %start.cause.program.image, label %start.cause.program.done"]);
+    try assertBlockHolds("windows", text, "start.cause.program.image",
+        ["@CreateFileW(ptr %program, i32 -2147483648"]);
+    try assertBlockHolds("windows", text, "start.cause.header.read", ["@ReadFile(", "i32 2",
+        "@CloseHandle("]);
+    try assertBlockHolds("windows", text, "start.cause.header.done",
+        ["icmp eq i16 %header.word, 23117", "select i1 %image.header, i32 4, i32 5"]);
+    try assertBlockHolds("windows", text, "start.cause.done", ["shl i32 %cause.found, 24"]);
+    try testing.assertTrue(text.indexOf("@GetFileAttributesW(") > text.indexOf("@CreateProcessW("),
+        "windows: the file system is asked before the start: {text}");
+    try host.finish();
+}
+
 // Fails unless the printed module holds the line.
 assertHolds(string triple, string text, string line) throws {
     try testing.assertTrue(text.indexOf(line) >= 0, "{triple}: no '{line}' in: {text}");
+}
+
+// Fails unless the block of the printed module under `label` holds every one of the lines.
+assertBlockHolds(string triple, string text, string label, string[] lines) throws {
+    string block = blockText(text, label);
+    for (let line in lines) {
+        try testing.assertTrue(block.indexOf(line) >= 0,
+            "{triple}: block '{label}' has no '{line}': {block}");
+    }
+}
+
+// The block under `label`, from its label to the blank line that ends it, and empty when the
+// printed module has no such block.
+blockText(string text, string label) -> string {
+    long start = text.indexOf("\n{label}:");
+    if (start < 0) {
+        return "";
+    }
+    long end = text.indexOf("\n\n", start + 1);
+    if (end < 0) {
+        return text.substring(start + 1);
+    }
+    return text.substring(start + 1, end);
 }
 
 // A field read at an offset another field also uses would serve both, so the layouts are held
