@@ -28,7 +28,7 @@ If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surf
 
 ## Repository map
 
-- `libs/std/` - the standard library, written in Ens, imported as the built-in `@std` package.
+- `libs/std/` - the standard library, written in Ens, imported as the built-in `@std` package; its own `AGENTS.md` holds the conventions its API follows.
 - `runtime/lld/` - `ens_lld.cpp`, one C entry point over lld's C++ link drivers, built as the `ens-lld` shared library. It carries no link policy; that all lives in `selfhost/link/`.
 - `selfhost/` - the `ens` compiler and build tool, written in Ens, as one workspace of packages:
   - `syntax.grammar` + `syntaxgen/` - the declarative grammar and the generator that emits the syntax-tree sources.
@@ -248,7 +248,7 @@ A comment only states what the code cannot; never phase tags, decision rationale
 
 ### Open work
 
-Open work is tracked as GitHub issues on `AlexDicy/Ens`, never in a file in the tree; `std-redesign/09-notes.md` keeps the accepted limits and standing rulings that are not work.
+Open work is tracked as GitHub issues on `AlexDicy/Ens`, never in a file in the tree.
 
 - One issue is one change that lands as one commit.
   Its title names the defect as it stands, with code in backticks, as in `` `Node<Node<T>>` inside `Node<T>` is reported twice ``, and its body follows `.github/ISSUE_TEMPLATE/defect.md`.

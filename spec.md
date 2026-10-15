@@ -1965,6 +1965,8 @@ Calling `skip()` before `next()` has returned an entry, or after it has returned
 `createDirectories()` creates the directory and every missing directory above it, leaving a path that is already a directory alone.
 `createDirectoryExclusive()` creates them the same way and returns whether this call is the one that created the directory itself, so two programs racing for the same name get different results and the one that gets `true` may treat the directory as its own.
 `moveTo(destination, replace = false)` moves what is at the path in one step and returns whether this call is the one that moved it, which is `false` when something was already at the destination; both paths have to be on the same volume, because a move across volumes would have to copy.
+Some file systems, such as overlay and network file systems, cannot refuse an existing destination as part of the move itself, and neither can Linux kernels older than 3.15.
+On those, a move without `replace` checks the destination first and then moves, so two programs moving onto the same name at the same moment can both get `true`.
 With `replace` set to `true` it moves over a file already at the destination in the same one step, so it returns `true` or raises a `FileSystemError`, as it does on Windows while another program has that file open.
 `copyTo(destination)` copies the file at the path, replacing whatever was at the destination, and the copy carries the source's permissions and never its set-user-id, set-group-id or sticky bits, because a copy hands over permissions and not privileges.
 `removeFile()` removes one file and raises a `FileSystemError` for a directory, and `removeDirectory()` removes one directory, which has to be empty already, so removing what a directory contains always takes a call of its own.
@@ -1974,6 +1976,8 @@ A symbolic link is removed as the link it is and never followed, so a link into 
 `Metadata` from `@std.fs.metadata` is a struct holding `kind`, `length` in bytes, which is `0` for a directory, and `modifiedMillis`, when the content last changed in milliseconds since 1970-01-01 UTC.
 Its `kind` is an `EntryKind`, one of `File`, `Directory`, `Symlink` and `Other`, the last being something the system keeps that is none of the first three, such as a device or a socket.
 A result that followed a symbolic link describes what the link points to, so its kind is never `Symlink`.
+On Linux, reading file metadata needs kernel 4.11 or newer.
+On an older kernel, the calls that read it, such as `metadata()`, `linkTarget()`, `copyTo()` and `tryLock()`, raise a `FileSystemError` of kind `Other`, and `exists()`, `isFile()` and `isDirectory()` return `false`.
 
 `TemporaryDirectory` and `TemporaryFile` from `@std.fs.temporary` each guard something that exists for as long as the value does.
 `TemporaryDirectory.create(prefix)` and `TemporaryFile.create(prefix)` make one under the directory this system keeps work in progress in, which is what `TMP`, `TEMP` or `TMPDIR` names, and `/tmp` on a system other than Windows whose environment names none.
