@@ -234,6 +234,15 @@ task("test")
             })
         end
 
+        -- the target library's unit tests: the processor a triple names, over every spelling of it.
+        if want("selfhost_target") then
+            table.insert(jobs, {
+                name = "selfhost_target",
+                source = path.join(os.projectdir(), "selfhost", "target"),
+                ens_test_args = {},
+            })
+        end
+
         -- the corpus round-trip harness parses every .ens file in the real source trees and
         -- asserts the front end is lossless and clean over all of them.
         if want("corpus_roundtrip") then
@@ -864,8 +873,8 @@ task("test")
                 end
             end
             for _, pkg in ipairs({"corpus", "frontend", "sema", "semacheck", "syntaxgen",
-                              "llvm", "codegen", "codegencheck", "host", "cli", "packages",
-                              "link", "build", "driver"}) do
+                              "target", "llvm", "codegen", "codegencheck", "host", "cli",
+                              "packages", "link", "build", "driver"}) do
                 local src = path.join(os.projectdir(), "selfhost", pkg, "src")
                 local seeds = {}
                 for _, f in ipairs(os.files(path.join(src, "**.ens"))) do
