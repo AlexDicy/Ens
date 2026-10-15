@@ -820,6 +820,12 @@ Commands use the same three exit codes: `0` when the command did what was asked,
   The default is `-O2`, and `-O0` turns the optimizer off.
 - `--target <triple>` builds for a target other than this machine's own, such as `x86_64-unknown-linux-gnu` or `arm64-apple-macosx14.0`.
   The first part of the triple names the processor: `x86_64` or `amd64` for a 64-bit Intel or AMD one, and `arm64` or `aarch64` for a 64-bit ARM one, and a triple naming any other processor is refused.
+  The end of the triple names the system: `windows`, `windows-msvc` or `win32` for Windows with the Microsoft C runtime, `linux` or `linux-gnu` for Linux with the GNU C library, and `macosx`, `macos` or `darwin` for macOS.
+  A vendor such as `pc`, `unknown` or `apple` comes between the processor and the system, and it may be left out when the system is one word or starts with `linux`, as in `x86_64-win32` or `x86_64-linux-gnu`.
+  A macOS system may end in a version: the macOS version after `macosx` or `macos`, as in `macosx14.0`, or the Darwin version after `darwin`, as in `darwin23` for macOS 14.
+  The program then runs on that version of macOS and later ones, and on macOS 11 and later when no version is written.
+  `windows-msvc` may also end in a version, as in `windows-msvc19.40.0`.
+  A triple naming any other system, such as `linux-musl` or `windows-gnu`, or naming none, is refused.
 - `--stdlib <folder>` names the folder holding `std/` instead of letting the build look for one by walking up from the sources; `ENS_STDLIB` does the same thing.
   A folder either one names that is not there, or that does not hold the standard library in its `std/` folder, is refused before anything is compiled.
 - `--explain-arc` reports what the reference-counting optimizer elided, as described in the section on memory management.

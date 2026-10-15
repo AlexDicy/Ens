@@ -234,7 +234,8 @@ task("test")
             })
         end
 
-        -- the target library's unit tests: the processor a triple names, over every spelling of it.
+        -- the target library's unit tests: the processor and the system a triple names, over every
+        -- spelling of each.
         if want("selfhost_target") then
             table.insert(jobs, {
                 name = "selfhost_target",

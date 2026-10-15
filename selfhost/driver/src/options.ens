@@ -2,6 +2,8 @@
 // option is checked here, before any work starts, so a mistyped level or an unknown pass is
 // reported as the usage problem it is rather than as a build failure.
 import TargetTriple from @ens.target.triple;
+import SystemSupport from @ens.target.triple;
+import TripleReading from @ens.target.triple;
 import @ens.target.triple;
 import CodegenSettings from @ens.codegen.settings;
 import OptimizationLevel from @ens.codegen.settings;
@@ -14,6 +16,7 @@ import Verbosity from @ens.build.options;
 import @ens.build.platform;
 import Invocation from @ens.cli.invocation;
 import List from @std.collections.list;
+import Platform from @std.platform;
 
 // The options a build will run on, or the usage problem that stopped them being made.
 export final class OptionsResolution {
@@ -50,14 +53,18 @@ export resolve(Invocation invocation, Path workingFolder) -> OptionsResolution {
     if (invocation.flag("quiet") && invocation.flag("verbose")) {
         return failed("'--quiet' and '--verbose' cannot be used together. Remove one of them");
     }
-    let target = platform.hostTarget();
+    TargetTriple? target = null;
     string? named = invocation.value("target");
     if (named != null) {
-        let parsed = TargetTriple.parse(named);
-        if (parsed == null) {
+        target = TargetTriple.parse(named);
+        if (target == null) {
             return failed(refusedTarget(named));
         }
-        target = parsed;
+    } else {
+        target = platform.getHostTarget();
+        if (target == null) {
+            return failed(refusedHost(platform.hostTriple()));
+        }
     }
 
     if (invocation.flag("no-link") && invocation.value("output") != null) {
@@ -110,18 +117,107 @@ firstUnknownPass(string[] named) -> string {
     return "";
 }
 
-// Why '--target' cannot take `text`, whose first part names no processor this toolchain builds
-// for. The example is the triple as written with only that part replaced.
+// Why '--target' cannot take `text`, which names a processor or a system this toolchain does not
+// build for, or names none. Each part at fault is named, and the example is the triple as written
+// with only those parts replaced.
 refusedTarget(string text) -> string {
-    string written = triple.processorPart(text);
-    string choices = "Write 'x86_64' for a 64-bit Intel or AMD processor, or 'aarch64' or 'arm64' "
-        + "for a 64-bit ARM one, as the first part of the triple";
-    if (written.isEmpty()) {
-        return "'--target {text}' names no processor. {choices}, as in 'x86_64{text}'";
+    let reading = triple.read(text);
+    return "{problemsOf("'--target {text}'", reading)} {fixOf(reading)}, as in "
+        + "'{exampleFor(reading)}'";
+}
+
+// Why a command that names no target cannot build for this machine, whose own target is `host`,
+// which names a processor or a system this toolchain does not build for. The example is the host's
+// triple with only the parts at fault replaced.
+public refusedHost(string host) -> string {
+    let reading = triple.read(host);
+    return "{problemsOf("this machine's target, '{host}',", reading)} Build for another target "
+        + "with '--target', as in '--target {exampleFor(reading)}'";
+}
+
+// What is wrong with the triple `reading` read, as sentences the first of which starts with
+// `subject`.
+problemsOf(string subject, TripleReading reading) -> string {
+    if (reading.supportsProcessor()) {
+        return "{subject} {systemReason(reading)}.";
     }
-    string example = processorLike(written) + text.substring(written.length);
-    return "'--target {text}' names the processor '{written}', which this toolchain cannot build "
-        + "for. {choices}, as in '{example}'";
+    string processor = reading.processor();
+    string unsupported = "names the processor '{processor}', which this toolchain cannot build for";
+    if (processor.isEmpty()) {
+        unsupported = "names no processor";
+    }
+    switch (reading.systemSupport()) {
+        SystemSupport.Supported -> {
+            return "{subject} {unsupported}.";
+        },
+        SystemSupport.Missing -> {
+            if (processor.isEmpty()) {
+                return "{subject} names no processor and no system.";
+            }
+            return "{subject} {unsupported}, and names no system.";
+        },
+        SystemSupport.Unsupported -> {
+            if (processor.isEmpty()) {
+                return "{subject} names no processor, and {systemReason(reading)}.";
+            }
+            return "{subject} names the processor '{processor}' and the system "
+                + "'{reading.system()}', and this toolchain builds for neither.";
+        },
+        SystemSupport.LinuxMusl, SystemSupport.LinuxGnuForm, SystemSupport.WindowsMinGW,
+                SystemSupport.WindowsCygwin -> {
+            return "{subject} {unsupported}. The triple also {systemReason(reading)}.";
+        },
+    }
+}
+
+// Why this toolchain cannot build for the system `reading` read, as what the triple does.
+systemReason(TripleReading reading) -> string {
+    string onlyWindows = "this toolchain builds Windows programs only against the Microsoft C "
+        + "runtime";
+    return switch (reading.systemSupport()) {
+        SystemSupport.Missing -> "names no system",
+        SystemSupport.LinuxMusl -> "builds against the C library 'musl', and this toolchain "
+            + "builds Linux programs only against the GNU C library",
+        SystemSupport.LinuxGnuForm -> "builds against the GNU C library in its "
+            + "'{reading.linuxLibrary()}' form, and this toolchain builds Linux programs only "
+            + "against its plain 'gnu' form",
+        SystemSupport.WindowsMinGW -> "builds against the MinGW C runtime, and {onlyWindows}",
+        SystemSupport.WindowsCygwin -> "builds against the Cygwin C library, and {onlyWindows}",
+        SystemSupport.Unsupported, SystemSupport.Supported -> "names the system "
+            + "'{reading.system()}', which this toolchain cannot build for",
+    };
+}
+
+// What to write in place of each part of the triple `reading` read that is at fault.
+fixOf(TripleReading reading) -> string {
+    string processors = "'x86_64' for a 64-bit Intel or AMD processor, or 'aarch64' or 'arm64' for "
+        + "a 64-bit ARM one";
+    string systems = switch (reading.systemSupport()) {
+        SystemSupport.LinuxMusl, SystemSupport.LinuxGnuForm -> "'linux-gnu'",
+        SystemSupport.WindowsMinGW, SystemSupport.WindowsCygwin -> "'windows-msvc'",
+        SystemSupport.Missing, SystemSupport.Unsupported, SystemSupport.Supported -> "'linux-gnu' "
+            + "for Linux, 'windows-msvc' for Windows or 'macosx' for macOS",
+    };
+    if (reading.systemSupport() == SystemSupport.Supported) {
+        return "Make the first part of the triple {processors}";
+    }
+    if (reading.supportsProcessor()) {
+        return "Make the end of the triple {systems}";
+    }
+    return "Make the first part of the triple {processors}. Make the end {systems}";
+}
+
+// The triple as written with the processor and the system replaced where they are at fault.
+exampleFor(TripleReading reading) -> string {
+    string processor = reading.processor();
+    if (!reading.supportsProcessor()) {
+        processor = processorLike(processor);
+    }
+    string system = reading.system();
+    if (reading.systemSupport() != SystemSupport.Supported) {
+        system = systemFor(reading.nearestPlatform());
+    }
+    return reading.spelledWith(processor, system);
 }
 
 // The processor to offer instead of `written`: an ARM one in the spelling `written` starts with,
@@ -134,6 +230,15 @@ processorLike(string written) -> string {
         return "arm64";
     }
     return "x86_64";
+}
+
+// The system to offer for a triple whose system is nearest to `platform`.
+systemFor(Platform platform) -> string {
+    return switch (platform) {
+        Platform.Windows -> "windows-msvc",
+        Platform.Linux -> "linux-gnu",
+        Platform.MacOS -> "macosx",
+    };
 }
 
 // A folder or file a command line named, as it reads from the folder the command ran in, or empty

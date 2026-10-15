@@ -34,7 +34,7 @@ If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surf
   - `syntax.grammar` + `syntaxgen/` - the declarative grammar and the generator that emits the syntax-tree sources.
   - `frontend/` - lexer, event parser, red-green syntax tree.
   - `sema/` - the semantic layer: module graph, types, declarations, signatures, layout, generics, expression/statement checking, flow narrowing, checked exceptions.
-  - `target/` - a target triple read once into what it names, which code generation, linking and the build carry instead of the text: the processor, from any of its spellings.
+  - `target/` - a target triple read once into what it names, which code generation, linking and the build carry instead of the text: the processor, the system and the oldest macOS a program runs on, from any of their spellings.
   - `llvm/` - the binding over LLVM-C: contexts, modules, builders, types, values, target machines.
   - `codegen/` - lowering to EIR (the ownership-explicit intermediate form), its verifiers, the optimization passes, and LLVM emission.
   - `host/` - what a run reads from the machine once: the environment snapshot, the user's `.ens` folder, path text, and a scratch folder that removes itself.

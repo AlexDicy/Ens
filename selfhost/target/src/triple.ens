@@ -1,5 +1,7 @@
-// A target triple read once, into the processor it names. Code that depends on the processor
-// switches on the value read here and never reads the text again.
+// A target triple read once, into the processor and the system it names. Code that depends on
+// either switches on the values read here and never reads the text again.
+import Platform from @std.platform;
+import @std.text.parse;
 
 // The processors this toolchain builds for.
 export enum Architecture {
@@ -10,22 +12,41 @@ export enum Architecture {
     Arm64,
 }
 
+export final class Macos {
+    // The oldest macOS an Ens program is built to run on when nothing names a version.
+    export static const string oldestVersion = "11.0";
+
+    // The first macOS that ran on a 64-bit ARM processor, and its number alone.
+    protected static const string firstArm64Version = "11.0";
+    protected static const long firstArm64Major = 11;
+}
+
 // A triple this toolchain builds for: the text as written, which is what LLVM and the build's
-// folders read, and the processor it names.
+// folders read, the processor and the system it names, and the oldest macOS a program built for a
+// macOS target runs on.
 export final class TargetTriple {
     string tripleText;
     Architecture tripleArchitecture;
+    Platform triplePlatform;
+    string tripleMacosVersion;
 
-    protected constructor(this.tripleText, this.tripleArchitecture);
+    protected constructor(this.tripleText, this.tripleArchitecture, this.triplePlatform,
+                          this.tripleMacosVersion);
 
-    // The target `text` names, or null when its first part names no processor this toolchain
-    // builds for.
+    // The target `text` names, or null when it names a processor or a system this toolchain does
+    // not build for.
     export static parse(string text) -> TargetTriple? {
-        let named = architectureOf(text);
-        if (named == null) {
+        let reading = read(text);
+        let architecture = reading.readArchitecture;
+        let platform = reading.readPlatform;
+        if (architecture == null || platform == null) {
             return null;
         }
-        return new TargetTriple(text, named);
+        string macosVersion = "";
+        if (platform == Platform.MacOS) {
+            macosVersion = macosVersionOf(reading.systemText, architecture);
+        }
+        return new TargetTriple(text, architecture, platform, macosVersion);
     }
 
     export text() -> string {
@@ -35,24 +56,329 @@ export final class TargetTriple {
     export architecture() -> Architecture {
         return this.tripleArchitecture;
     }
+
+    export platform() -> Platform {
+        return this.triplePlatform;
+    }
+
+    // The oldest macOS a program built for this macOS target runs on, which is the version LLVM
+    // writes into each of its objects.
+    export macosVersion() -> string {
+        if (this.triplePlatform != Platform.MacOS) {
+            panic("Internal: the target '{this.tripleText}' has no macOS version, because it is "
+                + "not a macOS target");
+        }
+        return this.tripleMacosVersion;
+    }
+
+    // Whether a program built for this target runs on a machine of the `machine` target: the
+    // same processor and the same system, however either triple spells them.
+    export runsOn(TargetTriple machine) -> bool {
+        return this.tripleArchitecture == machine.tripleArchitecture
+            && this.triplePlatform == machine.triplePlatform;
+    }
 }
 
-// The processor the triple's first part names, or null when it names one this toolchain does not
-// build for, such as the 32-bit Intel 'i686' or the big-endian ARM 'aarch64_be'.
-export architectureOf(string text) -> Architecture? {
-    return switch (processorPart(text)) {
+// How the system a triple names stands with this toolchain.
+export enum SystemSupport {
+    // A system this toolchain builds for.
+    Supported,
+
+    // No system at all, as in a triple of a processor alone.
+    Missing,
+
+    // Linux with the C library musl.
+    LinuxMusl,
+
+    // Linux with the GNU C library in a form other than its plain one, such as 'gnueabihf'.
+    LinuxGnuForm,
+
+    // Windows with the C runtime of MinGW.
+    WindowsMinGW,
+
+    // Windows with the C library of Cygwin.
+    WindowsCygwin,
+
+    // Any other system.
+    Unsupported,
+}
+
+// A triple read part by part, whether or not this toolchain builds for it: the processor and the
+// system as written, and what this toolchain makes of each.
+export final class TripleReading {
+    string readText;
+    protected string processorText;
+    protected string systemText;
+    protected Architecture? readArchitecture;
+    protected Platform? readPlatform;
+    SystemSupport readSupport;
+    Platform nearest;
+
+    protected constructor(this.readText, this.processorText, this.systemText,
+                          this.readArchitecture, this.readPlatform, this.readSupport, this.nearest);
+
+    // The first part of the triple as written, which names its processor, and empty text when the
+    // triple starts with '-'.
+    export processor() -> string {
+        return this.processorText;
+    }
+
+    // Whether this toolchain builds for the processor the triple names.
+    export supportsProcessor() -> bool {
+        return this.readArchitecture != null;
+    }
+
+    // The end of the triple as written, after the processor and the vendor, which names its system
+    // and the C library it builds against, and empty text when the triple names none.
+    export system() -> string {
+        return this.systemText;
+    }
+
+    export systemSupport() -> SystemSupport {
+        return this.readSupport;
+    }
+
+    // What follows 'linux-' in a Linux system, as written, which names the C library it builds
+    // against, and empty text for a system that is not Linux.
+    export linuxLibrary() -> string {
+        string linux = "linux-";
+        if (!this.systemText.startsWith(linux)) {
+            return "";
+        }
+        return this.systemText.substring(linux.length);
+    }
+
+    // The system this toolchain builds for that the triple's system is, or is a form of, or comes
+    // from the same maker as: Windows for MinGW and Cygwin, macOS for another Apple system, and
+    // Linux for every system none of the three is close to.
+    export nearestPlatform() -> Platform {
+        return this.nearest;
+    }
+
+    // The triple as written with `processor` as its first part and `system` as its end. A triple
+    // that names no system gets the vendor 'unknown' before the system it is given.
+    export spelledWith(string processor, string system) -> string {
+        string between = this.readText.substring(this.processorText.length,
+            this.readText.length - this.systemText.length);
+        if (this.systemText.isEmpty() && (between.isEmpty() || between == "-")) {
+            between = "-unknown-";
+        }
+        return processor + between + system;
+    }
+}
+
+// The target to build for on the machine LLVM names `hostTriple`. A Mac names itself by its kernel's
+// version, and a program built for that version does not run on an older Mac, so a Mac builds for
+// the oldest macOS an Ens program runs on. Every other machine's triple is the target as it is
+// written.
+export defaultTargetFor(string hostTriple) -> string {
+    let reading = read(hostTriple);
+    if (!reading.system().startsWith("darwin")) {
+        return hostTriple;
+    }
+    return reading.spelledWith(reading.processor(), "macosx" + Macos.oldestVersion);
+}
+
+// The triple `text` read part by part.
+export read(string text) -> TripleReading {
+    string processor = processorPart(text);
+    string system = systemPart(text);
+    let platform = platformOf(system);
+    let support = SystemSupport.Supported;
+    if (platform == null) {
+        support = supportOf(system);
+    }
+    return new TripleReading(text, processor, system, architectureOf(processor), platform, support,
+        platform ?? nearestPlatformOf(text, system, support));
+}
+
+// The processor `processor` names, or null when it names one this toolchain does not build for,
+// such as the 32-bit Intel 'i686' or the big-endian ARM 'aarch64_be'.
+architectureOf(string processor) -> Architecture? {
+    return switch (processor) {
         "x86_64", "amd64" -> Architecture.X64,
         "aarch64", "arm64" -> Architecture.Arm64,
         default -> null,
     };
 }
 
+// The system `system` names, or null when it names one this toolchain does not build and link for:
+// Windows with the Microsoft C runtime, whose 'windows-msvc' may carry a version, Linux with the GNU
+// C library, and macOS with or without a version.
+platformOf(string system) -> Platform? {
+    switch (system) {
+        "windows", "win32" -> {
+            return Platform.Windows;
+        },
+        "linux", "linux-gnu" -> {
+            return Platform.Linux;
+        },
+        default -> {
+            if (versionAfter(system, "windows-msvc") != null) {
+                return Platform.Windows;
+            }
+            if (macosVersionText(system) != null) {
+                return Platform.MacOS;
+            }
+            return null;
+        },
+    }
+}
+
+// How `system`, which names no system this toolchain builds for, stands with it.
+supportOf(string system) -> SystemSupport {
+    if (system.isEmpty()) {
+        return SystemSupport.Missing;
+    }
+    if (system == "linux-musl") {
+        return SystemSupport.LinuxMusl;
+    }
+    if (system.startsWith("linux-gnu")) {
+        return SystemSupport.LinuxGnuForm;
+    }
+    if (system == "windows-gnu" || system == "windows-gnullvm" || system.startsWith("mingw")) {
+        return SystemSupport.WindowsMinGW;
+    }
+    if (system == "cygwin" || system == "windows-cygnus") {
+        return SystemSupport.WindowsCygwin;
+    }
+    return SystemSupport.Unsupported;
+}
+
+// The system this toolchain builds for that is nearest to `system`, which names none it builds for.
+nearestPlatformOf(string text, string system, SystemSupport support) -> Platform {
+    switch (support) {
+        SystemSupport.LinuxMusl, SystemSupport.LinuxGnuForm -> {
+            return Platform.Linux;
+        },
+        SystemSupport.WindowsMinGW, SystemSupport.WindowsCygwin -> {
+            return Platform.Windows;
+        },
+        SystemSupport.Supported, SystemSupport.Missing, SystemSupport.Unsupported -> {
+            if (text.contains("-apple-") || system.startsWith("macos")
+                    || system.startsWith("darwin")) {
+                return Platform.MacOS;
+            }
+            if (system.startsWith("win")) {
+                return Platform.Windows;
+            }
+            return Platform.Linux;
+        },
+    }
+}
+
 // The first part of the triple as written, which names its processor, and empty text when the
-// triple starts with '-' or is empty.
-export processorPart(string text) -> string {
+// triple starts with '-'.
+processorPart(string text) -> string {
     long dash = text.indexOf("-");
     if (dash < 0) {
         return text;
     }
     return text.substring(0, dash);
+}
+
+// The parts of the triple after the processor and the vendor as written, which name its system
+// and the C library it builds against, and empty text when the triple names none. A vendor is the
+// second part of a triple of three parts or more, unless that part is 'linux', which some triples
+// write with no vendor before it, as in 'x86_64-linux-gnu'.
+systemPart(string text) -> string {
+    string[] parts = text.split("-");
+    if (parts.length < 2) {
+        return "";
+    }
+    long first = 2;
+    if (parts.length == 2 || parts[1] == "linux") {
+        first = 1;
+    }
+    return string.joined(parts.slice(first, parts.length), "-");
+}
+
+// The version a macOS system is written with, empty when it is written with none, or null when
+// `system` is not macOS: 'macosx', 'macos' or 'darwin' and a run of numbers joined by dots.
+macosVersionText(string system) -> string? {
+    for (let name in ["macosx", "macos", "darwin"]) {
+        if (system.startsWith(name)) {
+            return versionAfter(system, name);
+        }
+    }
+    return null;
+}
+
+// What follows `name` in `system`, empty when nothing does, or null when `system` does not start
+// with `name` or what follows it is not a version.
+versionAfter(string system, string name) -> string? {
+    if (!system.startsWith(name)) {
+        return null;
+    }
+    string version = system.substring(name.length);
+    if (!isVersion(version)) {
+        return null;
+    }
+    return version;
+}
+
+// Whether `text` is empty or numbers joined by single dots, as in '14' or '10.15.4'.
+isVersion(string text) -> bool {
+    if (text.isEmpty()) {
+        return true;
+    }
+    for (let part in text.split(".")) {
+        if (part.isEmpty()) {
+            return false;
+        }
+        for (let digit in part.toBytes()) {
+            if (digit < '0' || digit > '9') {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// The oldest macOS a program built for the macOS system `system` runs on, read the way LLVM reads
+// it into the objects it writes. A 'macosx' or 'macos' version is the macOS version itself, and a
+// 'darwin' version is the version of the macOS kernel, which the macOS release it shipped with
+// numbers its own way. A system with no version, or with one older than any macOS, gets the oldest
+// one an Ens program is built for, and a 64-bit ARM program never runs on a macOS older than 11.0,
+// the first that ran on that processor.
+macosVersionOf(string system, Architecture architecture) -> string {
+    string written = macosVersionText(system) ?? "";
+    string version = written;
+    if (system.startsWith("darwin")) {
+        version = macosReleaseOfDarwin(majorOf(written));
+    }
+    long major = majorOf(version);
+    if (major == 0) {
+        return Macos.oldestVersion;
+    }
+    if (architecture == Architecture.Arm64 && major < Macos.firstArm64Major) {
+        return Macos.firstArm64Version;
+    }
+    return version;
+}
+
+// The macOS release a Darwin kernel of the major version `darwin` shipped with, and empty text for
+// a version older than any macOS. Darwin 4 to 19 are macOS 10.0 to 10.15, Darwin 20 to 24 are
+// macOS 11 to 15, and from Darwin 25 on macOS is numbered one above Darwin.
+macosReleaseOfDarwin(long darwin) -> string {
+    if (darwin < 4) {
+        return "";
+    }
+    if (darwin <= 19) {
+        return "10.{darwin - 4}";
+    }
+    if (darwin <= 24) {
+        return "{darwin - 9}.0";
+    }
+    return "{darwin + 1}.0";
+}
+
+// The first number of the version `version`, and 0 when it has none.
+majorOf(string version) -> long {
+    long dot = version.indexOf(".");
+    string first = version;
+    if (dot >= 0) {
+        first = version.substring(0, dot);
+    }
+    return parse.parseLong(first) ?? 0;
 }
