@@ -1,0 +1,227 @@
+// Refusing a call whose type argument would be inferred as 'void', which means no value and so is
+// never a type argument.
+import SyntaxNode from @ens.frontend.syntax.node;
+import Expression from @ens.frontend.syntax.generated.nodes;
+import BlockNode from @ens.frontend.syntax.generated.nodes;
+import LambdaExpressionNode from @ens.frontend.syntax.generated.nodes;
+import LambdaBody from @ens.frontend.syntax.generated.nodes;
+import ArgumentListNode from @ens.frontend.syntax.generated.nodes;
+import ReturnStatementNode from @ens.frontend.syntax.generated.nodes;
+import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
+import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SafeMemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
+import TryExpressionNode from @ens.frontend.syntax.generated.nodes;
+import model.convert;
+import model.flow;
+import ExitScope from model.flow;
+import model.typenames;
+import Parameter from model.typemembers;
+import model.types;
+import Type from model.types;
+import ErrorType from model.types;
+import NullType from model.types;
+import FunctionType from model.types;
+import TypeParamType from model.types;
+import PrimitiveKind from model.types;
+import TypeArgumentInference from phases.inference;
+import phases.bodies.voidcalls;
+import phases.bodies.wording;
+import support.syntax;
+import List from @std.collections.list;
+import BodyChecker from phases.bodies;
+
+// Reports the refusal of the call to 'callee', as in "'run'", when one of its open type
+// parameters would be 'void' through one of its arguments, and returns whether it did.
+// 'argumentTypes' holds the type of each argument the inference read.
+public reportVoidTypeArgument(BodyChecker checker, ArgumentListNode arguments,
+                              Parameter[] parameters, List<Type> argumentTypes,
+                              TypeArgumentInference inference, TypeParamType[] typeParameters,
+                              string callee) -> bool {
+    for (let typeParameter in typeParameters) {
+        let source = inference.voidArgument(typeParameter.index());
+        if (source != null && source < parameters.length && source < argumentTypes.length()) {
+            let argument = arguments.arguments(source);
+            if (argument is Expression) {
+                checker.reporter().report(refusal(checker, argument, argumentTypes.get(source),
+                    parameters[source], typeParameter, callee), argument.span());
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// The refusal of 'argument', of type 'analyzed', passed for 'declared', which would make the type
+// parameter 'parameter' of 'callee' 'void'.
+refusal(BodyChecker checker, Expression argument, Type analyzed, Parameter declared,
+        TypeParamType parameter, string callee) -> string {
+    if (types.isVoidType(analyzed)) {
+        let refused = voidcalls.argumentRefusal(checker, argument, analyzed, callee, declared.type());
+        if (refused != null) {
+            return refused;
+        }
+    }
+    Type template = convert.coreOf(declared.type());
+    if (template is FunctionType && isParameter(template.returnType(), parameter)) {
+        string uses = "{callee} uses the type of the value '{declared.name()}' returns as its type "
+            + "argument '{parameter.name()}'.";
+        if (argument is LambdaExpressionNode) {
+            return "This lambda returns no value, but {uses} Return a value from the lambda.";
+        }
+        return "{functionReturnsNothing(argument)}, but {uses} Pass a function that returns a value.";
+    }
+    string named = wording.sideNamed(argument, "The argument for '{declared.name()}'");
+    string type = checker.names().of(analyzed);
+    return "{named} is {typenames.typeArticle(type)} {checker.names().quoted(analyzed)}, so the type "
+        + "argument '{parameter.name()}' of {callee} would be 'void'. 'void' means no value, so it "
+        + "cannot be a type argument.";
+}
+
+// That the function value 'argument' returns no value: "'callback' returns no value" for a value
+// that is named, and for any other value the function it gives, as in "'maker()' returns a
+// function that returns no value".
+functionReturnsNothing(Expression argument) -> string {
+    let spelled = wording.shortSpelling(argument);
+    if (spelled == null) {
+        return "This argument is a function that returns no value";
+    }
+    switch (syntax.unwrapParentheses(argument)) {
+        is IdentifierExpressionNode ignored -> {
+            return "'{spelled}' returns no value";
+        },
+        is MemberExpressionNode ignored -> {
+            return "'{spelled}' returns no value";
+        },
+        is SafeMemberExpressionNode ignored -> {
+            return "'{spelled}' returns no value";
+        },
+        is CallExpressionNode ignored -> {
+            return "'{spelled}' returns a function that returns no value";
+        },
+        is TryExpressionNode ignored -> {
+            return "'{spelled}' returns a function that returns no value";
+        },
+        default -> {
+            return "'{spelled}' is a function that returns no value";
+        },
+    }
+}
+
+isParameter(Type type, TypeParamType parameter) -> bool {
+    return type is TypeParamType && type.owner() == parameter.owner()
+        && type.index() == parameter.index();
+}
+
+// Checks each lambda argument whose parameter types the call already shows against a target that
+// returns nothing, and matches the type its body gives with the result its parameter expects.
+// The call is refused either way, so this only completes what the refusal names. True when a
+// lambda whose body gives no type leaves a type argument open, so no example can name it.
+public inferFromLambdas(BodyChecker checker, ArgumentListNode arguments, Parameter[] parameters,
+                        TypeArgumentInference inference) -> bool {
+    bool untyped = false;
+    for (long i = 0; i < arguments.argumentsCount() && i < parameters.length; i++) {
+        let argument = arguments.arguments(i);
+        Type template = convert.coreOf(parameters[i].type());
+        if (argument is LambdaExpressionNode && template is FunctionType) {
+            let given = lambdaResult(checker, argument, template, inference);
+            if (given != null) {
+                inference.unifyArgument(i, template.returnType(), given);
+            } else if (inference.settled(template.returnType()) == null) {
+                untyped = true;
+            }
+        }
+    }
+    return untyped;
+}
+
+// The type the body of 'lambda' gives when it is checked in a trial against 'template' with its
+// result replaced by 'void': the error type, which fits any result, when the body never ends
+// normally, and null when the lambda's parameters or thrown types are still open, when the trial
+// refuses the lambda, or when the body gives no type a refusal can use. Nothing the trial finds is
+// reported.
+lambdaResult(BodyChecker checker, LambdaExpressionNode lambda, FunctionType template,
+             TypeArgumentInference inference) -> Type? {
+    let settledParameters = settledAll(template.parameterTypes(), inference);
+    let settledThrown = settledAll(template.thrownTypes(), inference);
+    if (settledParameters == null || settledThrown == null) {
+        return null;
+    }
+    Type nothing = checker.store().primitive(PrimitiveKind.Void);
+    Type target = checker.store().functionOf(settledParameters, nothing, settledThrown);
+    let trial = checker.lambdaTrial();
+    Type? given = null;
+    if (!(trial.analyzeExpressionAdapt(lambda, target) is ErrorType)) {
+        given = bodyResult(trial, lambda.body(), nothing);
+    }
+    checker.endTrial();
+    return given;
+}
+
+// The type the checked 'body' gives: its value, the value of its first 'return' with one, or
+// 'nothing' when it can end or return without a value. The error type when it never ends normally,
+// and null when its value has no type a refusal can use.
+bodyResult(BodyChecker checker, LambdaBody body, Type nothing) -> Type? {
+    switch (body) {
+        is BlockNode block -> {
+            let returns = new List<ReturnStatementNode>();
+            collectReturns(block, returns);
+            for (let returned in returns) {
+                let value = returned.value();
+                if (value != null) {
+                    return valueResult(checker, value);
+                }
+            }
+            if (!returns.isEmpty() || !flow.blockTerminates(block, ExitScope.Function, checker)) {
+                return nothing;
+            }
+            return checker.store().errorType();
+        },
+        is Expression value -> {
+            return valueResult(checker, value);
+        },
+        default -> {
+            return null;
+        },
+    }
+}
+
+// The type the checked 'value' gives: 'void' for a call that returns no value, the error type for a
+// value that never returns, and null for a value with no type a refusal can use.
+valueResult(BodyChecker checker, Expression value) -> Type? {
+    if (checker.neverReturns(value)) {
+        return checker.store().errorType();
+    }
+    Type given = checker.recordedType(value);
+    if (given is ErrorType || given is NullType) {
+        return null;
+    }
+    return given;
+}
+
+// Appends the 'return' statements in 'node', outside the lambdas inside it, in source order.
+collectReturns(SyntaxNode node, List<ReturnStatementNode> into) {
+    for (let child in node.childNodes()) {
+        switch (child) {
+            is ReturnStatementNode returned -> {
+                into.push(returned);
+            },
+            is LambdaExpressionNode ignored -> { },
+            default -> {
+                collectReturns(child, into);
+            },
+        }
+    }
+}
+
+settledAll(Type[] templateTypes, TypeArgumentInference inference) -> Type[]? {
+    let settled = new List<Type>();
+    for (let templateType in templateTypes) {
+        let resolved = inference.settled(templateType);
+        if (resolved == null) {
+            return null;
+        }
+        settled.push(resolved);
+    }
+    return settled.toArray();
+}

@@ -420,6 +420,7 @@ It also looks through the interfaces a class implements and the classes it exten
 The first argument that mentions a type parameter binds it, and a later argument that disagrees is an error naming that binding and the argument it came from.
 Explicit type arguments always win over what the call would infer.
 A type argument no argument mentions, such as one that appears only in the return type, must be passed explicitly.
+`void` means no value, so it is never a type argument: writing one, as in `List<void>`, is an error, and so is a call that would infer one, such as a `() -> void` passed for a `() -> T` parameter.
 
 ```ens
 firstOf<T>(List<T> items) -> T {

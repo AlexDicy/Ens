@@ -16,6 +16,7 @@ import FunctionType from model.types;
 import TypeParamType from model.types;
 import InstantiationType from model.types;
 import TypeStore from model.types;
+import model.types;
 import List from @std.collections.list;
 
 public class TypeArgumentInference {
@@ -26,31 +27,42 @@ public class TypeArgumentInference {
     GreenNode owner;
     List<Type?> slotBindings;
     List<long> slotSources;
+    List<long> voidSources;
 
     public constructor(TypeStore store, GreenNode owner, long arity) {
         this.store = store;
         this.owner = owner;
         this.slotBindings = new List<Type?>();
         this.slotSources = new List<long>();
+        this.voidSources = new List<long>();
         for (long i = 0; i < arity; i++) {
             this.slotBindings.push(null);
             this.slotSources.push(TypeArgumentInference.unbound);
+            this.voidSources.push(TypeArgumentInference.unbound);
         }
     }
 
     // Binds each open type parameter the parameter type mentions, matching the argument
     // structurally and through what it conforms to. A mismatch binds nothing; the argument check
-    // reports it.
+    // reports it. 'void' is never a type argument, so a slot it would fill stays open and keeps
+    // the first argument that offered it.
     public unifyArgument(long argumentIndex, Type parameterType, Type argumentType) {
         switch (parameterType) {
             is TypeParamType parameter -> {
-                if (parameter.owner() == this.owner
-                        && parameter.index() < this.slotBindings.length()
-                        && this.slotBindings.get(parameter.index()) == null
-                        && !(argumentType is NullType) && !(argumentType is ErrorType)) {
-                    this.slotBindings.set(parameter.index(), argumentType);
-                    this.slotSources.set(parameter.index(), argumentIndex);
+                if (parameter.owner() != this.owner
+                        || parameter.index() >= this.slotBindings.length()
+                        || this.slotBindings.get(parameter.index()) != null
+                        || argumentType is NullType || argumentType is ErrorType) {
+                    return;
                 }
+                if (types.isVoidType(argumentType)) {
+                    if (this.voidSources.get(parameter.index()) == TypeArgumentInference.unbound) {
+                        this.voidSources.set(parameter.index(), argumentIndex);
+                    }
+                    return;
+                }
+                this.slotBindings.set(parameter.index(), argumentType);
+                this.slotSources.set(parameter.index(), argumentIndex);
             },
             is OptionalType optional -> {
                 Type inner = argumentType;
@@ -104,6 +116,65 @@ public class TypeArgumentInference {
 
     public binding(long index) -> Type? {
         return this.slotBindings.get(index);
+    }
+
+    // The index of the first argument that would have made the open slot 'index' 'void', or null
+    // when the slot is bound or no argument offered 'void' for it.
+    public voidArgument(long index) -> long? {
+        long source = this.voidSources.get(index);
+        if (this.slotBindings.get(index) != null || source == TypeArgumentInference.unbound) {
+            return null;
+        }
+        return source;
+    }
+
+    // The template type with every bound slot replaced by its binding, or null while it mentions
+    // a slot still open.
+    public settled(Type templateType) -> Type? {
+        if (this.mentionsOpenSlot(templateType)) {
+            return null;
+        }
+        let arguments = new List<Type>();
+        for (let binding in this.slotBindings) {
+            arguments.push(binding ?? this.store.errorType());
+        }
+        return this.store.substitute(templateType, this.owner, arguments.toArray());
+    }
+
+    mentionsOpenSlot(Type templateType) -> bool {
+        switch (templateType) {
+            is TypeParamType parameter -> {
+                return parameter.owner() == this.owner
+                    && parameter.index() < this.slotBindings.length()
+                    && this.slotBindings.get(parameter.index()) == null;
+            },
+            is OptionalType optional -> {
+                return this.mentionsOpenSlot(optional.inner());
+            },
+            is ArrayType array -> {
+                return this.mentionsOpenSlot(array.element());
+            },
+            is FunctionType functionType -> {
+                return this.anyMentionsOpenSlot(functionType.parameterTypes())
+                    || this.mentionsOpenSlot(functionType.returnType())
+                    || this.anyMentionsOpenSlot(functionType.thrownTypes());
+            },
+            is InstantiationType instantiation -> {
+                return this.anyMentionsOpenSlot(instantiation.arguments());
+            },
+            default -> {
+                return false;
+            },
+        }
+    }
+
+    anyMentionsOpenSlot(Type[] templateTypes) -> bool {
+        for (let templateType in templateTypes) {
+            if (this.mentionsOpenSlot(templateType)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // Every slot's binding in order, or null while any slot is still open.

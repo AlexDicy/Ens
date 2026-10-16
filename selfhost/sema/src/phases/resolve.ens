@@ -76,6 +76,7 @@ public class TypeResolver {
     Map<InstantiationType, List<MemberConstraint[]>> mentionScopes;
     bool checkBoundsImmediately;
     bool inReturnPosition;
+    long openTrials;
 
     public constructor(TypeStore store, string modulePath, string packagePrefix, string filePath,
                 ModuleLinkTable imports, ClassType? errorClass, SemaResult result,
@@ -102,6 +103,17 @@ public class TypeResolver {
         this.mentionScopes = new Map<InstantiationType, List<MemberConstraint[]>>();
         this.checkBoundsImmediately = false;
         this.inReturnPosition = false;
+        this.openTrials = 0;
+    }
+
+    // Drops what resolving reports or records for later phases until the matching endTrial(), so
+    // code can be checked for what it gives without reporting its problems.
+    public beginTrial() {
+        this.openTrials++;
+    }
+
+    public endTrial() {
+        this.openTrials--;
     }
 
     // A trailing 'throws' on a bare function type here could also belong to the declaration, so
@@ -120,6 +132,18 @@ public class TypeResolver {
             this.report("Parameter '{name}' cannot have type 'void', because 'void' means no "
                 + "value. Give '{name}' the type of the value passed to it, or remove the "
                 + "parameter.", reference.span());
+            return this.store.errorType();
+        }
+        return resolved;
+    }
+
+    // Resolves the written type argument for the type parameter 'parameter' of the generic
+    // 'owner', which cannot be 'void'.
+    public resolveTypeArgument(TypeNode reference, string parameter, string owner) -> Type {
+        Type resolved = this.resolveType(reference);
+        if (types.isVoidType(resolved)) {
+            this.report("'void' means no value, so it cannot be the type argument '{parameter}' of "
+                + "'{owner}'. Replace 'void' with the type of a value.", reference.span());
             return this.store.errorType();
         }
         return resolved;
@@ -162,6 +186,9 @@ public class TypeResolver {
     }
 
     report(string message, Span span) {
+        if (this.openTrials > 0) {
+            return;
+        }
         this.collected.push(new FileDiagnostic(this.resolverFilePath, message, span));
     }
 
@@ -386,8 +413,10 @@ public class TypeResolver {
             resolved.push(this.resolveType(listed));
             spans.push(listed.span());
         }
-        this.functionThrowsMentions.push(new FunctionThrowsMention(resolved.toArray(),
-            spans.toArray(), this.constraintScopeOwner, this.constraintScope));
+        if (this.openTrials == 0) {
+            this.functionThrowsMentions.push(new FunctionThrowsMention(resolved.toArray(),
+                spans.toArray(), this.constraintScopeOwner, this.constraintScope));
+        }
         return resolved.toArray();
     }
 
@@ -448,7 +477,8 @@ public class TypeResolver {
     // established that `base` is generic and `argumentList` is present.
     public instantiateGeneric(DeclaredType base, string name, TypeArgumentListNode argumentList,
             Span nameSpan) -> Type {
-        long arity = base.typeParameters().length;
+        string[] parameterNames = base.typeParameters();
+        long arity = parameterNames.length;
         long given = argumentList.argumentsCount();
         if (given != arity) {
             string expected = countOf(arity, "type argument");
@@ -456,7 +486,6 @@ public class TypeResolver {
             if (given == 1) {
                 written = "1 is written here";
             }
-            string[] parameterNames = base.typeParameters();
             string fix = "Write exactly one, for '{parameterNames[0]}'.";
             if (arity > 1) {
                 let quoted = new List<string>();
@@ -471,7 +500,8 @@ public class TypeResolver {
         let arguments = new List<Type>();
         bool failed = false;
         for (long i = 0; i < given; i++) {
-            Type argument = this.resolveType(argumentList.arguments(i));
+            Type argument = this.resolveTypeArgument(argumentList.arguments(i), parameterNames[i],
+                name);
             if (argument is ErrorType) {
                 failed = true;
             }
@@ -498,7 +528,7 @@ public class TypeResolver {
                     argumentList.arguments(keyed.keyIndex()).span())) {
                 return this.store.errorType();
             }
-        } else {
+        } else if (this.openTrials == 0) {
             let spans = new List<Span>();
             for (long i = 0; i < given; i++) {
                 spans.push(argumentList.arguments(i).span());
@@ -519,6 +549,9 @@ public class TypeResolver {
     // this instantiation, and a refusal its arguments earn inside the template is reported
     // there, naming the instantiation as it reads here.
     public recordInstantiationMention(InstantiationType instantiation, Span writtenAt) {
+        if (this.openTrials > 0) {
+            return;
+        }
         bool open = false;
         for (let argument in instantiation.arguments()) {
             if (convert.containsTypeParam(argument)) {
@@ -567,6 +600,9 @@ public class TypeResolver {
     // Records the judgment against every generic owner the key names, guarded by the active
     // member constraints where they speak about that owner, as a body records its own.
     recordKeyTypeObligation(DeclaredType template, Type key, Span keySpan) {
+        if (this.openTrials > 0) {
+            return;
+        }
         let owners = new Set<GreenNode>();
         obligations.collectOwners(key, owners);
         for (let owner in owners) {
