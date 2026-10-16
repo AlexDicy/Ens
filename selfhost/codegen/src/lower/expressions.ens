@@ -39,6 +39,7 @@ import EirLoadSlot from eir.model;
 import EirStoreSlot from eir.model;
 import EirJump from eir.model;
 import EirBranch from eir.model;
+import EirUnreachable from eir.model;
 import LoweringContext from lower.context;
 import lower.arrays;
 import lower.assignments;
@@ -65,6 +66,35 @@ public lower(LoweringContext lowering, Expression node) -> long {
     if (lowering.failed()) {
         return -1;
     }
+    if (lowering.result().isNeverReturningValue(node.green())) {
+        return lowerNeverReturningValue(lowering, node);
+    }
+    return lowerForm(lowering, node);
+}
+
+// Lowers 'node', which never returns but is written where a value of its recorded type is read.
+// The path ends after it, and the code after it, which nothing reaches, reads a value of that type
+// from a slot no path writes; a '?:' or a switch gives the one its merge holds instead.
+lowerNeverReturningValue(LoweringContext lowering, Expression node) -> long {
+    long value = lowerForm(lowering, node);
+    let valueType = lowering.typeOf(node);
+    if (lowering.failed() || value >= 0 || valueType == null) {
+        return value;
+    }
+    let builder = lowering.builder();
+    if (!builder.terminated()) {
+        builder.terminate(new EirUnreachable());
+    }
+    builder.moveTo(builder.newBlock("unreachable"));
+    long slot = ownership.defineMergeSlot(lowering, "unreachable", valueType);
+    long temp = builder.newTemp(valueType);
+    builder.append(new EirLoadSlot(temp, valueType, slot));
+    return temp;
+}
+
+// Lowers 'node' by its form alone, so a value that never returns gets no stand-in value, as suits
+// one nothing reads.
+public lowerForm(LoweringContext lowering, Expression node) -> long {
     switch (node) {
         is LiteralExpressionNode literal -> {
             return lowerLiteral(lowering, literal);
@@ -344,10 +374,11 @@ lowerTernary(LoweringContext lowering, TernaryExpressionNode ternary) -> long {
 }
 
 // Lowers one value of a '?:' or of a switch used as a value into 'slot', the place the values
-// merge through, or as a statement of its own when the whole join has type 'void'.
+// merge through. A value that never returns, or one of a join of type 'void', is lowered as a
+// statement of its own instead, so it ends its path or gives the merge nothing.
 public lowerJoinValue(LoweringContext lowering, long slot, Type resultType, Expression value)
         -> bool {
-    if (types.isVoidType(resultType)) {
+    if (types.isVoidType(resultType) || lowering.result().neverReturns(value.green())) {
         statements.lowerDiscarded(lowering, value);
         return !lowering.failed();
     }

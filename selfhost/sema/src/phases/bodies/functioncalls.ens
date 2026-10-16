@@ -18,6 +18,7 @@ import TernaryExpressionNode from @ens.frontend.syntax.generated.nodes;
 import ArrayLiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
 import StructLiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
 import TryExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ThisExpressionNode from @ens.frontend.syntax.generated.nodes;
 import SyntaxKind from @ens.frontend.syntax.generated.kind;
 import GreenNode from @ens.frontend.syntax.green;
 import Span from @ens.frontend.support.source;
@@ -66,6 +67,7 @@ import InstantiationType from model.types;
 import Visibility from model.types;
 import List from @std.collections.list;
 import phases.bodies.methodcalls;
+import phases.bodies.memberaccess;
 import phases.bodies.identifiers;
 import phases.bodies.construction;
 import BodyChecker from phases.bodies;
@@ -106,9 +108,10 @@ public analyzeTry(BodyChecker checker, TryExpressionNode node) -> Type {
     return analyzed;
 }
 
-// With a 'single' candidate, an argument holding a literal too large for 'float' waits for its
-// parameter, so its refusal can name it.
-public buildCallShape(BodyChecker checker, ArgumentListNode arguments, bool single) -> BuiltShape {
+// The shape of the arguments of 'call'. With a 'single' candidate, an argument holding a literal too
+// large for 'float' waits for its parameter, so its refusal can name it.
+public buildCallShape(BodyChecker checker, Expression call, ArgumentListNode arguments, bool single)
+        -> BuiltShape {
     let shape = new CallShape();
     shape.setLocalNamer((base) -> nullguidance.freeLocalName(checker, "", base));
     let positionalValues = new List<Expression?>();
@@ -203,7 +206,79 @@ public buildCallShape(BodyChecker checker, ArgumentListNode arguments, bool sing
     for (long i = 0; i < namedValues.length(); i++) {
         values.push(namedValues.get(i));
     }
+    markEndingCallPlace(checker, call, shape, values);
     return new BuiltShape(shape, values);
+}
+
+// Marks on 'shape', when one of the arguments of 'call' never returns, what the refusal of the call
+// as ambiguous reads: which of the arguments 'values' have no effects, whether nothing reads the
+// value of the call, and whether one of its arguments could replace the whole call.
+markEndingCallPlace(BodyChecker checker, Expression call, CallShape shape, List<Expression?> values) {
+    bool ends = false;
+    for (long i = 0; i < shape.argumentCount(); i++) {
+        ends = ends || shape.argumentAt(i).shape() == ArgumentShape.NeverReturning;
+    }
+    if (!ends) {
+        return;
+    }
+    for (long i = 0; i < values.length(); i++) {
+        let value = values.get(i);
+        if (value != null && isEffectFree(checker, value)) {
+            shape.argumentAt(i).markEffectFree();
+        }
+    }
+    if (checker.isDiscarded(call)) {
+        shape.markResultDiscarded();
+    }
+    if (checker.isWholeValue(call) && hasPlainReceiver(checker, call)) {
+        shape.markReplaceable();
+    }
+}
+
+// Whether the call 'call' has no receiver, or one that does nothing but produce its value and is not
+// read through '?.'. A call of 'super(...)' has no receiver, but it cannot be replaced.
+hasPlainReceiver(BodyChecker checker, Expression call) -> bool {
+    if (!(call is CallExpressionNode)) {
+        return true;
+    }
+    switch (syntax.unwrapParentheses(call.callee())) {
+        is MemberExpressionNode member -> {
+            return isEffectFree(checker, member.object());
+        },
+        is SafeMemberExpressionNode ignored -> {
+            return false;
+        },
+        is SuperExpressionNode ignored -> {
+            return false;
+        },
+        default -> {
+            return true;
+        },
+    }
+}
+
+// Whether evaluating 'value' does nothing but produce it: a literal, 'this', a local, a type or a
+// module named on its own, or a field read through one of those.
+isEffectFree(BodyChecker checker, Expression value) -> bool {
+    switch (syntax.unwrapParentheses(value)) {
+        is LiteralExpressionNode ignored -> {
+            return true;
+        },
+        is ThisExpressionNode ignored -> {
+            return true;
+        },
+        is IdentifierExpressionNode identifier -> {
+            let meaning = checker.resolveName(identifier.name().text());
+            return meaning is LocalName || meaning is TypeName || meaning is NamespaceName
+                || meaning is TypeParameterName;
+        },
+        is MemberExpressionNode member -> {
+            return isEffectFree(checker, member.object()) && memberaccess.fieldRead(checker, member) != null;
+        },
+        default -> {
+            return false;
+        },
+    }
 }
 
 // The argument 'value' shaped by what is written, with its parts analyzed as the call's other arguments
@@ -322,8 +397,20 @@ targetTypedArgument(BodyChecker checker, string name, Expression value) -> Argum
 
 public argumentValueOf(BodyChecker checker, string name, Expression value, Type analyzed) -> ArgumentValue {
     let argument = literalArgumentOf(name, value, analyzed);
+    if (checker.neverReturns(value)) {
+        argument.markNeverReturning();
+    }
     argument.setSpelling(wording.shortSpelling(value));
     return argument;
+}
+
+// The type the argument 'value', of type 'analyzed', offers the inference of type arguments: none,
+// as an error type, for a value that never returns, which fits every parameter.
+public offeredType(BodyChecker checker, Expression value, Type analyzed) -> Type {
+    if (checker.neverReturns(value)) {
+        return checker.store().errorType();
+    }
+    return analyzed;
 }
 
 literalArgumentOf(string name, Expression value, Type analyzed) -> ArgumentValue {
@@ -386,7 +473,7 @@ public checkResolvedArguments(BodyChecker checker, BuiltShape built, CallResolut
             literaltyping.adaptFloatLiteral(checker, value, parameterType, origin);
             let updated = checker.result().typeOf(value.green());
             if (updated != null) {
-                finalType = updated;
+                finalType = checker.readAs(value, updated, parameterType);
             }
         }
         if (parameterType is ErrorType || finalType is ErrorType) {
@@ -855,7 +942,7 @@ dispatchFunctionCall(BodyChecker checker, CallExpressionNode node, IdentifierExp
         return analyzeGenericCall(checker, node, first, name);
     }
     if (entries.length() > 1 || usesNamedArguments(node.arguments())) {
-        let built = buildCallShape(checker, node.arguments(), entries.length() == 1);
+        let built = buildCallShape(checker, node, node.arguments(), entries.length() == 1);
         let candidates = new List<CallCandidate>();
         for (long i = 0; i < entries.length(); i++) {
             candidates.push(new CallCandidate(entries.get(i).signature(), null, true));
@@ -890,7 +977,7 @@ public analyzeNamespaceFunctionCall(BodyChecker checker, CallExpressionNode node
     string targetPackagePrefix = target.module().packagePrefix();
     checker.result().setCallableFile(member.green(), target.module().filePath());
     if (entries.length() > 1 || usesNamedArguments(node.arguments())) {
-        let built = buildCallShape(checker, node.arguments(), entries.length() == 1);
+        let built = buildCallShape(checker, node, node.arguments(), entries.length() == 1);
         let candidates = new List<CallCandidate>();
         for (long i = 0; i < entries.length(); i++) {
             let entry = entries.get(i);
@@ -1035,7 +1122,7 @@ analyzeGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry e
         if (argument is Expression && !waitsForParameter(argument, explicitList != null)) {
             Type analyzed = checker.analyzeExpression(argument);
             refusedArgument = refusedArgument || analyzed is ErrorType;
-            argumentTypes.push(analyzed);
+            argumentTypes.push(offeredType(checker, argument, analyzed));
         } else {
             argumentTypes.push(checker.store().errorType());
         }
@@ -1126,7 +1213,7 @@ analyzeGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry e
                 literaltyping.adaptFloatLiteral(checker, argument, parameterType, origin);
                 let updated = checker.result().typeOf(argument.green());
                 if (updated != null) {
-                    actual = updated;
+                    actual = checker.readAs(argument, updated, parameterType);
                 }
             }
             let noValue = voidcalls.argumentRefusal(checker, argument, actual, "'{name}'",

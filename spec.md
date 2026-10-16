@@ -63,6 +63,15 @@ A function or method may be declared `noreturn`, a modifier stating that it neve
 A `noreturn` declaration has no return type, since it returns nothing at all, so writing a `-> T` clause alongside it is an error; it combines with visibility, `override`, `final`, and `throws`, but is not allowed on a constructor, a destructor, or a test.
 The compiler enforces this on the body: a `return` statement is rejected, and a body that can reach its end is rejected, reusing the same path analysis as the missing-return check.
 A call to a `noreturn` function ends the path it sits on, exactly as `panic()` does, so a value-returning function may close a branch with such a call and still be accepted, and a value narrowed before the call stays narrowed afterward.
+Such a call gives no value, but nothing after it runs, so it may stand where the program states the type of the value read there, and it takes that type.
+Those places are the initial value of a variable, an assigned value, an argument, a parameter's default value, a return value, a lambda's result, a field's value and an element of an array whose type is written.
+The value of an assignment with an operator, such as `total += stop();`, and the right side of `??` are such places too.
+So is any element after the first of an array whose type is not written, because the first element gives that array its type.
+As an argument it fits every parameter, so it neither picks one overload over another nor shows what a type argument is.
+A variable declared with `let`, or with `const` and no type, may take such a call as its initial value too, and it is never created.
+Anywhere else, such as an operand of `+`, before a `.`, as an index, as a condition or in an interpolation hole, using it is an error, because nothing there states the type it would take.
+It may also be an arm of a switch used as a value or a branch of `?:`, where it takes no part in the common type, so the other arms decide the type of the whole, as in `long level = switch (shade) { Light -> 1, Dark -> panic("dark"), };`.
+When every arm or branch never returns, the whole switch or `?:` never returns either, and it counts as such a call wherever it is written.
 The built-in `panic` is itself a `noreturn` function, so this is one rule rather than a special case.
 An abstract or interface method may be `noreturn` as part of its contract, and an override of a `noreturn` method must remain `noreturn`, because callers rely on it never returning.
 A throwing `noreturn` function still takes part in checked exceptions as usual: its call sites need `try`, and its declared or inferred `throws` set applies normally.
@@ -1521,7 +1530,8 @@ The assigned value is only the backing number the member converts to and from.
 
 A switch over an enum must be exhaustive: it either covers every member or provides a `default`. A non-exhaustive enum switch is a compile error that names the missing members, so adding a member forces every switch over that enum to be updated. A switch over an integer or a string must provide a `default`.
 
-A switch is also an expression: each arm yields a value, the arms unify to a common type (the same way the branches of `?:` do), and the switch evaluates to the matched arm's value. In statement position an arm's body may be a `{ }` block; used as a value, each arm is a single expression.
+A switch is also an expression: each arm yields a value or never returns, the arms that yield one unify to a common type (the same way the branches of `?:` do), and the switch evaluates to the matched arm's value.
+In statement position an arm's body may be a `{ }` block; used as a value, each arm is a single expression.
 
 Unification treats `null` as the absent case of a nullable type: a `null` branch or arm beside a `T` one yields `T?`, and a `T` one beside a `T?` one yields `T?`.
 Two class values that share a common ancestor unify to their nearest common base class, so `Circle` beside `Square` yields the closest class both extend.

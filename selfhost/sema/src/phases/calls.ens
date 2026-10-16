@@ -23,13 +23,15 @@ import PrimitiveKind from model.types;
 import List from @std.collections.list;
 
 // What an argument fits a parameter by: its type, or for an argument that names no type of its own,
-// what is written. A struct literal fits every parameter until a candidate is chosen.
+// what is written. A struct literal fits every parameter until a candidate is chosen, and a value
+// that never returns fits every parameter, since nothing ever reads it.
 public enum ArgumentShape {
     Typed,
     Lambda,
     Name,
     ArrayLiteral,
     StructLiteral,
+    NeverReturning,
 }
 
 // One analyzed call argument. The literal facts carry what conversionRank reads about
@@ -54,6 +56,7 @@ public class ArgumentValue {
     ArgumentValue[] elementValues;
     Type? typeAlone;
     string? writtenSpelling;
+    bool withoutEffects;
 
     public constructor(string name, Type type, bool isIntegerLiteral, bool isNegative,
                 ulong magnitude, bool isCharacterLiteral, Span span) {
@@ -72,6 +75,7 @@ public class ArgumentValue {
         this.elementValues = [];
         this.typeAlone = null;
         this.writtenSpelling = null;
+        this.withoutEffects = false;
     }
 
     // True for an argument typed once a candidate is chosen: one that names no type of its own, and
@@ -112,6 +116,10 @@ public class ArgumentValue {
         this.markShape(ArgumentShape.StructLiteral);
     }
 
+    public markNeverReturning() {
+        this.argumentShape = ArgumentShape.NeverReturning;
+    }
+
     markShape(ArgumentShape shape) {
         this.targetTyped = true;
         this.argumentShape = shape;
@@ -145,6 +153,16 @@ public class ArgumentValue {
 
     public setSpelling(string? spelled) {
         this.writtenSpelling = spelled;
+    }
+
+    // Whether evaluating the argument does nothing but produce its value. Only marked on the
+    // arguments of a call where one of them never returns.
+    protected isEffectFree() -> bool {
+        return this.withoutEffects;
+    }
+
+    public markEffectFree() {
+        this.withoutEffects = true;
     }
 
     // Whether this is the name of a method or function, or an array literal holding one.
@@ -225,6 +243,8 @@ public class CallShape {
     List<ArgumentValue> namedArguments;
     bool shapeMalformed;
     bool erroredArgument;
+    bool replaceableCall;
+    bool discardedResult;
     // How a fix names a local it declares: the name it would use, numbered where that is taken.
     (string) -> string localNamer;
 
@@ -233,6 +253,8 @@ public class CallShape {
         this.namedArguments = new List<ArgumentValue>();
         this.shapeMalformed = false;
         this.erroredArgument = false;
+        this.replaceableCall = false;
+        this.discardedResult = false;
         this.localNamer = (base) -> base;
     }
 
@@ -300,6 +322,27 @@ public class CallShape {
 
     public markErrorArgument() {
         this.erroredArgument = true;
+    }
+
+    // Whether the whole call can be replaced by one of its arguments: it is a statement of its own
+    // or the whole value of an initializer, an assignment or a return, and its receiver, if it has
+    // one, does nothing but produce its value and is not read through '?.'. Like the result being
+    // discarded, it is only marked on a call where an argument never returns.
+    protected isReplaceable() -> bool {
+        return this.replaceableCall;
+    }
+
+    public markReplaceable() {
+        this.replaceableCall = true;
+    }
+
+    // Whether nothing reads the value of the call.
+    protected isResultDiscarded() -> bool {
+        return this.discardedResult;
+    }
+
+    public markResultDiscarded() {
+        this.discardedResult = true;
     }
 }
 
@@ -619,6 +662,9 @@ public conversionRank(ArgumentValue argument, Type parameterType, bool byElement
         Lambda, Name, ArrayLiteral -> {
             return shapeRank(argument, parameterType, byElements);
         },
+        NeverReturning -> {
+            return 3;
+        },
         default -> { },
     }
     Type argumentType = argument.type();
@@ -849,6 +895,24 @@ public noMatchMessage(List<CallCandidate> candidates, CallShape shape, string di
         return "{declared} can be called with no arguments. {listing} Add the arguments of one "
             + "of them.";
     }
+    let ruling = rulingArguments(shape);
+    if (ruling.length() > 0) {
+        let taken = new List<string>();
+        for (let i in ruling) {
+            let argument = shape.argumentAt(i);
+            string text = argumentText(argument, names);
+            if (argument.shape() == ArgumentShape.Typed) {
+                text = "a value of type {text}";
+            }
+            taken.push("{text} as {argumentPosition(argument, i)}");
+        }
+        string changed = "the arguments";
+        if (ruling.length() == 1) {
+            changed = argumentPosition(shape.argumentAt(ruling.get(0)), ruling.get(0));
+        }
+        return "{declared} takes {diagnostics.andJoined(taken.toArray())}. {listing} Change {changed} "
+            + "to match one of them.";
+    }
     let typed = new List<string>();
     let described = new List<string>();
     bool untyped = false;
@@ -872,6 +936,33 @@ public noMatchMessage(List<CallCandidate> candidates, CallShape shape, string di
     }
     return "{declared} takes the arguments {diagnostics.andJoined(typed.toArray())}. {listing} Change "
         + "the arguments to match one of them.";
+}
+
+// The indexes of the arguments that keep a call from matching when another argument never returns,
+// which fits every parameter and so is left out. Empty when every argument returns, or none does.
+rulingArguments(CallShape shape) -> List<long> {
+    let ruling = new List<long>();
+    bool ends = false;
+    for (long i = 0; i < shape.argumentCount(); i++) {
+        if (shape.argumentAt(i).shape() == ArgumentShape.NeverReturning) {
+            ends = true;
+        } else {
+            ruling.push(i);
+        }
+    }
+    if (!ends) {
+        return new List<long>();
+    }
+    return ruling;
+}
+
+// Where 'argument', at 'index' among the call's arguments, is written: "argument 2", or "the
+// argument 'limit'" for a named one.
+argumentPosition(ArgumentValue argument, long index) -> string {
+    if (argument.name().length > 0) {
+        return "the argument '{argument.name()}'";
+    }
+    return "argument {index + 1}";
 }
 
 // The refusal of a call that only one of several candidates takes as many arguments as, against that
@@ -973,6 +1064,9 @@ argumentText(ArgumentValue argument, TypeNames names) -> string {
         StructLiteral -> {
             return "a struct literal";
         },
+        NeverReturning -> {
+            return "a value that never returns";
+        },
         Typed -> {
             return names.quoted(argument.type());
         },
@@ -1011,6 +1105,10 @@ ambiguityMessage(List<ViableCandidate> best, CallShape shape, string displayName
             untyped = untyped || argument.needsTarget();
         }
     }
+    let ending = endingAmbiguity(best, shape, displayName, kindWord, names);
+    if (ending != null) {
+        return "{problem} {ending}";
+    }
     if (untyped) {
         return "{problem} {localsFix(differing, first, shape, names)}";
     }
@@ -1041,6 +1139,78 @@ ambiguityMessage(List<ViableCandidate> best, CallShape shape, string displayName
             + "{diagnostics.andJoined(written.toArray())}, so the call matches one of them exactly.";
     }
     return "{problem} {defaultedArgumentFix(best, shape, displayName, kindWord, names)}";
+}
+
+// Why the choice among the candidates 'best' still matters when an argument never returns, so
+// none of them is ever called, with the fix that replaces the whole call by that argument where
+// nothing before it has effects. Null when every argument returns.
+endingAmbiguity(List<ViableCandidate> best, CallShape shape, string displayName, string kindWord,
+                TypeNames names) -> string? {
+    long ending = -1;
+    for (long i = 0; i < shape.argumentCount() && ending < 0; i++) {
+        if (shape.argumentAt(i).shape() == ArgumentShape.NeverReturning) {
+            ending = i;
+        }
+    }
+    if (ending < 0) {
+        return null;
+    }
+    let argument = shape.argumentAt(ending);
+    string position = argumentPosition(argument, ending);
+    string opening = "Argument {ending + 1} never returns";
+    if (argument.name().length > 0) {
+        opening = "The argument '{argument.name()}' never returns";
+    }
+    let spelled = argument.spelling();
+    if (spelled != null) {
+        opening = "'{spelled}', {position}, never returns";
+    }
+    bool constructs = kindWord == "Constructor" || kindWord == "Base constructor";
+    string why = "{opening}, so '{displayName}' is never called";
+    if (constructs) {
+        why = "{opening}, so no constructor of '{displayName}' is called";
+    }
+    let results = differentResults(best, names);
+    if (results != null && !constructs && !shape.isResultDiscarded()) {
+        why = "{why}. But {results}, and the code that reads the value of the call is still checked "
+            + "against what one of them returns.";
+    } else {
+        why = "{why}, but the call still has to match exactly one of them.";
+    }
+    if (!shape.isReplaceable()) {
+        return why;
+    }
+    for (long i = 0; i < ending; i++) {
+        if (!shape.argumentAt(i).isEffectFree()) {
+            return why;
+        }
+    }
+    if (spelled == null) {
+        return "{why} Replace the whole call with {position}.";
+    }
+    return "{why} Replace the whole call with '{spelled}'.";
+}
+
+// What each of the candidates 'best' returns, as in "'measure(int)' returns 'int' and
+// 'measure(string)' returns 'bool'", or null when they all return the same type.
+differentResults(List<ViableCandidate> best, TypeNames names) -> string? {
+    Type first = best.get(0).candidate.signature().returnType();
+    bool differ = false;
+    let returns = new List<string>();
+    for (let viable in best) {
+        let signature = viable.candidate.signature();
+        Type returned = signature.returnType();
+        differ = differ || returned != first;
+        string result = "returns {names.quoted(returned)}";
+        if (returned is PrimitiveType && returned.kind() == PrimitiveKind.Void) {
+            result = "returns no value";
+        }
+        returns.push("{quotedSignature(signature, names)} {result}");
+    }
+    if (!differ) {
+        return null;
+    }
+    return diagnostics.andJoined(returns.toArray());
 }
 
 // The fix for a call whose arguments that differ among the candidates include one that names no type

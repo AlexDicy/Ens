@@ -443,19 +443,31 @@ public checkSwitchArms(BodyChecker checker, Expression scrutinee, List<SwitchArm
         checker.reporter().report("A switch used as a value needs at least one arm.", span);
         return checker.store().errorType();
     }
-    literalfixes.noteSuffixedArms(checker, valueExpressions, valueArms, armTargetType ?? fixTarget, origin);
+    let givingValues = new List<Expression>();
+    let givingArms = new List<SwitchArm>();
+    for (long i = 0; i < valueExpressions.length(); i++) {
+        if (!checker.neverReturns(valueExpressions.get(i))) {
+            givingValues.push(valueExpressions.get(i));
+            givingArms.push(valueArms.get(i));
+        }
+    }
+    if (givingValues.length() == 0) {
+        return checker.store().primitive(PrimitiveKind.Void);
+    }
+    literalfixes.noteSuffixedArms(checker, givingValues, givingArms, armTargetType ?? fixTarget, origin);
     if (deferLiterals && armTargetType != null
-            && !adaptLiteralArms(checker, valueExpressions, valueArms, armTargetType, origin)) {
+            && !adaptLiteralArms(checker, givingValues, givingArms, armTargetType, origin)) {
         return checker.store().errorType();
     }
-    let valueless = valuelessArmRefusal(checker, valueExpressions, valueArms);
+    let valueless = valuelessArmRefusal(checker, givingValues, givingArms,
+        valueExpressions.length() - givingValues.length(), armTargetType);
     if (valueless != null) {
         valuejoins.holdMismatch(checker, valueless, span);
         return checker.store().errorType();
     }
     Type unified = checker.store().errorType();
-    for (long i = 0; i < valueExpressions.length(); i++) {
-        let expression = valueExpressions.get(i);
+    for (long i = 0; i < givingValues.length(); i++) {
+        let expression = givingValues.get(i);
         Type analyzed = checker.recordedType(expression);
         if (analyzed is ErrorType) {
             return checker.store().errorType();
@@ -471,7 +483,7 @@ public checkSwitchArms(BodyChecker checker, Expression scrutinee, List<SwitchArm
             if (fixTarget != null) {
                 fixOrigin = origin;
             }
-            fix = literalfixes.switchArmFix(checker, valueExpressions, valueArms, i, unified, fixTarget,
+            fix = literalfixes.switchArmFix(checker, givingValues, givingArms, i, unified, fixTarget,
                 fixOrigin, widening);
         }
         checker.targets().setBesideLiteral(fix == null);
@@ -494,27 +506,19 @@ public checkSwitchArms(BodyChecker checker, Expression scrutinee, List<SwitchArm
         }
         unified = joined;
     }
-    if (types.isVoidType(unified)) {
-        string arm = "{wording.armHead(valueArms.get(0))} -> "
-            + "{wording.oneLineSpelling(valueExpressions.get(0))}";
-        string named = "an arm";
-        if (arm.length <= wording.quotedCodeLimit()) {
-            named = "the arm '{arm}'";
-        }
-        checker.reporter().report("This switch is used as a value, but {named} gives no value. Give every "
-            + "arm a value.", span);
-        return checker.store().errorType();
-    }
-    for (long i = 0; i < valueExpressions.length(); i++) {
-        literaltyping.adaptIntegerLiteral(checker, valueExpressions.get(i), unified);
-        literaltyping.adaptFloatLiteral(checker, valueExpressions.get(i), unified);
+    for (let value in givingValues) {
+        literaltyping.adaptIntegerLiteral(checker, value, unified);
+        literaltyping.adaptFloatLiteral(checker, value, unified);
     }
     return unified;
 }
 
-// The refusal of a switch used as a value when the value of one of its 'arms', given in 'values',
-// is a call that returns no value. Null when none is, or when an arm has a type already refused.
-valuelessArmRefusal(BodyChecker checker, List<Expression> values, List<SwitchArm> arms) -> string? {
+// The refusal of a switch used as a value when the value of one of its 'arms' that can give one,
+// given in 'values', is a call that returns no value. Null when none is, or when an arm has a type
+// already refused. 'ending' is how many other arms there are, each of which never returns, and
+// 'target' is the type the place of the switch states, if it states one.
+valuelessArmRefusal(BodyChecker checker, List<Expression> values, List<SwitchArm> arms, long ending,
+                    Type? target) -> string? {
     long valueless = -1;
     long valued = -1;
     for (long i = 0; i < values.length(); i++) {
@@ -531,10 +535,28 @@ valuelessArmRefusal(BodyChecker checker, List<Expression> values, List<SwitchArm
     if (valueless < 0) {
         return null;
     }
-    if (valued < 0) {
+    string? needed = null;
+    if (valued >= 0) {
+        needed = voidcalls.valueOf(checker.recordedType(values.get(valued)), checker.names());
+    } else if (target != null && ending > 0) {
+        needed = voidcalls.valueOf(target, checker.names());
+    }
+    string instead = "Write a 'switch' statement instead, with each call as a statement of its own.";
+    if (valued < 0 && ending == 0) {
         let opening = voidcalls.noValuesOpening(values, "Every arm is a call that returns no value");
-        return "{opening}, so this switch has no value. Write a 'switch' statement instead, with "
-            + "each call as a statement of its own.";
+        return "{opening}, so this switch has no value. {instead}";
+    }
+    if (valued < 0 && needed == null) {
+        string unnamed = "Some arms are calls that return no value";
+        if (values.length() == 1) {
+            unnamed = "One arm is a call that returns no value";
+        }
+        string others = "the other arms never return";
+        if (ending == 1) {
+            others = "the other arm never returns";
+        }
+        return "{voidcalls.noValuesOpening(values, unnamed)}, and {others}, so this switch has no "
+            + "value. {instead}";
     }
     let value = values.get(valueless);
     string opening = voidcalls.noValueOpening(checker, value, checker.recordedType(value)) ?? "";
@@ -543,7 +565,6 @@ valuelessArmRefusal(BodyChecker checker, List<Expression> values, List<SwitchArm
     if (arm.length <= wording.quotedCodeLimit()) {
         named = "the arm '{arm}'";
     }
-    let needed = voidcalls.valueOf(checker.recordedType(values.get(valued)), checker.names());
     return "{opening}, so {named} gives this switch no value. Give that arm {needed ?? "a value"}.";
 }
 
@@ -985,9 +1006,8 @@ walkArmBody(BodyChecker checker, ArmBody body, bool requireValue, Type? target, 
             armNarrowings.push(checker.narrowing().flatten());
             if (requireValue) {
                 sink.push(expression);
-            } else {
-                checker.endPathIfNeverReturns(expression);
             }
+            checker.endPathIfNeverReturns(expression);
             return false;
         },
         default -> {

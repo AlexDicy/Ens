@@ -437,6 +437,7 @@ analyzeTernaryValues(BodyChecker checker, TernaryExpressionNode node, Type? targ
     let site = new ConditionSite("", node, "");
     Type thenType = narrowing.analyzeGuardedBranch(checker, node.condition(), thenValue, true, thenTarget,
         origin, site);
+    checker.endPathIfNeverReturns(thenValue);
     let branchFlows = new List<AssignmentFlow>();
     branchFlows.push(checker.assignment().snapshot());
     checker.assignment().restore(entry);
@@ -449,6 +450,7 @@ analyzeTernaryValues(BodyChecker checker, TernaryExpressionNode node, Type? targ
     noteJoinValue(checker, elseValue);
     Type elseType = narrowing.analyzeGuardedBranch(checker, node.condition(), elseValue, false, elseTarget,
         origin, site);
+    checker.endPathIfNeverReturns(elseValue);
     branchFlows.push(checker.assignment().snapshot());
     checker.assignment().finishBranches(branchFlows, entry);
     checker.targets().clearStash();
@@ -459,10 +461,22 @@ analyzeTernaryValues(BodyChecker checker, TernaryExpressionNode node, Type? targ
     if (thenType is ErrorType || elseType is ErrorType) {
         return checker.store().errorType();
     }
-    let valueless = valuelessBranchRefusal(checker, node, thenType, elseType);
+    bool thenEnds = checker.neverReturns(thenValue);
+    bool elseEnds = checker.neverReturns(elseValue);
+    if (thenEnds && elseEnds) {
+        return checker.store().primitive(PrimitiveKind.Void);
+    }
+    let valueless = valuelessBranchRefusal(checker, node, thenType, elseType, thenEnds, elseEnds,
+        target);
     if (valueless != null) {
         holdMismatch(checker, valueless, node.span());
         return checker.store().errorType();
+    }
+    if (elseEnds) {
+        return loneBranchType(checker, thenValue, thenType, thenJoins, target, origin);
+    }
+    if (thenEnds) {
+        return loneBranchType(checker, elseValue, elseType, elseJoins, target, origin);
     }
     literalfixes.noteSuffixedBranch(checker, node, true, elseType, fixTarget, fixOrigin);
     literalfixes.noteSuffixedBranch(checker, node, false, thenType, fixTarget, fixOrigin);
@@ -500,20 +514,59 @@ analyzeTernaryValues(BodyChecker checker, TernaryExpressionNode node, Type? targ
     return checker.store().errorType();
 }
 
-// The refusal of the '?:' 'node' when a branch is a call that returns no value, or null when
-// neither is one. Two such branches give no value to refuse where nothing reads one.
-valuelessBranchRefusal(BodyChecker checker, TernaryExpressionNode node, Type thenType, Type elseType)
-        -> string? {
-    let thenOpening = voidcalls.noValueOpening(checker, node.thenValue(), thenType);
-    let elseOpening = voidcalls.noValueOpening(checker, node.elseValue(), elseType);
-    if (thenOpening != null && elseOpening != null) {
+// The type of 'value', of type 'analyzed', the one branch of a '?:' that can give a value because
+// the other never returns. It is the type 'value' has alone, so a literal analyzed without the
+// target, as 'untargeted' says, takes it now.
+loneBranchType(BodyChecker checker, Expression value, Type analyzed, bool untargeted, Type? target,
+               LiteralOrigin? origin) -> Type {
+    if (target == null || !untargeted) {
+        return analyzed;
+    }
+    return checker.adaptAnalyzed(value, analyzed, target, origin);
+}
+
+// The refusal of the '?:' 'node' when a branch that can give a value is a call that returns no
+// value, or null when neither is one. 'thenEnds' and 'elseEnds' say which branches never return,
+// and 'target' is the type the place of the '?:' states, if it states one. The branches give no
+// value to refuse where nothing reads one.
+valuelessBranchRefusal(BodyChecker checker, TernaryExpressionNode node, Type thenType, Type elseType,
+                       bool thenEnds, bool elseEnds, Type? target) -> string? {
+    string? thenOpening = null;
+    if (!thenEnds) {
+        thenOpening = voidcalls.noValueOpening(checker, node.thenValue(), thenType);
+    }
+    string? elseOpening = null;
+    if (!elseEnds) {
+        elseOpening = voidcalls.noValueOpening(checker, node.elseValue(), elseType);
+    }
+    string instead = "Write an 'if' statement instead, with each call as a statement of its own.";
+    if ((thenOpening != null || thenEnds) && (elseOpening != null || elseEnds)) {
         if (checker.isDiscarded(node)) {
             return null;
         }
-        let opening = voidcalls.noValuesOpening(List.of([node.thenValue(), node.elseValue()]),
-            "Both branches are calls that return no value");
-        return "{opening}, so this '?:' has no value. Write an 'if' statement instead, with each call "
-            + "as a statement of its own.";
+        if (thenOpening != null && elseOpening != null) {
+            let opening = voidcalls.noValuesOpening(List.of([node.thenValue(), node.elseValue()]),
+                "Both branches are calls that return no value");
+            return "{opening}, so this '?:' has no value. {instead}";
+        }
+        string? needed = null;
+        if (target != null) {
+            needed = voidcalls.valueOf(target, checker.names());
+        }
+        if (thenOpening != null && needed != null) {
+            return "{thenOpening}, so the branch after '?' gives this '?:' no value. Give that branch "
+                + "{needed}.";
+        }
+        if (thenOpening != null) {
+            return "{thenOpening}, and the branch after ':' never returns, so this '?:' has no value. "
+                + instead;
+        }
+        if (needed != null) {
+            return "{elseOpening}, so the branch after ':' gives this '?:' no value. Give that branch "
+                + "{needed}.";
+        }
+        return "{elseOpening}, and the branch after '?' never returns, so this '?:' has no value. "
+            + instead;
     }
     if (thenOpening != null) {
         return "{thenOpening}, so the branch after '?' gives this '?:' no value. Give that branch "

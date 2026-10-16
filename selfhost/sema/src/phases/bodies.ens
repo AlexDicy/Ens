@@ -70,6 +70,7 @@ import PreludeScope from phases.prelude;
 import program.implicit;
 import model.convert;
 import NoreturnCalls from model.flow;
+import model.flow;
 import LiteralOrigin from phases.bodies.literaltargets;
 import LiteralTargets from phases.bodies.literaltargets;
 import phases.bodies.construction;
@@ -542,6 +543,8 @@ public final class BodyChecker implements NoreturnCalls {
     Set<GreenNode> rankedValues;
     // The expression being analyzed whose value nothing reads, such as an expression statement.
     GreenNode? discardedValue;
+    // The whole value of the initializer, the assignment or the return being analyzed.
+    GreenNode? wholeValue;
     // The 'is' tests to write for comparisons of 'as?' casts with null, by the path a test narrows.
     Map<NarrowingPath, string> castHints;
 
@@ -576,6 +579,7 @@ public final class BodyChecker implements NoreturnCalls {
         this.arrayNewNames = new Map<GreenNode, string>();
         this.rankedValues = new Set<GreenNode>();
         this.discardedValue = null;
+        this.wholeValue = null;
         this.castHints = new Map<NarrowingPath, string>();
         this.deferredObligations = context.obligations();
         this.obligationOwner = null;
@@ -851,10 +855,16 @@ public final class BodyChecker implements NoreturnCalls {
         return target != null && target.isNoreturn();
     }
 
-    // Ends the path after 'value' when it is a call that never returns, so no value of it is ever
-    // read, and records that so code generation ends the path there too.
+    // True when 'expression' never returns: a call that never returns, or a '?:' or a switch whose
+    // every value never returns.
+    public neverReturns(Expression expression) -> bool {
+        return flow.neverReturns(expression, this);
+    }
+
+    // Ends the path after 'value' when it never returns, so no value of it is ever read, and
+    // records that so code generation ends the path there too.
     public endPathIfNeverReturns(Expression value) {
-        if (this.callNeverReturns(value)) {
+        if (this.neverReturns(value)) {
             this.result().setNeverReturns(value.green());
             this.assignment().terminate();
         }
@@ -984,6 +994,13 @@ public final class BodyChecker implements NoreturnCalls {
     }
 
     walkStatement(Statement statement) {
+        let outer = this.wholeValue;
+        this.wholeValue = wholeValueOf(statement);
+        this.walkStatementKind(statement);
+        this.wholeValue = outer;
+    }
+
+    walkStatementKind(Statement statement) {
         switch (statement) {
             is BlockNode block -> {
                 this.walkScopedBlock(block);
@@ -1164,6 +1181,22 @@ public final class BodyChecker implements NoreturnCalls {
     // literal and a generic call the type they lack. A '?:', a switch and parentheses pass the target
     // on, and 'origin' is where it is set.
     public analyzeExpressionAdapt(Expression node, Type target, LiteralOrigin? origin = null) -> Type {
+        return this.readAs(node, this.adaptedExpression(node, target, origin), target);
+    }
+
+    // The type of 'node', of type 'analyzed', where a value of 'target' is read: 'target' itself
+    // for a value that never returns, since nothing ever reads it, and 'analyzed' otherwise.
+    public readAs(Expression node, Type analyzed, Type target) -> Type {
+        if (!types.isVoidType(analyzed) || types.isVoidType(target) || target is ErrorType
+                || !this.neverReturns(node)) {
+            return analyzed;
+        }
+        this.result().setNeverReturningValue(node.green());
+        this.result().setType(node.green(), target);
+        return target;
+    }
+
+    adaptedExpression(Expression node, Type target, LiteralOrigin? origin) -> Type {
         if (this.takeRanked(node)) {
             return this.adaptAnalyzed(node, this.recordedType(node), target, origin);
         }
@@ -1210,7 +1243,7 @@ public final class BodyChecker implements NoreturnCalls {
 
     // Adapts the analyzed 'node' of type 'analyzed' to 'target': an untyped literal takes the type, and a
     // 'char' is refused where a floating-point number is expected.
-    adaptAnalyzed(Expression node, Type analyzed, Type target, LiteralOrigin? origin) -> Type {
+    public adaptAnalyzed(Expression node, Type analyzed, Type target, LiteralOrigin? origin) -> Type {
         if (target is ErrorType || analyzed is ErrorType) {
             return analyzed;
         }
@@ -1255,6 +1288,12 @@ public final class BodyChecker implements NoreturnCalls {
         return this.discardedValue == node.green();
     }
 
+    // True when nothing reads the value of 'node', or when it is the whole value of the
+    // initializer, the assignment or the return being analyzed.
+    public isWholeValue(Expression node) -> bool {
+        return this.isDiscarded(node) || this.wholeValue == node.green();
+    }
+
     // Analyzes a part of an argument while a call's candidates are ranked. Typing the argument from the
     // chosen candidate then uses the type found here instead of analyzing the part again.
     public analyzeBeforeChoosing(Expression node) -> Type {
@@ -1291,4 +1330,32 @@ public final class BodyChecker implements NoreturnCalls {
         }
         return this.store().errorType();
     }
+}
+
+// The whole value 'statement' initializes, assigns or returns, without its parentheses, or null for a
+// statement that has none.
+wholeValueOf(Statement statement) -> GreenNode? {
+    Expression? value = null;
+    switch (statement) {
+        is VariableDeclarationNode declaration -> {
+            let initializer = declaration.initializer();
+            if (initializer != null) {
+                value = initializer.value();
+            }
+        },
+        is ReturnStatementNode returned -> {
+            value = returned.value();
+        },
+        is ExpressionStatementNode expression -> {
+            let written = syntax.unwrapParentheses(expression.expression());
+            if (written is AssignmentExpressionNode) {
+                value = written.value();
+            }
+        },
+        default -> { },
+    }
+    if (value == null) {
+        return null;
+    }
+    return syntax.unwrapParentheses(value).green();
 }
