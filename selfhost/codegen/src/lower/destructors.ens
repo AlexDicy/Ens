@@ -1,6 +1,7 @@
 // The destructor every class carries in its object header, called once when the last strong
 // reference goes away. It runs the user destructors of the whole chain most derived to base,
-// while every field is still readable, then releases what each flattened field holds.
+// while every field is still readable, then releases what each flattened field holds. An
+// abandoned construction is released by a finalizer that only releases the fields.
 import LambdaCapture from @ens.sema.model.lambdas;
 import @ens.sema.model.typemembers;
 import PrimitiveKind from @ens.sema.model.types;
@@ -15,7 +16,6 @@ import EirObjectFieldAddress from eir.model;
 import EirParameter from eir.model;
 import EirReturn from eir.model;
 import EirWeakRelease from eir.model;
-import layout.vtables;
 import mono.substitution;
 import FunctionInfo from lower.index;
 import ProgramIndex from lower.index;
@@ -25,6 +25,21 @@ import StorageWalker from lower.ownership;
 import support.primitives;
 import support.references;
 import List from @std.collections.list;
+
+// The finalizers the objects of one class carry: its destructor, and the abandoned finalizer when
+// the class needs one.
+public finalizersOf(Type classType, ProgramIndex index, TypeStore store) -> List<EirFunction> {
+    let found = new List<EirFunction>();
+    let synthesized = synthesize(classType, index, store);
+    if (synthesized != null) {
+        found.push(synthesized);
+    }
+    let abandoned = synthesizeAbandonedFinalizer(classType, store);
+    if (abandoned != null) {
+        found.push(abandoned);
+    }
+    return found;
+}
 
 // Builds the destructor of one class, declared or instantiated. The object header names the
 // concrete type's destructor at allocation, which is what makes destruction through a base
@@ -39,11 +54,27 @@ public synthesize(Type classType, ProgramIndex index, TypeStore store) -> EirFun
     let builder = new EirFunctionBuilder(classes.destructorSymbol(classType), false, null,
         [new EirParameter("object", classType)], voidType);
     long object = 0;
-    Type? current = classType;
-    while (current != null) {
-        callDeclaredDestructor(builder, current, index, voidType, object);
-        current = vtables.baseClassOf(current);
+    for (let declaring in classes.destructorChain(classType)) {
+        callDeclaredDestructor(builder, declaring, index, voidType, object);
     }
+    return finishWithFieldReleases(builder, classType, store, object);
+}
+
+// Builds the abandoned finalizer of one class, which releases what each flattened field holds and
+// runs no destructor. Returns null when the class needs none, and when code generation cannot lay
+// the class out.
+public synthesizeAbandonedFinalizer(Type classType, TypeStore store) -> EirFunction? {
+    let symbol = classes.abandonedFinalizerSymbol(classType);
+    if (symbol == null || !primitives.isRepresentableClass(classType)) {
+        return null;
+    }
+    let builder = new EirFunctionBuilder(symbol, false, null,
+        [new EirParameter("object", classType)], store.primitive(PrimitiveKind.Void));
+    return finishWithFieldReleases(builder, classType, store, 0);
+}
+
+finishWithFieldReleases(EirFunctionBuilder builder, Type classType, TypeStore store, long object)
+        -> EirFunction? {
     let fields = typemembers.fieldsOf(classType);
     if (fields == null) {
         return null;

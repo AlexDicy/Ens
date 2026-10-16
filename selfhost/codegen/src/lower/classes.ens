@@ -21,6 +21,7 @@ import EirClassNew from eir.model;
 import EirErrorTrace from eir.model;
 import EirRuntimeTypeName from eir.model;
 import EirLoadSlot from eir.model;
+import layout.vtables;
 import LoweringContext from lower.context;
 import lower.calls;
 import lower.conversions;
@@ -61,6 +62,30 @@ public destructorSymbol(Type classType) -> string {
         return symbols.destructorLinkName(authority.modulePath(), authority.name());
     }
     return "_dtor$" + typenames.display(classType);
+}
+
+// The classes of a chain that declare a destructor, most derived first, the order their
+// destructors run in.
+public destructorChain(Type classType) -> List<Type> {
+    let declaring = new List<Type>();
+    Type? current = classType;
+    while (current != null) {
+        if (declaredDestructor(current) != null) {
+            declaring.push(current);
+        }
+        current = vtables.baseClassOf(current);
+    }
+    return declaring;
+}
+
+// The symbol of the finalizer an abandoned construction stores, which releases what the fields
+// hold and runs no destructor. Null when no class in the chain declares a destructor, since the
+// class's own destructor then does only that.
+public abandonedFinalizerSymbol(Type classType) -> string? {
+    if (destructorChain(classType).isEmpty()) {
+        return null;
+    }
+    return destructorSymbol(classType) + "$fields";
 }
 
 // The concrete method a recorded resolution reaches once the receiver's type is substituted.
@@ -147,9 +172,10 @@ public implementationOn(Type receiver, Method interfaceMethod) -> Method? {
 }
 
 // 'new C(args)': a zeroed object whose header names its destructor, then the declared field
-// defaults of the whole chain, then the constructor over the same reference. A class declaring no
-// constructor of its own still runs the nearest inherited one callable with no arguments; only a
-// chain with no constructor at all is complete once its defaults are in place.
+// defaults of the whole chain, then the constructor over the same reference. An argument that
+// throws abandons the construction. A class declaring no constructor of its own still runs the
+// nearest inherited one callable with no arguments; only a chain with no constructor at all is
+// complete once its defaults are in place.
 public lowerNew(LoweringContext lowering, NewExpressionNode node) -> long {
     let type = lowering.typeOf(node);
     if (type == null) {
@@ -185,9 +211,12 @@ public lowerNew(LoweringContext lowering, NewExpressionNode node) -> long {
             node.span())) {
         return -1;
     }
-    // The fresh object is owned here and nowhere else yet, so an argument that unwinds must
-    // release it; its zeroed and defaulted fields make the destructor safe to run early.
-    lowering.protectValue(object);
+    let abandoned = abandonedFinalizerSymbol(classType);
+    if (abandoned != null) {
+        lowering.protectConstruction(object, abandoned);
+    } else {
+        lowering.protectValue(object);
+    }
     let ignored = calls.lowerInvocation(lowering, info, node.arguments(), node.green(),
         node.span(), classType, object);
     lowering.unprotectValue(object);

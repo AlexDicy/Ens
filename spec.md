@@ -309,6 +309,7 @@ Type arguments are never written on the method name: `List.withCapacity<int>(8)`
 A class may declare a `destructor`, introduced by the `destructor` keyword, to run cleanup when an instance is destroyed.
 A destructor takes no parameters, has no return type, and cannot be `throws`; a class declares at most one, and it cannot be called explicitly.
 When the last reference to an object is released its destructor runs, followed by each inherited destructor from the most derived class up to the base, and then the object's fields are released.
+When an argument of a `new` expression throws, the constructor never runs, so no destructor runs for that object either, and only what its fields already hold is released.
 Destructors are a class-only feature; structs and interfaces cannot declare them.
 
 An `abstract class` cannot be instantiated. It may declare `abstract` methods (a signature with no body), that every concrete subclass must `override`.
