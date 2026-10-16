@@ -6,10 +6,15 @@ import EirBlock from eir.model;
 import EirCall from eir.model;
 import EirClosureCall from eir.model;
 import EirForeignCall from eir.model;
+import EirFieldAddress from eir.model;
+import EirInstruction from eir.model;
+import EirLoadSlot from eir.model;
+import EirOptionalPayloadAddress from eir.model;
 import EirRetainPtr from eir.model;
 import EirReleasePtr from eir.model;
 import EirStorePtr from eir.model;
 import EirStoreSlot from eir.model;
+import EirSlotAddress from eir.model;
 import EirTakeSlot from eir.model;
 import EirWeakStore from eir.model;
 import EirWeakLoad from eir.model;
@@ -17,7 +22,9 @@ import EirWeakRelease from eir.model;
 import Place from eir.place;
 import PlaceRelation from eir.place;
 import PlaceRoot from eir.place;
+import eir.dump;
 import eir.place;
+import eir.walk;
 import @ens.sema.model.typenames;
 import support.primitives;
 import List from @std.collections.list;
@@ -29,6 +36,7 @@ export verifyStorage(EirFunction function) -> string[] {
     for (long b = 0; b < blocks.length(); b++) {
         checkBlock(function, blocks.get(b), problems);
     }
+    checkWrittenBeforeRead(function, problems);
     return problems.toArray();
 }
 
@@ -84,6 +92,202 @@ checkBlock(EirFunction function, EirBlock block, List<string> problems) {
             },
             default -> { },
         }
+    }
+}
+
+// A slot that does not start zeroed holds whatever the stack held until something writes it, so
+// reading it, a release included, is sound only once every path from the entry has written it.
+// A forward dataflow computes the slots definitely written at each block entry, to a fixpoint.
+checkWrittenBeforeRead(EirFunction function, List<string> problems) {
+    let slots = function.slots();
+    long slotCount = slots.length();
+    bool[] zeroed = new bool[slotCount + 1];
+    bool watching = false;
+    for (long s = 0; s < slotCount; s++) {
+        zeroed[s] = slots.get(s).startsZeroed();
+        watching = watching || !zeroed[s];
+    }
+    let blocks = function.blocks();
+    long blockCount = blocks.length();
+    if (!watching || blockCount == 0) {
+        return;
+    }
+    let addresses = new SlotAddresses(function);
+    bool[][] writtenInBlock = new bool[blockCount][slotCount + 1];
+    for (long b = 0; b < blockCount; b++) {
+        applyBlock(function, addresses, blocks.get(b), writtenInBlock[b], null);
+    }
+    bool[][] writtenAtEntry = new bool[blockCount][slotCount + 1];
+    bool[] reached = new bool[blockCount + 1];
+    writtenAtEntry[0] = zeroed;
+    reached[0] = true;
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (long b = 0; b < blockCount; b++) {
+            if (!reached[b]) {
+                continue;
+            }
+            bool[] entry = writtenAtEntry[b];
+            bool[] inside = writtenInBlock[b];
+            for (let successor in walk.successorsOf(blocks.get(b))) {
+                if (successor < 0 || successor >= blockCount) {
+                    continue;
+                }
+                bool[] known = writtenAtEntry[successor];
+                bool first = !reached[successor];
+                reached[successor] = true;
+                for (long s = 0; s < slotCount; s++) {
+                    bool written = entry[s] || inside[s];
+                    if (first) {
+                        known[s] = written;
+                    } else if (known[s] && !written) {
+                        known[s] = false;
+                        changed = true;
+                    }
+                }
+                changed = changed || first;
+            }
+        }
+    }
+    for (long b = 0; b < blockCount; b++) {
+        if (reached[b]) {
+            applyBlock(function, addresses, blocks.get(b), copied(writtenAtEntry[b]), problems);
+        }
+    }
+}
+
+// Marks the slots one block writes, in order, and reports each read of a slot not written yet
+// when problems is given. A call reads what it is handed, except a foreign call's out argument,
+// which the C function writes.
+applyBlock(EirFunction function, SlotAddresses addresses, EirBlock block, bool[] written,
+           List<string>? problems) {
+    let instructions = block.instructions();
+    for (long i = 0; i < instructions.length(); i++) {
+        let instruction = instructions.get(i);
+        switch (instruction) {
+            is EirStoreSlot store -> {
+                markWritten(written, store.slot);
+            },
+            is EirLoadSlot load -> {
+                checkRead(function, block, instruction, load.slot, written, problems);
+            },
+            is EirTakeSlot taken -> {
+                checkRead(function, block, instruction, taken.slot, written, problems);
+                markWritten(written, taken.slot);
+            },
+            is EirStorePtr store -> {
+                markWritten(written, addresses.wholeSlotOf(store.address));
+            },
+            is EirSlotAddress ignored -> { },
+            is EirFieldAddress ignored -> { },
+            is EirOptionalPayloadAddress ignored -> { },
+            is EirForeignCall call -> {
+                for (long a = 0; a < call.arguments.length; a++) {
+                    long argument = call.arguments[a];
+                    if (a < call.outFlags.length && call.outFlags[a]) {
+                        markWritten(written, addresses.wholeSlotOf(argument));
+                    } else {
+                        checkRead(function, block, instruction, addresses.slotOf(argument),
+                            written, problems);
+                    }
+                }
+            },
+            default -> {
+                for (let used in walk.usesOf(instruction)) {
+                    checkRead(function, block, instruction, addresses.slotOf(used), written,
+                        problems);
+                }
+            },
+        }
+    }
+    let terminator = block.terminator();
+    if (terminator == null || problems == null) {
+        return;
+    }
+    for (let used in walk.terminatorUsesOf(terminator)) {
+        long slot = addresses.slotOf(used);
+        if (slot >= 0 && slot < written.length && !written[slot]) {
+            reportUnwritten(function, block, dump.terminatorText(function, terminator), slot,
+                problems);
+        }
+    }
+}
+
+checkRead(EirFunction function, EirBlock block, EirInstruction instruction, long slot,
+          bool[] written, List<string>? problems) {
+    if (problems == null || slot < 0 || slot >= written.length || written[slot]) {
+        return;
+    }
+    reportUnwritten(function, block, dump.instructionText(instruction), slot, problems);
+}
+
+reportUnwritten(EirFunction function, EirBlock block, string reader, long slot,
+                List<string> problems) {
+    report(function, block, problems, "'{reader}' reads ${slot} "
+        + "'{function.slots().get(slot).name()}' on a path that never wrote it; the slot does "
+        + "not start zeroed, so the read finds whatever the stack held there");
+}
+
+markWritten(bool[] written, long slot) {
+    if (slot >= 0 && slot < written.length) {
+        written[slot] = true;
+    }
+}
+
+copied(bool[] flags) -> bool[] {
+    bool[] copy = new bool[flags.length];
+    for (long i = 0; i < flags.length; i++) {
+        copy[i] = flags[i];
+    }
+    return copy;
+}
+
+// The slot each address temp of one function reaches into, and whether it names that whole slot.
+final class SlotAddresses {
+    long[] slots;
+    bool[] whole;
+
+    constructor(EirFunction function) {
+        long count = function.tempTypes().length();
+        this.slots = new long[count + 1];
+        this.whole = new bool[count + 1];
+        for (long t = 0; t < this.slots.length; t++) {
+            this.slots[t] = -1;
+        }
+        let places = place.addressPlaces(function);
+        let blocks = function.blocks();
+        for (long b = 0; b < blocks.length(); b++) {
+            let instructions = blocks.get(b).instructions();
+            for (long i = 0; i < instructions.length(); i++) {
+                let instruction = instructions.get(i);
+                long result = walk.resultOf(instruction);
+                if (!walk.producesAddress(instruction) || result < 0 || result >= count) {
+                    continue;
+                }
+                let named = places.placeOf(result);
+                if (named != null && named.root() == PlaceRoot.Slot) {
+                    this.slots[result] = named.rootId();
+                    this.whole[result] = named.steps().length() == 0;
+                }
+            }
+        }
+    }
+
+    // The slot the temp is an address inside, or -1 when it is not one.
+    slotOf(long temp) -> long {
+        if (temp < 0 || temp >= this.slots.length) {
+            return -1;
+        }
+        return this.slots[temp];
+    }
+
+    // The slot the temp is the address of as a whole, or -1 when it names part of one or none.
+    wholeSlotOf(long temp) -> long {
+        if (temp < 0 || temp >= this.slots.length || !this.whole[temp]) {
+            return -1;
+        }
+        return this.slots[temp];
     }
 }
 

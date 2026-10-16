@@ -6,7 +6,13 @@ import PrimitiveKind from @ens.sema.model.types;
 import ClassType from @ens.sema.model.types;
 import EirFunctionBuilder from eir.model;
 import EirParameter from eir.model;
+import EirBranch from eir.model;
+import EirCall from eir.model;
+import EirCallee from eir.model;
 import EirConstInt from eir.model;
+import EirForeignCall from eir.model;
+import EirJump from eir.model;
+import EirLoadSlot from eir.model;
 import EirObjectFieldAddress from eir.model;
 import EirReleasePtr from eir.model;
 import EirRetainPtr from eir.model;
@@ -15,6 +21,10 @@ import EirStoreSlot from eir.model;
 import EirWeakLoad from eir.model;
 import EirWeakRelease from eir.model;
 import EirReturn from eir.model;
+import EirPropagate from eir.model;
+import EirTryCall from eir.model;
+import Type from @ens.sema.model.types;
+import TypeStore from @ens.sema.model.types;
 import eir.storage;
 import support;
 
@@ -126,6 +136,138 @@ test "counting a reference in storage that holds none is reported" {
     builder.append(new EirConstInt(zero, intType, 0));
     builder.terminate(new EirReturn(zero));
     try assertMentions(storage.verifyStorage(builder.finish()), "which holds int and so owns no");
+}
+
+test "a release reaching a slot that one path into it never wrote is reported" {
+    let store = try support.freshStore();
+    let stringType = store.stringType();
+    let builder = new EirFunctionBuilder("onePath", false, null,
+        [new EirParameter("chosen", store.primitive(PrimitiveKind.Bool))],
+        store.primitive(PrimitiveKind.Void));
+    long slot = builder.addSlot("discarded", stringType, false, false);
+    long written = builder.newBlock("written");
+    long skipped = builder.newBlock("skipped");
+    long merge = builder.newBlock("merge");
+    builder.terminate(new EirBranch(0, written, skipped));
+    builder.moveTo(written);
+    builder.append(new EirStoreSlot(slot, made(builder, store)));
+    builder.terminate(new EirJump(merge));
+    builder.moveTo(skipped);
+    builder.terminate(new EirJump(merge));
+    builder.moveTo(merge);
+    long address = builder.newTemp(stringType);
+    builder.append(new EirSlotAddress(address, stringType, slot));
+    builder.append(new EirReleasePtr(address));
+    builder.terminate(new EirReturn(-1));
+    let violations = storage.verifyStorage(builder.finish());
+    try testing.assertEqual(violations.length, 1L);
+    try testing.assertEqual(violations[0], "onePath: b3.merge: 'release_ptr %2' reads $0 "
+        + "'discarded' on a path that never wrote it; the slot does not start zeroed, so the "
+        + "read finds whatever the stack held there");
+}
+
+test "a slot every path writes, itself or as a foreign call's out argument, balances" {
+    let store = try support.freshStore();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let builder = new EirFunctionBuilder("everyPath", false, null,
+        [new EirParameter("chosen", store.primitive(PrimitiveKind.Bool))], intType);
+    long slot = builder.addSlot("count", intType, false, false);
+    long first = builder.newBlock("first");
+    long second = builder.newBlock("second");
+    long merge = builder.newBlock("merge");
+    builder.terminate(new EirBranch(0, first, second));
+    builder.moveTo(first);
+    long zero = builder.newTemp(intType);
+    builder.append(new EirConstInt(zero, intType, 0));
+    builder.append(new EirStoreSlot(slot, zero));
+    builder.terminate(new EirJump(merge));
+    builder.moveTo(second);
+    long address = builder.newTemp(intType);
+    builder.append(new EirSlotAddress(address, intType, slot));
+    builder.append(new EirForeignCall(-1, store.primitive(PrimitiveKind.Void), "fill", [address],
+        [intType], [true]));
+    builder.terminate(new EirJump(merge));
+    builder.moveTo(merge);
+    long count = builder.newTemp(intType);
+    builder.append(new EirLoadSlot(count, intType, slot));
+    builder.terminate(new EirReturn(count));
+    try assertNoViolations(storage.verifyStorage(builder.finish()));
+}
+
+test "a call handed the address of a slot nothing stored is reported as reading it" {
+    let store = try support.freshStore();
+    let stringType = store.stringType();
+    let voidType = store.primitive(PrimitiveKind.Void);
+    let builder = new EirFunctionBuilder("unparked", false, null, [], voidType);
+    long parked = builder.addSlot("byaddr.arg", stringType, false, true);
+    long address = builder.newTemp(stringType);
+    builder.append(new EirSlotAddress(address, stringType, parked));
+    builder.append(new EirCall(-1, voidType,
+        new EirCallee("show", null, [stringType], voidType, false, [true]), -1, [address], -1,
+        null));
+    builder.terminate(new EirReturn(-1));
+    let violations = storage.verifyStorage(builder.finish());
+    try testing.assertEqual(violations.length, 1L);
+    try testing.assertEqual(violations[0], "unparked: b0.entry: 'call @show(%0)' reads $0 "
+        + "'byaddr.arg' on a path that never wrote it; the slot does not start zeroed, so the "
+        + "read finds whatever the stack held there");
+}
+
+test "a try call handed the address of a slot nothing stored is reported as reading it" {
+    let store = try support.freshStore();
+    let stringType = store.stringType();
+    let voidType = store.primitive(PrimitiveKind.Void);
+    let builder = new EirFunctionBuilder("unparkedTry", false, null, [], voidType);
+    builder.setThrowing();
+    long parked = builder.addSlot("byaddr.arg", stringType, false, true);
+    long normal = builder.newBlock("normal");
+    long unwind = builder.newBlock("unwind");
+    long address = builder.newTemp(stringType);
+    builder.append(new EirSlotAddress(address, stringType, parked));
+    long error = builder.newTemp(stringType);
+    builder.terminate(new EirTryCall(-1, voidType,
+        new EirCallee("show", null, [stringType], voidType, true, [true]), -1, [address], -1,
+        null, error, normal, unwind, -1));
+    builder.moveTo(normal);
+    builder.terminate(new EirReturn(-1));
+    builder.moveTo(unwind);
+    builder.terminate(new EirPropagate(error));
+    try assertMentions(storage.verifyStorage(builder.finish()),
+        "unparkedTry: b0.entry: 'try_call @show(%0), error %1, to b1.normal, unwind b2.unwind' "
+        + "reads $0 'byaddr.arg' on a path that never wrote it");
+}
+
+test "a read at a loop's head that only the loop's body writes is reported" {
+    let store = try support.freshStore();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let boolType = store.primitive(PrimitiveKind.Bool);
+    let builder = new EirFunctionBuilder("backEdge", false, null,
+        [new EirParameter("more", boolType)], intType);
+    long slot = builder.addSlot("count", intType, false, false);
+    long head = builder.newBlock("head");
+    long body = builder.newBlock("body");
+    long exit = builder.newBlock("exit");
+    builder.terminate(new EirJump(head));
+    builder.moveTo(head);
+    long count = builder.newTemp(intType);
+    builder.append(new EirLoadSlot(count, intType, slot));
+    builder.terminate(new EirBranch(0, body, exit));
+    builder.moveTo(body);
+    builder.append(new EirStoreSlot(slot, count));
+    builder.terminate(new EirJump(head));
+    builder.moveTo(exit);
+    builder.terminate(new EirReturn(count));
+    try assertMentions(storage.verifyStorage(builder.finish()),
+        "backEdge: b1.head: '%1 = load $0: int' reads $0 'count' on a path that never wrote it");
+}
+
+// A fresh string a call returns, owned by the function.
+made(EirFunctionBuilder builder, TypeStore store) -> long {
+    Type stringType = store.stringType();
+    long text = builder.newTemp(stringType);
+    builder.append(new EirCall(text, stringType, new EirCallee("make", null, [], stringType), -1,
+        [], -1, null));
+    return text;
 }
 
 assertNoViolations(string[] violations) throws {
