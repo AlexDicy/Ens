@@ -256,6 +256,8 @@ So inside `class Box<Tag>` a field may read `List<Tag> items = new List<Tag>();`
 A field whose type has no default value, such as a class, a string, an array, or a struct without one, and that is not made nullable, must be definitely assigned on every path through each constructor.
 A `this.field` parameter, a declared field default, and a `this.field = ...` assignment in the body all count, and assigning the field in every branch of an `if` or `switch` satisfies the rule exactly as a single unconditional assignment does.
 A constructor that leaves such a field unassigned on some path, for example by returning early before it is set, is a compile error, and a class that has such a field but declares no constructor at all is rejected the same way.
+A constructor's `catch` clause that can catch an exception thrown by the arguments of `super(...)` runs before the base class is constructed.
+Such a clause may not reach its end or a `return`: every path through it ends the way a `noreturn` body does, for example by calling `panic`.
 
 A field may also be `const`, in a struct as in a class: a const field is given its value when the object is constructed and never changes afterwards.
 It is assigned by a constructor of the type that declares it, through a `this.field = ...` statement or a `this.field` shorthand parameter, and a struct's const field is equally set by an aggregate literal naming it.

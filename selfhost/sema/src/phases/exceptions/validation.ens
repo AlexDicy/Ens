@@ -23,6 +23,7 @@ import FunctionItem from phases.exceptions;
 import TypeItem from phases.exceptions;
 import ThrowSet from phases.exceptions;
 import ThrowCount from phases.exceptions;
+import CallThrows from phases.exceptions;
 import phases.members;
 import model.hierarchy;
 import model.typemembers;
@@ -343,6 +344,9 @@ public final class ThrowValidation {
         let method = item.method;
         if (method != null && (method.isConstructor() || method.isDestructor())) {
             this.validateNoEscape(item, method, outward);
+            if (method.isConstructor()) {
+                this.validateBaseConstruction(item);
+            }
         } else {
             this.validateContract(item, outward);
             this.validateOverride(item);
@@ -684,6 +688,84 @@ public final class ThrowValidation {
         }
         this.reporter.report("{kind}{ownerName} cannot let exceptions escape, but it can throw{thrown}. "
             + "Catch the exceptions with 'catch' clauses after the {word} body.", item.signature.nameSpan());
+    }
+
+    // A catch clause that finishes the constructor normally returns the object, so it must not
+    // catch what the arguments of 'super(...)' throw: it would run before the base class exists. A
+    // clause that calls 'super(...)' itself is refused for that call alone.
+    validateBaseConstruction(FunctionItem item) {
+        let owner = item.owner;
+        let declaration = item.declaration;
+        let chaining = syntax.chainingSuperCall(declaration.body());
+        if (owner == null || chaining == null || declaration.catchClausesCount() == 0) {
+            return;
+        }
+        let base = hierarchy.baseOf(owner);
+        if (base == null) {
+            return;
+        }
+        let raised = this.module.callThrowsUnder(chaining.arguments());
+        let clauseTypes = this.module.caughtClauseTypes(declaration);
+        string quotedOwner = this.names.quotedName(owner);
+        string quotedBase = this.names.quoted(base);
+        for (long i = 0; i < declaration.catchClausesCount(); i++) {
+            let clause = declaration.catchClauses(i);
+            let clauseType = clauseTypes.get(i);
+            let exits = this.result.catchExitsOf(clause.green());
+            if (clauseType == null || exits == null || syntax.writesSuperCall(clause)
+                    || this.shadowedByEarlier(clauseType, clauseTypes, i)) {
+                continue;
+            }
+            let caught = this.firstCallCaught(raised, clauseType, clauseTypes, i);
+            if (caught == null) {
+                continue;
+            }
+            string callee = calleePhrase(caught.call);
+            string named = nameList(caught.thrown, this.names);
+            string fix = "Move the call into a function that catches {named} and returns a value to "
+                + "pass to 'super(...)'. If the program cannot continue without that value, ";
+            if (exits.reachesEnd()) {
+                this.reporter.report("The constructor of {quotedOwner} can return an object whose "
+                    + "base class {quotedBase} was never constructed: {callee} can throw {named} in "
+                    + "the arguments of 'super(...)', and this 'catch' clause then reaches its end. "
+                    + fix + "end the clause with 'panic(...)'.", clause.catchKeyword().span());
+            }
+            for (let returned in exits.returns()) {
+                this.reporter.report("This 'return' can end the constructor of {quotedOwner} after "
+                    + "{callee} throws {named} in the arguments of 'super(...)', so the object would "
+                    + "be returned without its base class {quotedBase} constructed. " + fix
+                    + "replace 'return;' with 'panic(...)'.", returned);
+            }
+        }
+    }
+
+    // The first call in 'raised' that throws something the clause at 'index' catches, with what
+    // it catches of it, or null where the clause catches nothing those calls throw.
+    firstCallCaught(CallThrows raised, Type clauseType, List<Type?> clauseTypes, long index)
+            -> CaughtCall? {
+        let calls = raised.calls();
+        for (long i = 0; i < calls.length(); i++) {
+            let caught = this.caughtByClause(raised.raisedBy(i), clauseType, clauseTypes, index);
+            if (!caught.isEmpty()) {
+                return new CaughtCall(calls.get(i), caught);
+            }
+        }
+        return null;
+    }
+
+    // The types of 'raised' the clause at 'index' can catch, leaving out the ones an earlier
+    // clause catches whole.
+    caughtByClause(ThrowSet raised, Type clauseType, List<Type?> clauseTypes, long index) -> ThrowSet {
+        let caught = new ThrowSet();
+        let members = raised.members();
+        for (long i = 0; i < members.length(); i++) {
+            let thrown = members.get(i);
+            if (!this.module.caughtBefore(thrown, clauseTypes, index)
+                    && this.module.mightOverlap(clauseType, thrown)) {
+                caught.add(thrown);
+            }
+        }
+        return caught;
     }
 
     validateContract(FunctionItem item, ThrowSet outward) {
@@ -1372,4 +1454,12 @@ isTextAfter(string left, string right) -> bool {
         }
     }
     return leftBytes.length > rightBytes.length;
+}
+
+// A call and the thrown types of it that one catch clause catches.
+final class CaughtCall {
+    CallExpressionNode call;
+    ThrowSet thrown;
+
+    constructor(this.call, this.thrown);
 }
