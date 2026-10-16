@@ -15,9 +15,11 @@ import FunctionType from model.types;
 import ClassType from model.types;
 import ExternalType from model.types;
 import ErrorType from model.types;
+import TypeParamType from model.types;
 import StringType from model.types;
 import PrimitiveType from model.types;
 import PrimitiveKind from model.types;
+import List from @std.collections.list;
 import Set from @std.collections.set;
 
 // How a refusal opens. The line that wrote the refused code reads 'Cannot', while a reader who
@@ -796,7 +798,6 @@ isDeclaredAs(DeclaredType template, string name, string module) -> bool {
 // was asked of, which may hold the struct behind a nullable level, so that is what the refusal
 // names.
 structTextIssue(TextRequest request, Type shown, Type structType, TypeNames names) -> string? {
-    string instantiation = request.instantiation();
     let authority = types.authorityOf(structType);
     if (authority == null) {
         return null;
@@ -807,16 +808,14 @@ structTextIssue(TextRequest request, Type shown, Type structType, TypeNames name
     }
     string owner = names.quotedName(authority);
     string subject = "Struct {owner} cannot be converted to a string.";
-    if (instantiation.length > 0 || shown != structType) {
+    if (request.instantiation().length > 0 || shown != structType) {
         subject = request.subject() + " a value of type {names.quoted(shown)}: struct {owner} "
             + "has no text form.";
     }
     return subject + " Without an 'override toString() -> string', a struct is written as JSON, "
-        + "which lists each field's name and value. Field '{found.path()}' has type "
-        + "{names.quoted(found.leaf())}, and {noJsonFormValue(found.leaf(), names)} has no JSON "
-        + "form. Give {owner} an 'override toString() -> string' of its own, or "
-        + suggestedFix(instantiation, "remove field '{found.path()}'.",
-            "pass a type argument that has a JSON form.");
+        + "which lists each field's name and value. " + noJsonFormReason(found, "", names)
+        + " Give {owner} an 'override toString() -> string' of its own, or "
+        + joinedFixes(jsonFormFixes(request, found, authority, names)) + ".";
 }
 
 // Why an array whose innermost elements have struct type 'element' has no text form, or null when
@@ -824,7 +823,6 @@ structTextIssue(TextRequest request, Type shown, Type structType, TypeNames name
 // 'toString' of its own is reached only by taking the elements one at a time.
 arrayStructTextIssue(TextRequest request, Type shown, ArrayType array, Type element,
                      TypeNames names) -> string? {
-    string instantiation = request.instantiation();
     let authority = types.authorityOf(element);
     if (authority == null) {
         return null;
@@ -841,19 +839,71 @@ arrayStructTextIssue(TextRequest request, Type shown, ArrayType array, Type elem
         written = written + ", even though {owner} declares its own 'toString'";
     }
     string refusal = request.subject() + " a value of type {names.quoted(shown)}: {written}. "
-        + "Field '{found.path()}' of {owner} has type {names.quoted(found.leaf())}, and "
-        + "{noJsonFormValue(found.leaf(), names)} has no JSON form. ";
-    if (instantiation.length > 0) {
-        return refusal + "Pass a type argument that has a JSON form.";
+        + noJsonFormReason(found, " of {owner}", names) + " ";
+    string fixes = joinedFixes(jsonFormFixes(request, found, null, names));
+    if (request.instantiation().length > 0 || !ownText) {
+        return refusal + fixes.substring(0, 1).toUpperAscii() + fixes.substring(1) + ".";
     }
-    if (!ownText) {
-        return refusal + "Remove field '{found.path()}' from {owner}.";
-    }
-    string rest = loopExample(array, authority, request.spelling())
-        + ", or remove field '{found.path()}' from {owner}.";
+    string rest = loopExample(array, authority, request.spelling()) + ", or {fixes}.";
     return refusal + textAdvice(request.use(),
         "Interpolate the elements one at a time in a 'for' loop{rest}",
         "Call 'toString' on the elements one at a time in a 'for' loop{rest}");
+}
+
+// The field with no JSON form and why, with 'ownerClause' naming the struct it was reached from
+// when the subject of the refusal does not, and the 'toString' the JSON form passes over, if any.
+noJsonFormReason(OffendingField found, string ownerClause, TypeNames names) -> string {
+    string reason = "Field '{found.path()}'{ownerClause} has type {names.quoted(found.leaf())}, "
+        + "and {noJsonFormValue(found.leaf(), names)} has no JSON form.";
+    let passed = found.passedText();
+    if (passed == null) {
+        return reason;
+    }
+    return reason + " The 'toString' of {names.quotedName(passed)} is not used inside another "
+        + "struct.";
+}
+
+// The fixes that give the struct a JSON form, lowercase and in the order they are offered.
+// 'centered' is the struct the refusal opens with, which a fix does not name again.
+jsonFormFixes(TextRequest request, OffendingField found, DeclaredType? centered,
+              TypeNames names) -> List<string> {
+    let fixes = new List<string>();
+    if (request.instantiation().length > 0) {
+        fixes.push("pass a type argument that has a JSON form");
+    }
+    let argumentOwner = found.argumentOwner();
+    if (found.argumentChose() && argumentOwner == null) {
+        if (fixes.length() == 0) {
+            fixes.push("pass a type argument that has a JSON form");
+        }
+        return fixes;
+    }
+    if (argumentOwner != null) {
+        fixes.push("give the type of field '{found.argumentField()}'"
+            + structClause(" of", argumentOwner, centered, names)
+            + " a type argument that has a JSON form");
+        return fixes;
+    }
+    fixes.push("remove field '{found.name()}'"
+        + structClause(" from", found.declaring(), centered, names));
+    return fixes;
+}
+
+// The struct a fix names after 'preposition', or "" when it is the one the refusal opens with.
+structClause(string preposition, DeclaredType declaring, DeclaredType? centered,
+             TypeNames names) -> string {
+    if (declaring == centered) {
+        return "";
+    }
+    return "{preposition} {names.quotedName(declaring)}";
+}
+
+joinedFixes(List<string> fixes) -> string {
+    string joined = fixes.get(0);
+    for (long i = 1; i < fixes.length(); i++) {
+        joined = joined + ", or " + fixes.get(i);
+    }
+    return joined;
 }
 
 // A loop over the array as written, naming each element after its struct, or "" when the
@@ -870,12 +920,18 @@ loopExample(ArrayType array, DeclaredType elementType, string spelled) -> string
     return ", as in 'for (let {element} in {spelled}) \{ ... \}'";
 }
 
+// The type a value bottoms out at through its nullable levels and nested arrays.
+innermostCoreOf(Type type) -> Type {
+    Type core = convert.coreOf(type);
+    if (core is ArrayType) {
+        return innermostElementOf(core);
+    }
+    return core;
+}
+
 // What a value of the leaf type is, for a sentence saying it has no JSON form.
 noJsonFormValue(Type leaf, TypeNames names) -> string {
-    Type core = convert.coreOf(leaf);
-    if (core is ArrayType) {
-        core = innermostElementOf(core);
-    }
+    Type core = innermostCoreOf(leaf);
     if (types.isInterfaceLike(core)) {
         return "an interface value";
     }
@@ -891,15 +947,69 @@ noJsonFormValue(Type leaf, TypeNames names) -> string {
     return "a value of type {names.quoted(core)}";
 }
 
-// A struct field with no operator of its own: the dotted path from the compared struct down to
-// it, and the offending leaf type it bottoms out at.
+// The type a struct's declaration writes for its field 'name', in the struct's own type
+// parameters, or null when it declares no such field.
+declaredFieldType(DeclaredType declaring, string name) -> Type? {
+    let fields = typemembers.fieldsOf(declaring);
+    if (fields == null) {
+        return null;
+    }
+    for (long i = 0; i < fields.length(); i++) {
+        let field = fields.get(i);
+        if (field.name() == name) {
+            return field.type();
+        }
+    }
+    return null;
+}
+
+// A struct field with no operator of its own: the dotted path from the judged struct down to it,
+// the offending leaf type it bottoms out at, its own name and the struct that declares it. For a
+// missing JSON form it also records whether a type argument chose the field's type, the field
+// whose type writes that argument when one does, and the nested struct whose own 'toString' the
+// JSON form passes over.
 class OffendingField {
     string fieldPath;
     Type fieldLeaf;
 
-    protected constructor(string path, Type leaf) {
-        this.fieldPath = path;
-        this.fieldLeaf = leaf;
+    string fieldName;
+    DeclaredType declaringStruct;
+
+    bool argumentChoice;
+    string argumentFieldName;
+    DeclaredType? argumentFieldOwner;
+
+    DeclaredType? passedOver;
+
+    constructor(this.fieldPath, this.fieldLeaf, this.fieldName, this.declaringStruct,
+                this.argumentChoice, this.argumentFieldName, this.argumentFieldOwner,
+                this.passedOver);
+
+    // The field 'name' of 'declaring' itself, whose type bottoms out at 'leaf'.
+    protected static at(string name, Type leaf, DeclaredType declaring) -> OffendingField {
+        let declared = declaredFieldType(declaring, name);
+        bool chosen = declared != null && innermostCoreOf(declared) is TypeParamType;
+        return new OffendingField(name, leaf, name, declaring, chosen, "", null, null);
+    }
+
+    // The same field reached from one struct further out, through its field 'outer', which
+    // 'outerDeclaring' declares with a type that holds the struct 'nested'.
+    protected under(string outer, DeclaredType outerDeclaring, Type nested) -> OffendingField {
+        string argumentName = this.argumentFieldName;
+        DeclaredType? argumentOwner = this.argumentFieldOwner;
+        if (this.argumentChoice && argumentOwner == null) {
+            let declared = declaredFieldType(outerDeclaring, outer);
+            if (declared == null || !convert.containsTypeParam(declared)) {
+                argumentName = outer;
+                argumentOwner = outerDeclaring;
+            }
+        }
+        DeclaredType? passed = this.passedOver;
+        if (typemembers.declaredToString(nested) != null) {
+            passed = types.authorityOf(nested);
+        }
+        return new OffendingField(outer + "." + this.fieldPath, this.fieldLeaf, this.fieldName,
+            this.declaringStruct, this.argumentChoice, argumentName, argumentOwner, passed);
     }
 
     protected path() -> string {
@@ -908,6 +1018,33 @@ class OffendingField {
 
     protected leaf() -> Type {
         return this.fieldLeaf;
+    }
+
+    protected name() -> string {
+        return this.fieldName;
+    }
+
+    protected declaring() -> DeclaredType {
+        return this.declaringStruct;
+    }
+
+    // True when the declaring struct writes the field's type as one of its type parameters.
+    protected argumentChose() -> bool {
+        return this.argumentChoice;
+    }
+
+    // The field whose type writes the type argument that chose this field's type, when that is a
+    // field rather than the type the refusal opens with.
+    protected argumentField() -> string {
+        return this.argumentFieldName;
+    }
+
+    protected argumentOwner() -> DeclaredType? {
+        return this.argumentFieldOwner;
+    }
+
+    protected passedText() -> DeclaredType? {
+        return this.passedOver;
     }
 }
 
@@ -954,6 +1091,10 @@ firstOpaqueField(Type structType, Set<Type> visiting, bool hashing) -> Offending
     if (declaresOwnPair(structType) || !visiting.add(structType)) {
         return null;
     }
+    let declaring = types.authorityOf(structType);
+    if (declaring == null) {
+        return null;
+    }
     let fields = typemembers.fieldsOf(structType);
     if (fields == null) {
         return null;
@@ -968,23 +1109,23 @@ firstOpaqueField(Type structType, Set<Type> visiting, bool hashing) -> Offending
         if (core is ArrayType) {
             Type element = innermostElementOf(core);
             if (isOpaqueLeaf(element, hashing)) {
-                return new OffendingField(field.name(), core);
+                return OffendingField.at(field.name(), core, declaring);
             }
             if (types.isStructLike(element)) {
                 let inElement = firstOpaqueField(element, visiting, hashing);
                 if (inElement != null) {
-                    return new OffendingField(field.name(), core);
+                    return OffendingField.at(field.name(), core, declaring);
                 }
             }
             continue;
         }
         if (isOpaqueLeaf(core, hashing)) {
-            return new OffendingField(field.name(), core);
+            return OffendingField.at(field.name(), core, declaring);
         }
         if (types.isStructLike(core)) {
             let nested = firstOpaqueField(core, visiting, hashing);
             if (nested != null) {
-                return new OffendingField(field.name() + "." + nested.path(), nested.leaf());
+                return nested.under(field.name(), declaring, core);
             }
         }
     }
@@ -1009,6 +1150,10 @@ firstChangeableField(Type structType, Set<Type> visiting) -> OffendingField? {
     if (declaresOwnPair(structType) || !visiting.add(structType)) {
         return null;
     }
+    let declaring = types.authorityOf(structType);
+    if (declaring == null) {
+        return null;
+    }
     let fields = typemembers.fieldsOf(structType);
     if (fields == null) {
         return null;
@@ -1021,12 +1166,12 @@ firstChangeableField(Type structType, Set<Type> visiting) -> OffendingField? {
         }
         Type core = convert.coreOf(fieldType);
         if (core is ArrayType || isStandardCollection(core)) {
-            return new OffendingField(field.name(), core);
+            return OffendingField.at(field.name(), core, declaring);
         }
         if (types.isStructLike(core)) {
             let nested = firstChangeableField(core, visiting);
             if (nested != null) {
-                return new OffendingField(field.name() + "." + nested.path(), nested.leaf());
+                return nested.under(field.name(), declaring, core);
             }
         }
     }
@@ -1054,6 +1199,10 @@ firstNonJsonableField(Type structType, Set<Type> visiting) -> OffendingField? {
     if (!visiting.add(structType)) {
         return null;
     }
+    let declaring = types.authorityOf(structType);
+    if (declaring == null) {
+        return null;
+    }
     let fields = typemembers.fieldsOf(structType);
     if (fields == null) {
         return null;
@@ -1078,19 +1227,18 @@ firstNonJsonableField(Type structType, Set<Type> visiting) -> OffendingField? {
                 if (inElement == null) {
                     continue;
                 }
-                return new OffendingField(field.name() + "." + inElement.path(),
-                    inElement.leaf());
+                return inElement.under(field.name(), declaring, element);
             }
-            return new OffendingField(field.name(), fieldType);
+            return OffendingField.at(field.name(), fieldType, declaring);
         }
         if (types.isStructLike(core)) {
             let nested = firstNonJsonableField(core, visiting);
             if (nested != null) {
-                return new OffendingField(field.name() + "." + nested.path(), nested.leaf());
+                return nested.under(field.name(), declaring, core);
             }
             continue;
         }
-        return new OffendingField(field.name(), fieldType);
+        return OffendingField.at(field.name(), fieldType, declaring);
     }
     return null;
 }
