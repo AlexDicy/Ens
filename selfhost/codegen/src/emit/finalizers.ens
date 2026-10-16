@@ -1,7 +1,6 @@
 // The finalizers an object stores in its header. ens_release runs one when the strong count
 // reaches zero and frees the allocation afterwards, so a finalizer releases only what the object
 // owns and never touches the object itself. An array that owns nothing carries a null finalizer.
-import @ens.sema.model.typemembers;
 import Type from @ens.sema.model.types;
 import Value from @ens.llvm.values;
 import @ens.llvm.instructions;
@@ -12,6 +11,10 @@ import RuntimeFunction from emit.runtime;
 import TypeMapper from emit.types;
 import lower.symbols;
 import support.primitives;
+import ReferenceWalker from support.references;
+import support.references;
+import BasicBlock from @ens.llvm.blocks;
+import List from @std.collections.list;
 
 public final class Finalizers {
     Runtime runtime;
@@ -65,48 +68,51 @@ public final class Finalizers {
         return this.runtime.endDefinition(definition);
     }
 
-    // Releases what the storage at an address owns: a reference directly, a struct field by
-    // field, and a tagged optional's payload only when its tag marks it present.
+    // Releases what the storage at an address owns.
     releaseAt(RuntimeDefinition definition, Value address, Type type) {
+        references.walk<Value>(new StorageReleaser(this.runtime, this.mapper, definition), address,
+            type);
+    }
+}
+
+// Releases each reference storage holds, through its address. An optional's payload is reached in
+// a block of its own that only runs when the tag marks the payload present.
+final class StorageReleaser implements ReferenceWalker<Value> {
+    Runtime runtime;
+    TypeMapper mapper;
+    RuntimeDefinition definition;
+    List<BasicBlock> doneBlocks;
+
+    protected constructor(this.runtime, this.mapper, this.definition) {
+        this.doneBlocks = new List<BasicBlock>();
+    }
+
+    override reference(Value address) {
+        let held = memory.buildLoad(this.runtime.builder, this.runtime.pointerType, address, "");
+        this.runtime.call(this.runtime.release(), [held], "");
+    }
+
+    override field(Value record, Type recordType, long index, Type fieldType) -> Value {
+        return memory.buildStructGEP(this.runtime.builder, this.mapper.map(recordType), record,
+            index as uint, "");
+    }
+
+    override payload(Value pair, Type optionalType, Type payloadType) -> Value {
         let builder = this.runtime.builder;
-        if (primitives.isReferenceType(type)) {
-            let held = memory.buildLoad(builder, this.runtime.pointerType, address, "");
-            this.runtime.call(this.runtime.release(), [held], "");
-            return;
-        }
-        let payload = primitives.taggedPayloadOf(type);
-        if (payload != null) {
-            if (!primitives.hasArcContent(payload)) {
-                return;
-            }
-            let pairType = this.mapper.map(type);
-            let tagAddress = memory.buildStructGEP(builder, pairType, address, 0 as uint, "");
-            let present = memory.buildLoad(builder, this.runtime.int1Type, tagAddress, "");
-            let walkBlock = this.runtime.block(definition, "opt.walk");
-            let doneBlock = this.runtime.block(definition, "opt.done");
-            instructions.buildCondBr(builder, present, walkBlock, doneBlock);
-            builder.positionAtEnd(walkBlock);
-            this.releaseAt(definition,
-                memory.buildStructGEP(builder, pairType, address, 1 as uint, ""), payload);
-            instructions.buildBr(builder, doneBlock);
-            builder.positionAtEnd(doneBlock);
-            return;
-        }
-        if (primitives.structOf(type) == null) {
-            return;
-        }
-        let fields = typemembers.fieldsOf(type);
-        if (fields == null) {
-            return;
-        }
-        let structType = this.mapper.map(type);
-        for (long i = 0; i < fields.length(); i++) {
-            let field = fields.get(i);
-            if (!primitives.hasArcContent(field.type())) {
-                continue;
-            }
-            let fieldAddress = memory.buildStructGEP(builder, structType, address, i as uint, "");
-            this.releaseAt(definition, fieldAddress, field.type());
-        }
+        let pairType = this.mapper.map(optionalType);
+        let tagAddress = memory.buildStructGEP(builder, pairType, pair, 0 as uint, "");
+        let present = memory.buildLoad(builder, this.runtime.int1Type, tagAddress, "");
+        let walkBlock = this.runtime.block(this.definition, "opt.walk");
+        let doneBlock = this.runtime.block(this.definition, "opt.done");
+        instructions.buildCondBr(builder, present, walkBlock, doneBlock);
+        builder.positionAtEnd(walkBlock);
+        this.doneBlocks.push(doneBlock);
+        return memory.buildStructGEP(builder, pairType, pair, 1 as uint, "");
+    }
+
+    override endPayload() {
+        let doneBlock = this.doneBlocks.pop();
+        instructions.buildBr(this.runtime.builder, doneBlock);
+        this.runtime.builder.positionAtEnd(doneBlock);
     }
 }
