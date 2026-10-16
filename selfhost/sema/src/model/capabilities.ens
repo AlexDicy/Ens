@@ -97,16 +97,17 @@ public textUseNote(string owner, TextUse use, string quotedType) -> string {
 }
 
 // What asked a value for its text: the use, the instantiation a reader wrote when the use is
-// inside a generic body, the null guidance for a value with several '?', and the value as written
-// when it is short enough to quote in an example.
+// inside a generic body, the null guidance for a value with several '?', the value as written
+// when it is short enough to quote in an example, and whether a name is free to declare there.
 class TextRequest {
     string requestInstantiation;
     TextUse requestUse;
     string requestUnwrap;
     string requestSpelling;
+    (string) -> bool requestFreeName;
 
     protected constructor(this.requestInstantiation, this.requestUse, this.requestUnwrap,
-                          this.requestSpelling);
+                          this.requestSpelling, this.requestFreeName);
 
     protected instantiation() -> string {
         return this.requestInstantiation;
@@ -124,6 +125,11 @@ class TextRequest {
         return this.requestSpelling;
     }
 
+    protected isFreeName(string name) -> bool {
+        let isFree = this.requestFreeName;
+        return isFree(name);
+    }
+
     // How a refusal of this request opens, up to the type it names.
     protected subject() -> string {
         return textRefusalSubject(this.requestInstantiation, this.requestUse);
@@ -131,25 +137,29 @@ class TextRequest {
 }
 
 // Why a value of this type cannot fill an interpolation hole, or null when it can. 'unwrap' is the
-// null guidance for a hole whose type has more than one '?', and 'spelled' is the hole as written
-// when it is short enough to quote in an example, or "".
-public interpolationIssue(Type analyzed, TypeNames names, string unwrap = "", string spelled = "")
-        -> string? {
-    let request = new TextRequest("", TextUse.Interpolation, unwrap, spelled);
+// null guidance for a hole whose type has more than one '?', 'spelled' is the hole as written
+// when it is short enough to quote in an example, or "", and 'isFreeName' tells whether a name
+// can be declared where the hole is.
+public interpolationIssue(Type analyzed, TypeNames names, string unwrap, string spelled,
+                          (string) -> bool isFreeName) -> string? {
+    let request = new TextRequest("", TextUse.Interpolation, unwrap, spelled, isFreeName);
     return textIssueOf(request, analyzed, analyzed, names);
 }
 
 // Why a value of this type has no text for a 'toString()' call written on it, or null when it has.
-// 'spelled' is the value the call is written on when it is short enough to quote, or "".
-public toStringCallIssue(Type analyzed, TypeNames names, string spelled) -> string? {
-    let request = new TextRequest("", TextUse.ToStringCall, "", spelled);
+// 'spelled' is the value the call is written on when it is short enough to quote, or "", and
+// 'isFreeName' tells whether a name can be declared where the call is.
+public toStringCallIssue(Type analyzed, TypeNames names, string spelled,
+                         (string) -> bool isFreeName) -> string? {
+    let request = new TextRequest("", TextUse.ToStringCall, "", spelled, isFreeName);
     return textIssueOf(request, analyzed, analyzed, names);
 }
 
 // The same judgment for a use inside a generic body, refused for the arguments of the
 // 'instantiation' a reader wrote and reported at that reader's own line.
 public textIssue(string instantiation, TextUse use, Type analyzed, TypeNames names) -> string? {
-    return textIssueOf(new TextRequest(instantiation, use, "", ""), analyzed, analyzed, names);
+    let request = new TextRequest(instantiation, use, "", "", (string name) -> false);
+    return textIssueOf(request, analyzed, analyzed, names);
 }
 
 // 'shown' is the type the use was asked of, which every refusal names, and 'judged' is what decides
@@ -812,10 +822,11 @@ structTextIssue(TextRequest request, Type shown, Type structType, TypeNames name
         subject = request.subject() + " a value of type {names.quoted(shown)}: struct {owner} "
             + "has no text form.";
     }
+    let fixes = jsonFormFixes(request, found, structType, authority, authority, names);
+    fixes.insert(0, "give {owner} an 'override toString() -> string'");
     return subject + " Without an 'override toString() -> string', a struct is written as JSON, "
-        + "which lists each field's name and value. " + noJsonFormReason(found, "", names)
-        + " Give {owner} an 'override toString() -> string' of its own, or "
-        + joinedFixes(jsonFormFixes(request, found, authority, names)) + ".";
+        + "which lists each field's name and value. " + noJsonFormReason(found, "", names) + " "
+        + capitalized(joinedFixes(fixes)) + ".";
 }
 
 // Why an array whose innermost elements have struct type 'element' has no text form, or null when
@@ -839,49 +850,114 @@ arrayStructTextIssue(TextRequest request, Type shown, ArrayType array, Type elem
         written = written + ", even though {owner} declares its own 'toString'";
     }
     string refusal = request.subject() + " a value of type {names.quoted(shown)}: {written}. "
-        + noJsonFormReason(found, " of {owner}", names) + " ";
-    string fixes = joinedFixes(jsonFormFixes(request, found, null, names));
-    if (request.instantiation().length > 0 || !ownText) {
-        return refusal + fixes.substring(0, 1).toUpperAscii() + fixes.substring(1) + ".";
+        + noJsonFormReason(found, " of {owner}", names);
+    let fixes = jsonFormFixes(request, found, element, authority, null, names);
+    if (request.instantiation().length == 0 && ownText) {
+        string loop = textAdvice(request.use(), "interpolate the elements one at a time in a 'for' loop",
+            "call 'toString' on the elements one at a time in a 'for' loop");
+        fixes.insert(0, loop + loopExample(array, authority, request));
     }
-    string rest = loopExample(array, authority, request.spelling()) + ", or {fixes}.";
-    return refusal + textAdvice(request.use(),
-        "Interpolate the elements one at a time in a 'for' loop{rest}",
-        "Call 'toString' on the elements one at a time in a 'for' loop{rest}");
+    return refusal + " " + capitalized(joinedFixes(fixes)) + ".";
 }
 
 // The field with no JSON form and why, with 'ownerClause' naming the struct it was reached from
 // when the subject of the refusal does not, and the 'toString' the JSON form passes over, if any.
 noJsonFormReason(OffendingField found, string ownerClause, TypeNames names) -> string {
-    string reason = "Field '{found.path()}'{ownerClause} has type {names.quoted(found.leaf())}, "
-        + "and {noJsonFormValue(found.leaf(), names)} has no JSON form.";
+    string reason = "Field '{found.path()}'{ownerClause} has {fieldTypeClause(found.leaf(), names)}.";
     let passed = found.passedText();
     if (passed == null) {
         return reason;
     }
-    return reason + " The 'toString' of {names.quotedName(passed)} is not used inside another "
-        + "struct.";
+    return reason + " A struct inside another struct is written as JSON too, even though "
+        + "{names.quotedName(passed)} declares its own 'toString'.";
 }
 
-// The fixes that give the struct a JSON form, lowercase and in the order they are offered.
-// 'centered' is the struct the refusal opens with, which a fix does not name again.
-jsonFormFixes(TextRequest request, OffendingField found, DeclaredType? centered,
-              TypeNames names) -> List<string> {
+// The type of a field with no JSON form, and why, as the words after "has".
+fieldTypeClause(Type leaf, TypeNames names) -> string {
+    string quoted = names.quoted(leaf);
+    Type core = convert.coreOf(leaf);
+    if (core is ArrayType) {
+        string arrays = "";
+        Type element = convert.coreOf(core.element());
+        while (element is ArrayType) {
+            arrays = arrays + "arrays of ";
+            element = convert.coreOf(element.element());
+        }
+        let elementKind = leafKindOf(element);
+        if (elementKind == null) {
+            return "type {quoted}, whose elements have no JSON form";
+        }
+        return "type {quoted}, an array of {arrays}{elementKind.many}, and {elementKind.one} has "
+            + "no JSON form";
+    }
+    let kind = leafKindOf(core);
+    if (kind == null) {
+        return "type {quoted}, which has no JSON form";
+    }
+    string nullable = "";
+    if (core != leaf) {
+        nullable = "nullable ";
+    }
+    return "the {nullable}{kind.kind} type {quoted}, and {kind.one} has no JSON form";
+}
+
+// A kind of type whose values have no JSON form, named as the word before "type", as one value of
+// it, and as several.
+struct LeafKind {
+    string kind;
+    string one;
+    string many;
+}
+
+// The kind of a type with no JSON form, or null for any other type.
+leafKindOf(Type core) -> LeafKind? {
+    if (types.isInterfaceLike(core)) {
+        return {kind: "interface", one: "an interface value", many: "interface values"};
+    }
+    if (types.isClassLike(core)) {
+        return {kind: "class", one: "a class value", many: "class values"};
+    }
+    if (core is FunctionType) {
+        return {kind: "function", one: "a function value", many: "function values"};
+    }
+    if (core is ExternalType) {
+        return {kind: "external", one: "a value of an external type",
+            many: "values of an external type"};
+    }
+    return null;
+}
+
+// The fixes besides a 'toString' that give the struct 'judged' a JSON form, lowercase and in the
+// order they are offered. 'judgedType' is that struct as the refused value has it, whose type
+// arguments a fix names, and 'centered' is the struct the refusal opens with, which a fix does
+// not name again.
+jsonFormFixes(TextRequest request, OffendingField found, Type judgedType, DeclaredType judged,
+              DeclaredType? centered, TypeNames names) -> List<string> {
     let fixes = new List<string>();
     if (request.instantiation().length > 0) {
         fixes.push("pass a type argument that has a JSON form");
     }
-    let argumentOwner = found.argumentOwner();
-    if (found.argumentChose() && argumentOwner == null) {
+    if (found.isOpen()) {
         if (fixes.length() == 0) {
-            fixes.push("pass a type argument that has a JSON form");
+            string fix = "use {names.quotedName(judged)} with a type argument that has a JSON form";
+            let parameter = found.outermostChoice();
+            let argument = parameter == null ? null : typeArgumentOf(judgedType, parameter);
+            if (argument != null) {
+                fix = "{fix} instead of {names.quoted(argument)}";
+            }
+            fixes.push(fix);
         }
         return fixes;
     }
+    let argumentOwner = found.argumentOwner();
     if (argumentOwner != null) {
-        fixes.push("give the type of field '{found.argumentField()}'"
-            + structClause(" of", argumentOwner, centered, names)
-            + " a type argument that has a JSON form");
+        string named = "";
+        let argument = found.writtenArgument();
+        if (argument != null) {
+            named = " {names.quoted(argument)}";
+        }
+        fixes.push("change the type argument{named} in field '{found.argumentField()}'"
+            + structClause(" of", argumentOwner, centered, names) + " to one that has a JSON form");
         return fixes;
     }
     fixes.push("remove field '{found.name()}'"
@@ -906,18 +982,25 @@ joinedFixes(List<string> fixes) -> string {
     return joined;
 }
 
-// A loop over the array as written, naming each element after its struct, or "" when the
-// array is not quoted or its elements are arrays themselves.
-loopExample(ArrayType array, DeclaredType elementType, string spelled) -> string {
+capitalized(string text) -> string {
+    return text.substring(0, 1).toUpperAscii() + text.substring(1);
+}
+
+// A loop over the array as written, naming each element after its struct, or 'element' when that
+// name is taken where the array is written. "" when the array is not quoted, its elements are
+// arrays themselves, or both names are taken.
+loopExample(ArrayType array, DeclaredType elementType, TextRequest request) -> string {
+    string spelled = request.spelling();
     if (spelled.length == 0 || convert.coreOf(array.element()) is ArrayType) {
         return "";
     }
     string name = elementType.name();
-    string element = name.substring(0, 1).toLowerAscii() + name.substring(1);
-    if (element == spelled || element == name) {
-        element = "element";
+    for (let candidate in [name.substring(0, 1).toLowerAscii() + name.substring(1), "element"]) {
+        if (request.isFreeName(candidate)) {
+            return ", as in 'for (let {candidate} in {spelled}) \{ ... \}'";
+        }
     }
-    return ", as in 'for (let {element} in {spelled}) \{ ... \}'";
+    return "";
 }
 
 // The type a value bottoms out at through its nullable levels and nested arrays.
@@ -929,22 +1012,15 @@ innermostCoreOf(Type type) -> Type {
     return core;
 }
 
-// What a value of the leaf type is, for a sentence saying it has no JSON form.
-noJsonFormValue(Type leaf, TypeNames names) -> string {
-    Type core = innermostCoreOf(leaf);
-    if (types.isInterfaceLike(core)) {
-        return "an interface value";
+// The type argument that the instantiation 'type' bottoms out at gives its template's
+// 'parameter', or null when 'type' is no instantiation of that template.
+typeArgumentOf(Type type, TypeParamType parameter) -> Type? {
+    Type innermost = innermostCoreOf(type);
+    if (innermost is InstantiationType && innermost.template().declaration() == parameter.owner()
+            && parameter.index() < innermost.arguments().length) {
+        return innermost.arguments()[parameter.index()];
     }
-    if (types.isClassLike(core)) {
-        return "a class value";
-    }
-    if (core is FunctionType) {
-        return "a function value";
-    }
-    if (core is ExternalType) {
-        return "a value of an external type";
-    }
-    return "a value of type {names.quoted(core)}";
+    return null;
 }
 
 // The type a struct's declaration writes for its field 'name', in the struct's own type
@@ -965,8 +1041,9 @@ declaredFieldType(DeclaredType declaring, string name) -> Type? {
 
 // A struct field with no operator of its own: the dotted path from the judged struct down to it,
 // the offending leaf type it bottoms out at, its own name and the struct that declares it. For a
-// missing JSON form it also records whether a type argument chose the field's type, the field
-// whose type writes that argument when one does, and the nested struct whose own 'toString' the
+// missing JSON form it also records the type parameters that chose the field's type, innermost
+// first, while no field further out fixes the choice, the field whose type writes the type
+// argument that does fix it and that argument, and the nested struct whose own 'toString' the
 // JSON form passes over.
 class OffendingField {
     string fieldPath;
@@ -975,33 +1052,66 @@ class OffendingField {
     string fieldName;
     DeclaredType declaringStruct;
 
-    bool argumentChoice;
+    TypeParamType[] choosingParameters;
     string argumentFieldName;
     DeclaredType? argumentFieldOwner;
+    Type? argumentWritten;
 
     DeclaredType? passedOver;
 
     constructor(this.fieldPath, this.fieldLeaf, this.fieldName, this.declaringStruct,
-                this.argumentChoice, this.argumentFieldName, this.argumentFieldOwner,
-                this.passedOver);
+                this.choosingParameters, this.argumentFieldName, this.argumentFieldOwner,
+                this.argumentWritten, this.passedOver);
 
     // The field 'name' of 'declaring' itself, whose type bottoms out at 'leaf'.
     protected static at(string name, Type leaf, DeclaredType declaring) -> OffendingField {
+        TypeParamType[] parameters = [];
         let declared = declaredFieldType(declaring, name);
-        bool chosen = declared != null && innermostCoreOf(declared) is TypeParamType;
-        return new OffendingField(name, leaf, name, declaring, chosen, "", null, null);
+        if (declared != null) {
+            Type innermost = innermostCoreOf(declared);
+            if (innermost is TypeParamType) {
+                parameters = [innermost];
+            }
+        }
+        return new OffendingField(name, leaf, name, declaring, parameters, "", null, null, null);
     }
 
     // The same field reached from one struct further out, through its field 'outer', which
-    // 'outerDeclaring' declares with a type that holds the struct 'nested'.
+    // 'outerDeclaring' declares with a type that holds the struct 'nested'. The choice follows
+    // the declared type down through the type arguments it writes: one that is itself a type
+    // parameter of 'outerDeclaring' leaves the choice open one struct further out, and any other
+    // fixes it in 'outer', as does a declared type that does not show which argument chose it.
     protected under(string outer, DeclaredType outerDeclaring, Type nested) -> OffendingField {
+        let chain = new List<TypeParamType>();
+        for (let parameter in this.choosingParameters) {
+            chain.push(parameter);
+        }
         string argumentName = this.argumentFieldName;
         DeclaredType? argumentOwner = this.argumentFieldOwner;
-        if (this.argumentChoice && argumentOwner == null) {
-            let declared = declaredFieldType(outerDeclaring, outer);
-            if (declared == null || !convert.containsTypeParam(declared)) {
-                argumentName = outer;
-                argumentOwner = outerDeclaring;
+        Type? argument = this.argumentWritten;
+        if (chain.length() > 0) {
+            Type? written = declaredFieldType(outerDeclaring, outer);
+            while (written != null) {
+                Type innermost = innermostCoreOf(written);
+                if (innermost is TypeParamType) {
+                    chain.push(innermost);
+                    break;
+                }
+                if (chain.length() == 0) {
+                    argumentName = outer;
+                    argumentOwner = outerDeclaring;
+                    argument = written;
+                    break;
+                }
+                written = typeArgumentOf(written, chain.pop());
+                if (written == null) {
+                    argumentName = outer;
+                    argumentOwner = outerDeclaring;
+                    argument = null;
+                }
+            }
+            if (written == null) {
+                chain = new List<TypeParamType>();
             }
         }
         DeclaredType? passed = this.passedOver;
@@ -1009,7 +1119,7 @@ class OffendingField {
             passed = types.authorityOf(nested);
         }
         return new OffendingField(outer + "." + this.fieldPath, this.fieldLeaf, this.fieldName,
-            this.declaringStruct, this.argumentChoice, argumentName, argumentOwner, passed);
+            this.declaringStruct, chain.toArray(), argumentName, argumentOwner, argument, passed);
     }
 
     protected path() -> string {
@@ -1028,19 +1138,34 @@ class OffendingField {
         return this.declaringStruct;
     }
 
-    // True when the declaring struct writes the field's type as one of its type parameters.
-    protected argumentChose() -> bool {
-        return this.argumentChoice;
+    // True when a type argument of the struct the refusal opens with chose the field's type, and
+    // no field between the two fixes it.
+    protected isOpen() -> bool {
+        return this.choosingParameters.length > 0;
     }
 
-    // The field whose type writes the type argument that chose this field's type, when that is a
-    // field rather than the type the refusal opens with.
+    // The type parameter of the struct the refusal opens with that chose the field's type, or
+    // null when no type argument of that struct chose it.
+    protected outermostChoice() -> TypeParamType? {
+        if (this.choosingParameters.length == 0) {
+            return null;
+        }
+        return this.choosingParameters[this.choosingParameters.length - 1];
+    }
+
+    // The field whose type writes the type argument that fixes this field's type, the struct
+    // that declares that field, and the argument as that struct writes it, or null when the declared
+    // type does not show which of its arguments it is.
     protected argumentField() -> string {
         return this.argumentFieldName;
     }
 
     protected argumentOwner() -> DeclaredType? {
         return this.argumentFieldOwner;
+    }
+
+    protected writtenArgument() -> Type? {
+        return this.argumentWritten;
     }
 
     protected passedText() -> DeclaredType? {
