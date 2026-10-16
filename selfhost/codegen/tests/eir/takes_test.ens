@@ -1,6 +1,6 @@
 // The take verifier over hand-built EIR: the shape the move rewrite may produce passes, and each
-// way a take can move a reference out too early reports its own violation. Both bad functions
-// count every reference exactly right, so the value and storage verifiers stay silent on them.
+// way a take can move a reference out too early reports its own violation, in a loop too. Each bad
+// function counts every reference exactly right, so the value and storage verifiers stay silent.
 import @std.testing;
 import PrimitiveKind from @ens.sema.model.types;
 import Type from @ens.sema.model.types;
@@ -8,6 +8,9 @@ import TypeStore from @ens.sema.model.types;
 import EirFunction from eir.model;
 import EirFunctionBuilder from eir.model;
 import EirConstString from eir.model;
+import EirConstBool from eir.model;
+import EirJump from eir.model;
+import EirBranch from eir.model;
 import EirLoadSlot from eir.model;
 import EirRelease from eir.model;
 import EirReleasePtr from eir.model;
@@ -101,6 +104,79 @@ test "using a reference borrowed before the take is reported" {
     try assertBalanced(function);
     try assertMentions(takes.verifyTakes(function),
         "borrows what slot $0 'text' held and is still used after the take");
+}
+
+// The borrow each pass around the loop reads is used before that pass's take, and the next pass
+// reads a borrow of its own, so no use follows a take of the reference it borrowed.
+test "a borrow read again each time around a loop is not in use after that pass's take" {
+    let looped = try loopingOverASlot("looped");
+    let builder = looped.builder;
+    let stringType = looped.store.stringType();
+    builder.append(new EirStoreSlot(looped.slot, joinedString(builder, stringType)));
+    long borrowed = builder.newTemp(stringType);
+    builder.append(new EirLoadSlot(borrowed, stringType, looped.slot));
+    long length = measure(looped, borrowed);
+    long taken = builder.newTemp(stringType);
+    builder.append(new EirTakeSlot(taken, stringType, looped.slot));
+    builder.append(new EirRelease(taken));
+    let function = closeLoop(looped, length);
+    try assertBalanced(function);
+    try assertNoViolations(takes.verifyTakes(function));
+}
+
+// The read right after the take comes before the next pass writes the slot again.
+test "reading the slot after the take is reported in a loop that writes the slot first" {
+    let looped = try loopingOverASlot("loopReadsAgain");
+    let builder = looped.builder;
+    let stringType = looped.store.stringType();
+    builder.append(new EirStoreSlot(looped.slot, joinedString(builder, stringType)));
+    long taken = builder.newTemp(stringType);
+    builder.append(new EirTakeSlot(taken, stringType, looped.slot));
+    builder.append(new EirRelease(taken));
+    long reread = builder.newTemp(stringType);
+    builder.append(new EirLoadSlot(reread, stringType, looped.slot));
+    let function = closeLoop(looped, measure(looped, reread));
+    try assertBalanced(function);
+    try assertMentions(takes.verifyTakes(function),
+        "slot $0 'text' is read again after the take moved its reference out");
+}
+
+// A function returning a length whose slot is written inside a loop body, positioned in that body.
+loopingOverASlot(string symbol) -> Held throws {
+    let store = try support.freshStore();
+    let stringType = store.stringType();
+    let builder = new EirFunctionBuilder(symbol, false, null, [],
+        store.primitive(PrimitiveKind.Long));
+    long slot = builder.addSlot("text", stringType, true, false);
+    long body = builder.newBlock("body");
+    builder.terminate(new EirJump(body));
+    builder.moveTo(body);
+    return new Held(builder, store, slot);
+}
+
+// Ends the loop body with a branch back into it or out to a return of the length.
+closeLoop(Held looped, long length) -> EirFunction {
+    let builder = looped.builder;
+    let boolType = looped.store.primitive(PrimitiveKind.Bool);
+    long again = builder.newTemp(boolType);
+    builder.append(new EirConstBool(again, boolType, false));
+    long body = builder.current();
+    long exit = builder.newBlock("exit");
+    builder.terminate(new EirBranch(again, body, exit));
+    builder.moveTo(exit);
+    builder.terminate(new EirReturn(length));
+    return builder.finish();
+}
+
+// A fresh string that owns its reference.
+joinedString(EirFunctionBuilder builder, Type stringType) -> long {
+    long left = builder.newTemp(stringType);
+    builder.append(new EirConstString(left, stringType, "hel".toBytes()));
+    long right = builder.newTemp(stringType);
+    builder.append(new EirConstString(right, stringType, "lo".toBytes()));
+    long joined = builder.newTemp(stringType);
+    builder.append(new EirStringConcat(joined, stringType, left, right));
+    return joined;
 }
 
 // Asserts the two ownership verifiers accept the function, so the violation the take verifier

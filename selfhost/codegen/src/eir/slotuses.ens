@@ -1,7 +1,6 @@
 // What still reads what a slot holds, at the point its reference moves out of it. Every value read
 // out of an owning slot borrows its one +1, and so does every interior address reached through
 // such a value, so moving that +1 out is safe only past the last use of all of them.
-import EirBlock from eir.model;
 import EirFunction from eir.model;
 import EirInstruction from eir.model;
 import EirLoadSlot from eir.model;
@@ -27,10 +26,9 @@ public final class SlotUses {
     bool[] addresses;
     bool[] escaping;
     bool[] liveOut;
-    bool[] reached;
 
     protected constructor(this.function, this.slot, this.block, this.index, this.borrowing,
-                this.addresses, this.escaping, this.liveOut, this.reached);
+                this.addresses, this.escaping, this.liveOut);
 
     // True when what the slot holds is still needed at or after the move: either the slot is read
     // again, or a reference already borrowed out of it is still in use. Releasing the slot's own
@@ -43,10 +41,7 @@ public final class SlotUses {
     // it again.
     public readAgain() -> bool {
         let instructions = this.function.blocks().get(this.block).instructions();
-        for (long i = this.firstInstruction(); i < instructions.length(); i++) {
-            if (i == this.index) {
-                continue;
-            }
+        for (long i = this.index + 1; i < instructions.length(); i++) {
             let instruction = instructions.get(i);
             if (readsSlot(instruction, this.slot, this.escaping)) {
                 return true;
@@ -58,33 +53,46 @@ public final class SlotUses {
         return this.liveOut[this.block];
     }
 
-    // The first temp borrowing what the slot holds that is still used at or after the move, or -1
-    // when none is.
+    // The first temp borrowing what the slot holds that is still used after the move, or -1 when
+    // none is. A use counts when some path from the move reaches it without defining the temp
+    // again, so a loop that comes back around to a fresh borrow does not count the old one.
     public borrowStillUsed() -> long {
+        let tracked = new List<long>();
+        long[] position = new long[this.borrowing.length];
+        for (long t = 0; t < this.borrowing.length; t++) {
+            position[t] = -1;
+            if (this.borrowing[t]) {
+                position[t] = tracked.length();
+                tracked.push(t);
+            }
+        }
+        long width = tracked.length();
+        if (width == 0) {
+            return -1;
+        }
         let blocks = this.function.blocks();
-        for (long b = 0; b < blocks.length(); b++) {
-            if (b != this.block && !this.reached[b]) {
-                continue;
+        bool[] liveOut = this.borrowsLiveOut(position, width);
+        bool[] defined = new bool[width];
+        let instructions = blocks.get(this.block).instructions();
+        for (long i = this.index + 1; i < instructions.length(); i++) {
+            let instruction = instructions.get(i);
+            long used = this.borrowUsedBy(instruction, position, defined);
+            if (used >= 0) {
+                return used;
             }
-            let instructions = blocks.get(b).instructions();
-            long first = 0;
-            if (b == this.block) {
-                first = this.firstInstruction();
-            }
-            for (long i = first; i < instructions.length(); i++) {
-                long borrowed = this.borrowUsedBy(instructions.get(i));
-                if (borrowed >= 0) {
-                    return borrowed;
-                }
-            }
-            let terminator = blocks.get(b).terminator();
-            if (terminator == null) {
-                continue;
-            }
+            markDefined(walk.resultOf(instruction), position, defined);
+        }
+        let terminator = blocks.get(this.block).terminator();
+        if (terminator != null) {
             for (let used in walk.terminatorUsesOf(terminator)) {
-                if (this.borrows(used)) {
+                if (this.borrows(used) && !defined[position[used]]) {
                     return used;
                 }
+            }
+        }
+        for (long j = 0; j < width; j++) {
+            if (liveOut[this.block * width + j] && !defined[j]) {
+                return tracked.get(j);
             }
         }
         return -1;
@@ -95,23 +103,65 @@ public final class SlotUses {
         return temp >= 0 && temp < this.borrowing.length && this.borrowing[temp];
     }
 
-    // Where the move's own block starts counting. A block a path can reach again runs its whole
-    // instruction list after the move as well as before it.
-    firstInstruction() -> long {
-        if (this.reached[this.block]) {
-            return 0;
+    // Which borrowing temps are live where each block ends, one row of 'width' per block. A use
+    // flows up to the blocks before it until it meets the temp's definition.
+    borrowsLiveOut(long[] position, long width) -> bool[] {
+        let blocks = this.function.blocks();
+        long count = blocks.length();
+        bool[] usedFirst = new bool[count * width + 1];
+        bool[] definedIn = new bool[count * width + 1];
+        for (long b = 0; b < count; b++) {
+            bool[] defined = new bool[width];
+            for (let instruction in blocks.get(b).instructions()) {
+                long used = this.borrowUsedBy(instruction, position, defined);
+                if (used >= 0) {
+                    usedFirst[b * width + position[used]] = true;
+                }
+                markDefined(walk.resultOf(instruction), position, defined);
+            }
+            let terminator = blocks.get(b).terminator();
+            if (terminator != null) {
+                for (let used in walk.terminatorUsesOf(terminator)) {
+                    if (this.borrows(used) && !defined[position[used]]) {
+                        usedFirst[b * width + position[used]] = true;
+                    }
+                }
+            }
+            for (long j = 0; j < width; j++) {
+                definedIn[b * width + j] = defined[j];
+            }
         }
-        return this.index + 1;
+        bool[] liveOut = new bool[count * width + 1];
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (long b = count - 1; b >= 0; b--) {
+                for (let successor in walk.successorsOf(blocks.get(b))) {
+                    if (successor < 0 || successor >= count) {
+                        continue;
+                    }
+                    for (long j = 0; j < width; j++) {
+                        long entry = successor * width + j;
+                        bool liveIn = usedFirst[entry] || (liveOut[entry] && !definedIn[entry]);
+                        if (liveIn && !liveOut[b * width + j]) {
+                            liveOut[b * width + j] = true;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        return liveOut;
     }
 
-    // The borrowed temp one instruction uses, or -1. Releasing what the slot's own storage holds
-    // is no use of the reference that storage held.
-    borrowUsedBy(EirInstruction instruction) -> long {
+    // The borrowing temp one instruction uses that its own block has not defined by then, or -1.
+    // Releasing what the slot's own storage holds is no use of the reference that storage held.
+    borrowUsedBy(EirInstruction instruction, long[] position, bool[] defined) -> long {
         if (instruction is EirReleasePtr && this.namesSlot(instruction.address)) {
             return -1;
         }
         for (let used in walk.usesOf(instruction)) {
-            if (this.borrows(used)) {
+            if (this.borrows(used) && !defined[position[used]]) {
                 return used;
             }
         }
@@ -123,6 +173,13 @@ public final class SlotUses {
     }
 }
 
+// Marks a borrowing temp as defined, so a later use in the same block reads that definition.
+markDefined(long result, long[] position, bool[] defined) {
+    if (result >= 0 && result < position.length && position[result] >= 0) {
+        defined[position[result]] = true;
+    }
+}
+
 // One slot's picture around the instruction at `index` in `block` that moves its reference out:
 // the load a take is about to replace, or the take itself.
 public forMove(EirFunction function, long slot, long block, long index) -> SlotUses {
@@ -131,7 +188,7 @@ public forMove(EirFunction function, long slot, long block, long index) -> SlotU
     bool[] reaching = blocksReaching(function, block);
     return new SlotUses(function, slot, block, index,
         borrowedTemps(function, slot, block, index, reaching), addresses, escaping,
-        liveOutOf(function, slot, escaping), blocksReachedFrom(function, block));
+        liveOutOf(function, slot, escaping));
 }
 
 // The temps holding the address of the slot itself.
@@ -305,28 +362,6 @@ readsSlot(EirInstruction instruction, long slot, bool[] escaping) -> bool {
             && escaping[instruction.result];
     }
     return false;
-}
-
-// The blocks a path leaving this block can reach, itself included only when it lies on a cycle.
-blocksReachedFrom(EirFunction function, long block) -> bool[] {
-    let blocks = function.blocks();
-    long count = blocks.length();
-    bool[] reached = new bool[count + 1];
-    let pending = new List<long>();
-    pushSuccessors(blocks.get(block), count, reached, pending);
-    while (pending.length() > 0) {
-        pushSuccessors(blocks.get(pending.pop()), count, reached, pending);
-    }
-    return reached;
-}
-
-pushSuccessors(EirBlock from, long count, bool[] reached, List<long> pending) {
-    for (let successor in walk.successorsOf(from)) {
-        if (successor >= 0 && successor < count && !reached[successor]) {
-            reached[successor] = true;
-            pending.push(successor);
-        }
-    }
 }
 
 // The blocks a path leads from to this one, itself included only when it lies on a cycle.
