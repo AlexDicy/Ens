@@ -1,33 +1,49 @@
 // The storage half of ownership verification, the companion to the value half in eir.ownership.
 // Every instruction that moves the +1 a location holds names it through an address, which this
-// pass normalizes into a place. That a callee leaves its caller's storage alone is assumed.
+// pass normalizes into a place.
 import EirFunction from eir.model;
+import EirAbsentOptional from eir.model;
 import EirBlock from eir.model;
+import EirBranch from eir.model;
 import EirCall from eir.model;
+import EirCallee from eir.model;
 import EirClosureCall from eir.model;
+import EirConstNull from eir.model;
 import EirForeignCall from eir.model;
 import EirFieldAddress from eir.model;
 import EirInstruction from eir.model;
+import EirLoadPtr from eir.model;
 import EirLoadSlot from eir.model;
 import EirOptionalPayloadAddress from eir.model;
+import EirOptionalPresence from eir.model;
+import EirPropagate from eir.model;
+import EirReturn from eir.model;
 import EirRetainPtr from eir.model;
 import EirReleasePtr from eir.model;
 import EirStorePtr from eir.model;
 import EirStoreSlot from eir.model;
 import EirSlotAddress from eir.model;
 import EirTakeSlot from eir.model;
+import EirTryCall from eir.model;
+import EirTryClosureCall from eir.model;
 import EirWeakStore from eir.model;
 import EirWeakLoad from eir.model;
 import EirWeakRelease from eir.model;
+import EirZeroStruct from eir.model;
 import AddressPlaces from eir.place;
 import Place from eir.place;
 import PlaceRelation from eir.place;
 import PlaceRoot from eir.place;
+import PlaceStep from eir.place;
+import PlaceStepKind from eir.place;
 import eir.dump;
 import eir.place;
 import eir.walk;
 import @ens.sema.model.typenames;
+import Type from @ens.sema.model.types;
 import support.primitives;
+import ReferenceWalker from support.references;
+import support.references;
 import List from @std.collections.list;
 
 // Verifies one function's storage-level ownership; the returned list is empty when it holds.
@@ -39,6 +55,7 @@ export verifyStorage(EirFunction function) -> string[] {
         checkBlock(function, places, blocks.get(b), problems);
     }
     checkWrittenBeforeRead(function, places, problems);
+    checkHeldReferencesReleased(function, places, problems);
     return problems.toArray();
 }
 
@@ -243,6 +260,532 @@ copied(bool[] flags) -> bool[] {
         copy[i] = flags[i];
     }
     return copy;
+}
+
+// Every reference an owning slot holds is the function's to give up: each path that returns or
+// propagates has released or taken it first, and no store writes over it while it is still held.
+// Two forward dataflows run to a fixpoint. One computes which loads out of an owning slot still
+// read what their place holds, the other which references some path into each block may still
+// hold.
+checkHeldReferencesReleased(EirFunction function, AddressPlaces places, List<string> problems) {
+    let blocks = function.blocks();
+    let owned = new SlotReferences(function, places);
+    if (owned.count() == 0 || blocks.length() == 0) {
+        return;
+    }
+    owned.solve(blocks);
+    for (long b = 0; b < blocks.length(); b++) {
+        owned.reportBlock(function, b, blocks.get(b), problems);
+    }
+}
+
+// What one point of a block may still hold, and which tracked loads are still fresh there.
+final class HeldState {
+    long[] held;
+    long[] fresh;
+
+    constructor(this.held, this.fresh);
+}
+
+// The references the owning slots of one function can hold, numbered slot by slot in the order
+// the reference walk visits them, so the references inside any one place are a contiguous run.
+// The loads out of those places that a presence test or a store reads are tracked as well, each
+// fresh while nothing may have written its place since it ran.
+final class SlotReferences {
+    List<Place> places;
+    EirInstruction?[] definitions;
+    long[] slotStart;
+    long[] slotEnd;
+    long[] addressStart;
+    long[] addressEnd;
+    Place?[] addressPlaces;
+    Place?[] slotPlaces;
+    long[] loadIndex;
+    List<Place> loadPlaces;
+    List<long> loadStart;
+    List<long> loadEnd;
+    List<List<long>> slotLoads;
+    bool[] reached;
+    long[][] heldAtEntry;
+    long[][] freshAtEntry;
+
+    constructor(EirFunction function, AddressPlaces addresses) {
+        this.places = new List<Place>();
+        this.loadPlaces = new List<Place>();
+        this.loadStart = new List<long>();
+        this.loadEnd = new List<long>();
+        this.reached = new bool[0];
+        this.heldAtEntry = new long[0][0];
+        this.freshAtEntry = new long[0][0];
+        let slots = function.slots();
+        this.slotStart = new long[slots.length()];
+        this.slotEnd = new long[slots.length()];
+        this.slotPlaces = new Place?[slots.length()];
+        this.slotLoads = new List<List<long>>();
+        for (long s = 0; s < slots.length(); s++) {
+            this.slotStart[s] = this.places.length();
+            this.slotLoads.push(new List<long>());
+            let slot = slots.get(s);
+            if (!slot.borrows() && primitives.hasArcContent(slot.type())) {
+                this.slotPlaces[s] = new Place(PlaceRoot.Slot, s, new List<PlaceStep>());
+                references.walk<List<PlaceStep>>(new ReferencePlaces(this.places, s),
+                    new List<PlaceStep>(), slot.type());
+            }
+            this.slotEnd[s] = this.places.length();
+        }
+        long tempCount = this.places.length() == 0 ? 0 : function.tempTypes().length();
+        this.definitions = new EirInstruction?[tempCount];
+        this.addressStart = new long[tempCount];
+        this.addressEnd = new long[tempCount];
+        this.addressPlaces = new Place?[tempCount];
+        this.loadIndex = new long[tempCount];
+        if (tempCount == 0) {
+            return;
+        }
+        for (let block in function.blocks()) {
+            for (let instruction in block.instructions()) {
+                long result = walk.resultOf(instruction);
+                if (result < 0 || result >= tempCount) {
+                    continue;
+                }
+                this.definitions[result] = instruction;
+                if (walk.producesAddress(instruction)) {
+                    this.recordRange(result, addresses.placeOf(result));
+                }
+            }
+        }
+        this.trackLoads(function, tempCount);
+    }
+
+    count() -> long {
+        return this.places.length();
+    }
+
+    placeOf(long reference) -> Place {
+        return this.places.get(reference);
+    }
+
+    // Solves both dataflows: first which tracked loads are fresh as each block starts, those fresh
+    // on every path into it, then what some path into each block may still hold as it starts.
+    solve(List<EirBlock> blocks) {
+        long blockCount = blocks.length();
+        this.freshAtEntry = new long[blockCount][wordsFor(this.loadPlaces.length())];
+        this.heldAtEntry = new long[blockCount][wordsFor(this.count())];
+        if (!this.loadPlaces.isEmpty()) {
+            this.solveFreshness(blocks);
+        }
+        this.solveHeld(blocks);
+    }
+
+    solveFreshness(List<EirBlock> blocks) {
+        long blockCount = blocks.length();
+        bool[] seen = new bool[blockCount];
+        bool[] queued = new bool[blockCount];
+        let pending = new List<long>();
+        seen[0] = true;
+        queued[0] = true;
+        pending.push(0);
+        while (!pending.isEmpty()) {
+            long b = pending.pop();
+            queued[b] = false;
+            let state = this.run(blocks.get(b), this.heldAtEntry[b], this.freshAtEntry[b], null,
+                null);
+            for (let successor in walk.successorsOf(blocks.get(b))) {
+                if (successor < 0 || successor >= blockCount) {
+                    continue;
+                }
+                bool changed = !seen[successor];
+                if (changed) {
+                    seen[successor] = true;
+                    this.freshAtEntry[successor] = copiedWords(state.fresh);
+                } else {
+                    changed = meetInto(this.freshAtEntry[successor], state.fresh);
+                }
+                if (changed && !queued[successor]) {
+                    queued[successor] = true;
+                    pending.push(successor);
+                }
+            }
+        }
+    }
+
+    solveHeld(List<EirBlock> blocks) {
+        long blockCount = blocks.length();
+        this.reached = new bool[blockCount];
+        bool[] queued = new bool[blockCount];
+        let pending = new List<long>();
+        this.reached[0] = true;
+        queued[0] = true;
+        pending.push(0);
+        while (!pending.isEmpty()) {
+            long b = pending.pop();
+            queued[b] = false;
+            let block = blocks.get(b);
+            let state = this.run(block, this.heldAtEntry[b], this.freshAtEntry[b], null, null);
+            long[] successors = walk.successorsOf(block);
+            for (long edge = 0; edge < successors.length; edge++) {
+                long successor = successors[edge];
+                if (successor < 0 || successor >= blockCount) {
+                    continue;
+                }
+                bool grew = joinInto(this.heldAtEntry[successor],
+                    this.alongEdge(block, edge, state)) || !this.reached[successor];
+                this.reached[successor] = true;
+                if (grew && !queued[successor]) {
+                    queued[successor] = true;
+                    pending.push(successor);
+                }
+            }
+        }
+    }
+
+    // Runs one reached block from its entry states, reporting each store over a reference that may
+    // still be held and each reference still held where the block leaves the function.
+    reportBlock(EirFunction function, long index, EirBlock block, List<string> problems) {
+        if (!this.reached[index]) {
+            return;
+        }
+        let state = this.run(block, this.heldAtEntry[index], this.freshAtEntry[index], function,
+            problems);
+        let terminator = block.terminator();
+        if (terminator == null || !(terminator is EirReturn || terminator is EirPropagate)) {
+            return;
+        }
+        for (long reference = 0; reference < this.count(); reference++) {
+            if (contains(state.held, reference)) {
+                string leaked = place.placeText(function, this.placeOf(reference));
+                report(function, block, problems, "'{dump.terminatorText(function, terminator)}' "
+                    + "leaves the function while '{leaked}' still holds a reference, so the "
+                    + "reference leaks");
+            }
+        }
+    }
+
+    // Both states once a block has run, from copies of the states it starts with.
+    run(EirBlock block, long[] heldAtEntry, long[] freshAtEntry, EirFunction? function,
+        List<string>? problems) -> HeldState {
+        let state = new HeldState(copiedWords(heldAtEntry), copiedWords(freshAtEntry));
+        for (let instruction in block.instructions()) {
+            long overwritten = this.apply(instruction, state);
+            if (overwritten >= 0 && function != null && problems != null) {
+                string written = place.placeText(function, this.placeOf(overwritten));
+                report(function, block, problems, "'{dump.instructionText(instruction)}' writes "
+                    + "over '{written}' while it may still hold a reference, so that reference "
+                    + "leaks");
+            }
+        }
+        let terminator = block.terminator();
+        if (terminator is EirTryCall) {
+            this.call(state, terminator.callee, terminator.receiver, terminator.arguments);
+        } else if (terminator is EirTryClosureCall) {
+            this.mayWriteAll(state, terminator.arguments);
+        }
+        return state;
+    }
+
+    // Applies one instruction; returns the reference a store writes over while it may still be
+    // held, or -1.
+    apply(EirInstruction instruction, HeldState state) -> long {
+        long overwritten = -1;
+        switch (instruction) {
+            is EirStoreSlot store -> {
+                overwritten = this.store(state, this.slotStart[store.slot],
+                    this.slotEnd[store.slot], this.slotPlaces[store.slot], store.value);
+            },
+            is EirStorePtr store -> {
+                overwritten = this.store(state, this.addressStart[store.address],
+                    this.addressEnd[store.address], this.addressPlaces[store.address],
+                    store.value);
+            },
+            is EirTakeSlot taken -> {
+                this.empty(state, this.slotStart[taken.slot], this.slotEnd[taken.slot]);
+            },
+            is EirReleasePtr release -> {
+                this.empty(state, this.addressStart[release.address],
+                    this.addressEnd[release.address]);
+            },
+            is EirCall call -> {
+                this.call(state, call.callee, call.receiver, call.arguments);
+            },
+            is EirClosureCall call -> {
+                this.mayWriteAll(state, call.arguments);
+            },
+            is EirForeignCall call -> {
+                this.mayWriteAll(state, call.arguments);
+            },
+            default -> { },
+        }
+        long load = this.loadOf(walk.resultOf(instruction));
+        if (load >= 0) {
+            setRange(state.fresh, load, load + 1, true);
+        }
+        return overwritten;
+    }
+
+    // The absent side of a branch on whether a fresh load's optional is present holds nothing in
+    // the place it was loaded from.
+    alongEdge(EirBlock block, long edge, HeldState state) -> long[] {
+        let terminator = block.terminator();
+        if (!(terminator is EirBranch) || edge != 1) {
+            return state.held;
+        }
+        let presence = this.definitionOf(terminator.condition);
+        if (!(presence is EirOptionalPresence)) {
+            return state.held;
+        }
+        long load = this.loadOf(presence.value);
+        if (load < 0 || !contains(state.fresh, load)) {
+            return state.held;
+        }
+        long[] refined = copiedWords(state.held);
+        setRange(refined, this.loadStart.get(load), this.loadEnd.get(load), false);
+        return refined;
+    }
+
+    // A store holds what it writes, except a zero, a null or an absent optional, which hold
+    // nothing. Writing back the value a fresh load read out of the same place changes nothing.
+    store(HeldState state, long start, long end, Place? target, long value) -> long {
+        long load = this.loadOf(value);
+        if (load >= 0 && contains(state.fresh, load) && target != null
+                && place.relate(this.loadPlaces.get(load), target) == PlaceRelation.Same) {
+            return -1;
+        }
+        long overwritten = -1;
+        for (long r = start; r < end && overwritten < 0; r++) {
+            if (contains(state.held, r)) {
+                overwritten = r;
+            }
+        }
+        let written = this.definitionOf(value);
+        bool empty = written is EirZeroStruct || written is EirConstNull
+            || written is EirAbsentOptional;
+        setRange(state.held, start, end, !empty);
+        this.invalidate(state, start, end);
+        return overwritten;
+    }
+
+    empty(HeldState state, long start, long end) {
+        setRange(state.held, start, end, false);
+        this.invalidate(state, start, end);
+    }
+
+    // A callee may write through the receiver it is handed and through any address it is not
+    // handed by address. A by-address parameter is one the callee only reads.
+    call(HeldState state, EirCallee callee, long receiver, long[] arguments) {
+        this.mayWrite(state, receiver);
+        for (long i = 0; i < arguments.length; i++) {
+            if (!callee.passesByAddress(i)) {
+                this.mayWrite(state, arguments[i]);
+            }
+        }
+    }
+
+    // A callee handed an address may write anything inside the place it names.
+    mayWrite(HeldState state, long operand) {
+        if (operand >= 0 && operand < this.addressStart.length) {
+            long start = this.addressStart[operand];
+            long end = this.addressEnd[operand];
+            setRange(state.held, start, end, true);
+            this.invalidate(state, start, end);
+        }
+    }
+
+    mayWriteAll(HeldState state, long[] operands) {
+        for (let operand in operands) {
+            this.mayWrite(state, operand);
+        }
+    }
+
+    // A write anywhere inside a load's place leaves the load no longer fresh.
+    invalidate(HeldState state, long start, long end) {
+        if (start >= end) {
+            return;
+        }
+        for (let load in this.slotLoads.get(this.places.get(start).rootId())) {
+            if (start < this.loadEnd.get(load) && this.loadStart.get(load) < end) {
+                setRange(state.fresh, load, load + 1, false);
+            }
+        }
+    }
+
+    definitionOf(long temp) -> EirInstruction? {
+        if (temp < 0 || temp >= this.definitions.length) {
+            return null;
+        }
+        return this.definitions[temp];
+    }
+
+    // The tracked load a temp is the result of, or -1.
+    loadOf(long temp) -> long {
+        if (temp < 0 || temp >= this.loadIndex.length) {
+            return -1;
+        }
+        return this.loadIndex[temp];
+    }
+
+    // Records the run of references inside the place an address temp names, which stays empty
+    // when the place is not inside an owning slot.
+    recordRange(long address, Place? named) {
+        if (named == null || named.root() != PlaceRoot.Slot) {
+            return;
+        }
+        this.addressPlaces[address] = named;
+        long slot = named.rootId();
+        for (long r = this.slotStart[slot]; r < this.slotEnd[slot]; r++) {
+            if (!startsWith(this.places.get(r).steps(), named.steps())) {
+                continue;
+            }
+            if (this.addressEnd[address] == 0) {
+                this.addressStart[address] = r;
+            }
+            this.addressEnd[address] = r + 1;
+        }
+    }
+
+    // Numbers the loads out of a place holding references whose value a presence test or a store
+    // reads.
+    trackLoads(EirFunction function, long tempCount) {
+        bool[] read = new bool[tempCount];
+        for (let block in function.blocks()) {
+            for (let instruction in block.instructions()) {
+                long value = switch (instruction) {
+                    is EirOptionalPresence presence -> presence.value,
+                    is EirStoreSlot store -> store.value,
+                    is EirStorePtr store -> store.value,
+                    default -> -1,
+                };
+                if (value >= 0 && value < tempCount) {
+                    read[value] = true;
+                }
+            }
+        }
+        for (long temp = 0; temp < tempCount; temp++) {
+            this.loadIndex[temp] = -1;
+            let loaded = this.definitions[temp];
+            if (!read[temp] || loaded == null) {
+                continue;
+            }
+            if (loaded is EirLoadSlot) {
+                this.trackLoad(temp, this.slotStart[loaded.slot], this.slotEnd[loaded.slot],
+                    this.slotPlaces[loaded.slot]);
+            } else if (loaded is EirLoadPtr) {
+                this.trackLoad(temp, this.addressStart[loaded.address],
+                    this.addressEnd[loaded.address], this.addressPlaces[loaded.address]);
+            }
+        }
+    }
+
+    trackLoad(long temp, long start, long end, Place? source) {
+        if (start >= end || source == null) {
+            return;
+        }
+        this.slotLoads.get(source.rootId()).push(this.loadPlaces.length());
+        this.loadIndex[temp] = this.loadPlaces.length();
+        this.loadPlaces.push(source);
+        this.loadStart.push(start);
+        this.loadEnd.push(end);
+    }
+}
+
+// Collects the place of each reference a slot's value holds.
+final class ReferencePlaces implements ReferenceWalker<List<PlaceStep>> {
+    List<Place> found;
+    long slot;
+
+    constructor(this.found, this.slot);
+
+    override reference(List<PlaceStep> steps) {
+        this.found.push(new Place(PlaceRoot.Slot, this.slot, steps));
+    }
+
+    override field(List<PlaceStep> record, Type recordType, long index, Type fieldType)
+            -> List<PlaceStep> {
+        return extended(record, new PlaceStep(PlaceStepKind.Field, index));
+    }
+
+    override payload(List<PlaceStep> pair, Type optionalType, Type payloadType)
+            -> List<PlaceStep> {
+        return extended(pair, new PlaceStep(PlaceStepKind.Payload, 0));
+    }
+
+    override endPayload() { }
+}
+
+extended(List<PlaceStep> steps, PlaceStep step) -> List<PlaceStep> {
+    let longer = new List<PlaceStep>();
+    for (let existing in steps) {
+        longer.push(existing);
+    }
+    longer.push(step);
+    return longer;
+}
+
+// Whether a reference's steps begin with a place's, which puts the reference inside that place.
+startsWith(List<PlaceStep> steps, List<PlaceStep> prefix) -> bool {
+    if (prefix.length() > steps.length()) {
+        return false;
+    }
+    for (long i = 0; i < prefix.length(); i++) {
+        let step = steps.get(i);
+        let expected = prefix.get(i);
+        if (step.kind() != expected.kind()
+                || (step.isField() && step.value() != expected.value())) {
+            return false;
+        }
+    }
+    return true;
+}
+
+wordsFor(long bits) -> long {
+    return (bits + 63) / 64;
+}
+
+setRange(long[] bits, long start, long end, bool value) {
+    for (long i = start; i < end; i++) {
+        if (value) {
+            bits[i / 64] = bits[i / 64] | (1L << (i % 64));
+        } else {
+            bits[i / 64] = bits[i / 64] & ~(1L << (i % 64));
+        }
+    }
+}
+
+contains(long[] bits, long index) -> bool {
+    return (bits[index / 64] & (1L << (index % 64))) != 0;
+}
+
+copiedWords(long[] words) -> long[] {
+    long[] copy = new long[words.length];
+    for (long i = 0; i < words.length; i++) {
+        copy[i] = words[i];
+    }
+    return copy;
+}
+
+// Adds the bits of `added` to `into`; true when that changed it.
+joinInto(long[] into, long[] added) -> bool {
+    bool grew = false;
+    for (long i = 0; i < into.length; i++) {
+        long joined = into[i] | added[i];
+        if (joined != into[i]) {
+            into[i] = joined;
+            grew = true;
+        }
+    }
+    return grew;
+}
+
+// Keeps only the bits of `into` that `other` has too; true when that changed it.
+meetInto(long[] into, long[] other) -> bool {
+    bool shrank = false;
+    for (long i = 0; i < into.length; i++) {
+        long met = into[i] & other[i];
+        if (met != into[i]) {
+            into[i] = met;
+            shrank = true;
+        }
+    }
+    return shrank;
 }
 
 // The slot each address temp of one function reaches into, and whether it names that whole slot.

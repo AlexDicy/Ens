@@ -10,19 +10,29 @@ import EirBranch from eir.model;
 import EirCall from eir.model;
 import EirCallee from eir.model;
 import EirConstInt from eir.model;
+import EirConstNull from eir.model;
+import EirFieldAddress from eir.model;
 import EirForeignCall from eir.model;
 import EirJump from eir.model;
+import EirLoadPtr from eir.model;
 import EirLoadSlot from eir.model;
 import EirObjectFieldAddress from eir.model;
+import EirOptionalPayloadAddress from eir.model;
+import EirOptionalPresence from eir.model;
 import EirReleasePtr from eir.model;
 import EirRetainPtr from eir.model;
 import EirSlotAddress from eir.model;
+import EirStorePtr from eir.model;
 import EirStoreSlot from eir.model;
+import EirTakeSlot from eir.model;
 import EirWeakLoad from eir.model;
 import EirWeakRelease from eir.model;
 import EirReturn from eir.model;
 import EirPropagate from eir.model;
 import EirTryCall from eir.model;
+import EirZeroStruct from eir.model;
+import EirFunction from eir.model;
+import ProgramAnalysis from @ens.sema.pipeline;
 import Type from @ens.sema.model.types;
 import TypeStore from @ens.sema.model.types;
 import eir.storage;
@@ -261,6 +271,240 @@ test "a read at a loop's head that only the loop's body writes is reported" {
         "backEdge: b1.head: '%1 = load $0: int' reads $0 'count' on a path that never wrote it");
 }
 
+test "a reference a slot still holds where the function returns is reported" {
+    let store = try support.freshStore();
+    let builder = new EirFunctionBuilder("kept", false, null, [],
+        store.primitive(PrimitiveKind.Void));
+    long slot = builder.addSlot("text", store.stringType(), true, false);
+    builder.append(new EirStoreSlot(slot, made(builder, store)));
+    builder.terminate(new EirReturn(-1));
+    let violations = storage.verifyStorage(builder.finish());
+    try testing.assertEqual(violations.length, 1L);
+    try testing.assertEqual(violations[0], "kept: b0.entry: 'ret' leaves the function while "
+        + "'text' still holds a reference, so the reference leaks");
+}
+
+test "a slot released or taken before the function returns, or given only null, holds nothing" {
+    let store = try support.freshStore();
+    let stringType = store.stringType();
+    let builder = new EirFunctionBuilder("given", false, null, [],
+        store.primitive(PrimitiveKind.Void));
+    long released = builder.addSlot("released", stringType, true, false);
+    long taken = builder.addSlot("taken", stringType, true, false);
+    long cleared = builder.addSlot("cleared", stringType, true, false);
+    builder.append(new EirStoreSlot(released, made(builder, store)));
+    builder.append(new EirStoreSlot(taken, made(builder, store)));
+    release(builder, stringType, released);
+    long moved = builder.newTemp(stringType);
+    builder.append(new EirTakeSlot(moved, stringType, taken));
+    long absent = builder.newTemp(stringType);
+    builder.append(new EirConstNull(absent, stringType));
+    builder.append(new EirStoreSlot(cleared, absent));
+    builder.terminate(new EirReturn(-1));
+    try assertNoViolations(storage.verifyStorage(builder.finish()));
+}
+
+test "a store over a reference a slot may still hold is reported, a null as much as a value" {
+    let store = try support.freshStore();
+    let stringType = store.stringType();
+    let builder = new EirFunctionBuilder("overwritten", false, null, [],
+        store.primitive(PrimitiveKind.Void));
+    long replaced = builder.addSlot("replaced", stringType, true, false);
+    long nulled = builder.addSlot("nulled", stringType, true, false);
+    builder.append(new EirStoreSlot(replaced, made(builder, store)));
+    builder.append(new EirStoreSlot(replaced, made(builder, store)));
+    release(builder, stringType, replaced);
+    builder.append(new EirStoreSlot(nulled, made(builder, store)));
+    long absent = builder.newTemp(stringType);
+    builder.append(new EirConstNull(absent, stringType));
+    builder.append(new EirStoreSlot(nulled, absent));
+    builder.terminate(new EirReturn(-1));
+    let violations = storage.verifyStorage(builder.finish());
+    try testing.assertEqual(violations.length, 2L);
+    try testing.assertEqual(violations[0], "overwritten: b0.entry: 'store $0, %1' writes over "
+        + "'replaced' while it may still hold a reference, so that reference leaks");
+    try testing.assertEqual(violations[1], "overwritten: b0.entry: 'store $1, %4' writes over "
+        + "'nulled' while it may still hold a reference, so that reference leaks");
+}
+
+test "a store a loop repeats with one release after the loop is reported" {
+    let store = try support.freshStore();
+    let stringType = store.stringType();
+    let builder = new EirFunctionBuilder("looped", false, null,
+        [new EirParameter("more", store.primitive(PrimitiveKind.Bool))],
+        store.primitive(PrimitiveKind.Void));
+    long slot = builder.addSlot("text", stringType, true, false);
+    long head = builder.newBlock("head");
+    long body = builder.newBlock("body");
+    long done = builder.newBlock("done");
+    builder.terminate(new EirJump(head));
+    builder.moveTo(head);
+    builder.terminate(new EirBranch(0, body, done));
+    builder.moveTo(body);
+    builder.append(new EirStoreSlot(slot, made(builder, store)));
+    builder.terminate(new EirJump(head));
+    builder.moveTo(done);
+    release(builder, stringType, slot);
+    builder.terminate(new EirReturn(-1));
+    let violations = storage.verifyStorage(builder.finish());
+    try testing.assertEqual(violations.length, 1L);
+    try testing.assertEqual(violations[0], "looped: b2.body: 'store $0, %1' writes over 'text' "
+        + "while it may still hold a reference, so that reference leaks");
+}
+
+test "a store after a take, after a zero, or of the value a fresh load read there is no leak" {
+    let analysis = try pairProgram();
+    let store = analysis.store();
+    let pair = try support.structNamed(analysis, "Pair");
+    let stringType = store.stringType();
+    let builder = new EirFunctionBuilder("rewritten", false, null, [],
+        store.primitive(PrimitiveKind.Void));
+    long taken = builder.addSlot("taken", stringType, true, false);
+    builder.append(new EirStoreSlot(taken, made(builder, store)));
+    long moved = builder.newTemp(stringType);
+    builder.append(new EirTakeSlot(moved, stringType, taken));
+    builder.append(new EirStoreSlot(taken, moved));
+    release(builder, stringType, taken);
+    long zeroed = builder.addSlot("zeroed", pair, true, false);
+    builder.append(new EirStoreSlot(zeroed, madeOf(builder, pair)));
+    long cleared = builder.newTemp(pair);
+    builder.append(new EirTakeSlot(cleared, pair, zeroed));
+    long zero = builder.newTemp(pair);
+    builder.append(new EirZeroStruct(zero, pair));
+    builder.append(new EirStoreSlot(zeroed, zero));
+    builder.append(new EirStoreSlot(zeroed, cleared));
+    long whole = builder.newTemp(pair);
+    builder.append(new EirTakeSlot(whole, pair, zeroed));
+    long kept = builder.addSlot("kept", stringType, true, false);
+    builder.append(new EirStoreSlot(kept, made(builder, store)));
+    long current = builder.newTemp(stringType);
+    builder.append(new EirLoadSlot(current, stringType, kept));
+    builder.append(new EirStoreSlot(kept, current));
+    release(builder, stringType, kept);
+    builder.terminate(new EirReturn(-1));
+    try assertNoViolations(storage.verifyStorage(builder.finish()));
+}
+
+test "the absent side of a branch on an optional's presence holds nothing in its payload" {
+    let analysis = try pairProgram();
+    try assertNoViolations(storage.verifyStorage(try optionalReleased(analysis, false, false)));
+}
+
+test "a presence test in a later block than its load still clears the absent side" {
+    let analysis = try pairProgram();
+    try assertNoViolations(storage.verifyStorage(try optionalReleased(analysis, true, false)));
+}
+
+test "a presence test of a load its place was written after keeps the absent side held" {
+    let analysis = try pairProgram();
+    let violations = storage.verifyStorage(try optionalReleased(analysis, true, true));
+    try testing.assertEqual(violations.length, 2L);
+    try testing.assertEqual(violations[0], "dropped: b3.done: 'ret' leaves the function while "
+        + "'cell.payload.first' still holds a reference, so the reference leaks");
+}
+
+test "a call handed the address of a slot may leave references in it" {
+    let analysis = try pairProgram();
+    let store = analysis.store();
+    let pair = try support.structNamed(analysis, "Pair");
+    let voidType = store.primitive(PrimitiveKind.Void);
+    let builder = new EirFunctionBuilder("filled", false, null, [], voidType);
+    long slot = builder.addSlot("pair", pair, true, false);
+    long zero = builder.newTemp(pair);
+    builder.append(new EirZeroStruct(zero, pair));
+    builder.append(new EirStoreSlot(slot, zero));
+    long address = builder.newTemp(pair);
+    builder.append(new EirSlotAddress(address, pair, slot));
+    builder.append(new EirCall(-1, voidType, new EirCallee("fill", pair, [], voidType), address,
+        [], -1, null));
+    builder.terminate(new EirReturn(-1));
+    let violations = storage.verifyStorage(builder.finish());
+    try testing.assertEqual(violations.length, 2L);
+    try testing.assertEqual(violations[1], "filled: b0.entry: 'ret' leaves the function while "
+        + "'pair.second' still holds a reference, so the reference leaks");
+}
+
+test "a call handed a slot's address for a by-address parameter only reads it" {
+    let store = try support.freshStore();
+    let stringType = store.stringType();
+    let voidType = store.primitive(PrimitiveKind.Void);
+    let builder = new EirFunctionBuilder("readAfter", false, null, [], voidType);
+    long slot = builder.addSlot("text", stringType, true, false);
+    builder.append(new EirStoreSlot(slot, made(builder, store)));
+    long address = release(builder, stringType, slot);
+    builder.append(new EirCall(-1, voidType,
+        new EirCallee("look", null, [stringType], voidType, false, [true]), -1, [address], -1,
+        null));
+    builder.terminate(new EirReturn(-1));
+    try assertNoViolations(storage.verifyStorage(builder.finish()));
+}
+
+// Stores a pair into an optional slot and releases it the way the reference walk does: a load, a
+// presence test, and a branch to the payload's release. `split` puts the presence test in a block
+// of its own; `rewritten` takes the pair out of the slot after the load and stores another one.
+optionalReleased(ProgramAnalysis analysis, bool split, bool rewritten) -> EirFunction throws {
+    let store = analysis.store();
+    let pair = try support.structNamed(analysis, "Pair");
+    let optional = store.optionalOf(pair);
+    let stringType = store.stringType();
+    let boolType = store.primitive(PrimitiveKind.Bool);
+    let builder = new EirFunctionBuilder("dropped", false, null,
+        [new EirParameter("given", optional), new EirParameter("other", optional)],
+        store.primitive(PrimitiveKind.Void));
+    long slot = builder.addSlot("cell", optional, true, false);
+    builder.append(new EirStoreSlot(slot, 0));
+    long address = builder.newTemp(optional);
+    builder.append(new EirSlotAddress(address, optional, slot));
+    long value = builder.newTemp(optional);
+    builder.append(new EirLoadPtr(value, optional, address));
+    if (split) {
+        long next = builder.newBlock("next");
+        builder.terminate(new EirJump(next));
+        builder.moveTo(next);
+    }
+    if (rewritten) {
+        long taken = builder.newTemp(optional);
+        builder.append(new EirTakeSlot(taken, optional, slot));
+        builder.append(new EirStorePtr(address, 1));
+    }
+    long present = builder.newTemp(boolType);
+    builder.append(new EirOptionalPresence(present, boolType, value));
+    long walked = builder.newBlock("walk");
+    long done = builder.newBlock("done");
+    builder.terminate(new EirBranch(present, walked, done));
+    builder.moveTo(walked);
+    long payload = builder.newTemp(pair);
+    builder.append(new EirOptionalPayloadAddress(payload, pair, address));
+    for (long field = 0; field < 2; field++) {
+        long fieldAddress = builder.newTemp(stringType);
+        builder.append(new EirFieldAddress(fieldAddress, stringType, payload, field));
+        builder.append(new EirReleasePtr(fieldAddress));
+    }
+    builder.terminate(new EirJump(done));
+    builder.moveTo(done);
+    builder.terminate(new EirReturn(-1));
+    return builder.finish();
+}
+
+// Releases what a slot holding one reference holds, through the slot's address, and returns
+// that address.
+release(EirFunctionBuilder builder, Type type, long slot) -> long {
+    long address = builder.newTemp(type);
+    builder.append(new EirSlotAddress(address, type, slot));
+    builder.append(new EirReleasePtr(address));
+    return address;
+}
+
+// A program declaring a struct that holds two references.
+pairProgram() -> ProgramAnalysis throws {
+    return try support.analyzeMain(
+        "struct Pair \{\n"
+        + "    protected string first;\n"
+        + "    protected string second;\n"
+        + "\}\n"
+        + "main() \{\}\n");
+}
+
 // A fresh string a call returns, owned by the function.
 made(EirFunctionBuilder builder, TypeStore store) -> long {
     Type stringType = store.stringType();
@@ -268,6 +512,14 @@ made(EirFunctionBuilder builder, TypeStore store) -> long {
     builder.append(new EirCall(text, stringType, new EirCallee("make", null, [], stringType), -1,
         [], -1, null));
     return text;
+}
+
+// A value of the given type a call returns, owning what it holds.
+madeOf(EirFunctionBuilder builder, Type type) -> long {
+    long value = builder.newTemp(type);
+    builder.append(new EirCall(value, type, new EirCallee("make", null, [], type), -1, [], -1,
+        null));
+    return value;
 }
 
 assertNoViolations(string[] violations) throws {
