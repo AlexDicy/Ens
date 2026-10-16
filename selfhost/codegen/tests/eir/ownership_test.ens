@@ -3,8 +3,12 @@
 // checked through the identity checks the verifier and the later passes run on it.
 import @std.testing;
 import PrimitiveKind from @ens.sema.model.types;
+import Type from @ens.sema.model.types;
+import ProgramAnalysis from @ens.sema.pipeline;
 import EirFunctionBuilder from eir.model;
 import EirParameter from eir.model;
+import EirCall from eir.model;
+import EirCallee from eir.model;
 import EirConstInt from eir.model;
 import EirConstString from eir.model;
 import EirStringConcat from eir.model;
@@ -14,6 +18,9 @@ import EirReleasePtr from eir.model;
 import EirSlotAddress from eir.model;
 import EirElementAddress from eir.model;
 import EirLoadPtr from eir.model;
+import EirFieldAddress from eir.model;
+import EirLoadSlot from eir.model;
+import EirRetainPtr from eir.model;
 import EirStoreSlot from eir.model;
 import EirArrayNew from eir.model;
 import EirAccess from eir.model;
@@ -25,6 +32,7 @@ import EirConstBool from eir.model;
 import PlaceRelation from eir.place;
 import eir.place;
 import eir.ownership;
+import eir.storage;
 import eir.verify;
 import support;
 
@@ -378,6 +386,94 @@ test "two distinct slots are different places" {
     }
     try testing.assertTrue(place.relate(firstPlace, secondPlace) == PlaceRelation.Different,
         "distinct slots cannot overlap");
+}
+
+test "a struct a call produces and nothing stores or returns is reported as a leak" {
+    let analysis = try cellProgram();
+    let cell = try support.structNamed(analysis, "Cell");
+    let builder = new EirFunctionBuilder("dropped", false, null, [],
+        analysis.store().primitive(PrimitiveKind.Void));
+    long made = madeCell(builder, cell);
+    builder.terminate(new EirReturn(-1));
+    let violations = ownership.verifyOwnership(builder.finish());
+    try testing.assertEqual(violations.length, 1L);
+    try testing.assertEqual(violations[0], "dropped: b0.entry: the struct %0 still owns the "
+        + "references it holds where the function returns, which leaks them");
+}
+
+test "a struct a call produces balances once an owning slot takes it or it is returned" {
+    let analysis = try cellProgram();
+    let cell = try support.structNamed(analysis, "Cell");
+    let builder = new EirFunctionBuilder("kept", false, null, [], cell);
+    long slot = builder.addSlot("kept", cell, true, false);
+    builder.append(new EirStoreSlot(slot, madeCell(builder, cell)));
+    builder.terminate(new EirReturn(madeCell(builder, cell)));
+    try assertNoViolations(ownership.verifyOwnership(builder.finish()));
+}
+
+test "a struct written into a borrowing slot still owns its references" {
+    let analysis = try cellProgram();
+    let cell = try support.structNamed(analysis, "Cell");
+    let builder = new EirFunctionBuilder("parked", false, null, [],
+        analysis.store().primitive(PrimitiveKind.Void));
+    long slot = builder.addSlot("parked", cell, false, true);
+    builder.append(new EirStoreSlot(slot, madeCell(builder, cell)));
+    builder.terminate(new EirReturn(-1));
+    try assertMentions(ownership.verifyOwnership(builder.finish()),
+        "the struct %0 still owns the references it holds where the function returns");
+}
+
+test "a struct read out of storage is handed on once its references are retained there" {
+    let analysis = try cellProgram();
+    let cell = try support.structNamed(analysis, "Cell");
+    Type probe = cell.fields().get(0).type();
+    let builder = new EirFunctionBuilder("copied", false, null, [new EirParameter("from", cell)],
+        cell);
+    long source = builder.addSlot("from", cell, false, true);
+    builder.append(new EirStoreSlot(source, 0));
+    long first = builder.addSlot("first", cell, true, false);
+    long second = builder.addSlot("second", cell, true, false);
+    long read = builder.newTemp(cell);
+    builder.append(new EirLoadSlot(read, cell, source));
+    retainField(builder, cell, probe, source);
+    builder.append(new EirStoreSlot(first, read));
+    retainField(builder, cell, probe, source);
+    builder.append(new EirStoreSlot(second, read));
+    retainField(builder, cell, probe, source);
+    builder.terminate(new EirReturn(read));
+    let function = builder.finish();
+    try assertNoViolations(ownership.verifyOwnership(function));
+    try assertNoViolations(storage.verifyStorage(function));
+}
+
+// A program declaring 'Cell', a struct whose one field holds a reference.
+cellProgram() -> ProgramAnalysis throws {
+    return try support.analyzeMain("class Probe \{\n"
+        + "    constructor();\n"
+        + "\}\n"
+        + "struct Cell \{\n"
+        + "    Probe probe;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+}
+
+// A 'Cell' a call returns, owning the references it holds.
+madeCell(EirFunctionBuilder builder, Type cell) -> long {
+    long made = builder.newTemp(cell);
+    builder.append(new EirCall(made, cell, new EirCallee("make", null, [], cell), -1, [], -1,
+        null));
+    return made;
+}
+
+// Retains the reference a 'Cell' slot holds, the way lowering gives a copy read out of it its own.
+retainField(EirFunctionBuilder builder, Type cell, Type probe, long slot) {
+    long address = builder.newTemp(cell);
+    builder.append(new EirSlotAddress(address, cell, slot));
+    long field = builder.newTemp(probe);
+    builder.append(new EirFieldAddress(field, probe, address, 0));
+    builder.append(new EirRetainPtr(field));
 }
 
 assertNoViolations(string[] violations) throws {

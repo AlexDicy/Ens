@@ -5,7 +5,9 @@
 // because the borrow it was before the retain outlives the reference it passed on, so one borrowed
 // value can fill two owning places. Undefined and Conflict pass through every transition unchanged,
 // so the states reach a fixpoint in any block order. A block replayed before its predecessors have
-// settled then contributes nothing to its successors.
+// settled then contributes nothing to its successors. A struct holding references is tracked too;
+// its references are retained through its storage, so a struct temp is only ever Borrowed, Owned
+// or Consumed.
 import EirFunction from eir.model;
 import EirBlock from eir.model;
 import EirInstruction from eir.model;
@@ -71,6 +73,7 @@ class OwnershipVerifier {
     EirFunction function;
     long tempCount;
     bool[] tracked;
+    bool[] structs;
     List<string> problems;
     bool[] conflictReported;
 
@@ -78,13 +81,16 @@ class OwnershipVerifier {
         this.function = function;
         this.tempCount = function.tempTypes().length();
         this.tracked = new bool[this.tempCount];
+        this.structs = new bool[this.tempCount];
         this.problems = new List<string>();
         this.conflictReported = new bool[this.tempCount];
         let addresses = addressTemps(function);
         let payloads = payloadTemps(function);
         for (long i = 0; i < this.tempCount; i++) {
+            let type = function.tempTypes().get(i);
+            this.structs[i] = primitives.structOf(type) != null && primitives.hasArcContent(type);
             this.tracked[i] = !addresses[i] && !payloads[i]
-                && primitives.isReferenceType(function.tempTypes().get(i));
+                && (primitives.isReferenceType(type) || this.structs[i]);
         }
     }
 
@@ -327,12 +333,17 @@ class OwnershipVerifier {
         }
     }
 
-    // A store hands the temp's +1 to the storage, so the temp must own one.
+    // A store or a return hands the temp's +1 on, so the temp must own one. A borrowed struct is
+    // handed on as it is, because lowering retains its references through the storage it was read
+    // from first.
     consume(EirBlock block, long value, List<Ownership> states, bool reporting, string what) {
         if (!this.isTracked(value)) {
             return;
         }
         let held = states.get(value);
+        if (this.structs[value] && held == Ownership.Borrowed) {
+            return;
+        }
         if (reporting) {
             if (held == Ownership.Borrowed) {
                 this.report("{block.label()}: %{value} is {what} without owning a reference; "
@@ -389,7 +400,13 @@ class OwnershipVerifier {
             return;
         }
         for (long i = 0; i < this.tempCount; i++) {
-            if (this.isTracked(i) && ownsReference(states.get(i))) {
+            if (!this.isTracked(i) || !ownsReference(states.get(i))) {
+                continue;
+            }
+            if (this.structs[i]) {
+                this.report("{block.label()}: the struct %{i} still owns the references it holds "
+                    + "where {where}, which leaks them");
+            } else {
                 this.report("{block.label()}: %{i} still owns a reference where {where}, "
                     + "which leaks it");
             }
