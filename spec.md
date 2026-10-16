@@ -54,7 +54,8 @@ printArea() { // private by default; no need to specify -> void
 ```
 
 A function with a non-void return type must return a value on every path through its body: the compiler rejects a function that can reach the end of its body without hitting a `return`, `throw`, `rethrow`, or a call that never returns (`panic()` or any `noreturn` function).
-An `if`/`else` where every branch exits counts as exiting, as does a `switch` whose arms all exit and a `while (true)` loop with no `break`.
+An `if`/`else` where every branch exits counts as exiting, as does a `switch` whose arms all exit.
+A loop with no `break` that leaves it counts as exiting when its condition always holds: a `while` or `for` whose condition is the literal `true`, in any number of parentheses, or a `for` with no condition.
 
 A function or method may be declared `noreturn`, a modifier stating that it never returns to its caller: every path through its body ends by throwing, by calling `panic`, or by calling another `noreturn` function, or the body loops forever.
 A `noreturn` declaration has no return type, since it returns nothing at all, so writing a `-> T` clause alongside it is an error; it combines with visibility, `override`, `final`, and `throws`, but is not allowed on a constructor, a destructor, or a test.
