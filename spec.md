@@ -433,6 +433,7 @@ A bound may not name a `final` class: no type except that class itself could sat
 Every type argument must satisfy all bounds, being the class or a subclass of it and implementing each interface; a violation is a compile error naming the failing bound.
 A judgment a generic body defers to its type arguments, such as an array element that needs a default value or an interpolated value that needs a text form, is reported where those arguments were written and names the instantiation written there.
 The line inside the generic that could not be judged without them is reported beside it as a note naming that generic.
+Inside a member of a generic type, `this` has the type at its own type parameters, such as `Pair<T>`, so a judgment on `this` is made for each instantiation as well.
 An interface bound is also satisfied through interface extension: a class implementing an interface that extends the bound satisfies it, and so does the extending interface itself as a type argument.
 The body may use the members of every bound on a value of that parameter.
 The `Animation<S: Shape + Comparable<S>>` example above uses exactly this form.
