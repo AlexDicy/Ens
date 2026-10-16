@@ -1,6 +1,6 @@
 // Expression lowering: the dispatcher every other area calls back into, the leaf forms, the
 // explicit cast, and the ternary. Every entry point returns the temp holding the value, or -1
-// once lowering has failed.
+// for a value of type 'void' or once lowering has failed.
 import Expression from @ens.frontend.syntax.generated.nodes;
 import LiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
 import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
@@ -29,6 +29,7 @@ import TypeTestExpressionNode from @ens.frontend.syntax.generated.nodes;
 import CheckedCastExpressionNode from @ens.frontend.syntax.generated.nodes;
 import TryExpressionNode from @ens.frontend.syntax.generated.nodes;
 import Type from @ens.sema.model.types;
+import @ens.sema.model.types;
 import @ens.sema.model.literalvalues;
 import EirConstInt from eir.model;
 import EirConstFloat from eir.model;
@@ -52,6 +53,7 @@ import lower.operators;
 import lower.optionals;
 import lower.ownership;
 import lower.places;
+import lower.statements;
 import lower.stores;
 import lower.strings;
 import lower.structs;
@@ -299,7 +301,8 @@ lowerTernary(LoweringContext lowering, TernaryExpressionNode ternary) -> long {
     if (resultType == null) {
         return -1;
     }
-    if (!lowering.supportsValueType(resultType)) {
+    bool valued = !types.isVoidType(resultType);
+    if (valued && !lowering.supportsValueType(resultType)) {
         lowering.unsupported("a '? :' expression of type {lowering.names().quoted(resultType)}",
             ternary.span());
         return -1;
@@ -309,25 +312,46 @@ lowerTernary(LoweringContext lowering, TernaryExpressionNode ternary) -> long {
         return -1;
     }
     let builder = lowering.builder();
-    long slot = ownership.defineMergeSlot(lowering, "ternary", resultType);
+    long slot = -1;
+    if (valued) {
+        slot = ownership.defineMergeSlot(lowering, "ternary", resultType);
+    }
     long thenBlock = builder.newBlock("ternary.then");
     long elseBlock = builder.newBlock("ternary.else");
     long merge = builder.newBlock("ternary.end");
     builder.terminate(new EirBranch(condition, thenBlock, elseBlock));
     builder.moveTo(thenBlock);
-    if (!storeArm(lowering, slot, resultType, ternary.thenValue())) {
+    if (!lowerJoinValue(lowering, slot, resultType, ternary.thenValue())) {
         return -1;
     }
-    builder.terminate(new EirJump(merge));
+    if (!builder.terminated()) {
+        builder.terminate(new EirJump(merge));
+    }
     builder.moveTo(elseBlock);
-    if (!storeArm(lowering, slot, resultType, ternary.elseValue())) {
+    if (!lowerJoinValue(lowering, slot, resultType, ternary.elseValue())) {
         return -1;
     }
-    builder.terminate(new EirJump(merge));
+    if (!builder.terminated()) {
+        builder.terminate(new EirJump(merge));
+    }
     builder.moveTo(merge);
+    if (!valued) {
+        return -1;
+    }
     long temp = builder.newTemp(resultType);
     builder.append(new EirLoadSlot(temp, resultType, slot));
     return temp;
+}
+
+// Lowers one value of a '?:' or of a switch used as a value into 'slot', the place the values
+// merge through, or as a statement of its own when the whole join has type 'void'.
+public lowerJoinValue(LoweringContext lowering, long slot, Type resultType, Expression value)
+        -> bool {
+    if (types.isVoidType(resultType)) {
+        statements.lowerDiscarded(lowering, value);
+        return !lowering.failed();
+    }
+    return storeArm(lowering, slot, resultType, value);
 }
 
 // Writes one arm's value into the slot the branches merge through. The slot owns its contents,
