@@ -31,6 +31,7 @@ import phases.bodies.literaltyping;
 import phases.bodies.nullguidance;
 import AssignmentFlow from phases.bodies.definiteassignment;
 import phases.bodies.wording;
+import phases.bodies.voidcalls;
 import phases.bodies.narrowing;
 import NarrowingPath from model.narrow;
 import model.hierarchy;
@@ -215,10 +216,14 @@ public checkSwitchArms(BodyChecker checker, Expression scrutinee, List<SwitchArm
     bool classScrutinee = known && types.isClassLike(inner);
     bool valueScrutinee = known && (inner is EnumType || convert.isIntegerType(inner) || inner is StringType);
     bool typeSwitch = classScrutinee && hasTypeArm(arms);
+    let scrutineeNoValue = voidcalls.missingValueRefusal(checker, scrutinee, scrutineeType,
+        "switch on");
     if (known) {
         if (classScrutinee && !typeSwitch) {
             checker.reporter().report("A switch over a class value needs at least one "
                 + "'is Type ->' arm.", scrutinee.span());
+        } else if (scrutineeNoValue != null) {
+            checker.reporter().report(scrutineeNoValue, scrutinee.span());
         } else if (!classScrutinee && !valueScrutinee) {
             checker.reporter().report("Cannot switch on {wording.sideNamed(scrutinee, "this value")}, "
                 + "because its type {checker.names().quoted(scrutineeType)} is not an enum, an integer, a "
@@ -445,6 +450,11 @@ public checkSwitchArms(BodyChecker checker, Expression scrutinee, List<SwitchArm
             && !adaptLiteralArms(checker, valueExpressions, valueArms, armTargetType, origin)) {
         return checker.store().errorType();
     }
+    let valueless = valuelessArmRefusal(checker, valueExpressions, valueArms);
+    if (valueless != null) {
+        valuejoins.holdMismatch(checker, valueless, span);
+        return checker.store().errorType();
+    }
     Type unified = checker.store().errorType();
     for (long i = 0; i < valueExpressions.length(); i++) {
         let expression = valueExpressions.get(i);
@@ -502,6 +512,41 @@ public checkSwitchArms(BodyChecker checker, Expression scrutinee, List<SwitchArm
         literaltyping.adaptFloatLiteral(checker, valueExpressions.get(i), unified);
     }
     return unified;
+}
+
+// The refusal of a switch used as a value when the value of one of its 'arms', given in 'values',
+// is a call that returns no value. Null when none is, or when an arm has a type already refused.
+valuelessArmRefusal(BodyChecker checker, List<Expression> values, List<SwitchArm> arms) -> string? {
+    long valueless = -1;
+    long valued = -1;
+    for (long i = 0; i < values.length(); i++) {
+        Type analyzed = checker.recordedType(values.get(i));
+        if (analyzed is ErrorType) {
+            return null;
+        }
+        if (voidcalls.noValueOpening(checker, values.get(i), analyzed) == null) {
+            valued = i;
+        } else if (valueless < 0) {
+            valueless = i;
+        }
+    }
+    if (valueless < 0) {
+        return null;
+    }
+    if (valued < 0) {
+        let opening = voidcalls.noValuesOpening(values, "Every arm is a call that returns no value");
+        return "{opening}, so this switch has no value. Write a 'switch' statement instead, with "
+            + "each call as a statement of its own.";
+    }
+    let value = values.get(valueless);
+    string opening = voidcalls.noValueOpening(checker, value, checker.recordedType(value)) ?? "";
+    string arm = "{wording.armHead(arms.get(valueless))} -> {wording.oneLineSpelling(value)}";
+    string named = "one of the arms";
+    if (arm.length <= wording.quotedCodeLimit()) {
+        named = "the arm '{arm}'";
+    }
+    let needed = voidcalls.valueOf(checker.recordedType(values.get(valued)), checker.names());
+    return "{opening}, so {named} gives this switch no value. Give that arm {needed ?? "a value"}.";
 }
 
 // Adapts the literal arms analyzed without the target, or returns false when a literal does not
@@ -932,7 +977,11 @@ walkArmBody(BodyChecker checker, ArmBody body, bool requireValue, Type? target, 
                 checker.analyzeExpressionAdapt(expression, target, origin);
             } else {
                 checker.targets().stash(expression, target ?? fixTarget, origin);
-                checker.analyzeExpression(expression);
+                if (requireValue) {
+                    checker.analyzeExpression(expression);
+                } else {
+                    checker.analyzeDiscarded(expression);
+                }
                 checker.targets().clearStash();
             }
             armNarrowings.push(checker.narrowing().flatten());

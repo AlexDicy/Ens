@@ -87,10 +87,10 @@ checkInferredDeclaration(BodyChecker checker, VariableDeclarationNode node, stri
         return checker.store().errorType();
     }
     Type initType = literaltyping.analyzeInitializerOf(checker, name, initializer.value());
-    let refused = voidcalls.refusedCall(checker, initializer.value(), initType);
-    if (refused != null) {
-        checker.reporter().report("{refused} cannot be the initial value of '{name}'. "
-            + "{voidcalls.asStatement(initializer.value())}.", initializer.value().span());
+    let noValue = voidcalls.useRefusal(checker, initializer.value(), initType,
+        "be the initial value of '{name}'");
+    if (noValue != null) {
+        checker.reporter().report(noValue, initializer.value().span());
         return checker.store().errorType();
     }
     if (initType is NullType) {
@@ -114,7 +114,11 @@ checkTypedDeclaration(BodyChecker checker, VariableDeclarationNode node, string 
         let origin = literalfixes.valueOrigin(checker, OriginKind.Declared, name, declared,
             initializer.value(), node);
         Type initType = checker.analyzeExpressionAdapt(initializer.value(), declared, origin);
-        if (!(declared is ErrorType) && !(initType is ErrorType)
+        let noValue = voidcalls.typedRefusal(checker, initializer.value(), initType,
+            "be the initial value of '{name}'", "give '{name}'", declared);
+        if (!(declared is ErrorType) && noValue != null) {
+            checker.reporter().report(noValue, initializer.value().span());
+        } else if (!(declared is ErrorType) && !(initType is ErrorType)
                 && !convert.isAssignableStrict(declared, initType)) {
             string hint = nullguidance.valueAssignabilityHint(checker, declared, initType,
                 initializer.value(), literalfixes.declarationOrigin(OriginKind.Declared, name, declared));
@@ -255,7 +259,7 @@ public checkForStatement(BodyChecker checker, ForStatementNode node) {
                 checkVariableDeclaration(checker, declaration);
             },
             is ExpressionStatementNode expression -> {
-                checker.analyzeExpression(expression.expression());
+                checker.analyzeDiscarded(expression.expression());
                 checker.endPathIfNeverReturns(expression.expression());
             },
             default -> { },
@@ -288,7 +292,7 @@ public checkForStatement(BodyChecker checker, ForStatementNode node) {
         checker.assignment().setUnconditionalPosition(true);
         bool outerStatements = checker.frame().statementsAllowed();
         checker.frame().setStatementsAllowed(false);
-        checker.analyzeExpression(update);
+        checker.analyzeDiscarded(update);
         checker.endPathIfNeverReturns(update);
         checker.frame().setStatementsAllowed(outerStatements);
     }
@@ -308,6 +312,8 @@ public checkForEachStatement(BodyChecker checker, ForEachStatementNode node) {
     checker.enterScope();
     Type iterable = checker.analyzeExpression(node.iterable());
     Type element = checker.store().errorType();
+    let iterableNoValue = voidcalls.missingValueRefusal(checker, node.iterable(), iterable,
+        "loop over");
     if (!(iterable is ErrorType)) {
         if (iterable is OptionalType) {
             checker.reporter().report(nullguidance.maybeNullRefusal(checker, "'for (... in ...)' cannot "
@@ -320,6 +326,8 @@ public checkForEachStatement(BodyChecker checker, ForEachStatementNode node) {
         } else if (iterable is StringType) {
             checker.reporter().report("A 'string' cannot be iterated directly. "
                 + stringWalkAdvice(node.iterable()), node.iterable().span());
+        } else if (iterableNoValue != null) {
+            checker.reporter().report(iterableNoValue, node.iterable().span());
         } else {
             checker.reporter().report("'for (... in ...)' needs an array or an iterable value, but "
                 + "{wording.sideNamed(node.iterable(), "the value it walks")} has type "
@@ -460,7 +468,9 @@ public checkReturnStatement(BodyChecker checker, ReturnStatementNode node) {
             + "have a value.";
         bool spelled = !(actual is ErrorType) && !(actual is NullType) && !types.isVoidType(actual)
             && checker.names().canSpell(actual);
-        if (checker.frame().currentReturnHeader().length > 0 && spelled) {
+        if (voidcalls.noValueOpening(checker, value, actual) != null) {
+            refusal = "{refusal} {voidcalls.callAsStatement(value)}, and write 'return;' after it.";
+        } else if (checker.frame().currentReturnHeader().length > 0 && spelled) {
             refusal = "{refusal} Write 'return;', or declare a return type, as in "
                 + "'{checker.frame().currentReturnHeader()} -> {checker.names().of(actual)}'.";
         } else if (checker.frame().currentReturnHeader().length > 0) {
@@ -469,6 +479,12 @@ public checkReturnStatement(BodyChecker checker, ReturnStatementNode node) {
             refusal = "{refusal} Write 'return;'.";
         }
         checker.reporter().report(refusal, value.span());
+        return;
+    }
+    let noValue = voidcalls.typedRefusal(checker, value, actual,
+        "be returned from {currentCallable(checker)}", "return", expected);
+    if (!(expected is ErrorType) && noValue != null) {
+        checker.reporter().report(noValue, value.span());
         return;
     }
     if (!convert.isAssignableStrict(expected, actual)) {
@@ -488,6 +504,11 @@ public checkReturnStatement(BodyChecker checker, ReturnStatementNode node) {
 public checkThrowStatement(BodyChecker checker, ThrowStatementNode node) {
     Type thrown = checker.analyzeExpression(node.value());
     if (thrown is ErrorType) {
+        return;
+    }
+    let noValue = voidcalls.missingValueRefusal(checker, node.value(), thrown, "throw");
+    if (noValue != null) {
+        checker.reporter().report(noValue, node.value().span());
         return;
     }
     let errorClass = checker.resolver().errorClass();
@@ -523,11 +544,7 @@ public checkThrowStatement(BodyChecker checker, ThrowStatementNode node) {
 // The way out a 'return' gives where a statement that only works in a loop is written outside one,
 // with the value the return type needs.
 public leaveAdvice(BodyChecker checker) -> string {
-    string subject = checker.frame().currentReturnSubject();
-    string place = subject.substring(0, 1).toLowerAscii() + subject.substring(1);
-    if (subject == "A test") {
-        place = "this test";
-    }
+    string place = currentCallable(checker);
     let returned = checker.frame().currentReturnType();
     if (returned == null || types.isVoidType(returned)) {
         return "write 'return;' to leave {place}";
@@ -535,8 +552,33 @@ public leaveAdvice(BodyChecker checker) -> string {
     return "write 'return' with a value of type {checker.names().quoted(returned)} to leave {place}";
 }
 
-// Refuses the condition 'node' of the statement or operator 'what' unless it is a 'bool'.
+// The callable a 'return' leaves, as words inside a sentence: "function 'main'" or "this test".
+currentCallable(BodyChecker checker) -> string {
+    string subject = checker.frame().currentReturnSubject();
+    if (subject == "A test") {
+        return "this test";
+    }
+    return subject.substring(0, 1).toLowerAscii() + subject.substring(1);
+}
+
+// Refuses the condition 'node' of the statement or operator 'what' unless it is a 'bool'. A loop
+// tests its condition on every pass, so the fix for a call there keeps the call in the loop.
 public checkConditionIsBool(BodyChecker checker, Type condition, string what, Expression node) {
+    string place = "be the condition of this '{what}'";
+    string? noValue = null;
+    if (what == "if" || what == "?:") {
+        noValue = voidcalls.receiverRefusal(checker, node, condition, place,
+            "give the '{what}' a 'bool' condition");
+    } else {
+        let refused = voidcalls.refusedCall(checker, node, condition);
+        if (refused != null) {
+            noValue = "{refused} cannot {place}. Give the '{what}' a 'bool' condition.";
+        }
+    }
+    if (noValue != null) {
+        checker.reporter().report(noValue, node.span());
+        return;
+    }
     if (!(condition is ErrorType) && !convert.isBoolType(condition)) {
         checker.reporter().report("The condition of this '{what}' must be a 'bool', but "
             + "{wording.sideNamed(node, "the condition")} has type {checker.names().quoted(condition)}.",

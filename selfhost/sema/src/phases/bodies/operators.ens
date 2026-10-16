@@ -25,6 +25,7 @@ import phases.bodies.valuejoins;
 import phases.bodies.literaltyping;
 import phases.bodies.nullguidance;
 import phases.bodies.wording;
+import phases.bodies.voidcalls;
 import support.diagnostics;
 import List from @std.collections.list;
 import phases.bodies.narrowing;
@@ -53,6 +54,9 @@ public analyzeBinary(BodyChecker checker, BinaryExpressionNode node) -> Type {
         Type shortLeft = checker.analyzeExpression(node.left());
         Type shortRight = narrowing.analyzeGuardedBranch(checker, node.left(), node.right(),
             operator == SyntaxKind.AmpersandAmpersand, null, null, new ConditionSite("", node, ""));
+        if (reportedShortCircuitWithoutValue(checker, node, shortLeft, shortRight)) {
+            return checker.store().errorType();
+        }
         if (shortLeft is ErrorType || shortRight is ErrorType) {
             return checker.store().errorType();
         }
@@ -91,11 +95,72 @@ public analyzeBinary(BodyChecker checker, BinaryExpressionNode node) -> Type {
     if (left is ErrorType || right is ErrorType) {
         return checker.store().errorType();
     }
+    if (reportedOperandWithoutValue(checker, node, left, right)) {
+        return checker.store().errorType();
+    }
     checker.targets().enterOperands(node, target, origin);
     Type result = analyzeBinaryOperands(checker, node.span(), operator, node.operator().text(),
         node.left(), node.right(), left, right, null, slot);
     checker.targets().leaveOperands();
     return result;
+}
+
+// Refuses the first side of 'node' that is a call returning no value, and is true when it did.
+reportedOperandWithoutValue(BodyChecker checker, BinaryExpressionNode node, Type left, Type right)
+        -> bool {
+    if (!types.isVoidType(left) && !types.isVoidType(right)) {
+        return false;
+    }
+    string operatorText = node.operator().text();
+    string use = "be used with '{operatorText}'";
+    if (isComparison(node.operator().kind())) {
+        use = "be compared with '{operatorText}'";
+    }
+    let leftRefusal = voidcalls.useRefusal(checker, node.left(), left, use);
+    if (leftRefusal != null) {
+        checker.reporter().report(leftRefusal, node.left().span());
+        return true;
+    }
+    let rightRefusal = voidcalls.useRefusal(checker, node.right(), right, use);
+    if (rightRefusal != null) {
+        checker.reporter().report(rightRefusal, node.right().span());
+        return true;
+    }
+    return false;
+}
+
+isComparison(SyntaxKind operator) -> bool {
+    switch (operator) {
+        EqualsEquals, NotEquals, Less, Greater, LessEquals, GreaterEquals -> {
+            return true;
+        },
+        default -> {
+            return false;
+        },
+    }
+}
+
+// Refuses the first side of the '&&' or '||' 'node' that is a call returning no value, and is
+// true when it did. The right side runs only when the left does not decide the result, so its
+// fix keeps the call under that condition.
+reportedShortCircuitWithoutValue(BodyChecker checker, BinaryExpressionNode node, Type left,
+                                 Type right) -> bool {
+    if (!types.isVoidType(left) && !types.isVoidType(right)) {
+        return false;
+    }
+    string operatorText = node.operator().text();
+    let leftRefusal = voidcalls.useRefusal(checker, node.left(), left, "be used with '{operatorText}'");
+    if (leftRefusal != null) {
+        checker.reporter().report(leftRefusal, node.left().span());
+        return true;
+    }
+    let rightRefusal = voidcalls.conditionalRefusal(checker, node.right(), right, operatorText,
+        node.left());
+    if (rightRefusal == null) {
+        return false;
+    }
+    checker.reporter().report(rightRefusal, node.right().span());
+    return true;
 }
 
 // The result of 'left OP right' under the operator's own rules. A compound assignment passes its
@@ -911,6 +976,12 @@ public analyzePrefix(BodyChecker checker, PrefixExpressionNode node) -> Type {
     Type operand = analyzePrefixOperand(checker, prefixOperator, node.operand());
     if (prefixOperator == SyntaxKind.Minus || prefixOperator == SyntaxKind.Plus) {
         valuejoins.retargetLiteralRange(checker, node, node.operand(), prefixOperator == SyntaxKind.Minus);
+    }
+    let noValue = voidcalls.useRefusal(checker, node.operand(), operand,
+        "be used with '{node.operator().text()}'");
+    if (noValue != null) {
+        checker.reporter().report(noValue, node.operand().span());
+        return checker.store().errorType();
     }
     if (operand is ErrorType) {
         return checker.store().errorType();
