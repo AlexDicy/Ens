@@ -53,6 +53,7 @@ printArea() { // private by default; no need to specify -> void
 }
 ```
 
+A parameter, a field, or a variable of type `void` is an error, because `void` means no value.
 A function with a non-void return type must return a value on every path through its body: the compiler rejects a function that can reach the end of its body without hitting a `return`, `throw`, `rethrow`, or a call that never returns (`panic()` or any `noreturn` function).
 An `if`/`else` where every branch exits counts as exiting, as does a `switch` whose arms all exit.
 A loop with no `break` that leaves it counts as exiting when its condition always holds: a `while` or `for` whose condition is the literal `true`, in any number of parentheses, or a `for` with no condition.
