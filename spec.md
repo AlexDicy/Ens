@@ -1754,6 +1754,7 @@ A hole may hold one nullable level over any of those: it renders the value's own
 A `char` hole renders as its character rather than its numeric code point, so `"{'A'}"` is `"A"`; interpolate `c as int` when the number is wanted.
 Inside a generic body a hole may hold a value of a type-parameter type; the requirement is then checked against the concrete type of each instantiation.
 An explicit `.toString()` on a type-parameter value is checked the same way, against the concrete type of each instantiation.
+A hole or `.toString()` call whose type has no text form for any type argument, such as a struct with a class field or a function value, is refused in the generic body itself, and no instantiation reports it again.
 
 ---
 
