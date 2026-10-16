@@ -5,9 +5,9 @@
 // because the borrow it was before the retain outlives the reference it passed on, so one borrowed
 // value can fill two owning places. Undefined and Conflict pass through every transition unchanged,
 // so the states reach a fixpoint in any block order. A block replayed before its predecessors have
-// settled then contributes nothing to its successors. A struct holding references is tracked too;
-// its references are retained through its storage, so a struct temp is only ever Borrowed, Owned
-// or Consumed.
+// settled then contributes nothing to its successors. A struct or tagged optional holding
+// references is tracked too; its references are retained and released through storage, so its temp
+// is only ever Borrowed, Owned or Consumed.
 import EirFunction from eir.model;
 import EirBlock from eir.model;
 import EirInstruction from eir.model;
@@ -19,6 +19,9 @@ import EirStorePtr from eir.model;
 import EirTakeSlot from eir.model;
 import EirCast from eir.model;
 import EirOptionalPayload from eir.model;
+import EirOptionalPresence from eir.model;
+import EirPayloadRead from eir.model;
+import EirBranch from eir.model;
 import EirWrapOptional from eir.model;
 import EirClassNew from eir.model;
 import EirClosureNew from eir.model;
@@ -57,8 +60,9 @@ export verifyOwnership(EirFunction function) -> string[] {
     return verifier.run();
 }
 
-// Undefined joins with any state to give that state: on a path where a temp does not exist
-// there is nothing to leak, and the structural pass already rejects a use before a definition.
+// Undefined joins with any state to give that state: on a path where a temp does not exist, or
+// is an optional known to be absent, there is nothing to leak, and the structural pass already
+// rejects a use before a definition.
 // Two different defined states are a Conflict, which is sticky so one bug reports once.
 enum Ownership {
     Undefined,
@@ -73,7 +77,8 @@ class OwnershipVerifier {
     EirFunction function;
     long tempCount;
     bool[] tracked;
-    bool[] structs;
+    bool[] aggregates;
+    long[] presenceOf;
     List<string> problems;
     bool[] conflictReported;
 
@@ -81,17 +86,18 @@ class OwnershipVerifier {
         this.function = function;
         this.tempCount = function.tempTypes().length();
         this.tracked = new bool[this.tempCount];
-        this.structs = new bool[this.tempCount];
+        this.aggregates = new bool[this.tempCount];
         this.problems = new List<string>();
         this.conflictReported = new bool[this.tempCount];
         let addresses = addressTemps(function);
-        let payloads = payloadTemps(function);
         for (long i = 0; i < this.tempCount; i++) {
             let type = function.tempTypes().get(i);
-            this.structs[i] = primitives.structOf(type) != null && primitives.hasArcContent(type);
-            this.tracked[i] = !addresses[i] && !payloads[i]
-                && (primitives.isReferenceType(type) || this.structs[i]);
+            this.aggregates[i] = primitives.hasArcContent(type)
+                && (primitives.structOf(type) != null || primitives.taggedPayloadOf(type) != null);
+            this.tracked[i] = !addresses[i]
+                && (primitives.isReferenceType(type) || this.aggregates[i]);
         }
+        this.presenceOf = presenceTests(function);
     }
 
     protected run() -> string[] {
@@ -157,7 +163,9 @@ class OwnershipVerifier {
                 }
                 let exitStates = this.transferBlock(blocks.get(b), entryStates.get(b), false);
                 let terminator = blocks.get(b).terminator();
-                for (let successor in walk.successorsOf(blocks.get(b))) {
+                let successors = walk.successorsOf(blocks.get(b));
+                for (long edge = 0; edge < successors.length; edge++) {
+                    long successor = successors[edge];
                     if (successor < 0 || successor >= blockCount) {
                         continue;
                     }
@@ -169,6 +177,7 @@ class OwnershipVerifier {
                     if (terminator != null) {
                         edgeDefined = walk.terminatorDefsFor(terminator, successor);
                     }
+                    long absent = this.absentAlong(terminator, edge);
                     let target = entryStates.get(successor);
                     for (long i = 0; i < this.tempCount; i++) {
                         let flowing = exitStates.get(i);
@@ -176,6 +185,9 @@ class OwnershipVerifier {
                             if (defined == i && this.isTracked(i)) {
                                 flowing = Ownership.Owned;
                             }
+                        }
+                        if (i == absent) {
+                            flowing = Ownership.Undefined;
                         }
                         let merged = join(target.get(i), flowing);
                         if (merged != target.get(i)) {
@@ -199,6 +211,17 @@ class OwnershipVerifier {
             }
         }
         return entryStates;
+    }
+
+    // The optional found absent along one edge: the one whose tag a branch tests, on the branch's
+    // else edge. Every other edge gives -1, and a block both edges reach keeps what the then edge
+    // carries.
+    absentAlong(EirTerminator? terminator, long edge) -> long {
+        if (terminator is EirBranch && edge == 1 && terminator.condition >= 0
+                && terminator.condition < this.tempCount) {
+            return this.presenceOf[terminator.condition];
+        }
+        return -1;
     }
 
     undefinedStates() -> List<Ownership> {
@@ -284,39 +307,25 @@ class OwnershipVerifier {
                 if (this.slotBorrows(store.slot)) {
                     return;
                 }
-                this.consume(block, store.value, states, reporting,
-                    "stored into ${store.slot}");
+                this.store(block, store.value, states, reporting, "stored into ${store.slot}");
             },
             is EirStorePtr store -> {
-                this.consume(block, store.value, states, reporting,
+                this.store(block, store.value, states, reporting,
                     "stored through %{store.address}");
             },
-            // A conversion between two spellings of one reference is a rename, so the +1 passes
-            // to the result rather than being duplicated or dropped.
+            // A conversion between two spellings of one reference is a rename.
             is EirCast cast -> {
-                if (!this.isTracked(cast.result)) {
-                    return;
-                }
-                if (!this.isTracked(cast.operand)) {
-                    states.set(cast.result, Ownership.Borrowed);
-                    return;
-                }
-                let carried = states.get(cast.operand);
-                states.set(cast.result, carried);
-                if (ownsReference(carried)) {
-                    states.set(cast.operand, stateAfterConsume(carried));
-                }
+                this.carry(cast.operand, cast.result, states);
             },
-            // Wrapping puts what the payload holds inside a pair, which this pass tracks through
-            // its storage rather than as a value, so an owned payload's +1 leaves the value side
-            // here and a borrowed one stays borrowed.
+            // A wrapped pair holds what its payload held, and a moved payload what its pair held.
             is EirWrapOptional wrap -> {
-                if (!this.isTracked(wrap.value)) {
-                    return;
-                }
-                let held = states.get(wrap.value);
-                if (ownsReference(held)) {
-                    states.set(wrap.value, stateAfterConsume(held));
+                this.carry(wrap.value, wrap.result, states);
+            },
+            is EirOptionalPayload payload -> {
+                if (payload.read == EirPayloadRead.Move) {
+                    this.carry(payload.value, payload.result, states);
+                } else if (this.isTracked(payload.result)) {
+                    states.set(payload.result, Ownership.Borrowed);
                 }
             },
             default -> {
@@ -333,17 +342,40 @@ class OwnershipVerifier {
         }
     }
 
-    // A store or a return hands the temp's +1 on, so the temp must own one. A borrowed struct is
-    // handed on as it is, because lowering retains its references through the storage it was read
-    // from first.
+    // Hands what one temp holds to a temp naming the same references, so a +1 passes to the
+    // result rather than being duplicated or dropped.
+    carry(long source, long result, List<Ownership> states) {
+        if (!this.isTracked(result)) {
+            return;
+        }
+        if (!this.isTracked(source)) {
+            states.set(result, Ownership.Borrowed);
+            return;
+        }
+        let carried = states.get(source);
+        states.set(result, carried);
+        if (ownsReference(carried)) {
+            states.set(source, stateAfterConsume(carried));
+        }
+    }
+
+    // A store hands the temp's +1 to storage. A borrowed struct or optional is stored as it is,
+    // because lowering retains its references through the storage it was read from or the
+    // storage it is written to.
+    store(EirBlock block, long value, List<Ownership> states, bool reporting, string what) {
+        if (this.isTracked(value) && this.aggregates[value]
+                && states.get(value) == Ownership.Borrowed) {
+            return;
+        }
+        this.consume(block, value, states, reporting, what);
+    }
+
+    // A store, a return or a propagate hands the temp's +1 on, so the temp must own one.
     consume(EirBlock block, long value, List<Ownership> states, bool reporting, string what) {
         if (!this.isTracked(value)) {
             return;
         }
         let held = states.get(value);
-        if (this.structs[value] && held == Ownership.Borrowed) {
-            return;
-        }
         if (reporting) {
             if (held == Ownership.Borrowed) {
                 this.report("{block.label()}: %{value} is {what} without owning a reference; "
@@ -403,9 +435,12 @@ class OwnershipVerifier {
             if (!this.isTracked(i) || !ownsReference(states.get(i))) {
                 continue;
             }
-            if (this.structs[i]) {
+            if (primitives.structOf(this.function.tempTypes().get(i)) != null) {
                 this.report("{block.label()}: the struct %{i} still owns the references it holds "
                     + "where {where}, which leaks them");
+            } else if (this.aggregates[i]) {
+                this.report("{block.label()}: the optional %{i} still owns the references its "
+                    + "payload holds where {where}, which leaks them");
             } else {
                 this.report("{block.label()}: %{i} still owns a reference where {where}, "
                     + "which leaks it");
@@ -537,24 +572,26 @@ addressTemps(EirFunction function) -> bool[] {
     return addresses;
 }
 
-// The temps a payload extraction defines. A tagged optional is a container this pass tracks
-// through its storage, exactly as it tracks a struct, so whether the pair owned what came out of
-// it or borrowed it is not visible on the value side; the payload stays out of the analysis
-// rather than being guessed at. It reaches a reference type only for an optional of an optional,
-// which is why nothing needed this before.
-payloadTemps(EirFunction function) -> bool[] {
-    bool[] payloads = new bool[function.tempTypes().length() + 1];
+// For each bool temp that reads an optional's tag, the optional it reads, and -1 for every other
+// temp.
+presenceTests(EirFunction function) -> long[] {
+    long tempCount = function.tempTypes().length();
+    long[] tested = new long[tempCount];
+    for (long i = 0; i < tempCount; i++) {
+        tested[i] = -1;
+    }
     let blocks = function.blocks();
     for (long b = 0; b < blocks.length(); b++) {
         let instructions = blocks.get(b).instructions();
         for (long i = 0; i < instructions.length(); i++) {
             let instruction = instructions.get(i);
-            if (instruction is EirOptionalPayload) {
-                payloads[instruction.result] = true;
+            if (instruction is EirOptionalPresence && instruction.result >= 0
+                    && instruction.result < tempCount) {
+                tested[instruction.result] = instruction.value;
             }
         }
     }
-    return payloads;
+    return tested;
 }
 
 // True while a temp holds a +1 that still has to be released or consumed.

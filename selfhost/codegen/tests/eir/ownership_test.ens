@@ -22,6 +22,7 @@ import EirFieldAddress from eir.model;
 import EirLoadSlot from eir.model;
 import EirRetainPtr from eir.model;
 import EirStoreSlot from eir.model;
+import EirTakeSlot from eir.model;
 import EirArrayNew from eir.model;
 import EirAccess from eir.model;
 import EirBoundsCheck from eir.model;
@@ -29,6 +30,10 @@ import EirBranch from eir.model;
 import EirJump from eir.model;
 import EirReturn from eir.model;
 import EirConstBool from eir.model;
+import EirConstNull from eir.model;
+import EirOptionalPayload from eir.model;
+import EirOptionalPresence from eir.model;
+import EirPayloadRead from eir.model;
 import PlaceRelation from eir.place;
 import eir.place;
 import eir.ownership;
@@ -393,7 +398,7 @@ test "a struct a call produces and nothing stores or returns is reported as a le
     let cell = try support.structNamed(analysis, "Cell");
     let builder = new EirFunctionBuilder("dropped", false, null, [],
         analysis.store().primitive(PrimitiveKind.Void));
-    long made = madeCell(builder, cell);
+    long made = madeValue(builder, cell);
     builder.terminate(new EirReturn(-1));
     let violations = ownership.verifyOwnership(builder.finish());
     try testing.assertEqual(violations.length, 1L);
@@ -406,8 +411,8 @@ test "a struct a call produces balances once an owning slot takes it or it is re
     let cell = try support.structNamed(analysis, "Cell");
     let builder = new EirFunctionBuilder("kept", false, null, [], cell);
     long slot = builder.addSlot("kept", cell, true, false);
-    builder.append(new EirStoreSlot(slot, madeCell(builder, cell)));
-    builder.terminate(new EirReturn(madeCell(builder, cell)));
+    builder.append(new EirStoreSlot(slot, madeValue(builder, cell)));
+    builder.terminate(new EirReturn(madeValue(builder, cell)));
     try assertNoViolations(ownership.verifyOwnership(builder.finish()));
 }
 
@@ -417,13 +422,13 @@ test "a struct written into a borrowing slot still owns its references" {
     let builder = new EirFunctionBuilder("parked", false, null, [],
         analysis.store().primitive(PrimitiveKind.Void));
     long slot = builder.addSlot("parked", cell, false, true);
-    builder.append(new EirStoreSlot(slot, madeCell(builder, cell)));
+    builder.append(new EirStoreSlot(slot, madeValue(builder, cell)));
     builder.terminate(new EirReturn(-1));
     try assertMentions(ownership.verifyOwnership(builder.finish()),
         "the struct %0 still owns the references it holds where the function returns");
 }
 
-test "a struct read out of storage is handed on once its references are retained there" {
+test "a struct read out of storage is stored once its references are retained there" {
     let analysis = try cellProgram();
     let cell = try support.structNamed(analysis, "Cell");
     Type probe = cell.fields().get(0).type();
@@ -439,12 +444,190 @@ test "a struct read out of storage is handed on once its references are retained
     builder.append(new EirStoreSlot(first, read));
     retainField(builder, cell, probe, source);
     builder.append(new EirStoreSlot(second, read));
-    retainField(builder, cell, probe, source);
-    builder.terminate(new EirReturn(read));
+    builder.terminate(new EirReturn(retainedCopy(builder, cell, probe, read)));
     let function = builder.finish();
     try assertNoViolations(ownership.verifyOwnership(function));
     try assertNoViolations(storage.verifyStorage(function));
 }
+
+test "a borrowed struct or optional returned as it is is reported" {
+    let analysis = try cellProgram();
+    let cell = try support.structNamed(analysis, "Cell");
+    let optional = analysis.store().optionalOf(cell);
+    let returnedStruct = new EirFunctionBuilder("struct", false, null,
+        [new EirParameter("given", cell)], cell);
+    returnedStruct.terminate(new EirReturn(0));
+    try assertMentions(ownership.verifyOwnership(returnedStruct.finish()),
+        "%0 is returned without owning a reference");
+
+    let returnedOptional = new EirFunctionBuilder("optional", false, null,
+        [new EirParameter("given", optional)], optional);
+    returnedOptional.terminate(new EirReturn(0));
+    try assertMentions(ownership.verifyOwnership(returnedOptional.finish()),
+        "%0 is returned without owning a reference");
+}
+
+test "a struct or optional taken out of a slot that owns it owns what it holds" {
+    let analysis = try cellProgram();
+    let cell = try support.structNamed(analysis, "Cell");
+    let optional = analysis.store().optionalOf(cell);
+    let returned = new EirFunctionBuilder("returned", false, null, [], optional);
+    long slot = returned.addSlot("kept", optional, false, false);
+    returned.append(new EirStoreSlot(slot, madeValue(returned, optional)));
+    long taken = returned.newTemp(optional);
+    returned.append(new EirTakeSlot(taken, optional, slot));
+    returned.terminate(new EirReturn(taken));
+    let function = returned.finish();
+    try assertNoViolations(verify.verifyFunction(function));
+    try assertNoViolations(ownership.verifyOwnership(function));
+    try assertNoViolations(storage.verifyStorage(function));
+
+    let dropped = new EirFunctionBuilder("dropped", false, null, [],
+        analysis.store().primitive(PrimitiveKind.Void));
+    long held = dropped.addSlot("held", cell, false, false);
+    dropped.append(new EirStoreSlot(held, madeValue(dropped, cell)));
+    long ignored = dropped.newTemp(cell);
+    dropped.append(new EirTakeSlot(ignored, cell, held));
+    dropped.terminate(new EirReturn(-1));
+    try assertMentions(ownership.verifyOwnership(dropped.finish()),
+        "the struct %1 still owns the references it holds where the function returns");
+}
+
+test "an optional a call produces and nothing stores or returns is reported as a leak" {
+    let analysis = try cellProgram();
+    let optional = analysis.store().optionalOf(try support.structNamed(analysis, "Cell"));
+    let builder = new EirFunctionBuilder("dropped", false, null, [],
+        analysis.store().primitive(PrimitiveKind.Void));
+    let ignored = madeValue(builder, optional);
+    builder.terminate(new EirReturn(-1));
+    try assertMentions(ownership.verifyOwnership(builder.finish()),
+        "the optional %0 still owns the references its payload holds where the function returns");
+}
+
+test "a payload moved out of an owned optional takes over what the optional held" {
+    let store = try support.freshStore();
+    let payload = store.optionalOf(store.stringType());
+    let optional = store.optionalOf(payload);
+    let returned = new EirFunctionBuilder("returned", false, null, [], payload);
+    long moved = payloadOf(returned, madeValue(returned, optional), payload, EirPayloadRead.Move);
+    returned.terminate(new EirReturn(moved));
+    try assertNoViolations(ownership.verifyOwnership(returned.finish()));
+
+    let dropped = new EirFunctionBuilder("dropped", false, null, [], payload);
+    let ignored = payloadOf(dropped, madeValue(dropped, optional), payload, EirPayloadRead.Move);
+    dropped.terminate(new EirReturn(nullOf(dropped, payload)));
+    try assertMentions(ownership.verifyOwnership(dropped.finish()),
+        "%1 still owns a reference where the function returns");
+}
+
+test "a payload borrowed from an owned optional leaves the optional owning what it held" {
+    let store = try support.freshStore();
+    let payload = store.optionalOf(store.stringType());
+    let optional = store.optionalOf(payload);
+    let builder = new EirFunctionBuilder("borrowed", false, null, [], payload);
+    long pair = madeValue(builder, optional);
+    long borrowed = payloadOf(builder, pair, payload, EirPayloadRead.Borrow);
+    builder.append(new EirRelease(borrowed));
+    builder.terminate(new EirReturn(nullOf(builder, payload)));
+    let violations = ownership.verifyOwnership(builder.finish());
+    try assertMentions(violations, "%1 is released although it owns no reference");
+    try assertMentions(violations,
+        "the optional %0 still owns the references its payload holds where the function returns");
+}
+
+test "a payload moved out of a borrowed optional is borrowed" {
+    let store = try support.freshStore();
+    let payload = store.optionalOf(store.stringType());
+    let optional = store.optionalOf(payload);
+    let released = new EirFunctionBuilder("released", false, null,
+        [new EirParameter("given", optional)], payload);
+    long freed = payloadOf(released, 0, payload, EirPayloadRead.Move);
+    released.append(new EirRelease(freed));
+    released.terminate(new EirReturn(nullOf(released, payload)));
+    try assertMentions(ownership.verifyOwnership(released.finish()),
+        "%1 is released although it owns no reference");
+
+    let retained = new EirFunctionBuilder("retained", false, null,
+        [new EirParameter("given", optional)], payload);
+    long kept = payloadOf(retained, 0, payload, EirPayloadRead.Move);
+    retained.append(new EirRetain(kept));
+    retained.append(new EirRetain(kept));
+    retained.terminate(new EirReturn(kept));
+    try assertMentions(ownership.verifyOwnership(retained.finish()),
+        "%1 is retained while it already owns a reference, which leaks one");
+}
+
+test "an optional owns nothing along the edge where its tag reads absent" {
+    let store = try support.freshStore();
+    let payload = store.optionalOf(store.stringType());
+    let optional = store.optionalOf(payload);
+    let boolType = store.primitive(PrimitiveKind.Bool);
+    let tested = new EirFunctionBuilder("tested", false, null, [], payload);
+    long pair = madeValue(tested, optional);
+    long present = tested.newTemp(boolType);
+    tested.append(new EirOptionalPresence(present, boolType, pair));
+    long presentBlock = tested.newBlock("present");
+    long absentBlock = tested.newBlock("absent");
+    tested.terminate(new EirBranch(present, presentBlock, absentBlock));
+    tested.moveTo(presentBlock);
+    tested.terminate(new EirReturn(payloadOf(tested, pair, payload, EirPayloadRead.Move)));
+    tested.moveTo(absentBlock);
+    tested.terminate(new EirReturn(nullOf(tested, payload)));
+    try assertNoViolations(ownership.verifyOwnership(tested.finish()));
+
+    let untested = new EirFunctionBuilder("untested", false, null, [], payload);
+    long other = madeValue(untested, optional);
+    long condition = untested.newTemp(boolType);
+    untested.append(new EirConstBool(condition, boolType, true));
+    long thenBlock = untested.newBlock("then");
+    long elseBlock = untested.newBlock("else");
+    untested.terminate(new EirBranch(condition, thenBlock, elseBlock));
+    untested.moveTo(thenBlock);
+    untested.terminate(new EirReturn(payloadOf(untested, other, payload, EirPayloadRead.Move)));
+    untested.moveTo(elseBlock);
+    untested.terminate(new EirReturn(nullOf(untested, payload)));
+    try assertMentions(ownership.verifyOwnership(untested.finish()),
+        "else: the optional %0 still owns the references its payload holds");
+}
+test "an optional still owns what it holds along the edge where its tag reads present" {
+    let store = try support.freshStore();
+    let payload = store.optionalOf(store.stringType());
+    let optional = store.optionalOf(payload);
+    let boolType = store.primitive(PrimitiveKind.Bool);
+    let builder = new EirFunctionBuilder("dropped", false, null, [], payload);
+    long pair = madeValue(builder, optional);
+    long present = builder.newTemp(boolType);
+    builder.append(new EirOptionalPresence(present, boolType, pair));
+    long presentBlock = builder.newBlock("present");
+    long absentBlock = builder.newBlock("absent");
+    builder.terminate(new EirBranch(present, presentBlock, absentBlock));
+    builder.moveTo(presentBlock);
+    builder.terminate(new EirReturn(nullOf(builder, payload)));
+    builder.moveTo(absentBlock);
+    builder.terminate(new EirReturn(nullOf(builder, payload)));
+    let violations = ownership.verifyOwnership(builder.finish());
+    try testing.assertEqual(violations.length, 1L);
+    try assertMentions(violations,
+        "present: the optional %0 still owns the references its payload holds");
+}
+
+test "an optional tested by a branch with one target for both edges still owns what it holds" {
+    let store = try support.freshStore();
+    let payload = store.optionalOf(store.stringType());
+    let optional = store.optionalOf(payload);
+    let boolType = store.primitive(PrimitiveKind.Bool);
+    let builder = new EirFunctionBuilder("joined", false, null, [], payload);
+    long pair = madeValue(builder, optional);
+    long present = builder.newTemp(boolType);
+    builder.append(new EirOptionalPresence(present, boolType, pair));
+    long joined = builder.newBlock("joined");
+    builder.terminate(new EirBranch(present, joined, joined));
+    builder.moveTo(joined);
+    builder.terminate(new EirReturn(nullOf(builder, payload)));
+    try assertMentions(ownership.verifyOwnership(builder.finish()),
+        "joined: the optional %0 still owns the references its payload holds");
+}
+
 
 // A program declaring 'Cell', a struct whose one field holds a reference.
 cellProgram() -> ProgramAnalysis throws {
@@ -459,14 +642,6 @@ cellProgram() -> ProgramAnalysis throws {
         + "\}\n");
 }
 
-// A 'Cell' a call returns, owning the references it holds.
-madeCell(EirFunctionBuilder builder, Type cell) -> long {
-    long made = builder.newTemp(cell);
-    builder.append(new EirCall(made, cell, new EirCallee("make", null, [], cell), -1, [], -1,
-        null));
-    return made;
-}
-
 // Retains the reference a 'Cell' slot holds, the way lowering gives a copy read out of it its own.
 retainField(EirFunctionBuilder builder, Type cell, Type probe, long slot) {
     long address = builder.newTemp(cell);
@@ -474,6 +649,39 @@ retainField(EirFunctionBuilder builder, Type cell, Type probe, long slot) {
     long field = builder.newTemp(probe);
     builder.append(new EirFieldAddress(field, probe, address, 0));
     builder.append(new EirRetainPtr(field));
+}
+
+// A copy of a borrowed 'Cell' that owns its reference, made the way lowering hands one to a
+// return: retained through storage of its own and taken back out.
+retainedCopy(EirFunctionBuilder builder, Type cell, Type probe, long value) -> long {
+    long slot = builder.addSlot("retained", cell, false, false);
+    builder.append(new EirStoreSlot(slot, value));
+    retainField(builder, cell, probe, slot);
+    long owned = builder.newTemp(cell);
+    builder.append(new EirTakeSlot(owned, cell, slot));
+    return owned;
+}
+
+// A value of the given type a call returns, owning what it holds.
+madeValue(EirFunctionBuilder builder, Type type) -> long {
+    long made = builder.newTemp(type);
+    builder.append(new EirCall(made, type, new EirCallee("make", null, [], type), -1, [], -1,
+        null));
+    return made;
+}
+
+payloadOf(EirFunctionBuilder builder, long pair, Type payload, EirPayloadRead read) -> long {
+    long value = builder.newTemp(payload);
+    builder.append(new EirOptionalPayload(value, payload, pair, read));
+    return value;
+}
+
+// The absent reference, retained the way lowering hands it to a return.
+nullOf(EirFunctionBuilder builder, Type type) -> long {
+    long absent = builder.newTemp(type);
+    builder.append(new EirConstNull(absent, type));
+    builder.append(new EirRetain(absent));
+    return absent;
 }
 
 assertNoViolations(string[] violations) throws {
