@@ -4518,8 +4518,8 @@ void Analyzer::applyNarrowingJoin(const NarrowingFacts& entry,
 // =========================================================
 //
 // Conservative reachability for functions with a non-void return type: every
-// path through the body must end in return, throw, rethrow, or panic(). Loops
-// are not proven infinite, except `while (true)` with no break out of it.
+// path through the body must end in return, throw, rethrow, or panic(). A loop
+// is proven infinite only when its condition always holds and no break binds to it.
 
 static bool statementContainsLoopBreak(const ast::Statement& s);
 
@@ -4559,8 +4559,24 @@ static bool statementContainsLoopBreak(const ast::Statement& s) {
     return false;
 }
 
-// A call ends the path when its target is declared `noreturn` (the builtin `panic` among them).
-// `try noreturnCall()` also ends it: the call either throws or never returns.
+// True when a loop's condition can never be false: a `for` that writes none, or the literal
+// `true` in any number of parentheses.
+static bool loopConditionAlwaysHolds(const std::optional<ast::Expression>& condition) {
+    if (!condition) return true;
+    auto lit = unwrapParens(*condition).asLiteral();
+    return lit && lit->literalKind() == SyntaxKind::KwTrue;
+}
+
+// True when only leaving the function ends the loop: its condition always holds and no `break`
+// binds to it.
+static bool loopNeverEnds(const std::optional<ast::Expression>& condition,
+                          const std::optional<ast::Block>& body) {
+    return loopConditionAlwaysHolds(condition) && (!body || !blockContainsLoopBreak(*body));
+}
+
+// A call ends the path when the target it always runs is declared `noreturn` (the builtin `panic`
+// among them). `try noreturnCall()` also ends it: the call either throws or never returns. A safe
+// call `object?.method()` does not, because it runs nothing when the object is null.
 bool Analyzer::isNoreturnCall(const ast::Expression& expr) const {
     ast::Expression core = unwrapParens(expr);
     if (auto t = core.asTry()) {
@@ -4569,7 +4585,7 @@ bool Analyzer::isNoreturnCall(const ast::Expression& expr) const {
     auto call = core.asCall();
     if (!call) return false;
     auto callee = call->callee();
-    if (!callee) return false;
+    if (!callee || !(callee->asIdent() || callee->asMember())) return false;
     const auto* info = analysis.find(callee->node.greenNode());
     if (!info) return false;
     Symbol* sym = info->resolvedMethodSymbol ? info->resolvedMethodSymbol : info->resolvedSymbol;
@@ -4595,26 +4611,31 @@ bool Analyzer::ifStatementTerminates(const ast::IfStatement& stmt, ExitScope sco
 // The analyzer separately rejects a non-exhaustive switch statement (an enum
 // switch must cover every member or have a default, an int/string switch must
 // have a default, and a sealed type switch must cover every subclass), so a
-// switch terminates when every arm body is a block that terminates.
+// switch terminates when every arm terminates: a block arm that terminates, or
+// an expression arm that is a call that never returns.
 bool Analyzer::switchStatementTerminates(const ast::SwitchStatement& stmt, ExitScope scope) const {
     auto arms = stmt.arms();
     if (arms.empty()) return false;
     for (auto& arm : arms) {
-        auto bn = arm.bodyBlockNode();
-        if (!bn) return false;
-        auto blk = ast::Block::cast(*bn);
-        if (!blk || !blockTerminates(*blk, scope)) return false;
+        if (auto bn = arm.bodyBlockNode()) {
+            auto blk = ast::Block::cast(*bn);
+            if (!blk || !blockTerminates(*blk, scope)) return false;
+        } else {
+            auto expr = arm.bodyExpr();
+            if (!expr || !isNoreturnCall(*expr)) return false;
+        }
     }
     return true;
 }
 
-bool Analyzer::whileStatementTerminates(const ast::WhileStatement& stmt) const {
-    auto cond = stmt.condition();
-    if (!cond) return false;
-    auto lit = unwrapParens(*cond).asLiteral();
-    if (!lit || lit->literalKind() != SyntaxKind::KwTrue) return false;
-    auto body = stmt.body();
-    return !body || !blockContainsLoopBreak(*body);
+// A loop whose initializer never returns ends the path before its condition is first tested.
+bool Analyzer::forInitializerNeverReturns(const ast::ForStatement& stmt) const {
+    auto init = stmt.init();
+    if (!init) return false;
+    auto e = init->asExpressionStmt();
+    if (!e) return false;
+    auto expr = e->expression();
+    return expr && isNoreturnCall(*expr);
 }
 
 bool Analyzer::statementTerminates(const ast::Statement& s, ExitScope scope) const {
@@ -4625,7 +4646,14 @@ bool Analyzer::statementTerminates(const ast::Statement& s, ExitScope scope) con
     if (auto sw = s.asSwitch()) return switchStatementTerminates(*sw, scope);
     // A nested loop keeps function semantics: a break/continue inside it binds to
     // that loop, not to the branch, so only a proven-infinite loop exits here.
-    if (auto w = s.asWhile()) return whileStatementTerminates(*w);
+    // A `while` whose condition did not parse is not a `for (;;)`.
+    if (auto w = s.asWhile()) {
+        const auto& condition = w->condition();
+        return condition && loopNeverEnds(condition, w->body());
+    }
+    if (auto f = s.asFor()) {
+        return forInitializerNeverReturns(*f) || loopNeverEnds(f->condition(), f->body());
+    }
     if (auto e = s.asExpressionStmt()) {
         auto expr = e->expression();
         return expr && isNoreturnCall(*expr);
@@ -4864,14 +4892,10 @@ void Analyzer::analyzeIfStmt(const ast::IfStatement& stmt) {
 }
 
 // A loop's body may run zero times, so a write inside it is not definitely
-// assigned after the loop; only the pre-loop state and the state at each `break`
-// reach the normal exit. A `while (true)` / `for (;;)` with no break never exits
-// normally, so the code after it is unreachable.
-static bool isBoolTrueLiteral(const ast::Expression& e) {
-    if (auto lit = e.asLiteral()) return lit->literalKind() == SyntaxKind::KwTrue;
-    return false;
-}
-
+// assigned after the loop: the normal exit is reached from each `break`, and from
+// the state after the condition when that condition can be false. A loop whose
+// condition always holds and has no break never exits normally, so the code after
+// it is unreachable.
 void Analyzer::analyzeWhileStmt(const ast::WhileStatement& stmt) {
     // The condition is rechecked every iteration and writes inside the body
     // drop narrowing at that point, so condition narrowing is safe in the body.
@@ -4879,14 +4903,14 @@ void Analyzer::analyzeWhileStmt(const ast::WhileStatement& stmt) {
     // body write kills it, so drop every such narrowing up front.
     if (auto b = stmt.body()) preClearLoopBodyWrites(b->node);
     std::vector<NullCheckInfo> narrowings;
-    bool alwaysTrue = false;
+    bool alwaysHolds = false;
     if (auto c = stmt.condition()) {
         Type* ct = analyzeExpr(*c);
         if (!ct->isError() && !ct->isBool()) {
             errorAtNode(c->node, "While condition must be 'bool', got '" + ct->toString() + "'");
         }
         collectNarrowings(*c, /*conditionHolds=*/true, narrowings);
-        alwaysTrue = isBoolTrueLiteral(*c);
+        alwaysHolds = loopConditionAlwaysHolds(c);
     }
     AssignmentFlow postCond = snapshotAssignment();
     breakFlows_.push_back({});
@@ -4895,7 +4919,7 @@ void Analyzer::analyzeWhileStmt(const ast::WhileStatement& stmt) {
     loopDepth--;
     std::vector<AssignmentFlow> exits = std::move(breakFlows_.back());
     breakFlows_.pop_back();
-    if (!alwaysTrue) exits.push_back(postCond);
+    if (!alwaysHolds) exits.push_back(postCond);
     if (exits.empty()) {
         AssignmentFlow dead = postCond;
         dead.terminated = true;
@@ -4914,16 +4938,13 @@ void Analyzer::analyzeForStmt(const ast::ForStatement& stmt) {
     if (auto b = stmt.body()) preClearLoopBodyWrites(b->node);
     if (auto u = stmt.update()) preClearLoopBodyWrites(u->node);
     std::vector<NullCheckInfo> narrowings;
-    bool hasCondition = false;
-    bool alwaysTrue = false;
-    if (auto c = stmt.condition()) {
-        hasCondition = true;
+    auto c = stmt.condition();
+    if (c) {
         Type* ct = analyzeExpr(*c);
         if (!ct->isError() && !ct->isBool()) {
             errorAtNode(c->node, "For condition must be 'bool', got '" + ct->toString() + "'");
         }
         collectNarrowings(*c, /*conditionHolds=*/true, narrowings);
-        alwaysTrue = isBoolTrueLiteral(*c);
     }
     AssignmentFlow postCond = snapshotAssignment();
     // The update runs after each iteration, so it is analyzed after the body
@@ -4942,7 +4963,7 @@ void Analyzer::analyzeForStmt(const ast::ForStatement& stmt) {
     loopDepth--;
     std::vector<AssignmentFlow> exits = std::move(breakFlows_.back());
     breakFlows_.pop_back();
-    if (hasCondition && !alwaysTrue) exits.push_back(postCond);
+    if (!loopConditionAlwaysHolds(c)) exits.push_back(postCond);
     if (exits.empty()) {
         AssignmentFlow dead = postCond;
         dead.terminated = true;
@@ -8299,6 +8320,7 @@ Type* Analyzer::analyzeSwitchArms(const std::optional<ast::Expression>& scrutine
             analyzeExpr(*be);
             armNarrowings.push_back(flattenNarrowings());
             if (requireValue) valueExprs.push_back(*be);
+            else if (isNoreturnCall(*be)) flowTerminated_ = true;
         } else {
             armNarrowings.push_back(flattenNarrowings());
         }

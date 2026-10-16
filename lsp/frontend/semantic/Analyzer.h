@@ -281,7 +281,7 @@ private:
     bool blockTerminates(const ast::Block& block, ExitScope scope) const;
     bool ifStatementTerminates(const ast::IfStatement& stmt, ExitScope scope) const;
     bool switchStatementTerminates(const ast::SwitchStatement& stmt, ExitScope scope) const;
-    bool whileStatementTerminates(const ast::WhileStatement& stmt) const;
+    bool forInitializerNeverReturns(const ast::ForStatement& stmt) const;
     bool isNoreturnCall(const ast::Expression& expr) const;
     void analyzeImplicitConstructorAssignments(const ast::FuncDecl& fn);
     void analyzeCatchClause(const ast::CatchClause& clause, Scope* funcScope);
