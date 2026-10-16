@@ -12,6 +12,8 @@ import @ens.sema.model.typenames;
 import Type from @ens.sema.model.types;
 import EirAccess from eir.model;
 import EirFieldAddress from eir.model;
+import EirStoreSlot from eir.model;
+import EirZeroStruct from eir.model;
 import LoweringContext from lower.context;
 import lower.calls;
 import lower.classes;
@@ -112,11 +114,10 @@ localNameFor(string typeName) -> string {
     return typeName.substring(0, 1).toLowerAscii() + typeName.substring(1);
 }
 
-// '{f: v, ...}': a fresh aggregate. The scratch slot starts zeroed, every written field is stored
-// through the initialize barrier, the omitted fields take their declared defaults, and the loaded
-// aggregate carries onward the +1 its reference fields hold. The slot is deliberately not scope
-// tracked: the loaded value passes that ownership on, and releasing the slot as well would release
-// the same references twice.
+// '{f: v, ...}': a fresh aggregate. The scratch slot starts zero, every written field is stored
+// through the initialize barrier, the omitted fields take their declared defaults, and the
+// aggregate moved out of the slot carries onward the +1 its reference fields hold. The slot is not
+// scope tracked: the move passes that ownership on.
 public lowerLiteral(LoweringContext lowering, StructLiteralExpressionNode node) -> long {
     let type = lowering.typeOf(node);
     if (type == null) {
@@ -130,7 +131,8 @@ public lowerLiteral(LoweringContext lowering, StructLiteralExpressionNode node) 
         lowering.unsupported("creating a {lowering.names().quoted(type)}", node.span());
         return -1;
     }
-    long destination = scratchAddress(lowering, "structlit", type);
+    long scratch = scratchSlot(lowering, "structlit", type);
+    long destination = ownership.slotAddress(lowering, scratch, type);
     let fields = records.fieldsOf(type);
     if (fields == null) {
         return -1;
@@ -160,7 +162,7 @@ public lowerLiteral(LoweringContext lowering, StructLiteralExpressionNode node) 
     if (!defaults.applyOmitted(lowering, destination, type, written, node.span())) {
         return -1;
     }
-    return places.loadFrom(lowering, destination, type);
+    return ownership.moveOutOf(lowering, scratch, type);
 }
 
 // 'StructName(args)': the aggregate takes its field defaults, then the constructor runs over its
@@ -195,7 +197,8 @@ public lowerConstructorCall(LoweringContext lowering, CallExpressionNode call, M
             call.span())) {
         return -1;
     }
-    long destination = scratchAddress(lowering, "structctor", type);
+    long scratch = scratchSlot(lowering, "structctor", type);
+    long destination = ownership.slotAddress(lowering, scratch, type);
     if (!defaults.applyAll(lowering, destination, type, call.span())) {
         return -1;
     }
@@ -203,7 +206,7 @@ public lowerConstructorCall(LoweringContext lowering, CallExpressionNode call, M
     if (lowering.failed()) {
         return -1;
     }
-    return places.loadFrom(lowering, destination, type);
+    return ownership.moveOutOf(lowering, scratch, type);
 }
 
 // 'value.method(args)': the receiver is the address of the storage the receiver expression names,
@@ -312,9 +315,17 @@ lowerDeclaredBehavior(LoweringContext lowering, Type type, Method method, long r
     return calls.emitCall(lowering, info, type, receiver, arguments, -1, null, span);
 }
 
-// A slot holding one anonymous struct value, and its address. It starts zeroed so that a field
-// neither written nor defaulted is zero.
-scratchAddress(LoweringContext lowering, string name, Type type) -> long {
-    long slot = lowering.builder().addSlot(name, type, true, false);
-    return ownership.slotAddress(lowering, slot, type);
+// A slot holding one anonymous struct value while it is built, so a field neither written nor
+// defaulted is zero. A struct holding references is taken out of it, so every evaluation writes it
+// zero first; any other struct is loaded, and its slot starts zeroed once.
+scratchSlot(LoweringContext lowering, string name, Type type) -> long {
+    let builder = lowering.builder();
+    if (!primitives.hasArcContent(type)) {
+        return builder.addSlot(name, type, true, false);
+    }
+    long slot = builder.addSlot(name, type, false, false);
+    long zero = builder.newTemp(type);
+    builder.append(new EirZeroStruct(zero, type));
+    builder.append(new EirStoreSlot(slot, zero));
+    return slot;
 }
