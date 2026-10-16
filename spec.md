@@ -246,6 +246,7 @@ A field's default value is the one place a member is named on its own: a default
 A default reads those fields and assigns none of them, so `int b = (a = 5);` is an error where `a` is a sibling field.
 
 `super.method(...)` calls the base class's implementation, bypassing any override. A constructor may call `super(...)` as its first statement to run the base constructor; if it does not, the base class must be constructible with no arguments. `protected` members (see above) are reachable from subclasses.
+A `super(...)` written anywhere else is an error: after another statement, inside a branch, a `catch` clause, a lambda, or a method, and a second time in the same constructor.
 A class that declares no constructor gets one that takes no arguments and runs the base class's zero-argument constructor, so its base must have one this class can reach.
 
 Class fields may declare default values just like struct fields. Defaults are applied when an instance is created, in declaration order and before the constructor body runs, so constructor assignments overwrite them.

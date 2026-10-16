@@ -4,6 +4,7 @@ import Expression from @ens.frontend.syntax.generated.nodes;
 import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
 import SuperExpressionNode from @ens.frontend.syntax.generated.nodes;
 import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
+import FunctionDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
 import SafeMemberExpressionNode from @ens.frontend.syntax.generated.nodes;
 import GreenNode from @ens.frontend.syntax.green;
@@ -38,6 +39,7 @@ import TypeParamType from model.types;
 import TextFormObligation from phases.obligations;
 import HashObligation from phases.obligations;
 import List from @std.collections.list;
+import support.syntax;
 import phases.bodies.declarations;
 import BodyChecker from phases.bodies;
 import NamespaceName from phases.bodies;
@@ -216,17 +218,13 @@ public safeResultOf(BodyChecker checker, Type value) -> Type {
 
 public analyzeSuperCall(BodyChecker checker, CallExpressionNode node, SuperExpressionNode chained) -> Type {
     checker.analyzeExpression(chained);
-    checker.frame().noteSuperCall();
     Type voidType = checker.store().primitive(PrimitiveKind.Void);
-    if (!checker.frame().inConstructor() && checker.frame().thisType() != null) {
-        checker.reporter().report("'super(...)' can only be called from a constructor.", node.span());
-    }
     Type? base = null;
     let receiver = checker.frame().thisType();
     if (receiver != null) {
         base = hierarchy.baseOf(receiver);
     }
-    if (base == null) {
+    if (receiver == null || base == null) {
         functioncalls.analyzeArgumentsOnly(checker, node.arguments());
         return voidType;
     }
@@ -236,6 +234,10 @@ public analyzeSuperCall(BodyChecker checker, CallExpressionNode node, SuperExpre
     if (baseAuthority != null) {
         baseName = checker.names().plainNameOf(baseAuthority);
         quotedBase = checker.names().quotedName(baseAuthority);
+    }
+    let misplaced = superCallPlacementRefusal(checker, node, receiver, quotedBase);
+    if (misplaced != null) {
+        checker.reporter().report(misplaced, node.span());
     }
     let allConstructors = typemembers.constructorsOf(base);
     let constructors = memberaccess.existingOnly(checker, allConstructors);
@@ -250,7 +252,7 @@ public analyzeSuperCall(BodyChecker checker, CallExpressionNode node, SuperExpre
         if (arguments.argumentsCount() > 0) {
             checker.reporter().report("Base class {quotedBase} declares no constructor, so 'super(...)' "
                 + "takes no arguments. Write 'super()', or remove the call.", node.span());
-        } else if (checker.frame().inConstructor() && receiver != null && allConstructors.length() == 0) {
+        } else if (misplaced == null && allConstructors.length() == 0) {
             declarations.checkImplicitBaseChain(checker, receiver, null, false, node.span());
         }
         functioncalls.analyzeArgumentsOnly(checker, arguments);
@@ -288,6 +290,52 @@ public analyzeSuperCall(BodyChecker checker, CallExpressionNode node, SuperExpre
     functioncalls.checkDirectArguments(checker, "Base constructor", baseName, baseConstructor.signature(),
         arguments, node.span(), baseConstructor);
     return voidType;
+}
+
+// Why this 'super(...)' cannot run where it is written, or null where it is the statement a
+// constructor body starts with.
+superCallPlacementRefusal(BodyChecker checker, CallExpressionNode node, Type receiver, string quotedBase)
+        -> string? {
+    let frame = checker.frame();
+    if (!frame.enclosedByConstructor()) {
+        return "'super(...)' runs the constructor of base class {quotedBase}, so it can only be the "
+            + "first statement of a constructor. Remove this call.";
+    }
+    string owner = checker.names().quoted(receiver);
+    let authority = types.authorityOf(receiver);
+    if (authority != null) {
+        owner = checker.names().quotedName(authority);
+    }
+    CallExpressionNode? chaining = null;
+    let declaration = frame.callableSyntax();
+    if (declaration is FunctionDeclarationNode) {
+        chaining = syntax.chainingSuperCall(declaration.body());
+    }
+    if (frame.innermostLambda() != null) {
+        if (chaining != null) {
+            return "'super(...)' cannot be called inside a lambda, and the constructor of {owner} "
+                + "already calls it in its first statement. Remove this call.";
+        }
+        return "'super(...)' cannot be called inside a lambda, because a lambda can run later or "
+            + "not at all. Call it as the first statement of the constructor of {owner} instead.";
+    }
+    if (chaining == null) {
+        return "'super(...)' must be the first statement of the constructor of {owner}, so that "
+            + "base class {quotedBase} is constructed before anything else in the body runs. Move "
+            + "this call to the start of the constructor's body.";
+    }
+    if (chaining.span().start == node.span().start) {
+        return null;
+    }
+    if (frame.inCatchClause()) {
+        return "'super(...)' cannot be called in a 'catch' clause, because base class {quotedBase} "
+            + "is constructed by the 'super(...)' the constructor of {owner} starts with. Remove "
+            + "this call. To construct {quotedBase} from a fallback value, move the call that can "
+            + "throw into a function that catches the failure and returns that value, and call it "
+            + "inside the first 'super(...)'.";
+    }
+    return "The constructor of {owner} already calls 'super(...)' in its first statement, and base "
+        + "class {quotedBase} is constructed only once. Remove this call.";
 }
 
 // The built-in members of strings, arrays, and primitives, intercepted before general
