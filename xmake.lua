@@ -129,8 +129,8 @@ target("ens-lld")
     end)
 
 
--- The language server. `xmake test` never builds it, so a change anywhere under lsp/ is gated by
--- building this target by hand.
+-- The language server. The ens_lsp job of `xmake test` skips it while a running editor holds the
+-- binary, so a change anywhere under lsp/ is gated by building this target by hand.
 target("ens-lsp")
     set_kind("binary")
     set_languages("cxx20")
