@@ -1,7 +1,6 @@
 // Inlining: a call to a small function that is not recursive is replaced by a copy of its body,
 // directly or through a dispatch whose receiver is proven, and the copy keeps every frame a trace
-// prints. A call that would recurse, a callee too large to copy, and a result with no way out of
-// the copy stay calls.
+// prints. A call that would recurse and a callee too large to copy stay calls.
 import @std.testing;
 import TestFailure from @std.testing;
 import List from @std.collections.list;
@@ -260,9 +259,9 @@ test "a result returned from more than one place reaches the caller through a sl
         "the result is taken out of the slot the returns store into: {text}");
 }
 
-// A struct holding a reference has no slot it can pass through without changing who owns what it
-// holds, so a callee returning one from more than one place stays a call.
-test "a struct holding a reference returned from more than one place stays a call" {
+// Each return owns what the struct or optional holds, so the slot the returns store into is taken
+// from, exactly as for a reference, and every verifier still accepts the caller.
+test "a struct or optional returned from more than one place reaches the caller through a slot" {
     let program = try support.lowerWholeProgram(
         "struct Named \{\n"
         + "    protected string name = \"\";\n"
@@ -273,16 +272,52 @@ test "a struct holding a reference returned from more than one place stays a cal
         + "    \}\n"
         + "    return b;\n"
         + "\}\n"
+        + "pick(bool first, string a) -> string?? \{\n"
+        + "    if (first) \{\n"
+        + "        return a;\n"
+        + "    \}\n"
+        + "    return null;\n"
+        + "\}\n"
         + "caller(bool first) -> long \{\n"
         + "    Named a = \{name: \"one\"\};\n"
         + "    Named b = \{name: \"three\"\};\n"
-        + "    return choose(first, a, b).name.length;\n"
+        + "    string? picked = pick(first, \"two\") ?? null;\n"
+        + "    return choose(first, a, b).name.length + (picked?.length ?? 0);\n"
         + "\}\n"
         + "main() -> int \{\n"
-        + "    return (caller(true) - 3) as int;\n"
+        + "    return (caller(true) - 6) as int;\n"
         + "\}\n");
-    string text = dump.dumpFunction(try inlinedFunction(program, "main$caller"));
-    try testing.assertTrue(text.indexOf("call @main$choose") >= 0, "the call stays: {text}");
+    let after = try inlinedFunction(program, "main$caller");
+    try support.assertOptimized(after, "caller");
+    string text = dump.dumpFunction(after);
+    try testing.assertTrue(text.indexOf("call @main$choose") < 0
+        && text.indexOf("call @main$pick") < 0, "both calls are gone: {text}");
+    try testing.assertTrue(text.indexOf("take $") >= 0 && text.indexOf("inlined.result") >= 0,
+        "each result is taken out of the slot the returns store into: {text}");
+}
+
+// A borrowed optional returned from one place: the copy's return owns the pair it takes out of
+// the slot it was retained through, so the caller moving the payload out owns it.
+test "an optional holding a reference returned from one place becomes the call's owned result" {
+    let program = try support.lowerWholeProgram(
+        "text() -> string?? \{\n"
+        + "    return \"a\";\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    string? inner = text() ?? null;\n"
+        + "    if (inner == null) \{\n"
+        + "        return 1;\n"
+        + "    \}\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let after = try inlinedFunction(program, "ens.main");
+    try support.assertOptimized(after, "main");
+    string text = dump.dumpFunction(after);
+    try testing.assertTrue(text.indexOf("call @main$text") < 0, "the call is gone: {text}");
+    try testing.assertTrue(text.indexOf("inlined.result") < 0,
+        "the one return defines the call's result itself: {text}");
+    try testing.assertTrue(text.indexOf("take $") >= 0 && text.indexOf("opt.payload move") >= 0,
+        "the payload moves out of the pair the copy took out of storage: {text}");
 }
 
 test "a function called from one place is copied there whatever its size, and from two it is not" {
