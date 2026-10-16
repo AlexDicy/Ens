@@ -1,0 +1,74 @@
+// The storage instructions emitted from hand-built EIR and read back as LLVM IR.
+import @std.testing;
+import @ens.llvm.analysis;
+import Type from @ens.sema.model.types;
+import EirFunction from eir.model;
+import EirFunctionBuilder from eir.model;
+import EirConstString from eir.model;
+import EirStringConcat from eir.model;
+import EirStoreSlot from eir.model;
+import EirTakeSlot from eir.model;
+import EirSlotAddress from eir.model;
+import EirReleasePtr from eir.model;
+import EirReturn from eir.model;
+import ModuleEmitter from emit.context;
+import emit.bodies;
+import emit.signatures;
+import support;
+
+// A function moving a fresh string out of its slot 'text' and returning it, with the release a
+// scope's end emits after the take when `released` is true.
+movingOut(Type stringType, string symbol, bool released) -> EirFunction {
+    let builder = new EirFunctionBuilder(symbol, false, null, [], stringType);
+    long slot = builder.addSlot("text", stringType, false, false);
+    long left = builder.newTemp(stringType);
+    builder.append(new EirConstString(left, stringType, "hel".toBytes()));
+    long right = builder.newTemp(stringType);
+    builder.append(new EirConstString(right, stringType, "lo".toBytes()));
+    long joined = builder.newTemp(stringType);
+    builder.append(new EirStringConcat(joined, stringType, left, right));
+    builder.append(new EirStoreSlot(slot, joined));
+    long taken = builder.newTemp(stringType);
+    builder.append(new EirTakeSlot(taken, stringType, slot));
+    if (released) {
+        long address = builder.newTemp(stringType);
+        builder.append(new EirSlotAddress(address, stringType, slot));
+        builder.append(new EirReleasePtr(address));
+    }
+    builder.terminate(new EirReturn(taken));
+    return builder.finish();
+}
+
+// The IR of one defined function, from its 'define' line to its closing brace.
+definitionOf(string text, string symbol) -> string {
+    long start = text.indexOf("@{symbol}(");
+    if (start < 0) {
+        return "";
+    }
+    long end = text.indexOf("\n\}\n", start);
+    if (end < 0) {
+        return text.substring(start);
+    }
+    return text.substring(start, end);
+}
+
+test "a take writes null back only into a slot that is read or released again" {
+    let program = try support.lowerWholeProgram("main() -> int \{\n    return 0;\n\}\n");
+    let stringType = program.analysis.store().stringType();
+    let emitter = new ModuleEmitter("main", program.plans, support.hostTarget(), null);
+    let functions = [movingOut(stringType, "released", true), movingOut(stringType, "last", false)];
+    for (let function in functions) {
+        signatures.declareFunction(emitter, function);
+    }
+    for (let function in functions) {
+        try testing.assertEqual(bodies.emitFunction(emitter, function), "");
+    }
+    string text = analysis.moduleText(emitter.module);
+    string verdict = analysis.verify(emitter.module);
+    emitter.dispose();
+    try testing.assertEqual(verdict, "");
+    try testing.assertTrue(definitionOf(text, "released").indexOf("store ptr null, ptr %text") >= 0,
+        "the take before the release left the string in its slot: {text}");
+    try testing.assertTrue(definitionOf(text, "last").indexOf("store ptr null") < 0,
+        "the last take wrote null into a slot nothing reads again: {text}");
+}

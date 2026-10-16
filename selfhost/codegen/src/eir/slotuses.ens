@@ -14,8 +14,8 @@ import support.primitives;
 import List from @std.collections.list;
 
 // One slot's picture around one move: the temps that borrow what it holds there, the addresses of
-// it that reach further than a release, and where its own reads leave each block live. Computed
-// fresh from the function it describes and never shared beyond the call that requested it.
+// it, and what reads it. Computed fresh from the function it describes and never shared beyond
+// the call that requested it.
 public final class SlotUses {
     EirFunction function;
     long slot;
@@ -24,11 +24,10 @@ public final class SlotUses {
 
     bool[] borrowing;
     bool[] addresses;
-    bool[] escaping;
-    bool[] liveOut;
+    SlotReads reads;
 
     protected constructor(this.function, this.slot, this.block, this.index, this.borrowing,
-                this.addresses, this.escaping, this.liveOut);
+                this.addresses, this.reads);
 
     // True when what the slot holds is still needed at or after the move: either the slot is read
     // again, or a reference already borrowed out of it is still in use. Releasing the slot's own
@@ -40,17 +39,7 @@ public final class SlotUses {
     // Whether the slot itself is read again from the move on, on some path, before anything writes
     // it again.
     public readAgain() -> bool {
-        let instructions = this.function.blocks().get(this.block).instructions();
-        for (long i = this.index + 1; i < instructions.length(); i++) {
-            let instruction = instructions.get(i);
-            if (readsSlot(instruction, this.slot, this.escaping)) {
-                return true;
-            }
-            if (instruction is EirStoreSlot && instruction.slot == this.slot) {
-                return false;
-            }
-        }
-        return this.liveOut[this.block];
+        return this.reads.after(this.function, this.block, this.index);
     }
 
     // The first temp borrowing what the slot holds that is still used after the move, or -1 when
@@ -169,7 +158,7 @@ public final class SlotUses {
     }
 
     namesSlot(long temp) -> bool {
-        return temp >= 0 && temp < this.addresses.length && this.addresses[temp];
+        return namedBy(this.addresses, temp);
     }
 }
 
@@ -184,11 +173,18 @@ markDefined(long result, long[] position, bool[] defined) {
 // the load a take is about to replace, or the take itself.
 public forMove(EirFunction function, long slot, long block, long index) -> SlotUses {
     bool[] addresses = slotAddresses(function, slot);
-    bool[] escaping = escapingAddresses(function, addresses);
     bool[] reaching = blocksReaching(function, block);
     return new SlotUses(function, slot, block, index,
-        borrowedTemps(function, slot, block, index, reaching), addresses, escaping,
-        liveOutOf(function, slot, escaping));
+        borrowedTemps(function, slot, block, index, reaching), addresses,
+        new SlotReads(slot, addresses, escapingAddresses(function, addresses), false));
+}
+
+// Whether the slot is read or released again after the instruction at `index` in `block`, on some
+// path, before anything writes it again.
+public readOrReleasedAfter(EirFunction function, long slot, long block, long index) -> bool {
+    bool[] addresses = slotAddresses(function, slot);
+    let reads = new SlotReads(slot, addresses, escapingAddresses(function, addresses), true);
+    return reads.after(function, block, index);
 }
 
 // The temps holding the address of the slot itself.
@@ -306,62 +302,101 @@ carriesBorrow(EirFunction function, EirInstruction instruction, bool[] borrowing
     return false;
 }
 
-// Backward liveness of the slot's own reads at block exits, with a release of its storage not
-// counting as a read.
-liveOutOf(EirFunction function, long slot, bool[] escaping) -> bool[] {
-    let blocks = function.blocks();
-    long count = blocks.length();
-    // 0 none, 1 reads first, 2 writes first
-    long[] firstEffect = new long[count + 1];
-    for (long b = 0; b < count; b++) {
-        let instructions = blocks.get(b).instructions();
-        for (long i = 0; i < instructions.length(); i++) {
+// What reads a slot: a load or a take of it, and a use of its address for anything but releasing
+// what it holds. When releases count, a release through its address reads it as well.
+final class SlotReads {
+    long slot;
+    bool[] addresses;
+    bool[] escaping;
+    bool releases;
+
+    protected constructor(this.slot, this.addresses, this.escaping, this.releases);
+
+    // Whether the slot is read again after the instruction at `index` in `block`, on some path,
+    // before anything writes it again.
+    protected after(EirFunction function, long block, long index) -> bool {
+        let instructions = function.blocks().get(block).instructions();
+        for (long i = index + 1; i < instructions.length(); i++) {
             let instruction = instructions.get(i);
-            if (readsSlot(instruction, slot, escaping)) {
-                firstEffect[b] = 1;
-                break;
+            if (this.readBy(instruction)) {
+                return true;
             }
-            if (instruction is EirStoreSlot && instruction.slot == slot) {
-                firstEffect[b] = 2;
-                break;
+            if (this.writtenBy(instruction)) {
+                return false;
             }
         }
+        return this.liveOut(function)[block];
     }
-    bool[] liveOut = new bool[count + 1];
-    bool changed = true;
-    while (changed) {
-        changed = false;
+
+    // Backward liveness of the reads at block exits.
+    liveOut(EirFunction function) -> bool[] {
+        let blocks = function.blocks();
+        long count = blocks.length();
+        // 0 none, 1 reads first, 2 writes first
+        long[] firstEffect = new long[count + 1];
         for (long b = 0; b < count; b++) {
-            bool live = false;
-            for (let successor in walk.successorsOf(blocks.get(b))) {
-                if (successor < 0 || successor >= count) {
-                    continue;
+            for (let instruction in blocks.get(b).instructions()) {
+                if (this.readBy(instruction)) {
+                    firstEffect[b] = 1;
+                    break;
                 }
-                if (firstEffect[successor] == 1 || (firstEffect[successor] == 0 && liveOut[successor])) {
-                    live = true;
+                if (this.writtenBy(instruction)) {
+                    firstEffect[b] = 2;
+                    break;
                 }
-            }
-            if (live && !liveOut[b]) {
-                liveOut[b] = true;
-                changed = true;
             }
         }
+        bool[] liveOut = new bool[count + 1];
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (long b = 0; b < count; b++) {
+                bool live = false;
+                for (let successor in walk.successorsOf(blocks.get(b))) {
+                    if (successor < 0 || successor >= count) {
+                        continue;
+                    }
+                    if (firstEffect[successor] == 1
+                            || (firstEffect[successor] == 0 && liveOut[successor])) {
+                        live = true;
+                    }
+                }
+                if (live && !liveOut[b]) {
+                    liveOut[b] = true;
+                    changed = true;
+                }
+            }
+        }
+        return liveOut;
     }
-    return liveOut;
+
+    readBy(EirInstruction instruction) -> bool {
+        switch (instruction) {
+            is EirLoadSlot load -> {
+                return load.slot == this.slot;
+            },
+            is EirTakeSlot taken -> {
+                return taken.slot == this.slot;
+            },
+            is EirSlotAddress address -> {
+                return address.slot == this.slot && namedBy(this.escaping, address.result);
+            },
+            is EirReleasePtr release -> {
+                return this.releases && namedBy(this.addresses, release.address);
+            },
+            default -> {
+                return false;
+            },
+        }
+    }
+
+    writtenBy(EirInstruction instruction) -> bool {
+        return instruction is EirStoreSlot && instruction.slot == this.slot;
+    }
 }
 
-readsSlot(EirInstruction instruction, long slot, bool[] escaping) -> bool {
-    if (instruction is EirLoadSlot && instruction.slot == slot) {
-        return true;
-    }
-    if (instruction is EirTakeSlot && instruction.slot == slot) {
-        return true;
-    }
-    if (instruction is EirSlotAddress && instruction.slot == slot) {
-        return instruction.result >= 0 && instruction.result < escaping.length
-            && escaping[instruction.result];
-    }
-    return false;
+namedBy(bool[] temps, long temp) -> bool {
+    return temp >= 0 && temp < temps.length && temps[temp];
 }
 
 // The blocks a path leads from to this one, itself included only when it lies on a cycle.

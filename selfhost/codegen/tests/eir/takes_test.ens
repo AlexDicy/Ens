@@ -23,6 +23,7 @@ import EirReturn from eir.model;
 import eir.ownership;
 import eir.storage;
 import eir.takes;
+import eir.slotuses;
 import support;
 
 // A function whose one slot owns the only reference to a fresh string, ready for a take.
@@ -139,6 +140,88 @@ test "reading the slot after the take is reported in a loop that writes the slot
     try assertBalanced(function);
     try assertMentions(takes.verifyTakes(function),
         "slot $0 'text' is read again after the take moved its reference out");
+}
+
+test "a take leaves its slot to clear only when a release of the slot can follow it" {
+    let released = try holdingAString("released", false);
+    long movedOut = takeOut(released);
+    releaseSlot(released);
+    released.builder.terminate(new EirReturn(movedOut));
+    try testing.assertTrue(usedAfterTake(released.builder.finish()),
+        "the release after the take is not counted");
+
+    let last = try holdingAString("last", false);
+    last.builder.terminate(new EirReturn(takeOut(last)));
+    try testing.assertFalse(usedAfterTake(last.builder.finish()),
+        "a take with nothing after it is counted");
+
+    let rewritten = try holdingAString("rewritten", false);
+    let stringType = rewritten.store.stringType();
+    long first = takeOut(rewritten);
+    rewritten.builder.append(new EirStoreSlot(rewritten.slot,
+        joinedString(rewritten.builder, stringType)));
+    releaseSlot(rewritten);
+    rewritten.builder.terminate(new EirReturn(first));
+    try testing.assertFalse(usedAfterTake(rewritten.builder.finish()),
+        "a release after the slot is written again is counted");
+}
+
+test "a take in a loop leaves its slot to clear only when a path out of the loop releases it" {
+    let releasedOnExit = try loopingOverASlot("releasedOnExit");
+    let builder = releasedOnExit.builder;
+    let stringType = releasedOnExit.store.stringType();
+    builder.append(new EirStoreSlot(releasedOnExit.slot, joinedString(builder, stringType)));
+    builder.append(new EirRelease(takeOut(releasedOnExit)));
+    let boolType = releasedOnExit.store.primitive(PrimitiveKind.Bool);
+    long again = builder.newTemp(boolType);
+    builder.append(new EirConstBool(again, boolType, false));
+    long body = builder.current();
+    long exit = builder.newBlock("exit");
+    builder.terminate(new EirBranch(again, body, exit));
+    builder.moveTo(exit);
+    releaseSlot(releasedOnExit);
+    builder.terminate(new EirReturn(measure(releasedOnExit, joinedString(builder, stringType))));
+    try testing.assertTrue(usedAfterTake(builder.finish()),
+        "the release after the loop is not counted");
+
+    let writtenEachPass = try loopingOverASlot("writtenEachPass");
+    let passBuilder = writtenEachPass.builder;
+    passBuilder.append(new EirStoreSlot(writtenEachPass.slot,
+        joinedString(passBuilder, stringType)));
+    long taken = takeOut(writtenEachPass);
+    long length = measure(writtenEachPass, taken);
+    passBuilder.append(new EirRelease(taken));
+    try testing.assertFalse(usedAfterTake(closeLoop(writtenEachPass, length)),
+        "the next pass's write is not counted as writing the slot first");
+}
+
+takeOut(Held held) -> long {
+    let stringType = held.store.stringType();
+    long taken = held.builder.newTemp(stringType);
+    held.builder.append(new EirTakeSlot(taken, stringType, held.slot));
+    return taken;
+}
+
+releaseSlot(Held held) {
+    let stringType = held.store.stringType();
+    long address = held.builder.newTemp(stringType);
+    held.builder.append(new EirSlotAddress(address, stringType, held.slot));
+    held.builder.append(new EirReleasePtr(address));
+}
+
+// Whether the function's first take is followed by a read or a release of its slot.
+usedAfterTake(EirFunction function) -> bool {
+    let blocks = function.blocks();
+    for (long b = 0; b < blocks.length(); b++) {
+        let instructions = blocks.get(b).instructions();
+        for (long i = 0; i < instructions.length(); i++) {
+            let instruction = instructions.get(i);
+            if (instruction is EirTakeSlot) {
+                return slotuses.readOrReleasedAfter(function, instruction.slot, b, i);
+            }
+        }
+    }
+    panic("the function has no take");
 }
 
 // A function returning a length whose slot is written inside a loop body, positioned in that body.
