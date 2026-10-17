@@ -177,7 +177,7 @@ test "a narrowed return retains the payload it returns before the scopes release
         "the parameter's scope should release only after the retain: {dumped}");
 }
 
-test "a safe member read through an optional of a reference-holding struct owns its scratch copy" {
+test "a safe member read through a borrowed optional struct reads the payload where it is" {
     let dumped = try support.loweredDump(
         "struct Cell \{\n"
         + "    protected string label;\n"
@@ -187,10 +187,153 @@ test "a safe member read through an optional of a reference-holding struct owns 
         + "    string? read = maybe?.label;\n"
         + "    return 0;\n"
         + "\}\n", "main");
-    try testing.assertTrue(dumped.indexOf("safepayload") >= 0,
-        "the present payload should be parked in the scratch slot: {dumped}");
-    try testing.assertTrue(dumped.indexOf("retain_ptr") >= 0,
-        "the scratch copy should retain the references the payload holds: {dumped}");
+    try testing.assertEqual(dumped,
+        "func internal @ens.main() -> int \{\n"
+        + "  $0 maybe: Cell? zeroed\n"
+        + "  $1 structlit: Cell\n"
+        + "  $2 read: string? zeroed\n"
+        + "  $3 safe: string?\n"
+        + "  $4 payload: Cell borrowed\n"
+        + "b0.entry:\n"
+        + "  %0 = zero: Cell\n"
+        + "  store $1, %0\n"
+        + "  %1 = slot_addr $1: &Cell  ; structlit\n"
+        + "  %2 = const \"x\": string\n"
+        + "  %3 = field_addr %1, 0: &string  ; structlit.label\n"
+        + "  retain %2\n"
+        + "  store_ptr %3, %2\n"
+        + "  %4 = take $1: Cell\n"
+        + "  %5 = opt.wrap %4: Cell?\n"
+        + "  store $0, %5\n"
+        + "  %6 = load $0: Cell?\n"
+        + "  %7 = opt.present %6: bool\n"
+        + "  br %7, b1.safe.present, b2.safe.absent\n"
+        + "b1.safe.present:\n"
+        + "  %8 = opt.payload borrow %6: Cell\n"
+        + "  store $4, %8\n"
+        + "  %9 = slot_addr $4: &Cell  ; payload\n"
+        + "  %10 = field_addr %9, 0: &string  ; payload.label\n"
+        + "  %11 = load_ptr %10: string\n"
+        + "  %12 = reinterpret %11: string?\n"
+        + "  retain %12\n"
+        + "  store $3, %12\n"
+        + "  jump b3.safe.end\n"
+        + "b2.safe.absent:\n"
+        + "  %13 = const null: string?\n"
+        + "  retain %13\n"
+        + "  store $3, %13\n"
+        + "  jump b3.safe.end\n"
+        + "b3.safe.end:\n"
+        + "  %14 = take $3: string?\n"
+        + "  store $2, %14\n"
+        + "  %15 = const 0: int\n"
+        + "  %16 = slot_addr $2: &string?  ; read\n"
+        + "  release_ptr %16\n"
+        + "  %17 = slot_addr $0: &Cell?  ; maybe\n"
+        + "  %18 = load_ptr %17: Cell?\n"
+        + "  %19 = opt.present %18: bool\n"
+        + "  br %19, b4.opt.arc, b5.opt.arc.end\n"
+        + "b4.opt.arc:\n"
+        + "  %20 = opt.payload_addr %17: &Cell\n"
+        + "  %21 = field_addr %20, 0: &string  ; maybe.payload.label\n"
+        + "  release_ptr %21\n"
+        + "  jump b5.opt.arc.end\n"
+        + "b5.opt.arc.end:\n"
+        + "  ret %15\n"
+        + "\}\n");
+}
+
+test "a safe member read through a reference a call produced releases it where the access ends" {
+    let dumped = try support.loweredDump(
+        "class Probe \{\n"
+        + "    protected string label = \"p\";\n"
+        + "\}\n"
+        + "probe() -> Probe? \{\n"
+        + "    return new Probe();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    string? read = probe()?.label;\n"
+        + "    return 0;\n"
+        + "\}\n", "main");
+    try testing.assertEqual(dumped,
+        "func internal @ens.main() -> int \{\n"
+        + "  $0 read: string? zeroed\n"
+        + "  $1 safe: string?\n"
+        + "b0.entry:\n"
+        + "  %0 = call @main$probe(): Probe?\n"
+        + "  %1 = const null: Probe?\n"
+        + "  %2 = cmp.ne %0, %1: bool\n"
+        + "  br %2, b1.safe.present, b2.safe.absent\n"
+        + "b1.safe.present:\n"
+        + "  %3 = object_field_addr %0, 0: &string  ; %0.label\n"
+        + "  %4 = load_ptr %3: string\n"
+        + "  %5 = reinterpret %4: string?\n"
+        + "  retain %5\n"
+        + "  store $1, %5\n"
+        + "  jump b3.safe.end\n"
+        + "b2.safe.absent:\n"
+        + "  %6 = const null: string?\n"
+        + "  retain %6\n"
+        + "  store $1, %6\n"
+        + "  jump b3.safe.end\n"
+        + "b3.safe.end:\n"
+        + "  %7 = take $1: string?\n"
+        + "  release %0\n"
+        + "  store $0, %7\n"
+        + "  %8 = const 0: int\n"
+        + "  %9 = slot_addr $0: &string?  ; read\n"
+        + "  release_ptr %9\n"
+        + "  ret %8\n"
+        + "\}\n");
+}
+
+test "'??' moves its merged value out of its slot, so the call it is passed to releases it" {
+    let dumped = try support.loweredDump(
+        "class Probe \{\}\n"
+        + "show(Probe probe) \{\}\n"
+        + "main() -> int \{\n"
+        + "    Probe? maybe = null;\n"
+        + "    Probe other = new Probe();\n"
+        + "    show(maybe ?? other);\n"
+        + "    return 0;\n"
+        + "\}\n", "main");
+    try testing.assertEqual(dumped,
+        "func internal @ens.main() -> int \{\n"
+        + "  $0 maybe: Probe? zeroed\n"
+        + "  $1 other: Probe zeroed\n"
+        + "  $2 coalesce: Probe\n"
+        + "b0.entry:\n"
+        + "  %0 = const null: null\n"
+        + "  %1 = reinterpret %0: Probe?\n"
+        + "  retain %1\n"
+        + "  store $0, %1\n"
+        + "  %2 = class.new @_dtor$main$Probe: Probe\n"
+        + "  store $1, %2\n"
+        + "  %3 = load $0: Probe?\n"
+        + "  %4 = const null: Probe?\n"
+        + "  %5 = cmp.ne %3, %4: bool\n"
+        + "  br %5, b1.coalesce.present, b2.coalesce.absent\n"
+        + "b1.coalesce.present:\n"
+        + "  %6 = reinterpret %3: Probe\n"
+        + "  retain %6\n"
+        + "  store $2, %6\n"
+        + "  jump b3.coalesce.end\n"
+        + "b2.coalesce.absent:\n"
+        + "  %7 = load $1: Probe\n"
+        + "  retain %7\n"
+        + "  store $2, %7\n"
+        + "  jump b3.coalesce.end\n"
+        + "b3.coalesce.end:\n"
+        + "  %8 = take $2: Probe\n"
+        + "  call @main$show(%8)\n"
+        + "  release %8\n"
+        + "  %9 = const 0: int\n"
+        + "  %10 = slot_addr $1: &Probe  ; other\n"
+        + "  release_ptr %10\n"
+        + "  %11 = slot_addr $0: &Probe?  ; maybe\n"
+        + "  release_ptr %11\n"
+        + "  ret %9\n"
+        + "\}\n");
 }
 
 test "a generic lookup returning V? wraps its found value per instance" {
@@ -399,6 +542,8 @@ test "'==' over produced optional structs releases both operands once it has the
         + "\}\n"
         + "main() \{\}\n", "same");
     try testing.assertEqual(countOccurrences(dumped, "released: Cell?"), 2L);
+    try testing.assertEqual(countOccurrences(dumped, "payload: Cell borrowed"), 2L);
+    try testing.assertEqual(countOccurrences(dumped, "retain"), 0L);
     let againstNull = try support.loweredDump(producedCells()
         + "absent() -> bool \{\n"
         + "    return made() == null;\n"
@@ -407,16 +552,40 @@ test "'==' over produced optional structs releases both operands once it has the
     try testing.assertEqual(countOccurrences(againstNull, "released: Cell?"), 1L);
 }
 
-test "'?.' on a produced optional struct moves its payload into the scratch it reads" {
+test "'?.' on a produced optional struct moves its payload into a copy released after the call" {
     let dumped = try support.loweredDump(producedCells()
         + "named() -> string? \{\n"
         + "    return made()?.name();\n"
         + "\}\n"
         + "main() \{\}\n", "named");
-    try testing.assertTrue(dumped.indexOf("opt.payload move") >= 0,
-        "the scratch should take the payload over from the produced pair: {dumped}");
-    try testing.assertTrue(dumped.indexOf("opt.payload borrow") < 0,
-        "nothing should copy the payload of a pair no one else holds: {dumped}");
+    try testing.assertEqual(dumped,
+        "func internal @main$named() -> string? \{\n"
+        + "  $0 safecall: string?\n"
+        + "  $1 safepayload: Cell\n"
+        + "b0.entry:\n"
+        + "  %0 = call @main$made(): Cell?\n"
+        + "  %1 = opt.present %0: bool\n"
+        + "  br %1, b1.safecall.present, b2.safecall.absent\n"
+        + "b1.safecall.present:\n"
+        + "  %2 = opt.payload move %0: Cell\n"
+        + "  store $1, %2\n"
+        + "  %3 = slot_addr $1: &Cell  ; safepayload\n"
+        + "  %4 = call @main$Cell$name(this %3): string\n"
+        + "  %5 = reinterpret %4: string?\n"
+        + "  store $0, %5\n"
+        + "  %6 = slot_addr $1: &Cell  ; safepayload\n"
+        + "  %7 = field_addr %6, 0: &Probe  ; safepayload.probe\n"
+        + "  release_ptr %7\n"
+        + "  jump b3.safecall.end\n"
+        + "b2.safecall.absent:\n"
+        + "  %8 = const null: string?\n"
+        + "  retain %8\n"
+        + "  store $0, %8\n"
+        + "  jump b3.safecall.end\n"
+        + "b3.safecall.end:\n"
+        + "  %9 = take $0: string?\n"
+        + "  ret %9\n"
+        + "\}\n");
 }
 
 // '++' on a location declared optional steps the value under the optional level and wraps the

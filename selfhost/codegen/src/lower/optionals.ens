@@ -1,7 +1,9 @@
 // The optional operators: '??' picks the left value when it is present, and '?.' and '?[' reach
-// through a nullable receiver. Every form merges through one result slot the enclosing scope owns,
-// so the value read back is borrowed and each path settles its own references.
+// through a nullable receiver. Every form merges through one result slot, and the merge moves the
+// value out of it, so the expression produces its value owned and each path settles its own
+// references. A receiver or a payload copy the access owns is released where the access ends.
 import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
+import Expression from @ens.frontend.syntax.generated.nodes;
 import NullCoalesceExpressionNode from @ens.frontend.syntax.generated.nodes;
 import SafeMemberExpressionNode from @ens.frontend.syntax.generated.nodes;
 import SafeSubscriptExpressionNode from @ens.frontend.syntax.generated.nodes;
@@ -23,10 +25,10 @@ import EirCast from eir.model;
 import EirCastOp from eir.model;
 import EirFieldAddress from eir.model;
 import EirJump from eir.model;
-import EirLoadSlot from eir.model;
 import EirOptionalPayload from eir.model;
 import EirPayloadRead from eir.model;
 import EirOptionalPresence from eir.model;
+import EirStoreSlot from eir.model;
 import EirStringLength from eir.model;
 import LoweringContext from lower.context;
 import lower.arrays;
@@ -61,7 +63,8 @@ public presenceOf(LoweringContext lowering, long value, Type type) -> long {
 
 // 'left ?? right': the left value when present, the right otherwise, both converted to the
 // merged result type. The left owns its reference on both paths exactly once: the present path
-// stores it into the result slot and the absent path releases it, where it is null anyway.
+// stores it into the result slot and the absent path releases it, where it is null anyway. The
+// merged value is moved out of the slot, so the caller owns it.
 public lowerCoalesce(LoweringContext lowering, NullCoalesceExpressionNode node) -> long {
     let resultType = lowering.typeOf(node);
     let leftType = lowering.typeOf(node.left());
@@ -128,9 +131,7 @@ public lowerCoalesce(LoweringContext lowering, NullCoalesceExpressionNode node) 
     builder.terminate(new EirJump(mergeBlock));
 
     builder.moveTo(mergeBlock);
-    long merged = builder.newTemp(resultType);
-    builder.append(new EirLoadSlot(merged, resultType, slot));
-    return merged;
+    return ownership.moveOutOf(lowering, slot, resultType);
 }
 
 // 'value?.member' as a read: null when the receiver is absent, the member's value otherwise,
@@ -148,7 +149,8 @@ public lowerSafeMember(LoweringContext lowering, SafeMemberExpressionNode node) 
         lowering.unsupported("'?.' on {lowering.names().quoted(receiverType)}", node.span());
         return -1;
     }
-    long receiver = classes.borrowedReference(lowering, node.object(), receiverType);
+    let held = new List<long>();
+    long receiver = reachedReference(lowering, node.object(), receiverType, held);
     if (receiver < 0) {
         return -1;
     }
@@ -157,12 +159,15 @@ public lowerSafeMember(LoweringContext lowering, SafeMemberExpressionNode node) 
     if (value < 0) {
         return -1;
     }
-    return finishGuard(lowering, guard, value, memberIsOwned(lowering, node, receiverType),
+    long merged = finishGuard(lowering, guard, value, memberIsOwned(lowering, node, receiverType),
         node.span());
+    classes.releaseHeld(lowering, held);
+    return merged;
 }
 
-// '?.' through an optional struct: the tag guards, and a present payload is parked in a scratch
-// slot so the field reads out of real storage.
+// '?.' through an optional struct: the tag guards, and the field is read out of the present
+// payload: in place for a borrowed pair, and out of a copy released once the field is read for a
+// pair the receiver produced.
 lowerTaggedSafeMember(LoweringContext lowering, SafeMemberExpressionNode node,
                       Type receiverType, Type resultType) -> long {
     let payloadType = primitives.taggedPayloadOf(receiverType);
@@ -187,16 +192,29 @@ lowerTaggedSafeMember(LoweringContext lowering, SafeMemberExpressionNode node,
     }
     let builder = lowering.builder();
     let guard = beginGuard(lowering, receiver, receiverType, resultType, "safe");
-    long base = taggedScratchAddress(lowering, receiver,
-        places.producesOwnedValue(lowering, node.object()), payloadType);
-    if (base < 0) {
-        return -1;
+    bool owned = places.producesOwnedValue(lowering, node.object());
+    long copy = -1;
+    long base = -1;
+    if (owned) {
+        copy = payloadCopy(lowering, receiver, true, payloadType);
+        if (copy < 0) {
+            return -1;
+        }
+        base = ownership.slotAddress(lowering, copy, payloadType);
+    } else {
+        base = payloadAddress(lowering, receiver, payloadType);
     }
     let field = fields.get(index);
     long address = builder.newTemp(field.type());
     builder.append(new EirFieldAddress(address, field.type(), base, index));
     long value = places.loadFrom(lowering, address, field.type());
-    return finishGuard(lowering, guard, value, false, node.span());
+    if (!storePresent(lowering, guard, value, false, node.span())) {
+        return -1;
+    }
+    if (owned) {
+        releasePayloadCopy(lowering, copy, payloadType);
+    }
+    return closeGuard(lowering, guard, node.span());
 }
 
 // 'value?[index]': the element when the receiver array is present, null otherwise.
@@ -211,7 +229,8 @@ public lowerSafeSubscript(LoweringContext lowering, SafeSubscriptExpressionNode 
         lowering.unsupported("'?[' on {lowering.names().quoted(receiverType)}", node.span());
         return -1;
     }
-    long receiver = classes.borrowedReference(lowering, node.object(), receiverType);
+    let held = new List<long>();
+    long receiver = reachedReference(lowering, node.object(), receiverType, held);
     if (receiver < 0) {
         return -1;
     }
@@ -227,7 +246,9 @@ public lowerSafeSubscript(LoweringContext lowering, SafeSubscriptExpressionNode 
         return -1;
     }
     long element = places.loadFrom(lowering, address, arrayType.element());
-    return finishGuard(lowering, guard, element, false, node.span());
+    long merged = finishGuard(lowering, guard, element, false, node.span());
+    classes.releaseHeld(lowering, held);
+    return merged;
 }
 
 // 'value?.method(args)': the call runs only when the receiver is present, and its result - or
@@ -277,7 +298,12 @@ public lowerSafeCall(LoweringContext lowering, CallExpressionNode call,
         return -1;
     }
     let held = new List<long>();
-    long receiver = classes.callOperand(lowering, callee.object(), receiverType, held);
+    long receiver = -1;
+    if (places.producesOwnedValue(lowering, callee.object())) {
+        receiver = reachedReference(lowering, callee.object(), receiverType, held);
+    } else {
+        receiver = classes.callOperand(lowering, callee.object(), receiverType, held);
+    }
     if (receiver < 0) {
         return -1;
     }
@@ -317,8 +343,8 @@ public lowerSafeCall(LoweringContext lowering, CallExpressionNode call,
     return merged;
 }
 
-// '?.method(args)' through an optional struct: the tag guards, and the call runs over a scratch
-// copy of the present payload.
+// '?.method(args)' through an optional struct: the tag guards, and the call runs over a copy of
+// the present payload, released once the call returns.
 lowerTaggedSafeCall(LoweringContext lowering, CallExpressionNode call,
                     SafeMemberExpressionNode callee, Method method, Type receiverType) -> long {
     let payloadType = primitives.taggedPayloadOf(receiverType);
@@ -359,16 +385,18 @@ lowerTaggedSafeCall(LoweringContext lowering, CallExpressionNode call,
         long mergeBlock = builder.newBlock("safecall.end");
         builder.terminate(new EirBranch(present, presentBlock, mergeBlock));
         builder.moveTo(presentBlock);
-        long voidBase = taggedScratchAddress(lowering, receiver, owned, payloadType);
-        if (voidBase < 0) {
+        long voidCopy = payloadCopy(lowering, receiver, owned, payloadType);
+        if (voidCopy < 0) {
             return -1;
         }
-        let ignored = calls.lowerDispatchedCall(lowering, info, call, structType, voidBase,
-            -1, null);
+        let ignored = calls.lowerDispatchedCall(lowering, info, call, structType,
+            ownership.slotAddress(lowering, voidCopy, payloadType), -1, null);
         if (lowering.failed()) {
             return -1;
         }
+        lowering.unprotectStorage(voidCopy);
         if (!builder.terminated()) {
+            ownership.releaseSlotContents(lowering, voidCopy, payloadType);
             builder.terminate(new EirJump(mergeBlock));
         }
         builder.moveTo(mergeBlock);
@@ -379,38 +407,70 @@ lowerTaggedSafeCall(LoweringContext lowering, CallExpressionNode call,
         return -1;
     }
     let guard = beginGuard(lowering, receiver, receiverType, resultType, "safecall");
-    long base = taggedScratchAddress(lowering, receiver, owned, payloadType);
-    if (base < 0) {
+    long copy = payloadCopy(lowering, receiver, owned, payloadType);
+    if (copy < 0) {
         return -1;
     }
-    long result = calls.lowerDispatchedCall(lowering, info, call, structType, base, -1, null);
+    long result = calls.lowerDispatchedCall(lowering, info, call, structType,
+        ownership.slotAddress(lowering, copy, payloadType), -1, null);
     if (result < 0) {
         return -1;
     }
-    return finishGuard(lowering, guard, result, primitives.hasArcContent(returned),
-        call.span());
+    if (!storePresent(lowering, guard, result, primitives.hasArcContent(returned), call.span())) {
+        return -1;
+    }
+    releasePayloadCopy(lowering, copy, payloadType);
+    return closeGuard(lowering, guard, call.span());
 }
 
-// The present payload parked in a scratch slot, so the access runs over addressable storage of
-// its own. An owned pair's payload moves into the scratch, and a borrowed pair's is copied, which
-// retains the references it holds; either way the scratch's scope releases them. On the absent
-// path the scratch stays zeroed, which releases as nothing.
-public taggedScratchAddress(LoweringContext lowering, long receiver, bool owned, Type payloadType)
-        -> long {
+// The address of a present pair's payload, in a slot that borrows it, so a read runs over
+// addressable storage without taking a reference of its own. Every such read ends while the pair
+// is still alive, because a pair read out of storage that the read's code may replace is one its
+// expression owns, and whoever owns the pair releases what it holds.
+public payloadAddress(LoweringContext lowering, long pair, Type payloadType) -> long {
+    let builder = lowering.builder();
+    long payload = builder.newTemp(payloadType);
+    builder.append(new EirOptionalPayload(payload, payloadType, pair, EirPayloadRead.Borrow));
+    long slot = builder.addSlot("payload", payloadType, false, true);
+    builder.append(new EirStoreSlot(slot, payload));
+    return ownership.slotAddress(lowering, slot, payloadType);
+}
+
+// A copy of a present pair's payload that owns what it holds, so a method called over it may
+// change it: an owned pair's payload moves into it, and a borrowed pair's is retained. The caller
+// releases it with releasePayloadCopy where the access ends, and an unwind before then releases it
+// on the way out. Returns the slot, or -1 when lowering failed.
+payloadCopy(LoweringContext lowering, long pair, bool owned, Type payloadType) -> long {
     let builder = lowering.builder();
     let read = EirPayloadRead.Borrow;
     if (owned) {
         read = EirPayloadRead.Move;
     }
     long payload = builder.newTemp(payloadType);
-    builder.append(new EirOptionalPayload(payload, payloadType, receiver, read));
-    long scratch = builder.addSlot("safepayload", payloadType, true, false);
-    if (!stores.initializeSlot(lowering, scratch, payloadType,
+    builder.append(new EirOptionalPayload(payload, payloadType, pair, read));
+    long slot = builder.addSlot("safepayload", payloadType, false, false);
+    if (!stores.initializeSlot(lowering, slot, payloadType,
             stores.operandFor(lowering, payload, owned, payloadType))) {
         return -1;
     }
-    ownership.trackSlot(lowering, scratch, payloadType);
-    return ownership.slotAddress(lowering, scratch, payloadType);
+    lowering.protectStorage(slot);
+    return slot;
+}
+
+releasePayloadCopy(LoweringContext lowering, long slot, Type payloadType) {
+    lowering.unprotectStorage(slot);
+    ownership.releaseSlotContents(lowering, slot, payloadType);
+}
+
+// The reference a '?.' or '?[' reaches through. One the receiver produced is recorded in
+// `held`, so it is released once the access is done rather than when the scope ends.
+reachedReference(LoweringContext lowering, Expression node, Type type, List<long> held) -> long {
+    long value = expressions.lowerConverted(lowering, node, type);
+    if (value >= 0 && places.producesOwnedValue(lowering, node)) {
+        lowering.protectValue(value);
+        held.push(value);
+    }
+    return value;
 }
 
 // One guarded access: the result slot, the block layout, and the presence branch, positioned at
@@ -437,21 +497,36 @@ beginGuard(LoweringContext lowering, long receiver, Type receiverType, Type resu
     return new SafeGuard(slot, absentBlock, mergeBlock, resultType);
 }
 
-// Stores the present path's value, fills the absent path with the absent result, and loads the
-// merged value, borrowed from the slot its scope owns.
+// Stores the present path's value, fills the absent path with the absent result, and moves the
+// merged value out of the result slot, so the access produces it owned.
 finishGuard(LoweringContext lowering, SafeGuard guard, long value, bool owned, Span span)
         -> long {
-    let builder = lowering.builder();
+    if (!storePresent(lowering, guard, value, owned, span)) {
+        return -1;
+    }
+    return closeGuard(lowering, guard, span);
+}
+
+// Writes the present path's value into the result slot.
+storePresent(LoweringContext lowering, SafeGuard guard, long value, bool owned, Span span)
+        -> bool {
     long converted = conversions.convert(lowering, value, guard.resultType, span);
     if (converted < 0) {
-        return -1;
+        return false;
     }
     if (!stores.initializeSlot(lowering, guard.resultSlot, guard.resultType,
             stores.operandFor(lowering, converted, owned, guard.resultType))) {
         lowering.internalError("the guarded value borrows a value with no storage to retain",
             span);
-        return -1;
+        return false;
     }
+    return true;
+}
+
+// Ends the present path, fills the absent path with the absent result, and moves the merged value
+// out of the result slot.
+closeGuard(LoweringContext lowering, SafeGuard guard, Span span) -> long {
+    let builder = lowering.builder();
     builder.terminate(new EirJump(guard.mergeBlock));
 
     builder.moveTo(guard.absentBlock);
@@ -465,9 +540,7 @@ finishGuard(LoweringContext lowering, SafeGuard guard, long value, bool owned, S
     builder.terminate(new EirJump(guard.mergeBlock));
 
     builder.moveTo(guard.mergeBlock);
-    long merged = builder.newTemp(guard.resultType);
-    builder.append(new EirLoadSlot(merged, guard.resultType, guard.resultSlot));
-    return merged;
+    return ownership.moveOutOf(lowering, guard.resultSlot, guard.resultType);
 }
 
 // The absent result: the zeroed pair for a tagged optional, null for a reference.
@@ -483,11 +556,10 @@ absentValue(LoweringContext lowering, Type resultType) -> long {
     return absent;
 }
 
+// The slot the paths of a guarded access merge through. Every path writes it and the merge moves
+// the value out, so it is empty again before any code that could leave the scope runs.
 resultSlot(LoweringContext lowering, Type resultType, string name) -> long {
-    long slot = lowering.builder().addSlot(name, resultType,
-        primitives.hasArcContent(resultType), false);
-    ownership.trackSlot(lowering, slot, resultType);
-    return slot;
+    return lowering.builder().addSlot(name, resultType, false, false);
 }
 
 // The member's value on the present path: a field's contents, a weak field's upgraded
