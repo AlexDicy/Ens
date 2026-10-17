@@ -3,6 +3,7 @@
 import Span from @ens.frontend.support.source;
 import SyntaxNode from @ens.frontend.syntax.node;
 import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
+import Expression from @ens.frontend.syntax.generated.nodes;
 import Reporter from support.diagnostics;
 import LocalBinding from model.scopes;
 import model.convert;
@@ -19,6 +20,15 @@ import CatchThisUse from result;
 import EscapeGap from result;
 import CatchFinish from result;
 import phases.bodies.unassigneduses;
+import BaseContext from phases.bodies.unassigneduses;
+import LateSuper from phases.bodies.unassigneduses;
+import LateWrite from phases.bodies.unassigneduses;
+import LateCall from phases.bodies.unassigneduses;
+import FeedingWrite from phases.bodies.unassigneduses;
+import BaseArgument from phases.bodies.unassigneduses;
+import BaseRun from phases.bodies.unassigneduses;
+import Reordering from phases.bodies.reordering;
+import model.hierarchy;
 import List from @std.collections.list;
 
 // An assignment to one field of 'this', kept with the place that wrote it, so a second
@@ -35,24 +45,32 @@ public final class FieldWrite {
 }
 
 // A place the constructor body can throw from, a call or a 'throw' statement, with the fields
-// definitely assigned there.
+// definitely assigned there and whether the base class is built there on every path.
 final class EscapePoint {
     SyntaxNode escape;
     List<Field> assigned;
+    bool baseBuilt;
 
-    constructor(this.escape, this.assigned);
+    constructor(this.escape, this.assigned, this.baseBuilt);
 }
 
 // A snapshot of definite-assignment state at one program point: the locals and this-fields
-// assigned so far, the this-field assignments that may have run on some path reaching it, and
+// assigned so far, the this-field assignments that may have run on some path reaching it, whether
+// the base class is built on every path, the 'super(...)' that may have built it on one and every
+// such call, the held refusals that no 'super(...)' has followed on a path reaching it, and
 // whether the path has already left through a return, throw, break, continue, or panic.
 public final class AssignmentFlow {
     protected List<LocalBinding> assigned;
     protected List<Field> assignedFields;
     protected List<FieldWrite> maybeAssignedWrites;
+    protected bool baseBuilt;
+    protected Span? baseCall;
+    protected List<LateCall> superCalls;
+    protected List<HeldRefusal> pendingRefusals;
     protected bool isTerminated;
 
-    protected constructor(this.assigned, this.assignedFields, this.maybeAssignedWrites, this.isTerminated);
+    protected constructor(this.assigned, this.assignedFields, this.maybeAssignedWrites,
+        this.baseBuilt, this.baseCall, this.superCalls, this.pendingRefusals, this.isTerminated);
 
     public terminated() -> bool {
         return this.isTerminated;
@@ -72,41 +90,69 @@ public final class AssignmentState {
     bool isUnconditional;
     LocalBinding? targetBinding;
 
-    // The class whose constructor body is being analyzed, or null outside a constructor.
-    // assignedThisFields is the current flow's set of fields definitely assigned, which holds every
-    // inherited field once the base class is constructed, and ctorSeededThisWrites is the
-    // assignments made before the body runs.
-    // maybeAssignedThisWrites is the assignments that may have run on some path reaching here,
-    // which is what holds a 'const' field to one write and names the earlier place a second
-    // assignment is reported against. ctorEscapedMaybeWrites accumulates that set wherever an
-    // exception can leave the body, so a catch clause has what may already be written.
-    // refusedThisFields is the own fields with a write or a read already refused in the body,
-    // which the end of a path does not report as unassigned. endReached and
-    // finishingReturnSpans are how the paths checked since the body or the current catch clause
-    // began finish the constructor normally: by reaching its end, and through each of those
-    // returns, and catchSuperCallSpans is the 'super(...)' calls in the current catch clause.
-    // escapePoints is each place the body can throw from, with the fields assigned there.
-    // onCatchPath is whether a catch clause is being checked. There a field is missing only where
-    // the body threw before assigning it, which the exceptions phase judges against what the clause
-    // catches: catchThisUses is the uses of 'this' that need a field the body may not have
-    // assigned, and catchFinishes the places a path finishes the constructor without one.
-    // reportedFields is the fields whose missing value is already reported on the current path, so
-    // a field is reported once. triedCalls is the calls the innermost 'try' being checked covers.
+    // The class whose constructor body is being analyzed, or null outside a constructor, with the
+    // fields definitely assigned on the current flow, every inherited one once the base class is
+    // built, and the assignments made before the body runs.
     Type? fieldOwner;
     List<Field> assignedThisFields;
     List<FieldWrite> ctorSeededThisWrites;
+
+    // The assignments that may have run on a path reaching here, which hold a 'const' field to one
+    // write, and that set wherever an exception can leave the body, for the catch clauses.
     List<FieldWrite> maybeAssignedThisWrites;
     List<FieldWrite> ctorEscapedMaybeWrites;
+
+    // The own fields with a use already refused, which the end of a path does not report again,
+    // and the fields reported missing on the current path.
     List<Field> refusedThisFields;
+    List<Field> reportedFields;
+
+    // How the paths checked since the body or the current catch clause began finish the
+    // constructor: by reaching its end, through these returns, and the 'super(...)' calls in it.
     bool endReached;
     List<Span> finishingReturnSpans;
     List<Span> catchSuperCallSpans;
+
+    // Each place the body can throw from with the fields assigned there, and the calls the
+    // innermost 'try' being checked covers.
     List<EscapePoint> escapePoints;
+    List<CallExpressionNode> triedCalls;
+
+    // Whether a catch clause is being checked, with what it does that the exceptions phase judges
+    // against what it catches: its uses of 'this' and its finishes without a field.
     bool onCatchPath;
     List<CatchThisUse> catchThisUses;
-    List<Field> reportedFields;
-    List<CallExpressionNode> triedCalls;
     List<CatchFinish> catchFinishes;
+
+    // Whether the base class is built on every path reaching here, and the 'super(...)' that may
+    // have built it on one. 'buildsBaseAtExit' says the body writes no 'super(...)'.
+    bool baseBuilt;
+    Span? baseCall;
+    bool buildsBaseAtExit;
+
+    // Whether the arguments of 'super(...)' are being checked, whether a use of 'this' before the
+    // base class is built is refused already, and whether a 'super(...)' is refused for its place.
+    bool inSuperArguments;
+    bool baseUseReported;
+    bool superCallRefused;
+
+    // Every 'super(...)' that may have run on a path reaching here, and the ones before which own
+    // fields had no value, with the assignments after them.
+    List<LateCall> superCalls;
+    LateSuper lateSuper;
+
+    // The refusals reported once the body is checked, because their fixes name the 'super(...)'
+    // calls after them, and the ones no 'super(...)' has followed yet on the path being checked.
+    List<HeldRefusal> heldRefusals;
+    List<HeldRefusal> pendingRefusals;
+
+    // The statements refused for reading a base field, a group for each field, and the base fields
+    // a 'this.field' parameter of the constructor assigns once the base class is built.
+    List<FeedingGroup> feedingGroups;
+    List<string> boundBaseFields;
+
+    // What judges where a fix can move the code of the constructor being checked.
+    Reordering? reorder;
 
     public constructor(Reporter reporter, TypeNames names) {
         this.reporter = reporter;
@@ -132,6 +178,19 @@ public final class AssignmentState {
         this.reportedFields = new List<Field>();
         this.triedCalls = new List<CallExpressionNode>();
         this.catchFinishes = new List<CatchFinish>();
+        this.baseBuilt = true;
+        this.baseCall = null;
+        this.buildsBaseAtExit = false;
+        this.inSuperArguments = false;
+        this.baseUseReported = false;
+        this.superCallRefused = false;
+        this.superCalls = new List<LateCall>();
+        this.lateSuper = new LateSuper();
+        this.heldRefusals = new List<HeldRefusal>();
+        this.pendingRefusals = new List<HeldRefusal>();
+        this.feedingGroups = new List<FeedingGroup>();
+        this.boundBaseFields = new List<string>();
+        this.reorder = null;
     }
 
     public reset() {
@@ -156,6 +215,19 @@ public final class AssignmentState {
         this.reportedFields = new List<Field>();
         this.triedCalls = new List<CallExpressionNode>();
         this.catchFinishes = new List<CatchFinish>();
+        this.baseBuilt = true;
+        this.baseCall = null;
+        this.buildsBaseAtExit = false;
+        this.inSuperArguments = false;
+        this.baseUseReported = false;
+        this.superCallRefused = false;
+        this.superCalls = new List<LateCall>();
+        this.lateSuper = new LateSuper();
+        this.heldRefusals = new List<HeldRefusal>();
+        this.pendingRefusals = new List<HeldRefusal>();
+        this.feedingGroups = new List<FeedingGroup>();
+        this.boundBaseFields = new List<string>();
+        this.reorder = null;
     }
 
     // The state inside a lambda's body: the enclosing locals' assignments carry in, and it is
@@ -174,6 +246,12 @@ public final class AssignmentState {
 
     public constructorFieldOwner() -> Type? {
         return this.fieldOwner;
+    }
+
+    // What judges where a fix can move the code of the constructor being checked, or null outside
+    // one.
+    public reordering() -> Reordering? {
+        return this.reorder;
     }
 
     public unconditionalPosition() -> bool {
@@ -211,21 +289,174 @@ public final class AssignmentState {
         this.flowTerminated = true;
     }
 
-    // Starts the constructor of receiver. One that does not start with 'super(...)' has its base
-    // class constructed before its body runs.
-    public enterConstructor(Type receiver, bool chainsToBase) {
+    // Starts the constructor of receiver, whose base class is built by a 'super(...)' in the body,
+    // or where it finishes when 'buildsBaseAtExit' says the body writes none. A base class that such
+    // a body cannot build is refused at the constructor alone, so the body is checked as if built.
+    public enterConstructor(Type receiver, bool buildsBaseAtExit, Reordering reorder) {
         this.fieldOwner = receiver;
-        if (!chainsToBase) {
+        this.reorder = reorder;
+        let chain = typemembers.implicitBaseConstructor(receiver);
+        this.baseBuilt = hierarchy.baseOf(receiver) == null;
+        this.baseCall = null;
+        this.buildsBaseAtExit = buildsBaseAtExit;
+        this.baseUseReported = false;
+        this.superCallRefused = false;
+        this.superCalls = new List<LateCall>();
+        this.lateSuper = new LateSuper();
+        this.heldRefusals = new List<HeldRefusal>();
+        this.pendingRefusals = new List<HeldRefusal>();
+        this.feedingGroups = new List<FeedingGroup>();
+        this.boundBaseFields = new List<string>();
+        if (buildsBaseAtExit && chain.owner() != null && chain.chosen() == null) {
             this.markBaseConstructed();
         }
     }
 
-    // The base class is constructed here, so every field it declares has its value.
-    public markBaseConstructed() {
+    public enterSuperArguments() -> bool {
+        bool outer = this.inSuperArguments;
+        this.inSuperArguments = true;
+        return outer;
+    }
+
+    public leaveSuperArguments(bool outer) {
+        this.inSuperArguments = outer;
+    }
+
+    // The 'super(...)' 'call', spelled 'spelled', builds the base class here, from 'arguments', and
+    // runs what 'run' describes. One that may already have run on a path reaching it is refused, and
+    // so is one before which an own field that needs a value has none, unless the call is the first
+    // statement of the body, the order the constructors written before two-phase construction use.
+    public noteSuperCall(CallExpressionNode call, bool firstStatement, string spelled,
+            List<BaseArgument> arguments, BaseRun run) {
         let owner = this.fieldOwner;
         if (owner == null || this.flowTerminated) {
             return;
         }
+        let earlier = this.baseCall;
+        if (earlier != null) {
+            this.reporter.report(unassigneduses.repeatedSuperCallRefusal(owner, this.baseBuilt,
+                this.names), call.span());
+            this.markBaseConstructed();
+            return;
+        }
+        let missing = new List<Field>();
+        if (!firstStatement) {
+            missing = this.unassignedOwnFields(owner, true);
+        }
+        let noted = new LateCall(call, spelled, missing, arguments, run);
+        if (missing.length() > 0) {
+            this.lateSuper.calls.push(noted);
+            for (let field in missing) {
+                this.markThisFieldRefused(field);
+            }
+        }
+        for (let held in this.pendingRefusals) {
+            if (!held.calls.contains(noted)) {
+                held.calls.push(noted);
+            }
+        }
+        this.pendingRefusals = new List<HeldRefusal>();
+        this.superCalls = new List<LateCall>();
+        this.superCalls.push(noted);
+        this.baseCall = call.span();
+        this.markBaseConstructed();
+    }
+
+    // The 'super(...)' calls on paths reaching here before which 'field' had no value and after
+    // which no assignment to it is kept yet. Empty where an assignment to 'field' here is no late
+    // one.
+    public lateCallsAwaiting(Field field) -> List<LateCall> {
+        let calls = new List<LateCall>();
+        if (this.onCatchPath) {
+            return calls;
+        }
+        for (let call in this.superCalls) {
+            if (call.fields.contains(field) && !this.lateSuper.covers(field, call)) {
+                calls.push(call);
+            }
+        }
+        return calls;
+    }
+
+    // Whether a 'super(...)' on a path reaching here ran with 'field' assigned.
+    public assignedAtSuperCall(Field field) -> bool {
+        for (let call in this.superCalls) {
+            if (!call.fields.contains(field)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Keeps 'write', an assignment to an own field after 'super(...)', for the refusal of the calls.
+    public noteLateWrite(LateWrite write) {
+        if (!this.onCatchPath) {
+            this.lateSuper.writes.push(write);
+        }
+    }
+
+    // Refuses the 'super(...)' calls of the constructor checked before which own fields that need a
+    // value had none, once the assignments after them are known, and reports each held refusal for
+    // the calls that followed it.
+    public reportLateFields() {
+        for (let held in this.heldRefusals) {
+            this.reporter.report(held.text(held.calls), held.span);
+        }
+        this.heldRefusals = new List<HeldRefusal>();
+        this.pendingRefusals = new List<HeldRefusal>();
+        let owner = this.fieldOwner;
+        let late = this.lateSuper;
+        if (owner != null && late.calls.length() > 0) {
+            this.reporter.report(unassigneduses.lateFieldsRefusal(owner, late, this.names),
+                late.span());
+        }
+        this.lateSuper = new LateSuper();
+    }
+
+    // Holds the refusal at 'span' that 'text' writes for the 'super(...)' calls that build the base
+    // class on the paths after it.
+    hold(Span span, (List<LateCall>) -> string text) {
+        let held = new HeldRefusal(span, new List<LateCall>(), text);
+        this.heldRefusals.push(held);
+        this.pendingRefusals.push(held);
+    }
+
+    // Keeps that a 'this.field' parameter of the constructor checked assigns 'field', which the base
+    // class declares, once the base class is built.
+    public noteBaseFieldBinding(Field field) {
+        if (!this.boundBaseFields.contains(field.name())) {
+            this.boundBaseFields.push(field.name());
+        }
+    }
+
+    // Whether a 'this.field' parameter of the constructor checked assigns the base field 'name' once
+    // the base class is built.
+    public bindsBaseField(string name) -> bool {
+        return this.boundBaseFields.contains(name);
+    }
+
+    // Whether 'field' has a value on the path reaching here.
+    public hasValue(Field field) -> bool {
+        return this.fieldsContain(this.assignedThisFields, field);
+    }
+
+    // The 'super(...)' at 'span', refused for where it is written, is taken to build the base class
+    // here, and no path of the constructor is refused for building none.
+    public noteMisplacedSuperCall(Span span) {
+        if (this.baseCall == null) {
+            this.baseCall = span;
+        }
+        this.superCallRefused = true;
+        this.markBaseConstructed();
+    }
+
+    // The base class is constructed here, so every field it declares has its value.
+    markBaseConstructed() {
+        let owner = this.fieldOwner;
+        if (owner == null || this.flowTerminated) {
+            return;
+        }
+        this.baseBuilt = true;
         let fields = typemembers.fieldsOf(owner);
         if (fields == null) {
             return;
@@ -254,14 +485,21 @@ public final class AssignmentState {
     // everything written before any place the body could have thrown from.
     public enterCatchPath() {
         this.assignedLocals = new List<LocalBinding>();
+        let owner = this.fieldOwner;
+        this.baseBuilt = owner == null || hierarchy.baseOf(owner) == null;
         if (this.escapePoints.length() == 0) {
             this.assignedThisFields = this.writtenFields(this.ctorSeededThisWrites);
         } else {
             this.assignedThisFields = this.copyFields(this.escapePoints.get(0).assigned);
+            this.baseBuilt = true;
             for (let point in this.escapePoints) {
                 this.assignedThisFields = this.commonFields(this.assignedThisFields, point.assigned);
+                this.baseBuilt = this.baseBuilt && point.baseBuilt;
             }
         }
+        this.baseCall = null;
+        this.superCalls = new List<LateCall>();
+        this.pendingRefusals = new List<HeldRefusal>();
         this.maybeAssignedThisWrites = this.copyWrites(this.ctorSeededThisWrites);
         for (long i = 0; i < this.ctorEscapedMaybeWrites.length(); i++) {
             let escaped = this.ctorEscapedMaybeWrites.get(i);
@@ -278,6 +516,18 @@ public final class AssignmentState {
         this.catchThisUses = new List<CatchThisUse>();
         this.catchFinishes = new List<CatchFinish>();
         this.reportedFields = new List<Field>();
+    }
+
+    // The places the body can throw from once the base class is built where 'built' says so, and
+    // before it otherwise.
+    public escapes(bool built) -> SyntaxNode[] {
+        let escapes = new List<SyntaxNode>();
+        for (let point in this.escapePoints) {
+            if (point.baseBuilt == built) {
+                escapes.push(point.escape);
+            }
+        }
+        return escapes.toArray();
     }
 
     // What the catch clause being checked does that depends on how far the body ran before it threw.
@@ -445,27 +695,41 @@ public final class AssignmentState {
                 this.ctorEscapedMaybeWrites.push(write);
             }
         }
-        this.escapePoints.push(new EscapePoint(escape, this.copyFields(this.assignedThisFields)));
+        this.escapePoints.push(new EscapePoint(escape, this.copyFields(this.assignedThisFields),
+            this.baseBuilt));
     }
 
-    // Refuses a use of 'this' at a field that has no value yet on the path reaching it. An inherited
-    // field has its value once the base class is constructed, and an own field that needs one once
-    // it is assigned. A refused field is not reported again as unassigned at the end of a path. In
-    // a catch clause the use is kept for the exceptions phase, with each place the body can throw
-    // from without the field.
-    public checkThisFieldUse(ThisUse use) {
+    // Refuses a use of 'this' at a field with no value yet on the path reaching it, or keeps it for
+    // the exceptions phase in a catch clause. A read of an inherited field in 'feeding' is refused
+    // together with the other statements before 'super(...)' that read the same field.
+    public checkThisFieldUse(ThisUse use, FeedingWrite? feeding = null) {
         let owner = this.fieldOwner;
         let field = use.field();
-        if (owner == null || field == null || this.flowTerminated || !this.needsValue(owner, field)
-                || this.fieldsContain(this.assignedThisFields, field)
-                || this.fieldsContain(this.reportedFields, field)) {
+        if (owner == null || field == null || this.flowTerminated
+                || this.fieldsContain(this.assignedThisFields, field)) {
+            return;
+        }
+        FeedingWrite? fed = null;
+        if (feeding != null && !this.onCatchPath && this.baseContext() != BaseContext.SuperArguments
+                && typemembers.isInheritedField(owner, field) && this.feeds(owner, feeding)) {
+            if (this.joinFeedingGroup(field, feeding)) {
+                return;
+            }
+            fed = feeding;
+        }
+        if (!this.needsValue(owner, field) || this.fieldsContain(this.reportedFields, field)) {
             return;
         }
         bool inherited = typemembers.isInheritedField(owner, field);
         this.reportedFields.push(field);
         if (!this.onCatchPath) {
-            this.reporter.report(unassigneduses.refusal(use, owner, field, inherited, this.names),
-                use.span());
+            BaseContext context = this.baseContext();
+            if (fed != null) {
+                this.refuseFeedingRead(field, fed, context, use.span());
+            } else {
+                this.reporter.report(unassigneduses.refusal(use, owner, field, inherited, context,
+                    this.names), use.span());
+            }
             this.markThisFieldRefused(field);
             return;
         }
@@ -489,6 +753,14 @@ public final class AssignmentState {
         if (owner == null || this.flowTerminated) {
             return;
         }
+        if (!this.baseBuilt && !this.onCatchPath) {
+            if (!this.baseUseReported) {
+                this.baseUseReported = true;
+                this.reporter.report(unassigneduses.beforeBaseRefusal(use, owner,
+                    this.baseContext(), this.names), use.span());
+            }
+            return;
+        }
         let missing = this.missingFieldFor(use, owner, this.assignedThisFields);
         if (missing == null || this.fieldsContain(this.reportedFields, missing)) {
             return;
@@ -496,8 +768,8 @@ public final class AssignmentState {
         this.reportedFields.push(missing);
         if (!this.onCatchPath) {
             bool inherited = typemembers.isInheritedField(owner, missing);
-            this.reporter.report(unassigneduses.refusal(use, owner, missing, inherited, this.names),
-                use.span());
+            this.reporter.report(unassigneduses.refusal(use, owner, missing, inherited,
+                this.baseContext(), this.names), use.span());
             this.markThisFieldRefused(missing);
             return;
         }
@@ -556,6 +828,8 @@ public final class AssignmentState {
     public finishConstructorAtEnd(Span span) {
         if (this.fieldOwner != null && !this.flowTerminated) {
             this.endReached = true;
+            this.checkBaseBuilt(span, false);
+            this.notePartialLateFields();
         }
         this.checkConstructorFieldsAssigned(span);
     }
@@ -563,8 +837,150 @@ public final class AssignmentState {
     public finishConstructorAtReturn(Span returnSpan) {
         if (this.fieldOwner != null && !this.flowTerminated) {
             this.finishingReturnSpans.push(returnSpan);
+            this.checkBaseBuilt(returnSpan, true);
+            this.notePartialLateFields();
         }
         this.checkConstructorFieldsAssigned(returnSpan);
+    }
+
+    // Keeps each own field that had no value before a 'super(...)' on a path finishing the
+    // constructor here and is not assigned on it.
+    notePartialLateFields() {
+        if (this.onCatchPath) {
+            return;
+        }
+        for (let call in this.superCalls) {
+            for (let field in call.fields) {
+                if (!this.fieldsContain(this.assignedThisFields, field)
+                        && !this.lateSuper.partial.contains(field)) {
+                    this.lateSuper.partial.push(field);
+                }
+            }
+        }
+    }
+
+    // Refuses a path that finishes a constructor writing 'super(...)' at 'span', the end of its body
+    // or a 'return', before the base class is built on it. A catch clause is judged by the
+    // exceptions phase, which knows what it catches.
+    checkBaseBuilt(Span span, bool isReturn) {
+        let owner = this.fieldOwner;
+        if (owner == null || this.baseBuilt || this.buildsBaseAtExit || this.onCatchPath
+                || this.superCallRefused) {
+            return;
+        }
+        this.reporter.report(unassigneduses.unbuiltBaseRefusal(owner, isReturn,
+            this.baseCall != null, this.names), span);
+        this.markBaseConstructed();
+    }
+
+    // Whether 'feeding' gives a value that is needed before the base class is built: to an own
+    // field of 'owner' that has none yet, or to a local that later statements use.
+    feeds(Type owner, FeedingWrite feeding) -> bool {
+        let target = feeding.target;
+        if (target == null) {
+            return feeding.local != null;
+        }
+        return this.needsValue(owner, target) && !this.fieldsContain(this.assignedThisFields, target);
+    }
+
+    // Adds 'feeding' to the statements refused for reading the inherited field 'read', where some
+    // are, and returns whether they are. A statement is refused once, for the first field it reads.
+    joinFeedingGroup(Field read, FeedingWrite feeding) -> bool {
+        for (let group in this.feedingGroups) {
+            if (group.read == read) {
+                if (!this.feedingRefused(feeding)) {
+                    group.writes.push(feeding);
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Whether the statement of 'feeding' is refused for reading a field of the base class already.
+    feedingRefused(FeedingWrite feeding) -> bool {
+        for (let group in this.feedingGroups) {
+            for (let write in group.writes) {
+                if (write.place.start == feeding.place.start) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // Refuses the read of the inherited field 'read' at 'span' in the value of 'feeding'. The fix
+    // names the 'super(...)' calls after it, so the refusal is held until the body is checked.
+    refuseFeedingRead(Field read, FeedingWrite feeding, BaseContext context, Span span) {
+        if (this.feedingRefused(feeding)) {
+            return;
+        }
+        let held = this.reorder;
+        if (held == null) {
+            return;
+        }
+        Reordering reorder = held;
+        let group = new FeedingGroup(read, new List<FeedingWrite>());
+        group.writes.push(feeding);
+        this.feedingGroups.push(group);
+        let names = this.names;
+        this.hold(span, (List<LateCall> calls) ->
+            unassigneduses.feedingReadRefusal(read, group.writes, context, calls, names, reorder));
+    }
+
+    // Where a use of 'this' before the base class is built is written.
+    baseContext() -> BaseContext {
+        if (this.inSuperArguments) {
+            return BaseContext.SuperArguments;
+        }
+        if (this.buildsBaseAtExit) {
+            return BaseContext.BuiltAtExit;
+        }
+        return BaseContext.BeforeSuper;
+    }
+
+    // Refuses a write of 'value', of type 'valueType', through 'this' to 'field' at 'span' before
+    // the base class is built, where 'field' is one the base class declares. Before a 'super(...)'
+    // the fix may pass the value to that call, so the refusal is held until it.
+    public checkInheritedFieldWrite(Field field, Expression value, Type? valueType, Span span) {
+        let owner = this.fieldOwner;
+        let held = this.reorder;
+        if (owner == null || held == null || this.flowTerminated || this.baseBuilt
+                || this.onCatchPath || !typemembers.isInheritedField(owner, field)) {
+            return;
+        }
+        Reordering reorder = held;
+        BaseContext context = this.baseContext();
+        let names = this.names;
+        if (context != BaseContext.BeforeSuper) {
+            this.reporter.report(unassigneduses.inheritedWriteRefusal(field, context,
+                new List<LateCall>(), value, valueType, names, reorder), span);
+            return;
+        }
+        this.hold(span, (List<LateCall> calls) ->
+            unassigneduses.inheritedWriteRefusal(field, context, calls, value, valueType, names,
+                reorder));
+    }
+
+    // The own fields of 'owner' that need a value and have none on the path reaching here. A field
+    // already refused is left out, unless it is one a 'super(...)' on another path ran without and
+    // 'beforeSuper' says the fields are the ones a 'super(...)' runs without.
+    unassignedOwnFields(Type owner, bool beforeSuper = false) -> List<Field> {
+        let missing = new List<Field>();
+        let fields = typemembers.fieldsOf(owner);
+        if (fields == null) {
+            return missing;
+        }
+        for (long i = typemembers.baseFieldCount(owner); i < fields.length(); i++) {
+            let field = fields.get(i);
+            if (!(field.type() is ErrorType) && needsAssignment(field)
+                    && !this.fieldsContain(this.assignedThisFields, field)
+                    && (!this.fieldsContain(this.refusedThisFields, field)
+                    || beforeSuper && this.lateSuper.lacking().contains(field))) {
+                missing.push(field);
+            }
+        }
+        return missing;
     }
 
     // Reports every own field left unassigned on the path reaching span when the field needed an
@@ -577,19 +993,7 @@ public final class AssignmentState {
         if (owner == null || this.flowTerminated) {
             return;
         }
-        let fields = typemembers.fieldsOf(owner);
-        if (fields == null) {
-            return;
-        }
-        let missing = new List<Field>();
-        for (long i = typemembers.baseFieldCount(owner); i < fields.length(); i++) {
-            let field = fields.get(i);
-            if (!(field.type() is ErrorType) && needsAssignment(field)
-                    && !this.fieldsContain(this.assignedThisFields, field)
-                    && !this.fieldsContain(this.refusedThisFields, field)) {
-                missing.push(field);
-            }
-        }
+        let missing = this.unassignedOwnFields(owner);
         if (missing.length() == 0) {
             return;
         }
@@ -643,14 +1047,50 @@ public final class AssignmentState {
     public snapshot() -> AssignmentFlow {
         return new AssignmentFlow(this.copyBindings(this.assignedLocals),
             this.copyFields(this.assignedThisFields),
-            this.copyWrites(this.maybeAssignedThisWrites), this.flowTerminated);
+            this.copyWrites(this.maybeAssignedThisWrites), this.baseBuilt, this.baseCall,
+            this.copyCalls(this.superCalls), this.copyHeld(this.pendingRefusals),
+            this.flowTerminated);
+    }
+
+    copyHeld(List<HeldRefusal> held) -> List<HeldRefusal> {
+        let copy = new List<HeldRefusal>();
+        this.unionHeldInto(copy, held);
+        return copy;
+    }
+
+    unionHeldInto(List<HeldRefusal> target, List<HeldRefusal> source) {
+        for (let held in source) {
+            if (!target.contains(held)) {
+                target.push(held);
+            }
+        }
+    }
+
+    copyCalls(List<LateCall> calls) -> List<LateCall> {
+        let copy = new List<LateCall>();
+        for (let call in calls) {
+            copy.push(call);
+        }
+        return copy;
     }
 
     public restore(AssignmentFlow flow) {
         this.assignedLocals = this.copyBindings(flow.assigned);
         this.assignedThisFields = this.copyFields(flow.assignedFields);
         this.maybeAssignedThisWrites = this.copyWrites(flow.maybeAssignedWrites);
+        this.baseBuilt = flow.baseBuilt;
+        this.baseCall = flow.baseCall;
+        this.superCalls = this.copyCalls(flow.superCalls);
+        this.pendingRefusals = this.copyHeld(flow.pendingRefusals);
         this.flowTerminated = flow.isTerminated;
+    }
+
+    unionCallsInto(List<LateCall> target, List<LateCall> source) {
+        for (let call in source) {
+            if (!target.contains(call)) {
+                target.push(call);
+            }
+        }
     }
 
     unionWritesInto(List<FieldWrite> target, List<FieldWrite> source) {
@@ -670,6 +1110,10 @@ public final class AssignmentState {
         let result = new List<LocalBinding>();
         let resultFields = new List<Field>();
         let resultMaybeWrites = new List<FieldWrite>();
+        bool resultBaseBuilt = true;
+        Span? resultBaseCall = null;
+        let resultCalls = new List<LateCall>();
+        let resultHeld = new List<HeldRefusal>();
         bool anySurvivor = false;
         for (long i = 0; i < flows.length(); i++) {
             let flow = flows.get(i);
@@ -677,6 +1121,10 @@ public final class AssignmentState {
                 continue;
             }
             this.unionWritesInto(resultMaybeWrites, flow.maybeAssignedWrites);
+            resultBaseBuilt = resultBaseBuilt && flow.baseBuilt;
+            resultBaseCall = resultBaseCall ?? flow.baseCall;
+            this.unionCallsInto(resultCalls, flow.superCalls);
+            this.unionHeldInto(resultHeld, flow.pendingRefusals);
             if (!anySurvivor) {
                 result = this.copyBindings(flow.assigned);
                 resultFields = this.copyFields(flow.assignedFields);
@@ -712,9 +1160,13 @@ public final class AssignmentState {
                     }
                 }
                 this.unionWritesInto(resultMaybeWrites, flow.maybeAssignedWrites);
+                resultBaseCall = resultBaseCall ?? flow.baseCall;
+                this.unionCallsInto(resultCalls, flow.superCalls);
+                this.unionHeldInto(resultHeld, flow.pendingRefusals);
             }
         }
-        return new AssignmentFlow(result, resultFields, resultMaybeWrites, !anySurvivor);
+        return new AssignmentFlow(result, resultFields, resultMaybeWrites, resultBaseBuilt,
+            resultBaseCall, resultCalls, resultHeld, !anySurvivor);
     }
 
     // Sets the assignment state after branches that each started from 'entry' to the join of the
@@ -741,6 +1193,25 @@ public final class AssignmentState {
             this.restore(this.join(exits));
         }
     }
+}
+
+// A refusal reported at 'span' once the body is checked, with the text 'text' writes for 'calls',
+// the 'super(...)' calls that build the base class on the paths after it.
+final class HeldRefusal {
+    Span span;
+    List<LateCall> calls;
+    (List<LateCall>) -> string text;
+
+    constructor(this.span, this.calls, this.text);
+}
+
+// The statements whose values are refused for reading 'read', a field of the base class, before
+// the base class is built.
+final class FeedingGroup {
+    Field read;
+    List<FeedingWrite> writes;
+
+    constructor(this.read, this.writes);
 }
 
 public bindingsContain(List<LocalBinding> set, LocalBinding binding) -> bool {

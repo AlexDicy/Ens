@@ -13,6 +13,10 @@ import Type from model.types;
 import ClassType from model.types;
 import InterfaceType from model.types;
 import StructType from model.types;
+import PrimitiveType from model.types;
+import StringType from model.types;
+import EnumType from model.types;
+import OptionalType from model.types;
 import PrimitiveBinding from model.types;
 import TypeParamType from model.types;
 import InstantiationType from model.types;
@@ -426,6 +430,43 @@ export fieldsOf(Type type) -> List<Field>? {
     }
 }
 
+// Whether a value of 'type' shares no part with another value, so it changes only through the
+// place that holds it: a primitive, a string, an enum, a struct of such types, or a nullable one.
+export sharesNoPart(Type type) -> bool {
+    return sharesNoPartWithin(type, new List<Type>());
+}
+
+// sharesNoPart for a type held inside the structs 'enclosing'.
+sharesNoPartWithin(Type type, List<Type> enclosing) -> bool {
+    switch (type) {
+        is PrimitiveType ignored -> {
+            return true;
+        },
+        is StringType ignored -> {
+            return true;
+        },
+        is EnumType ignored -> {
+            return true;
+        },
+        is OptionalType optional -> {
+            return sharesNoPartWithin(optional.inner(), enclosing);
+        },
+        default -> { },
+    }
+    let fields = fieldsOf(type);
+    if (!types.isStructLike(type) || fields == null || enclosing.contains(type)) {
+        return false;
+    }
+    enclosing.push(type);
+    for (let field in fields) {
+        if (!sharesNoPartWithin(field.type(), enclosing)) {
+            return false;
+        }
+    }
+    let ignored = enclosing.pop();
+    return true;
+}
+
 // The field a name reaches on a type, or null when the name reaches none of its fields.
 export inheritedOrOwnField(Type owner, string name) -> Field? {
     let fields = fieldsOf(owner);
@@ -738,12 +779,13 @@ reachesConstructor(Type chooser, Type owner, Method candidate) -> bool {
         site.packagePrefix());
 }
 
-// The refusal for a chain whose owner has no constructor its chooser can call with no arguments.
-// 'opening' names what runs the chain. 'declared' is the constructor that leaves out 'super(...)'.
-// It is null for a class that declares no constructor, and the fix then declares one marked
-// 'marker'. The text is empty for a chain with no owner.
+// The refusal, opened by 'opening', for a chain whose owner has no constructor callable with no
+// arguments, or "" for a chain with no owner. 'declared' is the constructor that leaves out
+// 'super(...)', with 'assignedFirst' the own fields it assigns first, or null where the fix declares
+// one marked 'marker'.
 public implicitBaseRefusal(string opening, ImplicitBaseConstructor chain, Signature? declared,
-                           bool declaredHasBody, string marker, TypeNames names) -> string {
+                           bool declaredHasBody, string[] assignedFirst, string marker,
+                           TypeNames names) -> string {
     let owner = chain.owner();
     if (owner == null) {
         return "";
@@ -760,7 +802,7 @@ public implicitBaseRefusal(string opening, ImplicitBaseConstructor chain, Signat
     }
     let reachable = chain.reachable();
     if (reachable != null) {
-        return "{text} {superCallFix(reachable, declared, declaredHasBody, marker, names, true)}.";
+        return "{text} {superCallFix(reachable, declared, declaredHasBody, assignedFirst, marker, names, true)}.";
     }
     let declaring = types.authorityOf(owner);
     if (declaring != null && !declaring.isEditable()) {
@@ -775,7 +817,7 @@ public implicitBaseRefusal(string opening, ImplicitBaseConstructor chain, Signat
     if (unreachable != null) {
         return markFix + ".";
     }
-    return "{markFix}, then {superCallFix(marked, declared, declaredHasBody, marker, names, false)}.";
+    return "{markFix}, then {superCallFix(marked, declared, declaredHasBody, assignedFirst, marker, names, false)}.";
 }
 
 // The package a declared type belongs to, or empty for a type that belongs to none.
@@ -802,13 +844,12 @@ quotedConstructor(Method method, TypeNames names) -> string {
     return code.quotedFor(names);
 }
 
-// The fix that passes 'target' its parameters without defaults through 'super(...)'. With no
-// 'declared' constructor, the fix declares one marked 'marker'. A declared constructor starts its
-// body with the call, or gains a body that does, and takes the parameters it lacks. A name it
-// already uses for something else gets a number after it. Each type this file has no name for
-// comes with an import.
-superCallFix(Method target, Signature? declared, bool declaredHasBody, string marker,
-             TypeNames names, bool opensSentence) -> string {
+// The fix that passes 'target' its parameters without defaults through 'super(...)', from a
+// constructor it declares marked 'marker' where 'declared' is null, and otherwise from 'declared'
+// after it assigns 'assignedFirst', adding the parameters it lacks. A name already taken gets a
+// number after it, and a type this file has no name for comes with an import.
+superCallFix(Method target, Signature? declared, bool declaredHasBody, string[] assignedFirst,
+             string marker, TypeNames names, bool opensSentence) -> string {
     let taken = new Set<string>();
     if (declared != null) {
         for (let parameter in declared.parameters()) {
@@ -856,11 +897,22 @@ superCallFix(Method target, Signature? declared, bool declaredHasBody, string ma
         fix = "declare a constructor that calls 'super(...)', as in "
             + "'{prefix}constructor({listed.toString()}) \{ {call} \}'";
     } else {
-        fix = "start this constructor's body with '{call}'";
-        if (!declaredHasBody) {
-            fix = "give this constructor a body that starts with '{call}'";
+        let quoted = new List<string>();
+        for (let field in assignedFirst) {
+            quoted.push("'{field}'");
         }
-        if (addedTypes.length() > 0) {
+        string fields = diagnostics.andJoined(quoted.toArray());
+        fix = "start this constructor's body with '{call}'";
+        if (!declaredHasBody && assignedFirst.length > 0) {
+            fix = "give this constructor a body that assigns {fields} and then calls '{call}'";
+        } else if (!declaredHasBody) {
+            fix = "give this constructor a body that starts with '{call}'";
+        } else if (assignedFirst.length > 0) {
+            fix = "call '{call}' in this constructor's body after it assigns {fields}";
+        }
+        if (addedTypes.length() > 0 && assignedFirst.length > 0) {
+            fix = fix + ", and add '{listed.toString()}' to its parameters";
+        } else if (addedTypes.length() > 0) {
             fix = fix + " and add '{listed.toString()}' to its parameters";
         }
     }

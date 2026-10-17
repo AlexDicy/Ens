@@ -223,8 +223,8 @@ public class Shape {
 public class Square extends Shape {
     int side;
     constructor(int s) {
-        super(4);          // run the base constructor first
-        this.side = s;
+        this.side = s;     // assign the subclass's own fields first
+        super(4);          // then construct the base class
     }
     public override area() -> int { return this.side * this.side; }
 }
@@ -253,16 +253,53 @@ Like a `toString` on a struct, one written `override` follows its class's visibi
 Inside a method, a constructor, or a destructor, a struct's or a class's own fields and methods are reached through `this`, as in `this.width` and `this.area()`, because a bare name there is a local, a parameter, or a top-level declaration and never a member.
 A field's default value is the one place a member is named on its own: a default may read the fields declared before it in the same class, as `string name = "{width}x{height}";` does.
 A default reads those fields and assigns none of them, so `int b = (a = 5);` is an error where `a` is a sibling field.
-A class computes the defaults of its fields before its constructor runs, and so does a struct that declares a constructor.
-In such a type a default may read an earlier field only when that field has a default of its own, or when its type has a default value, such as a number or a nullable type, and it is not `const`.
+A class computes the defaults of its own fields in declaration order when its constructor starts, after the arguments of `new` or `super(...)` are evaluated and before the body runs, so the constructor's assignments overwrite them.
+A struct that declares a constructor computes them before that constructor runs.
+In either a default may read an earlier field only when that field has a default of its own, or when its type has a default value, such as a number or a nullable type, and it is not `const`.
 A struct literal assigns the fields it lists before it computes the defaults of the others, so in a struct that declares no constructor a default may read any earlier field.
 `this` is not available in a default, since the object is still being built.
 
-`super.method(...)` calls the base class's implementation, bypassing any override. A constructor may call `super(...)` as its first statement to run the base constructor; if it does not, the base class must be constructible with no arguments. `protected` members (see above) are reachable from subclasses.
-A `super(...)` written anywhere else is an error: after another statement, inside a branch, a `catch` clause, a lambda, or a method, and a second time in the same constructor.
-A class that declares no constructor gets one that takes no arguments and runs the base class's zero-argument constructor, so its base must have one this class can reach.
+`super.method(...)` calls the base class's implementation, bypassing any override. `protected` members (see above) are reachable from subclasses.
 
-Class fields may declare default values just like struct fields. Defaults are applied when an instance is created, in declaration order and before the constructor body runs, so constructor assignments overwrite them.
+A subclass constructor builds its object in two phases, divided by the `super(...)` statement that constructs the base class.
+In the first phase it assigns its own fields, while the fields the base class declares have no value yet.
+`super(...)` then runs the constructor of the base class, which builds the base part the same way.
+Once `super(...)` returns, every field has a value, so the rest of the constructor may call any method on `this`, overrides included, and pass or store `this`.
+An override the base constructor calls sees the subclass's fields set, because they are assigned before the base constructor runs.
+
+```ens
+public class Named {
+    protected string name;
+    protected constructor(this.name) {
+        print(this.describe());     // runs the override of the class being built
+    }
+    protected describe() -> string { return this.name; }
+}
+
+public class Greeting extends Named {
+    string greeting;
+    constructor(string name, string greeting) {
+        this.greeting = greeting;   // the first phase assigns the subclass's fields
+        super(name);                // the base class is constructed here
+        print(this.describe());     // the second phase may use 'this' in any way
+    }
+    protected override describe() -> string { return "{this.greeting}, {this.name}"; }
+}
+```
+
+An own field needs a value when it has no default and its type has no default value, or when it is `const` and has no default.
+Every own field that needs a value is assigned on every path before `super(...)`, and a `this.field` parameter counts.
+A constructor that begins with `super(...)` may still assign its own fields after it.
+A constructor that writes `super(...)` calls it exactly once on every path that finishes it, as a statement of its own.
+It may call it in each branch of an `if` or a `switch`, but not inside a loop, a lambda or a `catch` clause, and a `return` before it is an error.
+Before `super(...)` returns, `this` may only be used to assign the subclass's own fields, to read those that have values, and to test its type with `is`, and a field the base class declares can neither be read nor assigned.
+A `this.field` parameter that names a field of the base class assigns it once the base class is built.
+A constructor that does not write `super(...)` constructs its base class with the base's zero-argument constructor where it finishes: at the end of its body, at a `return`, and at the end of a `catch` clause.
+Its whole body is then its first phase, and the base class must have a zero-argument constructor this class can reach.
+A class that declares no constructor gets one that takes no arguments and does the same.
+
+Class fields may declare default values just like struct fields.
+A class that declares no constructor computes its defaults where a subclass's constructor builds it, with `super(...)` or where that constructor finishes.
 A field default and a parameter default may name the enclosing declaration's type parameters, and each runs with the type arguments written where the instance was created or the call was made.
 So inside `class Box<Tag>` a field may read `List<Tag> items = new List<Tag>();`, and a method may declare `takes(List<Tag> more = new List<Tag>())`.
 
@@ -272,12 +309,12 @@ A constructor that leaves such a field unassigned on some path, for example by r
 Such a field may be read through `this` only where every path reaching the read has assigned it.
 A compound assignment such as `+=`, a write to a member of the field, and a call of the function value the field holds all read it.
 In a `catch` clause, a field counts as assigned only when the body assigns it before every point where the body can throw an exception the clause catches.
-The fields a base class declares have their values once `super(...)` finishes, so neither the arguments of `super(...)` nor a `catch` clause that catches what those arguments throw may read them.
+The fields a base class declares have their values once `super(...)` returns, so neither the first phase nor a `catch` clause that catches what the first phase throws may read them.
 Until every field that needs a value has one, inherited fields included, a constructor may use `this` only to read and write its fields and to test its type with `is`.
 Before that point, calling a method on `this` or `super`, passing `this` to a call, storing it in a variable, a field or an array, and creating a lambda that uses `this` are errors, because the code they reach may read a field that has no value yet.
 A `switch` over `this` may test its type with `is` arms, but an arm that names the value, as `is Square square ->` does, stores `this` in that name.
 Writing `this` in an interpolation hole calls `toString` on it, and comparing it with `==` or `!=` calls `equals`, so both are errors there as well, unless the type is a `final` class and no class in its chain declares that method.
-When a constructor's `catch` clause catches an exception thrown by the arguments of `super(...)`, it runs before the base class is constructed.
+In a constructor that writes `super(...)`, a `catch` clause that catches an exception thrown before `super(...)` returns, by the first phase or by the arguments of `super(...)`, runs before the base class is constructed.
 Such a clause may not reach its end or a `return`: every path through it ends by calling `panic` or another `noreturn` function, or loops forever.
 
 A field may also be `const`, in a struct as in a class: a const field is given its value when the object is constructed and never changes afterwards.
@@ -336,7 +373,7 @@ Type arguments are never written on the method name: `List.withCapacity<int>(8)`
 A class may declare a `destructor`, introduced by the `destructor` keyword, to run cleanup when an instance is destroyed.
 A destructor takes no parameters, has no return type, and cannot be `throws`; a class declares at most one, and it cannot be called explicitly.
 When the last reference to an object is released its destructor runs, followed by each inherited destructor from the most derived class up to the base, and then the object's fields are released.
-When an argument of a `new` expression throws, the constructor never runs, so no destructor runs for that object either, and only what its fields already hold is released.
+When an argument of a `new` expression throws, the constructor never runs, so no destructor runs for that object either, and its fields hold no values yet.
 An assignment stores the new value before it releases the old one, so a destructor that release runs finds the new value in the field or element, and a value that destructor writes there is the one kept.
 Destructors are a class-only feature; structs and interfaces cannot declare them.
 

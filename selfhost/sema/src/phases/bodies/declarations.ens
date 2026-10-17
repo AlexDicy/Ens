@@ -22,6 +22,8 @@ import LiteralOrigin from phases.bodies.literaltargets;
 import phases.bodies.memberaccess;
 import phases.bodies.assignments;
 import phases.bodies.mutation;
+import phases.bodies.thisuses;
+import Reordering from phases.bodies.reordering;
 import phases.bodies.literalfixes;
 import phases.bodies.nullguidance;
 import phases.bodies.wording;
@@ -35,6 +37,7 @@ import Signature from model.typemembers;
 import TypeNames from model.typenames;
 import model.types;
 import Type from model.types;
+import phases.bodies.definiteassignment;
 import ErrorType from model.types;
 import PrimitiveKind from model.types;
 import DeclaredType from model.types;
@@ -230,10 +233,10 @@ checkCallableBody(BodyChecker checker, Signature signature, Type? receiver, Type
     checker.assignment().reset();
     // A constructor also tracks its own fields: a this-field shorthand parameter assigns
     // the field before the body runs, and every own non-defaultable field must be assigned
-    // on every path that leaves the body normally.
+    // on every path that leaves the body normally. One whose body writes no 'super(...)' builds
+    // its base class where it finishes.
     if (checker.frame().inConstructor() && receiver != null) {
-        bool chainsToBase = syntax.chainingSuperCall(node.body()) != null;
-        seedConstructorFields(checker, signature, receiver, chainsToBase);
+        seedConstructorFields(checker, signature, receiver, !syntax.callsSuper(node.body()));
     }
     let body = node.body();
     if (body != null) {
@@ -243,6 +246,9 @@ checkCallableBody(BodyChecker checker, Signature signature, Type? receiver, Type
     }
     if (checker.assignment().constructorFieldOwner() != null) {
         checker.assignment().finishConstructorAtEnd(signature.nameSpan());
+        checker.assignment().reportLateFields();
+        checker.result().setUnbuiltEscapes(node.green(), checker.assignment().escapes(false));
+        checker.result().setBuiltEscapes(node.green(), checker.assignment().escapes(true));
     }
 
     checkConstructorChainsToBase(checker, signature, node);
@@ -286,9 +292,9 @@ pushOwnerTypeParameters(BodyChecker checker, DeclaredType owner) -> long {
     return parameters.length;
 }
 
-// A constructor that does not start with 'super(...)' runs the base constructor its class's
-// implicit chain chooses, so that chain must choose one that exists here. A 'super(...)' written
-// anywhere else in it is refused where it is written, and that refusal is the one report.
+// A constructor that writes no 'super(...)' runs the base constructor its class's implicit chain
+// chooses where it finishes, so that chain must choose one that exists here. A 'super(...)' written
+// where it cannot run is refused where it is written, and that refusal is the one report.
 checkConstructorChainsToBase(BodyChecker checker, Signature signature, FunctionDeclarationNode node) {
     if (!checker.frame().inConstructor() || syntax.writesSuperCall(node)) {
         return;
@@ -339,8 +345,35 @@ public checkImplicitBaseChain(BodyChecker checker, Type receiver, Signature? dec
         return;
     }
     string opening = "The constructor of {checker.names().quotedName(current)} does not call 'super(...)'";
-    checker.reporter().report(typemembers.implicitBaseRefusal(opening, chain, declared, declaredHasBody, "",
-        checker.names()), at);
+    checker.reporter().report(typemembers.implicitBaseRefusal(opening, chain, declared, declaredHasBody,
+        fieldsAssignedFirst(receiver, declared), "", checker.names()), at);
+}
+
+// The own fields of 'receiver' that need a value and that no 'this.field' parameter of 'declared'
+// assigns, which its body assigns before 'super(...)'.
+fieldsAssignedFirst(Type receiver, Signature declared) -> string[] {
+    let names = new List<string>();
+    let fields = typemembers.fieldsOf(receiver);
+    if (fields == null) {
+        return names.toArray();
+    }
+    for (long i = typemembers.baseFieldCount(receiver); i < fields.length(); i++) {
+        let field = fields.get(i);
+        if (definiteassignment.needsAssignment(field) && !bindsParameter(declared, field.name())) {
+            names.push(field.name());
+        }
+    }
+    return names.toArray();
+}
+
+// Whether a 'this.field' parameter of 'declared' assigns the field 'name'.
+bindsParameter(Signature declared, string name) -> bool {
+    for (let parameter in declared.parameters()) {
+        if (parameter.bindsField() && parameter.name() == name) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Why an excluded conditional base constructor does not exist here, and the fix. 'memberWord'
@@ -648,14 +681,15 @@ checkParameterDefaults(BodyChecker checker, Signature signature, Type? owner, Fu
     checker.resolver().popTypeParameters(pushed);
 }
 
-// Records the this-field shorthand parameters as assigned before the body runs, so a
-// constructor whose only initialization is 'constructor(this.field)' starts complete.
-// A shorthand parameter is a write, so it meets the same const rule and the same
-// member-access check an ordinary write to the field meets.
-// A const base field reports that refusal alone, since const holds inside the declaring
-// package too.
-seedConstructorFields(BodyChecker checker, Signature signature, Type receiver, bool chainsToBase) {
-    checker.assignment().enterConstructor(receiver, chainsToBase);
+// Records the 'this.field' parameters of own fields as assigned before the body runs, and those of
+// inherited fields as assigned once the base class is built. Each is a write, checked for 'const'
+// and for access as a written assignment is, and a 'const' base field reports the 'const' refusal
+// alone.
+seedConstructorFields(BodyChecker checker, Signature signature, Type receiver,
+        bool buildsBaseAtExit) {
+    let implicitBase = thisuses.baseRunOf(typemembers.implicitBaseConstructor(receiver).chosen());
+    checker.assignment().enterConstructor(receiver, buildsBaseAtExit,
+        new Reordering(checker.result(), receiver, implicitBase));
     if (typemembers.fieldsOf(receiver) == null) {
         return;
     }
@@ -680,7 +714,11 @@ seedConstructorFields(BodyChecker checker, Signature signature, Type receiver, b
             memberaccess.checkMemberAccess(checker, field.name(), field.visibility(), field.definingType(),
                 parameter.span());
         }
-        checker.assignment().seedField(field, parameter.span());
+        if (typemembers.isInheritedField(receiver, field)) {
+            checker.assignment().noteBaseFieldBinding(field);
+        } else {
+            checker.assignment().seedField(field, parameter.span());
+        }
     }
     checker.assignment().finishSeeding();
 }

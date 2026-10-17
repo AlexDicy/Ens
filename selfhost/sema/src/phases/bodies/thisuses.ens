@@ -27,22 +27,51 @@ import NewExpressionNode from @ens.frontend.syntax.generated.nodes;
 import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
 import GenericNameExpressionNode from @ens.frontend.syntax.generated.nodes;
 import SuperExpressionNode from @ens.frontend.syntax.generated.nodes;
+import PrefixExpressionNode from @ens.frontend.syntax.generated.nodes;
+import PostfixExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SubscriptExpressionNode from @ens.frontend.syntax.generated.nodes;
 import InitializerNode from @ens.frontend.syntax.generated.nodes;
 import VariableDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import AssignmentExpressionNode from @ens.frontend.syntax.generated.nodes;
 import ArrayLiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
 import StructLiteralFieldNode from @ens.frontend.syntax.generated.nodes;
 import LambdaExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ExpressionStatementNode from @ens.frontend.syntax.generated.nodes;
+import ForEachStatementNode from @ens.frontend.syntax.generated.nodes;
+import ForStatementNode from @ens.frontend.syntax.generated.nodes;
+import WhileStatementNode from @ens.frontend.syntax.generated.nodes;
+import IfStatementNode from @ens.frontend.syntax.generated.nodes;
+import FunctionDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import FieldDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import BlockNode from @ens.frontend.syntax.generated.nodes;
 import ListNode from @ens.frontend.syntax.generated.nodes;
 import SwitchArm from @ens.frontend.syntax.generated.nodes;
 import SyntaxKind from @ens.frontend.syntax.generated.kind;
+import OutArgumentNode from @ens.frontend.syntax.generated.nodes;
+import @ens.frontend.syntax.generated.factory;
 import SyntaxNode from @ens.frontend.syntax.node;
 import Span from @ens.frontend.support.source;
 import model.overriding;
 import Method from model.typemembers;
 import model.types;
 import ThisUse from result;
+import LateWrite from phases.bodies.unassigneduses;
+import LateCall from phases.bodies.unassigneduses;
+import FeedingWrite from phases.bodies.unassigneduses;
+import BaseFieldUses from phases.bodies.unassigneduses;
+import Rewritten from phases.bodies.unassigneduses;
+import BaseRun from phases.bodies.unassigneduses;
+import phases.bodies.reordering;
+import model.convert;
+import phases.bodies.unassigneduses;
+import Statement from @ens.frontend.syntax.generated.nodes;
+import SafeSubscriptExpressionNode from @ens.frontend.syntax.generated.nodes;
+import model.typemembers;
+import Field from model.typemembers;
+import Type from model.types;
 import ThisUseKind from result;
+import LocalFeed from phases.bodies.unassigneduses;
+import phases.bodies.definiteassignment;
 import BodyChecker from phases.bodies;
 import phases.bodies.wording;
 import support.syntax;
@@ -174,7 +203,7 @@ superCallSpelling(CallExpressionNode call, string name) -> string {
 }
 
 // The outermost parentheses around 'node', or 'node' where none are around it.
-parenthesized(SyntaxNode node) -> SyntaxNode {
+public parenthesized(SyntaxNode node) -> SyntaxNode {
     SyntaxNode written = node;
     SyntaxNode? around = enclosing(node);
     while (around is ParenthesizedExpressionNode) {
@@ -184,8 +213,708 @@ parenthesized(SyntaxNode node) -> SyntaxNode {
     return written;
 }
 
+// The statement 'expression' is written as, spelled on one line, or "" where it is too long to
+// quote or is not a statement of its own.
+public statementSpelling(Expression expression) -> string {
+    let holder = enclosing(parenthesized(expression));
+    if (!(holder is ExpressionStatementNode)) {
+        return "";
+    }
+    string spelled = wording.greenSpelling(holder.green());
+    if (spelled.length > wording.quotedCodeLimit()) {
+        return "";
+    }
+    return spelled;
+}
+
+// The assignment 'node' to the own field 'field' after 'calls', before each of which the field had
+// no value, described for the refusal that moves the statement holding it above them.
+// 'alsoAssigned' says a path reaching it ran a 'super(...)' with the field assigned.
+public lateWriteOf(BodyChecker checker, AssignmentExpressionNode node, Field field,
+        List<LateCall> calls, bool alsoAssigned) -> LateWrite {
+    let receiver = checker.frame().thisType();
+    let held = heldStatement(node, calls);
+    string statement = heldBy(held, field);
+    bool quoted = false;
+    if (held is ExpressionStatementNode) {
+        string spelled = wording.greenSpelling(held.green());
+        if (spelled.length <= wording.quotedCodeLimit()) {
+            statement = "'{spelled}'";
+            quoted = true;
+        }
+    }
+    let uses = new BaseFieldUses();
+    ThisUse? other = null;
+    let declarations = new List<VariableDeclarationNode>();
+    string later = "";
+    let reorder = checker.assignment().reordering();
+    if (receiver != null && reorder != null) {
+        other = collectThisUses(held, receiver, uses);
+        later = laterLocalOf(held, calls, receiver, declarations);
+    }
+    Rewritten? rewritten = null;
+    if (other == null && declarations.length() == 0 && quoted && uses.replaceable()) {
+        rewritten = unassigneduses.rewrittenWith(held.green(), uses, calls);
+    }
+    let quotedDeclarations = new List<string>();
+    for (let declaration in declarations) {
+        quotedDeclarations.push("'{wording.greenSpelling(declaration.green())}'");
+    }
+    return new LateWrite(field, calls, alsoAssigned, statement, uses, other, later,
+        quotedDeclarations, rewritten,
+        () -> later.length == 0 && reorder != null && reorder.movesAbove(held, declarations, calls));
+}
+
+// The statement that holds 'node' in the innermost block that also holds one of 'calls', the
+// outermost such statement where the calls are in different blocks.
+heldStatement(SyntaxNode node, List<LateCall> calls) -> SyntaxNode {
+    SyntaxNode? widest = null;
+    for (let call in calls) {
+        let held = heldAfter(call.call, node);
+        if (held != null && (widest == null || held.span().length > widest.span().length)) {
+            widest = held;
+        }
+    }
+    return widest ?? bodyStatementOf(node) ?? node;
+}
+
+// The statement of the constructor's body that holds 'node', or null outside one.
+bodyStatementOf(SyntaxNode node) -> SyntaxNode? {
+    SyntaxNode current = node;
+    SyntaxNode? holder = enclosing(node);
+    while (holder != null) {
+        if (holder is BlockNode && enclosing(holder) is FunctionDeclarationNode) {
+            return current;
+        }
+        current = holder;
+        holder = enclosing(holder);
+    }
+    return null;
+}
+
+// The statement that holds 'node' in the innermost block holding both 'call' and 'node', or null.
+heldAfter(SyntaxNode call, SyntaxNode node) -> SyntaxNode? {
+    let block = enclosingBlock(call);
+    while (block != null) {
+        if (holds(block, node)) {
+            return statementIn(block, node);
+        }
+        block = enclosingBlock(block);
+    }
+    return null;
+}
+
+// The innermost block around 'node', or null.
+public enclosingBlock(SyntaxNode node) -> BlockNode? {
+    SyntaxNode? holder = enclosing(node);
+    while (holder != null) {
+        if (holder is BlockNode) {
+            return holder;
+        }
+        holder = enclosing(holder);
+    }
+    return null;
+}
+
+// Whether 'node' is written inside 'outer'.
+holds(SyntaxNode outer, SyntaxNode node) -> bool {
+    return node.span().start >= outer.span().start && node.span().end() <= outer.span().end();
+}
+
+// The statement of 'block' that holds 'node'.
+public statementIn(BlockNode block, SyntaxNode node) -> SyntaxNode {
+    SyntaxNode current = node;
+    SyntaxNode? holder = enclosing(node);
+    while (holder != null && !isNode(holder, block)) {
+        current = holder;
+        holder = enclosing(holder);
+    }
+    return current;
+}
+
+// A local that 'held' reads, declared after one of 'calls' in its block, whose declaration cannot
+// move above that call with 'held', or "". The declarations that can are added to 'declarations'
+// in the order they are written.
+laterLocalOf(SyntaxNode held, List<LateCall> calls, Type receiver,
+        List<VariableDeclarationNode> declarations) -> string {
+    let block = enclosing(held);
+    if (!(block is BlockNode)) {
+        return "";
+    }
+    for (let call in calls) {
+        if (!holds(block, call.call)) {
+            continue;
+        }
+        let callStatement = statementIn(block, call.call);
+        let between = new List<VariableDeclarationNode>();
+        bool after = false;
+        for (long i = 0; i < block.statementsCount(); i++) {
+            let statement = block.statements(i);
+            if (isNode(statement, held)) {
+                break;
+            }
+            if (isNode(statement, callStatement)) {
+                after = true;
+            } else if (after && statement is VariableDeclarationNode) {
+                between.push(statement);
+            }
+        }
+        bool movable = calls.length() == 1 && callStatement is ExpressionStatementNode;
+        let moved = new List<VariableDeclarationNode>();
+        string blocked = movedDeclarations(held, between, movable, receiver, moved);
+        if (blocked.length > 0) {
+            return blocked;
+        }
+        for (let declaration in between) {
+            if (moved.contains(declaration) && !declarations.contains(declaration)) {
+                declarations.push(declaration);
+            }
+        }
+    }
+    return "";
+}
+
+// Adds to 'moved' each declaration of 'between' whose local 'node' reads, and in turn those whose
+// locals they read. Returns the name of a local read whose declaration cannot move, or "".
+movedDeclarations(SyntaxNode node, List<VariableDeclarationNode> between, bool movable,
+        Type receiver, List<VariableDeclarationNode> moved) -> string {
+    for (let declaration in between) {
+        string name = declaration.name().text();
+        if (moved.contains(declaration) || !wording.usesName(node.green(), name)) {
+            continue;
+        }
+        let uses = new BaseFieldUses();
+        if (!movable || wording.greenSpelling(declaration.green()).length > wording.quotedCodeLimit()
+                || collectThisUses(declaration, receiver, uses) != null || uses.any()) {
+            return name;
+        }
+        moved.push(declaration);
+        string blocked = movedDeclarations(declaration, between, movable, receiver, moved);
+        if (blocked.length > 0) {
+            return blocked;
+        }
+    }
+    return "";
+}
+
+// The assignment to an own field whose value holds 'read', a member access through 'this', as in
+// 'this.label = this.name;', or null where the read is in none.
+public feedingWriteOf(BodyChecker checker, MemberExpressionNode read) -> FeedingWrite? {
+    let receiver = checker.frame().thisType();
+    if (receiver == null) {
+        return null;
+    }
+    SyntaxNode current = read;
+    SyntaxNode? holder = enclosing(read);
+    while (holder != null && !(holder is Statement) && !(holder is LambdaExpressionNode)) {
+        if (holder is AssignmentExpressionNode) {
+            return feedingWrite(holder, current, receiver);
+        }
+        if (holder is InitializerNode) {
+            let declaration = enclosing(holder);
+            if (declaration is VariableDeclarationNode) {
+                return localFeeding(checker, declaration, receiver);
+            }
+            return null;
+        }
+        current = holder;
+        holder = enclosing(holder);
+    }
+    return null;
+}
+
+// The declaration 'declaration' of a local described as a feeding write, where statements after it
+// in its block use the local before the next statement that calls 'super(...)', or null.
+localFeeding(BodyChecker checker, VariableDeclarationNode declaration, Type receiver)
+        -> FeedingWrite? {
+    let block = enclosing(declaration);
+    if (!(block is BlockNode)) {
+        return null;
+    }
+    string name = declaration.name().text();
+    let users = new List<string>();
+    let userNodes = new List<SyntaxNode>();
+    let fields = new List<Field>();
+    bool after = false;
+    for (long i = 0; i < block.statementsCount(); i++) {
+        let statement = block.statements(i);
+        if (isNode(statement, declaration)) {
+            after = true;
+        } else if (after && syntax.writesSuperOutsideLambdas(statement)) {
+            break;
+        } else if (after && wording.usesName(statement.green(), name)) {
+            string spelled = wording.greenSpelling(statement.green());
+            if (spelled.length > wording.quotedCodeLimit()) {
+                spelled = "";
+            }
+            users.push(spelled);
+            userNodes.push(statement);
+            addUnassignedFieldsAssigned(checker, statement, receiver, fields);
+        }
+    }
+    if (users.length() == 0) {
+        return null;
+    }
+    string statement = wording.greenSpelling(declaration.green());
+    if (statement.length > wording.quotedCodeLimit()) {
+        statement = "";
+    }
+    let uses = new BaseFieldUses();
+    let other = collectThisUses(declaration, receiver, uses);
+    return new FeedingWrite(declaration.span(), null, new LocalFeed(name, users, userNodes, fields),
+        statement, declaration, uses, other != null);
+}
+
+// Adds to 'fields' each own field of 'receiver' that 'node' assigns with '=' through 'this' and
+// that needs a value and has none yet.
+addUnassignedFieldsAssigned(BodyChecker checker, SyntaxNode node, Type receiver, List<Field> fields) {
+    if (node is LambdaExpressionNode) {
+        return;
+    }
+    if (node is AssignmentExpressionNode && node.operator().text() == "=") {
+        let target = syntax.unwrapParentheses(node.target());
+        if (target is MemberExpressionNode && thisOf(target.object()) != null) {
+            let field = typemembers.inheritedOrOwnField(receiver, target.member().text());
+            if (field != null && !typemembers.isInheritedField(receiver, field)
+                    && definiteassignment.needsAssignment(field)
+                    && !checker.assignment().hasValue(field) && !fields.contains(field)) {
+                fields.push(field);
+            }
+        }
+    }
+    for (let child in node.childNodes()) {
+        addUnassignedFieldsAssigned(checker, child, receiver, fields);
+    }
+}
+
+// The assignment 'assignment' described as a feeding write where 'value' is its value and its
+// target is an own field of 'receiver' through 'this', or null.
+feedingWrite(AssignmentExpressionNode assignment, SyntaxNode value, Type receiver) -> FeedingWrite? {
+    let target = syntax.unwrapParentheses(assignment.target());
+    if (!isNode(assignment.value(), value) || assignment.operator().text() != "="
+            || !(target is MemberExpressionNode) || thisOf(target.object()) == null) {
+        return null;
+    }
+    let field = typemembers.inheritedOrOwnField(receiver, target.member().text());
+    if (field == null || typemembers.isInheritedField(receiver, field)) {
+        return null;
+    }
+    string statement = statementSpelling(assignment);
+    SyntaxNode? statementNode = null;
+    let holder = enclosing(parenthesized(assignment));
+    if (holder is ExpressionStatementNode) {
+        statementNode = holder;
+    }
+    let uses = new BaseFieldUses();
+    let other = collectThisUses(assignment.value(), receiver, uses);
+    return new FeedingWrite(assignment.span(), field, null, statement, statementNode, uses,
+        other != null);
+}
+
+// How a refusal names 'statement', a statement of a constructor's body that assigns 'field' inside
+// it, as in "the 'if' statement that assigns 'reason'".
+heldBy(SyntaxNode statement, Field field) -> string {
+    string kind = "statement";
+    switch (statement) {
+        is IfStatementNode ignored -> {
+            kind = "'if' statement";
+        },
+        is SwitchStatementNode ignored -> {
+            kind = "'switch' statement";
+        },
+        is WhileStatementNode ignored -> {
+            kind = "'while' loop";
+        },
+        is ForStatementNode ignored -> {
+            kind = "'for' loop";
+        },
+        is ForEachStatementNode ignored -> {
+            kind = "'for' loop";
+        },
+        is BlockNode ignored -> {
+            kind = "block";
+        },
+        default -> { },
+    }
+    return "the {kind} that assigns '{field.name()}'";
+}
+
+// Adds to 'uses' the fields of the base class of 'receiver' that 'node' uses through 'this', and
+// returns its first use of 'this' other than using a field and testing its type, or null.
+public collectThisUses(SyntaxNode node, Type receiver, BaseFieldUses uses) -> ThisUse? {
+    if (node is MemberExpressionNode && thisOf(node.object()) != null && !isCallee(node)) {
+        string member = node.member().text();
+        let field = typemembers.inheritedOrOwnField(receiver, member);
+        if (field == null) {
+            return new ThisUse(ThisUseKind.Value, null, "", node.span());
+        }
+        if (typemembers.isInheritedField(receiver, field)) {
+            let place = placeAround(node);
+            if (isWritten(place)) {
+                uses.noteWrite(member, !isNode(place, node));
+            } else {
+                uses.noteRead(member, node.green(),
+                    holdsStruct(field) && callsMethodWithin(node, place));
+            }
+        }
+        return null;
+    }
+    if (node is CallExpressionNode) {
+        let callee = syntax.unwrapParentheses(node.callee());
+        if (callee is MemberExpressionNode && thisOf(callee.object()) != null) {
+            return new ThisUse(ThisUseKind.MethodCall, null, callee.member().text(), callee.span());
+        }
+        if (callee is MemberExpressionNode && syntax.unwrapParentheses(callee.object())
+                is SuperExpressionNode) {
+            return new ThisUse(ThisUseKind.BaseMethodCall, null,
+                superCallSpelling(node, callee.member().text()), callee.span());
+        }
+    }
+    if (node is LambdaExpressionNode && mentionsThis(node)) {
+        return new ThisUse(ThisUseKind.LambdaCapture, null, "", node.span());
+    }
+    if (node is ThisExpressionNode) {
+        let around = enclosing(parenthesized(node));
+        if (around is TypeTestExpressionNode) {
+            return null;
+        }
+        return valueUseAt(node) ?? new ThisUse(ThisUseKind.Value, null, "", node.span());
+    }
+    if (node is SuperExpressionNode) {
+        return new ThisUse(ThisUseKind.Value, null, "", node.span());
+    }
+    for (let child in node.childNodes()) {
+        let use = collectThisUses(child, receiver, uses);
+        if (use != null) {
+            return use;
+        }
+    }
+    return null;
+}
+
+// The outermost member access, element access or parentheses that 'node' is the object of, or
+// 'node' itself.
+placeAround(SyntaxNode node) -> SyntaxNode {
+    SyntaxNode current = node;
+    SyntaxNode? holder = enclosing(current);
+    while (holder != null && holdsAsObject(holder, current)) {
+        current = holder;
+        holder = enclosing(current);
+    }
+    return current;
+}
+
+// Whether 'holder' is a member access, an element access or parentheses whose object is 'part'.
+holdsAsObject(SyntaxNode holder, SyntaxNode part) -> bool {
+    switch (holder) {
+        is ParenthesizedExpressionNode ignored -> {
+            return true;
+        },
+        is MemberExpressionNode member -> {
+            return isNode(member.object(), part);
+        },
+        is SafeMemberExpressionNode member -> {
+            return isNode(member.object(), part);
+        },
+        is SubscriptExpressionNode subscript -> {
+            return isNode(subscript.object(), part);
+        },
+        is SafeSubscriptExpressionNode subscript -> {
+            return isNode(subscript.object(), part);
+        },
+        default -> {
+            return false;
+        },
+    }
+}
+
+// Whether the place 'place' is assigned, or changed with '++' or '--'.
+isWritten(SyntaxNode place) -> bool {
+    switch (enclosing(place)) {
+        is AssignmentExpressionNode assignment -> {
+            return isNode(assignment.target(), place);
+        },
+        is PrefixExpressionNode prefix -> {
+            string operator = prefix.operator().text();
+            return operator == "++" || operator == "--";
+        },
+        is PostfixExpressionNode ignored -> {
+            return true;
+        },
+        default -> {
+            return false;
+        },
+    }
+}
+
+// Whether a method is called on 'node' or on a part of it, up to 'place'.
+callsMethodWithin(SyntaxNode node, SyntaxNode place) -> bool {
+    SyntaxNode current = node;
+    while (!isNode(current, place)) {
+        let holder = enclosing(current);
+        if (holder == null) {
+            return false;
+        }
+        if (isCallee(holder)) {
+            return true;
+        }
+        current = holder;
+    }
+    return isCallee(place);
+}
+
+// Whether running the constructor 'chosen' leaves the field 'name' holding what its 'this.name'
+// parameter assigns: a 'const' field its class declares, or one no code of the chain changes.
+public keepsBoundField(Method chosen, string name) -> bool {
+    Type owner = chosen.definingType();
+    let field = typemembers.inheritedOrOwnField(owner, name);
+    if (field == null) {
+        return false;
+    }
+    if (field.isConst() && field.definingType() == owner) {
+        return true;
+    }
+    return leavesFieldAlone(chosen, field);
+}
+
+// Whether the constructor 'chosen', and each base constructor it runs, changes 'field' nowhere and
+// lets 'this' reach no code. A method called on a struct may be 'mutating', so it counts as a change.
+leavesFieldAlone(Method chosen, Field field) -> bool {
+    let declaration = chosen.signature().declaration();
+    if (declaration == null) {
+        return false;
+    }
+    let root = factory.createRoot(declaration);
+    if (assignsField(root, field.name())
+            || holdsStruct(field) && callsMethodOnField(root, field.name())) {
+        return false;
+    }
+    let implicit = typemembers.implicitBaseConstructor(chosen.definingType());
+    let base = implicit.chosen();
+    return leavesThisAlone(chosen)
+        && (implicit.owner() == null || base != null && leavesFieldAlone(base, field));
+}
+
+// Whether 'field' holds a struct, which a 'mutating' method can change.
+holdsStruct(Field field) -> bool {
+    return types.isStructLike(convert.coreOf(field.type()));
+}
+
+// Whether the constructor 'chosen', and each base constructor it runs, lets 'this' reach no code.
+public leavesThisAlone(Method chosen) -> bool {
+    let declaration = chosen.signature().declaration();
+    if (declaration == null) {
+        return false;
+    }
+    Type owner = chosen.definingType();
+    if (collectThisUses(factory.createRoot(declaration), owner, new BaseFieldUses()) != null) {
+        return false;
+    }
+    let implicit = typemembers.implicitBaseConstructor(owner);
+    if (implicit.owner() == null) {
+        return true;
+    }
+    let base = implicit.chosen();
+    return base != null && leavesThisAlone(base);
+}
+
+// Whether 'node' calls a method on the field 'name' of 'this' or on a part of it, which changes it
+// where the method is 'mutating'.
+callsMethodOnField(SyntaxNode node, string name) -> bool {
+    if (node is MemberExpressionNode && thisOf(node.object()) != null
+            && node.member().text() == name && callsMethodWithin(node, placeAround(node))) {
+        return true;
+    }
+    for (let child in node.childNodes()) {
+        if (callsMethodOnField(child, name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// What running the base constructor 'chosen' may do besides building the base class. Nothing is
+// known of a constructor that is not resolved.
+public baseRunOf(Method? chosen) -> BaseRun {
+    if (chosen == null) {
+        return new BaseRun(true, true);
+    }
+    bool runsCode = !runsNoCode(chosen);
+    return new BaseRun(runsCode, runsCode && !leavesThisAlone(chosen));
+}
+
+// Whether running the constructor 'chosen' runs no code of the program: it has no statements, the
+// defaults of its class run none, and neither does each base constructor it runs.
+runsNoCode(Method chosen) -> bool {
+    let declaration = chosen.signature().declaration();
+    if (declaration == null) {
+        return false;
+    }
+    let root = factory.createRoot(declaration);
+    if (!(root is FunctionDeclarationNode)) {
+        return false;
+    }
+    let body = root.body();
+    if (body != null && body.statementsCount() > 0) {
+        return false;
+    }
+    Type owner = chosen.definingType();
+    let fields = typemembers.fieldsOf(owner);
+    if (fields == null) {
+        return false;
+    }
+    for (long i = typemembers.baseFieldCount(owner); i < fields.length(); i++) {
+        let written = fields.get(i).declaration();
+        if (written == null) {
+            continue;
+        }
+        let root = factory.createRoot(written);
+        if (!(root is FieldDeclarationNode)) {
+            return false;
+        }
+        let initial = root.defaultValue();
+        if (initial != null && !reordering.runsNothing(initial.value())) {
+            return false;
+        }
+    }
+    let implicit = typemembers.implicitBaseConstructor(owner);
+    if (implicit.owner() == null) {
+        return true;
+    }
+    let base = implicit.chosen();
+    return base != null && runsNoCode(base);
+}
+
+// Whether 'node' changes the local or parameter 'name' anywhere under it, by assigning it or a part
+// of it with '=' or a compound assignment, with '++' or '--', or as an 'out' argument.
+public assignsName(SyntaxNode node, string name) -> bool {
+    switch (node) {
+        is AssignmentExpressionNode assignment -> {
+            if (changesLocal(assignment.target(), name)) {
+                return true;
+            }
+        },
+        is PrefixExpressionNode prefix -> {
+            string operator = prefix.operator().text();
+            if ((operator == "++" || operator == "--") && changesLocal(prefix.operand(), name)) {
+                return true;
+            }
+        },
+        is PostfixExpressionNode postfix -> {
+            if (changesLocal(postfix.operand(), name)) {
+                return true;
+            }
+        },
+        is OutArgumentNode argument -> {
+            if (argument.name().text() == name) {
+                return true;
+            }
+        },
+        default -> { },
+    }
+    for (let child in node.childNodes()) {
+        if (assignsName(child, name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Whether writing to 'target' changes the local or parameter 'name': the local itself, or a member or
+// an element of it at any depth.
+changesLocal(Expression target, string name) -> bool {
+    Expression current = syntax.unwrapParentheses(target);
+    while (true) {
+        switch (current) {
+            is IdentifierExpressionNode identifier -> {
+                return identifier.name().text() == name;
+            },
+            is MemberExpressionNode member -> {
+                current = syntax.unwrapParentheses(member.object());
+            },
+            is SubscriptExpressionNode subscript -> {
+                current = syntax.unwrapParentheses(subscript.object());
+            },
+            default -> {
+                return false;
+            },
+        }
+    }
+}
+
+// Whether 'node' changes the field 'name' of 'this' anywhere under it, by assigning it or a part of
+// it with '=' or a compound assignment, or with '++' or '--'.
+public assignsField(SyntaxNode node, string name) -> bool {
+    switch (node) {
+        is AssignmentExpressionNode assignment -> {
+            if (changesField(assignment.target(), name)) {
+                return true;
+            }
+        },
+        is PrefixExpressionNode prefix -> {
+            string operator = prefix.operator().text();
+            if ((operator == "++" || operator == "--") && changesField(prefix.operand(), name)) {
+                return true;
+            }
+        },
+        is PostfixExpressionNode postfix -> {
+            if (changesField(postfix.operand(), name)) {
+                return true;
+            }
+        },
+        default -> { },
+    }
+    for (let child in node.childNodes()) {
+        if (assignsField(child, name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Whether writing to 'target' changes the field 'name' of 'this': the field itself, or a member or an
+// element of it at any depth.
+public changesField(Expression target, string name) -> bool {
+    Expression current = syntax.unwrapParentheses(target);
+    while (true) {
+        switch (current) {
+            is MemberExpressionNode member -> {
+                if (thisOf(member.object()) != null) {
+                    return member.member().text() == name;
+                }
+                current = syntax.unwrapParentheses(member.object());
+            },
+            is SubscriptExpressionNode subscript -> {
+                current = syntax.unwrapParentheses(subscript.object());
+            },
+            default -> {
+                return false;
+            },
+        }
+    }
+}
+
+// Whether 'node' is the callee of a call.
+isCallee(SyntaxNode node) -> bool {
+    let around = enclosing(parenthesized(node));
+    return around is CallExpressionNode && isNode(parenthesized(node), around.callee());
+}
+
+// Whether 'this' or 'super' is written under 'node'.
+mentionsThis(SyntaxNode node) -> bool {
+    if (node is ThisExpressionNode || node is SuperExpressionNode) {
+        return true;
+    }
+    for (let child in node.childNodes()) {
+        if (mentionsThis(child)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // The node 'node' is written in, past the list that holds it.
-enclosing(SyntaxNode node) -> SyntaxNode? {
+public enclosing(SyntaxNode node) -> SyntaxNode? {
     let parent = node.parent();
     if (parent is ListNode) {
         return parent.parent();
@@ -194,7 +923,7 @@ enclosing(SyntaxNode node) -> SyntaxNode? {
 }
 
 // Whether 'first' and 'second' are the same node of the tree.
-isNode(SyntaxNode first, SyntaxNode second) -> bool {
+public isNode(SyntaxNode first, SyntaxNode second) -> bool {
     return first.green() == second.green() && first.span().start == second.span().start;
 }
 
@@ -244,6 +973,9 @@ escapeAt(Span span, SyntaxNode written, SyntaxNode? around) -> ThisUse {
     }
     switch (holder) {
         is ArgumentListNode arguments -> {
+            if (passesToSuper(arguments)) {
+                return new ThisUse(ThisUseKind.SuperArgument, null, "", span);
+            }
             return new ThisUse(ThisUseKind.Argument, null, calleeNamed(arguments), span);
         },
         is NamedArgumentNode named -> {
@@ -317,6 +1049,12 @@ passesOn(SyntaxNode holder, SyntaxNode value) -> bool {
             return false;
         },
     }
+}
+
+// Whether 'arguments' are the arguments of 'super(...)' itself.
+passesToSuper(ArgumentListNode arguments) -> bool {
+    let call = enclosing(arguments);
+    return call is CallExpressionNode && syntax.unwrapParentheses(call.callee()) is SuperExpressionNode;
 }
 
 // The callee of the call whose arguments are 'arguments', as a text names it: "'show'", "the

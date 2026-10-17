@@ -25,7 +25,6 @@ import FunctionItem from phases.exceptions;
 import TypeItem from phases.exceptions;
 import ThrowSet from phases.exceptions;
 import ThrowCount from phases.exceptions;
-import CallThrows from phases.exceptions;
 import phases.members;
 import model.hierarchy;
 import model.typemembers;
@@ -695,12 +694,9 @@ public final class ThrowValidation {
             + "Catch the exceptions with 'catch' clauses after the {word} body.", item.signature.nameSpan());
     }
 
-    // What a constructor's catch clauses do that depends on how far the body ran before it threw.
-    // A clause that catches what the arguments of 'super(...)' throw runs before the base class
-    // exists, so it must not finish the constructor normally, which returns the object. A
-    // 'super(...)' in a clause is refused for that call alone, naming the call to move where the
-    // clause catches what one throws. A use of 'this' in a clause is refused where the clause
-    // catches what the body throws before a field the use needs has a value.
+    // Refuses what a constructor's catch clauses do that depends on how far the body ran before it
+    // threw: finishing the constructor, calling 'super(...)', or using 'this', where the clause
+    // catches what the body throws before the base class or a field the use needs has a value.
     validateConstructorCatches(FunctionItem item) {
         let owner = item.owner;
         let declaration = item.declaration;
@@ -708,11 +704,16 @@ public final class ThrowValidation {
             return;
         }
         let base = hierarchy.baseOf(owner);
-        let chaining = syntax.chainingSuperCall(declaration.body());
-        let raised = new CallThrows();
-        if (chaining != null) {
-            raised = this.module.callThrowsUnder(chaining.arguments());
+        let unbuilt = this.result.unbuiltEscapesOf(declaration.green()) ?? [];
+        let built = this.result.builtEscapesOf(declaration.green()) ?? [];
+        let everyEscape = new List<SyntaxNode>();
+        for (let escape in unbuilt) {
+            everyEscape.push(escape);
         }
+        for (let escape in built) {
+            everyEscape.push(escape);
+        }
+        bool bodyBuilds = syntax.callsSuper(declaration.body());
         let clauseTypes = this.module.caughtClauseTypes(declaration);
         string quotedOwner = this.names.quotedName(owner);
         string quotedBase = "";
@@ -727,45 +728,128 @@ public final class ThrowValidation {
                 continue;
             }
             if (clauseType == null || this.shadowedByEarlier(clauseType, clauseTypes, i)) {
-                this.refuseSuperCallsInCatch(facts, null, quotedOwner, quotedBase);
+                this.refuseSuperCallsInCatch(facts, null, false, bodyBuilds, quotedBase);
                 continue;
             }
-            let caught = this.firstCallCaught(raised, clauseType, clauseTypes, i);
-            this.refuseSuperCallsInCatch(facts, caught, quotedOwner, quotedBase);
-            if (caught != null && !syntax.writesSuperCall(clause)) {
+            let caught = this.firstUnbuiltCaught(unbuilt, everyEscape, clauseType, clauseTypes, i);
+            let caughtAfter = this.firstUnbuiltCaught(built, everyEscape, clauseType, clauseTypes, i);
+            if (!bodyBuilds) {
+                caught = caught ?? caughtAfter;
+                caughtAfter = null;
+            }
+            this.refuseSuperCallsInCatch(facts, caught, caughtAfter != null, bodyBuilds, quotedBase);
+            if (bodyBuilds && caught != null && !syntax.writesSuperCall(clause)) {
                 this.refuseUnconstructedExits(clause, facts, caught, quotedOwner, quotedBase);
             }
-            this.refuseCatchThisUses(facts, clauseType, clauseTypes, i, quotedBase);
+            this.refuseCatchThisUses(facts, everyEscape, clauseType, clauseTypes, i, quotedBase);
             this.refuseCatchFinishes(facts, clauseType, clauseTypes, i, owner);
         }
     }
 
-    refuseSuperCallsInCatch(ConstructorCatch facts, CaughtCall? caught, string quotedOwner,
-            string quotedBase) {
-        for (let superCall in facts.superCalls()) {
-            string text = "'super(...)' cannot be called in a 'catch' clause, because the constructor "
-                + "of {quotedOwner} already constructs base class {quotedBase} with the 'super(...)' "
-                + "it starts with. Remove this call.";
-            if (caught != null) {
-                text = text + " To construct {quotedBase} with a fallback value, move the call to "
-                    + "{calleePhrase(caught.call)} into a function that catches "
-                    + "{nameList(caught.thrown, this.names)} and returns a value to pass to the first "
-                    + "'super(...)'.";
+    // Refuses each 'super(...)' in a catch clause, with the fix for what it catches the body throwing
+    // before the base class is built, from 'caught', and once it is built where 'catchesAfter' says
+    // so. 'bodyBuilds' says the body calls 'super(...)'.
+    refuseSuperCallsInCatch(ConstructorCatch facts, UnbuiltCatch? caught, bool catchesAfter,
+            bool bodyBuilds, string quotedBase) {
+        string refusal = "'super(...)' cannot be called in a 'catch' clause, because base class "
+            + "{quotedBase} is constructed only in the body of the constructor.";
+        string fix = "Remove this call.";
+        if (!bodyBuilds && caught != null && caught.call() == null) {
+            fix = "Call 'super(...)' at the end of the body, and replace this call with "
+                + "'panic(...)'.";
+        } else if (!bodyBuilds && caught != null && caught.only) {
+            fix = "{this.fallbackFix(caught)}, call 'super(...)' at the end of the body, and remove "
+                + "this 'catch' clause.";
+        } else if (!bodyBuilds && caught != null) {
+            fix = "{this.fallbackFix(caught)}, call 'super(...)' at the end of the body, and remove "
+                + "this call.";
+        } else if (!bodyBuilds) {
+            fix = "Call 'super(...)' at the end of the body, and remove this call.";
+        } else if (catchesAfter) {
+            refusal = "'super(...)' cannot be called in a 'catch' clause, because the clause can run "
+                + "after the body has already called it.";
+            if (caught != null && caught.call() == null) {
+                fix = "Remove this call, and end the clause with 'panic(...)'.";
+            } else if (caught != null) {
+                fix = "{this.fallbackFix(caught)}, and remove this call.";
             }
-            this.reporter.report(text, superCall);
+        } else if (caught != null && caught.call() == null) {
+            fix = "Replace this call with 'panic(...)'.";
+        } else if (caught != null) {
+            fix = "{this.fallbackFix(caught)}{removedClause(caught)}. If the program cannot continue "
+                + "without that value, replace this call with 'panic(...)'.";
+        }
+        for (let superCall in facts.superCalls()) {
+            this.reporter.report("{refusal} {fix}", superCall);
         }
     }
 
-    // A clause that catches what the arguments of 'super(...)' throw, from 'caught', and finishes
-    // the constructor normally returns an object whose base class was never constructed.
-    refuseUnconstructedExits(CatchClauseNode clause, ConstructorCatch facts, CaughtCall caught,
-            string quotedOwner, string quotedBase) {
-        string callee = calleePhrase(caught.call);
+    // The fix for a clause that catches what the call of 'caught' throws before 'super(...)': move
+    // the call into a function that returns a fallback value, which an argument of 'super(...)'
+    // passes on where the call is one.
+    fallbackFix(UnbuiltCatch caught) -> string {
+        let call = caught.call();
+        if (call == null) {
+            return "";
+        }
         string named = nameList(caught.thrown, this.names);
-        string escape = "{callee} can throw {named} in the arguments of 'super(...)', and this "
-            + "'catch' clause";
-        string fix = "Move the call into a function that catches {named} and returns a value to "
-            + "pass to 'super(...)'. If the program cannot continue without that value, ";
+        if (caught.inSuperArguments()) {
+            return "Move the call to {calleePhrase(call)} into a function that catches {named} and "
+                + "returns a value to pass to 'super(...)'";
+        }
+        return "Move the call to {calleePhrase(call)} into a function that catches {named} and "
+            + "returns a fallback value";
+    }
+
+    // The first place in 'escapes' whose exception the clause at 'index' catches, or null, with
+    // whether no other place of 'everyEscape', every place the body can throw from, throws what the
+    // clause catches.
+    firstUnbuiltCaught(SyntaxNode[] escapes, List<SyntaxNode> everyEscape, Type clauseType,
+            List<Type?> clauseTypes, long index) -> UnbuiltCatch? {
+        for (let escape in escapes) {
+            let caught = this.caughtAtEscape(escape, clauseType, clauseTypes, index);
+            if (!caught.isEmpty()) {
+                return new UnbuiltCatch(escape, caught,
+                    this.onlyCaughtAt(escape, everyEscape, clauseType, clauseTypes, index));
+            }
+        }
+        return null;
+    }
+
+    // Whether 'escape' is the one place of 'everyEscape' whose exception the clause at 'index'
+    // catches, so that the clause never runs once the code there throws nothing.
+    onlyCaughtAt(SyntaxNode escape, List<SyntaxNode> everyEscape, Type clauseType,
+            List<Type?> clauseTypes, long index) -> bool {
+        for (let other in everyEscape) {
+            if (other.span().start != escape.span().start
+                    && !this.caughtAtEscape(other, clauseType, clauseTypes, index).isEmpty()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // A clause that catches what the body throws before 'super(...)' builds the base class, from
+    // 'caught', and finishes the constructor normally returns an object whose base class was never
+    // constructed.
+    refuseUnconstructedExits(CatchClauseNode clause, ConstructorCatch facts, UnbuiltCatch caught,
+            string quotedOwner, string quotedBase) {
+        string named = nameList(caught.thrown, this.names);
+        let call = caught.call();
+        string escape = "the body can throw {named} before 'super(...)', and this 'catch' clause";
+        string fix = "If the program cannot continue, ";
+        if (call != null && caught.inSuperArguments()) {
+            escape = "{calleePhrase(call)} can throw {named} in the arguments of 'super(...)', and "
+                + "this 'catch' clause";
+            fix = "Move the call into a function that catches {named} and returns a value to pass "
+                + "to 'super(...)'{removedClause(caught)}. If the program cannot continue without "
+                + "that value, ";
+        } else if (call != null) {
+            escape = "{calleePhrase(call)} can throw {named} before 'super(...)', and this 'catch' "
+                + "clause";
+            fix = "Move the call into a function that catches {named} and returns a fallback "
+                + "value{removedClause(caught)}. If the program cannot continue without that value, ";
+        }
         if (facts.reachesEnd()) {
             this.reporter.report("The constructor of {quotedOwner} can return an object whose base "
                 + "class {quotedBase} was never constructed: {escape} then reaches its end. " + fix
@@ -780,9 +864,10 @@ public final class ThrowValidation {
     }
 
     // Refuses each use of 'this' in the clause at 'index' at the first place the body can throw
-    // from, without a field the use needs, whose exception the clause catches.
-    refuseCatchThisUses(ConstructorCatch facts, Type clauseType, List<Type?> clauseTypes, long index,
-            string quotedBase) {
+    // from, without a field the use needs, whose exception the clause catches. 'everyEscape' is
+    // every place the body can throw from.
+    refuseCatchThisUses(ConstructorCatch facts, List<SyntaxNode> everyEscape, Type clauseType,
+            List<Type?> clauseTypes, long index, string quotedBase) {
         for (let deferred in facts.uses()) {
             for (let gap in deferred.gaps()) {
                 let caught = this.caughtAtEscape(gap.escape(), clauseType, clauseTypes, index);
@@ -795,8 +880,11 @@ public final class ThrowValidation {
                     callee = calleePhrase(escape);
                 }
                 this.reporter.report(unassigneduses.catchRefusal(deferred.use(), gap.missing(),
-                    gap.missingIsInherited(), callee, nameList(caught, this.names), quotedBase,
-                    this.names), deferred.use().span());
+                    gap.missingIsInherited(), callee, nameList(caught, this.names),
+                    syntax.insideSuperArguments(escape),
+                    this.onlyCaughtAt(escape, everyEscape, clauseType, clauseTypes, index),
+                    quotedBase, this.names),
+                    deferred.use().span());
                 break;
             }
         }
@@ -821,20 +909,6 @@ public final class ThrowValidation {
                 this.reporter.report(text, finish.span());
             }
         }
-    }
-
-    // The first call in 'raised' that throws something the clause at 'index' catches, with what
-    // it catches of it, or null where the clause catches nothing those calls throw.
-    firstCallCaught(CallThrows raised, Type clauseType, List<Type?> clauseTypes, long index)
-            -> CaughtCall? {
-        let calls = raised.calls();
-        for (long i = 0; i < calls.length(); i++) {
-            let caught = this.caughtByClause(raised.raisedBy(i), clauseType, clauseTypes, index);
-            if (!caught.isEmpty()) {
-                return new CaughtCall(calls.get(i), caught);
-            }
-        }
-        return null;
     }
 
     // What the clause at 'index' catches of what the body throws at 'escape'.
@@ -1269,6 +1343,15 @@ movableFix() -> string {
     return "Prefix it with 'try'";
 }
 
+// What a fix that moves the call of 'caught' into a function that throws nothing adds where that
+// call is the one place the clause catches a throw from, which leaves the clause unable to run.
+removedClause(UnbuiltCatch caught) -> string {
+    if (caught.only) {
+        return ", and remove this 'catch' clause";
+    }
+    return "";
+}
+
 // How a diagnostic names what a call calls. A function, method or variable holding a function
 // value is named by its quoted name. Any other callee is the function value its expression
 // produces, quoted when that expression is written on one line without a comment.
@@ -1545,10 +1628,25 @@ isTextAfter(string left, string right) -> bool {
     return leftBytes.length > rightBytes.length;
 }
 
-// A call and the thrown types of it that one catch clause catches.
-final class CaughtCall {
-    CallExpressionNode call;
+// A place the body can throw from before the base class is built, with what a catch clause catches
+// from there, and whether it is the one place the clause catches a throw from.
+final class UnbuiltCatch {
+    SyntaxNode escape;
     ThrowSet thrown;
+    bool only;
 
-    constructor(this.call, this.thrown);
+    constructor(this.escape, this.thrown, this.only);
+
+    // The call that throws, or null for a 'throw' statement.
+    call() -> CallExpressionNode? {
+        let escape = this.escape;
+        if (escape is CallExpressionNode) {
+            return escape;
+        }
+        return null;
+    }
+
+    inSuperArguments() -> bool {
+        return syntax.insideSuperArguments(this.escape);
+    }
 }

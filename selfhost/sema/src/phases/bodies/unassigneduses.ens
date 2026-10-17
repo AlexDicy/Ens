@@ -11,14 +11,31 @@ import TypeNames from model.typenames;
 import model.types;
 import Type from model.types;
 import FunctionType from model.types;
+import Span from @ens.frontend.support.source;
+import Expression from @ens.frontend.syntax.generated.nodes;
+import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
+import GreenNode from @ens.frontend.syntax.green;
+import SyntaxNode from @ens.frontend.syntax.node;
+import support.diagnostics;
 import ThisUse from result;
 import ThisUseKind from result;
 import phases.bodies.wording;
+import Reordering from phases.bodies.reordering;
 import List from @std.collections.list;
 
+// Where a constructor uses 'this' before its base class is built: in the arguments of
+// 'super(...)', before a 'super(...)' its body writes, or in a body that writes none, whose base
+// class is built where the constructor finishes.
+public enum BaseContext {
+    SuperArguments,
+    BeforeSuper,
+    BuiltAtExit,
+}
+
 // The refusal of a use the body of a constructor of 'owner' reaches before 'missing' has a value.
-// An inherited field has none until 'super(...)' finishes, so the use is in its arguments.
-public refusal(ThisUse use, Type owner, Field missing, bool inherited, TypeNames names) -> string {
+// An inherited field has none until the base class is built, at the place 'context' names.
+public refusal(ThisUse use, Type owner, Field missing, bool inherited, BaseContext context,
+        TypeNames names) -> string {
     string named = namedField(missing, inherited, names);
     string subject = "Field {named}";
     string name = missing.name();
@@ -35,12 +52,31 @@ public refusal(ThisUse use, Type owner, Field missing, bool inherited, TypeNames
     }
     if (inherited) {
         string refused = "read it";
+        string here = "it cannot be read here";
+        string after = "Read it after 'super(...)'.";
         if (use.kind() == ThisUseKind.MemberWrite) {
             refused = "set its field '{use.detail()}'";
+            here = "its field '{use.detail()}' cannot be set here";
+            after = "Set it after 'super(...)'.";
+        } else if (use.kind() == ThisUseKind.CompoundAssignment) {
+            refused = "change it with '{use.detail()}'";
+            here = "'{use.detail()}' cannot change it here";
+            after = "Write this line after 'super(...)'.";
         }
-        return "{subject} has no value until 'super(...)' finishes, so the arguments of 'super(...)' "
-            + "cannot {refused}. Pass a value that does not come from 'this', such as a parameter of "
-            + "the constructor.";
+        string base = quotedOwnerOf(missing, names);
+        string until = "{subject} has no value until {base} is constructed";
+        switch (context) {
+            BaseContext.SuperArguments -> {
+                return "{until}, so the arguments of 'super(...)' cannot {refused}. Pass a value "
+                    + "that does not come from 'this', such as a parameter of the constructor.";
+            },
+            BaseContext.BuiltAtExit -> {
+                return "{until}, so {here}. " + builtAtExit(base, "this line");
+            },
+            default -> {
+                return "{until}, so {here}. {after}";
+            },
+        }
     }
     string unassigned = "before every path through the constructor assigns it";
     switch (use.kind()) {
@@ -64,54 +100,1055 @@ public refusal(ThisUse use, Type owner, Field missing, bool inherited, TypeNames
 // What a use that needs every field does in a constructor of 'owner' before field 'missing',
 // spelled 'named', has a value.
 everyFieldUse(ThisUse use, Type owner, Field missing, string named) -> string {
-    string before = "before field {named} has a value";
-    string name = missing.name();
+    return usedBefore(use, "before field {named} has a value", readerOf(use, owner, missing),
+        "'{missing.name()}'") ?? "Until field {named} has a value, 'this' can only be used to read "
+        + "and write its fields and to test its type with 'is'.";
+}
+
+// What 'use' does before 'before', and that the code it reaches may read 'read', where 'reader'
+// names what a method call on 'this' runs. Null for a use of 'this' as a value of no other kind.
+usedBefore(ThisUse use, string before, string reader, string read) -> string? {
     switch (use.kind()) {
         ThisUseKind.MethodCall -> {
-            return "'{use.detail()}' is called on 'this' {before}, and "
-                + "{readerOf(use, owner, missing)} may read '{name}'.";
+            return "'{use.detail()}' is called on 'this' {before}, and {reader} may read {read}.";
         },
         ThisUseKind.BehaviorCall -> {
             return "'{use.detail()}' is called on 'this' {before}, and '{use.detail()}' may read "
-                + "'{name}'.";
+                + "{read}.";
         },
         ThisUseKind.BaseMethodCall -> {
-            return "'{use.detail()}' is called {before}, and the code it runs may read '{name}'.";
+            return "'{use.detail()}' is called {before}, and the code it runs may read {read}.";
         },
         ThisUseKind.TextForm -> {
-            return "'\{this\}' calls 'toString' on 'this' {before}, and 'toString' may read '{name}'.";
+            return "'\{this\}' calls 'toString' on 'this' {before}, and 'toString' may read {read}.";
         },
         ThisUseKind.EqualsReceiver -> {
-            return "'{use.detail()}' calls 'equals' on 'this' {before}, and 'equals' may read '{name}'.";
+            return "'{use.detail()}' calls 'equals' on 'this' {before}, and 'equals' may read {read}.";
         },
         ThisUseKind.EqualsArgument -> {
             return "'{use.detail()}' passes 'this' to 'equals' {before}, and 'equals' may read "
-                + "'{name}'.";
+                + "{read}.";
         },
         ThisUseKind.Argument -> {
-            return "'this' is passed to {use.detail()} {before}, and {use.detail()} may read '{name}'.";
+            return "'this' is passed to {use.detail()} {before}, and {use.detail()} may read {read}.";
+        },
+        ThisUseKind.SuperArgument -> {
+            return "'this' is passed to 'super(...)' {before}, and the constructor of the base class "
+                + "may read {read}.";
         },
         ThisUseKind.StoredInLocal -> {
             return "'this' is stored in '{use.detail()}' {before}, and code that uses "
-                + "'{use.detail()}' may read '{name}'.";
+                + "'{use.detail()}' may read {read}.";
         },
         ThisUseKind.StoredInField -> {
             return "'this' is stored in field '{use.detail()}' {before}, and code that uses "
-                + "'{use.detail()}' may read '{name}'.";
+                + "'{use.detail()}' may read {read}.";
         },
         ThisUseKind.ArrayElement -> {
             return "'this' is put in an array {before}, and code that reads the array may read "
-                + "'{name}'.";
+                + "{read}.";
         },
         ThisUseKind.LambdaCapture -> {
             return "This lambda uses 'this', and it is created {before}, so calling it may read "
-                + "'{name}'.";
+                + "{read}.";
         },
         default -> {
-            return "Until field {named} has a value, 'this' can only be used to read and write its "
-                + "fields and to test its type with 'is'.";
+            return null;
         },
     }
+}
+
+// The refusal of 'use', which needs every field, in a constructor of 'owner' before its base class
+// is built, at the place 'context' names.
+public beforeBaseRefusal(ThisUse use, Type owner, BaseContext context, TypeNames names) -> string {
+    let baseType = hierarchy.baseOf(owner);
+    string base = "the base class";
+    if (baseType != null) {
+        base = quotedClassName(baseType, names);
+    }
+    string place = usePlace(use);
+    string before = "before base class {base} is constructed";
+    string fix = "Move {place} after 'super(...)'.";
+    switch (context) {
+        BaseContext.SuperArguments -> {
+            before = "in the arguments of 'super(...)', before base class {base} is constructed";
+            fix = "Pass 'super(...)' a value that does not come from 'this', such as a parameter of "
+                + "the constructor.";
+        },
+        BaseContext.BuiltAtExit -> {
+            fix = builtAtExit(base, place);
+        },
+        default -> { },
+    }
+    if (use.kind() == ThisUseKind.SuperArgument) {
+        return "'this' is passed to 'super(...)' before base class {base} is constructed, and the "
+            + "constructor of {base} may read its fields. {fix}";
+    }
+    string done = usedBefore(use, before, "'{use.detail()}'", "the fields of {base}")
+        ?? "'this' is used as a value {before}, so the code that receives it may read the fields of "
+        + "{base}.";
+    return "{done} {fix}";
+}
+
+// The fix for a use of 'this' at 'place' in a constructor that writes no 'super(...)', whose base
+// class 'base' is constructed where it finishes.
+builtAtExit(string base, string place) -> string {
+    return "A constructor that does not call 'super(...)' constructs {base} when it finishes, so "
+        + "call 'super();' before {place}.";
+}
+
+// The refusal of a write through 'this' of 'value', of type 'valueType', to 'field' of a base class
+// before it is built, at the place 'context' names. Where the one call of 'calls' after the write
+// sets the field from an argument, the fix passes 'value' as that argument if it is the same there.
+public inheritedWriteRefusal(Field field, BaseContext context, List<LateCall> calls,
+        Expression? value, Type? valueType, TypeNames names, Reordering reorder) -> string {
+    string named = namedField(field, true, names);
+    string base = quotedOwnerOf(field, names);
+    string refusal = "Field {named} cannot be assigned before {base} is constructed, because "
+        + "constructing {base} gives it its value.";
+    switch (context) {
+        BaseContext.BuiltAtExit -> {
+            return "{refusal} " + builtAtExit(base, "this line");
+        },
+        BaseContext.SuperArguments -> {
+            return "{refusal} Assign it after 'super(...)'.";
+        },
+        default -> { },
+    }
+    if (calls.length() != 1) {
+        return "{refusal} Assign it after 'super(...)'.";
+    }
+    let call = calls.get(0);
+    let argument = call.argumentFor(field.name());
+    if (argument == null || !argument.kept) {
+        return "{refusal} Assign it after 'super(...)'.";
+    }
+    if (value == null || valueType == null || valueType != argument.argumentType
+            || !reorder.passesAlike(value, call, argument.index)) {
+        return "{refusal} Assign it after 'super(...)'.";
+    }
+    let passed = passedCall(call, argument.index, value);
+    if (passed == null) {
+        return "{refusal} Pass the value to 'super(...)' as its argument for '{field.name()}', and "
+            + "remove this assignment.";
+    }
+    return "{refusal} Pass the value to 'super(...)', as in '{passed}', and remove this assignment.";
+}
+
+// The statement of 'call' with argument 'index' replaced by 'value', or null where it is too long
+// to quote or the argument is not written by position.
+passedCall(LateCall call, long index, Expression? value) -> string? {
+    let arguments = call.call.arguments();
+    if (value == null || call.spelled.length == 0 || index >= arguments.argumentsCount()) {
+        return null;
+    }
+    let spelled = new List<string>();
+    for (long i = 0; i < arguments.argumentsCount(); i++) {
+        let argument = arguments.arguments(i);
+        if (!(argument is Expression)) {
+            return null;
+        }
+        spelled.push(i == index ? wording.oneLineSpelling(value) : wording.oneLineSpelling(argument));
+    }
+    string passed = "super({string.joined(spelled.toArray(), ", ")});";
+    if (passed.length > wording.quotedCodeLimit()) {
+        return null;
+    }
+    return passed;
+}
+
+// The fields of the base class that code uses through 'this': each one it reads, with the member
+// access that reads it, and each one it assigns.
+public final class BaseFieldUses {
+    public List<string> readNames;
+    public List<GreenNode> readNodes;
+    public List<string> writtenNames;
+    bool partWritten;
+    bool methodCalled;
+
+    public constructor() {
+        this.readNames = new List<string>();
+        this.readNodes = new List<GreenNode>();
+        this.writtenNames = new List<string>();
+        this.partWritten = false;
+        this.methodCalled = false;
+    }
+
+    // Keeps the read of the field 'name' at 'node'. 'callsMethod' says a method is called on the
+    // struct it holds, which changes it where the method is 'mutating'.
+    public noteRead(string name, GreenNode node, bool callsMethod) {
+        this.readNames.push(name);
+        this.readNodes.push(node);
+        this.methodCalled = this.methodCalled || callsMethod;
+    }
+
+    // Keeps a write to the field 'name', to a part of it where 'part' says so.
+    public noteWrite(string name, bool part) {
+        if (!this.writtenNames.contains(name)) {
+            this.writtenNames.push(name);
+        }
+        this.partWritten = this.partWritten || part;
+    }
+
+    public any() -> bool {
+        return this.readNames.length() > 0 || this.writtenNames.length() > 0;
+    }
+
+    // Whether the code only reads the fields, so each read can be replaced by the value it reads.
+    public replaceable() -> bool {
+        return this.readNames.length() > 0 && this.writtenNames.length() == 0 && !this.methodCalled;
+    }
+
+    // The fields read, each once.
+    public reads() -> List<string> {
+        let names = new List<string>();
+        for (let name in this.readNames) {
+            if (!names.contains(name)) {
+                names.push(name);
+            }
+        }
+        return names;
+    }
+
+    // The verb for the writes: "changes" where one writes a part of a field, else "assigns".
+    public writeVerb() -> string {
+        if (this.partWritten) {
+            return "changes";
+        }
+        return "assigns";
+    }
+}
+
+// A statement before 'super(...)', 'statementNode', spelled 'statement' or "" where too long to
+// quote, whose value at 'place' uses fields of the base class as 'uses' lists, and 'this' in
+// another way where 'usesThis' says so. It assigns 'target', an own field with no value yet, or
+// declares the local 'local' describes.
+public final class FeedingWrite {
+    public Span place;
+    public Field? target;
+    public LocalFeed? local;
+    public string statement;
+    public SyntaxNode? statementNode;
+    public BaseFieldUses uses;
+    public bool usesThis;
+
+    public constructor(this.place, this.target, this.local, this.statement, this.statementNode,
+        this.uses, this.usesThis);
+
+    // The name of the field or the local the statement gives a value to.
+    public assigned() -> string {
+        let target = this.target;
+        if (target != null) {
+            return target.name();
+        }
+        let local = this.local;
+        if (local != null) {
+            return local.name;
+        }
+        return "";
+    }
+}
+
+// A local named 'name' whose initial value reads fields of the base class, with the statements
+// 'userNodes' after its declaration that use it before the base class is built, spelled in 'users'
+// or "" where too long to quote, and the own fields with no value yet that they assign.
+public final class LocalFeed {
+    public string name;
+    public List<string> users;
+    public List<SyntaxNode> userNodes;
+    public List<Field> fields;
+
+    public constructor(this.name, this.users, this.userNodes, this.fields);
+}
+
+// The refusal of the reads of 'read', a field of the base class, in the values of 'feedings' before
+// 'calls' build it, at the place 'context' names. Each fix gives what a statement assigns a value
+// without the base class: computed from parameters, or a first value until it runs after the calls.
+public feedingReadRefusal(Field read, List<FeedingWrite> feedings, BaseContext context,
+        List<LateCall> calls, TypeNames names, Reordering reorder) -> string {
+    string base = quotedOwnerOf(read, names);
+    string until = "Field {namedField(read, true, names)} has no value until {base} is constructed";
+    let statements = quotedStatements(feedings);
+    string text = "{until}, so it cannot be read here.";
+    if (feedings.length() > 1 && statements.length() == feedings.length()) {
+        text = "{until}, so {diagnostics.andJoined(statements.toArray())} cannot read it.";
+    }
+    let rewrittenStatements = new List<string>();
+    let rewrittenNames = new List<string>();
+    let parameters = new List<string>();
+    let firstValued = new List<FeedingWrite>();
+    let constant = new List<Field>();
+    let locals = new List<FeedingWrite>();
+    for (let feeding in feedings) {
+        let rewritten = rewrittenFeeding(feeding, calls);
+        let target = feeding.target;
+        let local = feeding.local;
+        if (rewritten != null) {
+            rewrittenStatements.push("'{rewritten.statement}'");
+            rewrittenNames.push(feeding.assigned());
+            for (let parameter in rewritten.parameters) {
+                if (!parameters.contains(parameter)) {
+                    parameters.push(parameter);
+                }
+            }
+        } else if (target != null && target.isConst()) {
+            constant.push(target);
+        } else if (target != null) {
+            firstValued.push(feeding);
+        } else if (local != null && constantFields(local.fields).length() > 0) {
+            for (let field in constantFields(local.fields)) {
+                constant.push(field);
+            }
+        } else {
+            locals.push(feeding);
+        }
+    }
+    if (rewrittenStatements.length() > 0) {
+        text = "{text} {computedFrom(rewrittenNames, parameters)}, as in "
+            + "{diagnostics.andJoined(rewrittenStatements.toArray())}.";
+    }
+    if (firstValued.length() > 0) {
+        string place = "instead";
+        if (feedings.length() == 1) {
+            place = "here";
+        }
+        text = "{text} {firstValueFix(firstValued, place, context, calls, reorder)}";
+    }
+    for (let local in locals) {
+        text = "{text} {localFeedFix(local, context, calls, reorder)}";
+    }
+    if (constant.length() > 0) {
+        text = "{text} {constantFix(constant, base)}";
+    }
+    return text;
+}
+
+// "Compute 'label' from 'given', the constructor's parameter", naming the fields 'fields' and the
+// parameters 'parameters' their values come from.
+computedFrom(List<string> fields, List<string> parameters) -> string {
+    string named = "the constructor's parameter";
+    if (parameters.length() > 1) {
+        named = "the constructor's parameters";
+    }
+    return "Compute {wording.quotedList(fields)} from {wording.quotedList(parameters)}, {named}";
+}
+
+// The fix that gives each field 'feedings' assign a first value at 'place', "here" or "instead",
+// and writes the statements again once 'calls' build the base class, or after a 'super();' the
+// fix adds for 'context'. A statement is quoted only where it does the same after the calls.
+firstValueFix(List<FeedingWrite> feedings, string place, BaseContext context, List<LateCall> calls,
+        Reordering reorder) -> string {
+    let fields = new List<Field>();
+    let names = new List<string>();
+    for (let feeding in feedings) {
+        let target = feeding.target;
+        if (target != null) {
+            fields.push(target);
+            names.push(target.name());
+        }
+    }
+    string given = "Give {wording.quotedList(names)} first values {place}";
+    string later = "assign {wording.quotedList(names)} their values";
+    if (names.length() == 1) {
+        given = "Give '{names.get(0)}' a first value {place}";
+        later = "assign '{names.get(0)}' its value";
+    }
+    let statements = quotedStatements(feedings);
+    if (statements.length() == feedings.length() && writtenAgainAlike(feedings, context, calls,
+            reorder)) {
+        later = "write {diagnostics.andJoined(statements.toArray())}";
+    }
+    string examples = firstValues(fields);
+    if (context == BaseContext.BuiltAtExit) {
+        return "{given}, as in {examples}, then call 'super();' and {later} after it.";
+    }
+    return "{given}, as in {examples}, and {later} after {afterCalls(calls)}.";
+}
+
+// Whether each statement of 'feedings' does the same written again right after each of 'calls', or
+// after the 'super();' a fix adds in its place where 'context' says the body writes none.
+writtenAgainAlike(List<FeedingWrite> feedings, BaseContext context, List<LateCall> calls,
+        Reordering reorder) -> bool {
+    for (let feeding in feedings) {
+        let statement = feeding.statementNode;
+        if (statement == null) {
+            return false;
+        }
+        let moved = new List<SyntaxNode>();
+        moved.push(statement);
+        let exempt = new List<string>();
+        exempt.push(feeding.assigned());
+        if (context == BaseContext.BuiltAtExit) {
+            if (!reorder.movesPastImplicitBase(moved, exempt)) {
+                return false;
+            }
+            continue;
+        }
+        if (calls.length() == 0) {
+            return false;
+        }
+        for (let call in calls) {
+            if (!reorder.movesAfter(moved, call, exempt)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// The fix for 'feeding', the declaration of a local that later statements use before the base class
+// is built: move them all after 'calls', with a first value above that call for each field they
+// assign, or call 'super();' above the declaration where 'context' says the constructor writes
+// none. Where they do not do the same after the calls, the reads move instead.
+localFeedFix(FeedingWrite feeding, BaseContext context, List<LateCall> calls, Reordering reorder)
+        -> string {
+    let local = feeding.local;
+    if (local == null) {
+        return "";
+    }
+    string first = "";
+    if (local.fields.length() == 1) {
+        first = "give '{local.fields.get(0).name()}' a first value";
+    } else if (local.fields.length() > 1) {
+        let names = new List<string>();
+        for (let field in local.fields) {
+            names.push(field.name());
+        }
+        first = "give {wording.quotedList(names)} first values";
+    }
+    string examples = firstValues(local.fields);
+    if (context == BaseContext.BuiltAtExit) {
+        if (first.length == 0) {
+            return "Call 'super();' above this declaration.";
+        }
+        return "Above this declaration, {first}, as in {examples}, and call 'super();'.";
+    }
+    string after = afterCalls(calls);
+    string above = "that call";
+    if (calls.length() > 1) {
+        above = "those calls";
+    }
+    string moved = "Read it after {after}";
+    if (movesAfterAlike(feeding, local, calls, reorder)) {
+        let quoted = new List<string>();
+        quoted.push("'{feeding.statement}'");
+        for (let user in local.users) {
+            quoted.push("'{user}'");
+        }
+        moved = "Move {diagnostics.andJoined(quoted.toArray())} after {after}";
+        if (calls.length() != 1 || feeding.statement.length == 0 || local.users.contains("")) {
+            moved = "Move this declaration and the statements that use '{local.name}' after {after}";
+        }
+    }
+    if (first.length == 0) {
+        return "{moved}.";
+    }
+    return "{moved}, and {first} above {above}, as in {examples}.";
+}
+
+// Whether the declaration of 'feeding', of the local 'local', and the statements that use it do the
+// same written right after each of 'calls'.
+movesAfterAlike(FeedingWrite feeding, LocalFeed local, List<LateCall> calls, Reordering reorder)
+        -> bool {
+    let declaration = feeding.statementNode;
+    if (declaration == null || calls.length() == 0) {
+        return false;
+    }
+    let moved = new List<SyntaxNode>();
+    moved.push(declaration);
+    for (let user in local.userNodes) {
+        moved.push(user);
+    }
+    let exempt = new List<string>();
+    for (let field in local.fields) {
+        exempt.push(field.name());
+    }
+    for (let call in calls) {
+        if (!reorder.movesAfter(moved, call, exempt)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The fix for the 'const' fields 'fields', which are assigned once and so take no first value.
+constantFix(List<Field> fields, string base) -> string {
+    if (fields.length() == 1) {
+        return "'{fields.get(0).name()}' is 'const', so it is assigned only once: compute its "
+            + "value without reading the fields of {base}.";
+    }
+    let names = new List<string>();
+    for (let field in fields) {
+        names.push(field.name());
+    }
+    return "{wording.quotedList(names)} are 'const', so each is assigned only once: compute their "
+        + "values without reading the fields of {base}.";
+}
+
+// The 'const' fields among 'fields'.
+constantFields(List<Field> fields) -> List<Field> {
+    let constant = new List<Field>();
+    for (let field in fields) {
+        if (field.isConst()) {
+            constant.push(field);
+        }
+    }
+    return constant;
+}
+
+// The assignments that give 'fields' first values, quoted and joined.
+firstValues(List<Field> fields) -> string {
+    let examples = new List<string>();
+    for (let field in fields) {
+        examples.push("'{firstValue(field)}'");
+    }
+    return diagnostics.andJoined(examples.toArray());
+}
+
+// The statements of 'feedings' that are short enough to quote, quoted.
+quotedStatements(List<FeedingWrite> feedings) -> List<string> {
+    let quoted = new List<string>();
+    for (let feeding in feedings) {
+        if (feeding.statement.length > 0) {
+            quoted.push("'{feeding.statement}'");
+        }
+    }
+    return quoted;
+}
+
+// The 'super(...)' calls 'calls' as the place code is written after to run once the base class is
+// built.
+afterCalls(List<LateCall> calls) -> string {
+    if (calls.length() == 0) {
+        return "'super(...)'";
+    }
+    return listedCalls(calls, "each of ");
+}
+
+// The calls 'calls' quoted and joined, each spelling once, with 'several' before a list of more
+// than one, as in "each of 'super("a");' and 'super("b");'".
+listedCalls(List<LateCall> calls, string several) -> string {
+    let quoted = new List<string>();
+    for (let call in calls) {
+        if (!quoted.contains(call.quoted())) {
+            quoted.push(call.quoted());
+        }
+    }
+    if (quoted.length() == 1 && calls.length() > 1) {
+        return "each {quoted.get(0)}";
+    }
+    if (quoted.length() == 1) {
+        return quoted.get(0);
+    }
+    return several + diagnostics.andJoined(quoted.toArray());
+}
+
+// A statement computed from the parameters 'parameters', each named once.
+public final class Rewritten {
+    public string statement;
+    public List<string> parameters;
+
+    public constructor(this.statement, this.parameters);
+}
+
+// The statement of 'feeding' computed from the parameters the base fields it reads hold once each
+// of 'calls' returns.
+rewrittenFeeding(FeedingWrite feeding, List<LateCall> calls) -> Rewritten? {
+    let statementNode = feeding.statementNode;
+    if (statementNode == null || feeding.statement.length == 0 || feeding.usesThis
+            || !feeding.uses.replaceable()) {
+        return null;
+    }
+    return rewrittenWith(statementNode.green(), feeding.uses, calls);
+}
+
+// The statement 'statement' with each read of a base field in 'uses' replaced by the parameter the
+// field holds once each of 'calls' returns. Null where a field holds no such parameter after every
+// call, or where the result is too long to quote.
+public rewrittenWith(GreenNode statement, BaseFieldUses uses, List<LateCall> calls) -> Rewritten? {
+    if (calls.length() == 0 || !uses.replaceable()) {
+        return null;
+    }
+    let replacements = new List<string>();
+    let parameters = new List<string>();
+    for (let name in uses.readNames) {
+        let parameter = calls.get(0).parameterFor(name);
+        if (parameter == null) {
+            return null;
+        }
+        for (let call in calls) {
+            if (call.parameterFor(name) != parameter) {
+                return null;
+            }
+        }
+        replacements.push(parameter);
+        if (!parameters.contains(parameter)) {
+            parameters.push(parameter);
+        }
+    }
+    string spelled = wording.spellingWithNodes(statement, uses.readNodes, replacements);
+    if (spelled.length > wording.quotedCodeLimit()) {
+        return null;
+    }
+    return new Rewritten(spelled, parameters);
+}
+
+// The refusal of a 'super(...)' that may already have run on a path reaching it, in a constructor
+// of 'owner'; 'definite' says it ran on every such path.
+public repeatedSuperCallRefusal(Type owner, bool definite, TypeNames names) -> string {
+    string base = baseOfOwner(owner, names);
+    if (definite) {
+        return "The constructor of {quotedClassName(owner, names)} already calls 'super(...)' on "
+            + "this path, and base class {base} is constructed only once. Remove this call.";
+    }
+    return "'super(...)' may already have run on a path that reaches this call, and base class "
+        + "{base} is constructed only once. Call 'super(...)' once on each path.";
+}
+
+// A parameter of the base constructor a 'super(...)' runs that sets the base field 'baseField' from
+// argument 'index' of the call, whose type is 'argumentType'. 'kept' says the field holds that
+// argument once the call returns, and 'argumentName' names the parameter of the constructor being
+// checked whose value the field then holds, or is "" where none does.
+public final class BaseArgument {
+    public string baseField;
+    public long index;
+    public Type? argumentType;
+    public string argumentName;
+    public bool kept;
+
+    public constructor(this.baseField, this.index, this.argumentType, this.argumentName, this.kept);
+}
+
+// What a base constructor may do besides building the base class: run code of the program, and let
+// 'this' reach that code.
+public final class BaseRun {
+    public bool runsCode;
+    public bool lendsThis;
+
+    public constructor(this.runsCode, this.lendsThis);
+}
+
+// A 'super(...)' of a constructor's body, spelled 'spelled' where it is short enough to quote, before
+// which the own fields 'fields' had no value, with the base fields its arguments set and what else
+// the base constructor it runs does.
+public final class LateCall {
+    public CallExpressionNode call;
+    public string spelled;
+    public List<Field> fields;
+    public List<BaseArgument> arguments;
+    public BaseRun run;
+
+    public constructor(this.call, this.spelled, this.fields, this.arguments, this.run);
+
+    public quoted() -> string {
+        if (this.spelled.length == 0) {
+            return "'super(...)'";
+        }
+        return "'{this.spelled}'";
+    }
+
+    // The argument a parameter of the base constructor sets 'baseField' from, or null.
+    public argumentFor(string baseField) -> BaseArgument? {
+        for (let argument in this.arguments) {
+            if (argument.baseField == baseField) {
+                return argument;
+            }
+        }
+        return null;
+    }
+
+    // The parameter of the constructor being checked whose value 'baseField' holds once the call
+    // returns, or null.
+    public parameterFor(string baseField) -> string? {
+        let argument = this.argumentFor(baseField);
+        if (argument == null || !argument.kept || argument.argumentName.length == 0) {
+            return null;
+        }
+        return argument.argumentName;
+    }
+}
+
+// An assignment to the own field 'written' after 'calls', before each of which it had no value,
+// held by 'statement' with the declarations it moves with; 'alsoAssigned' says a path reaching it
+// ran a 'super(...)' with the field assigned. 'baseUses', 'otherUse' and 'laterLocal' keep it from
+// moving above the calls as written, 'alike' says it does the same there once the body is checked,
+// and 'fromParameters' is it computed from parameters.
+public final class LateWrite {
+    public Field written;
+    public List<LateCall> calls;
+    public bool alsoAssigned;
+    public string statement;
+    public BaseFieldUses baseUses;
+    public ThisUse? otherUse;
+    public string laterLocal;
+    public List<string> declarations;
+    Rewritten? fromParameters;
+    () -> bool alike;
+
+    public constructor(this.written, this.calls, this.alsoAssigned, this.statement, this.baseUses,
+        this.otherUse, this.laterLocal, this.declarations, this.fromParameters, this.alike);
+
+    // Whether the statement does the same before the calls as it is written.
+    public movable() -> bool {
+        return !this.baseUses.any() && this.otherUse == null && this.laterLocal.length == 0
+            && this.alike();
+    }
+
+    // The statement computed from parameters, where it does the same above the calls.
+    public rewritten() -> Rewritten? {
+        if (!this.alike()) {
+            return null;
+        }
+        return this.fromParameters;
+    }
+}
+
+// The 'super(...)' calls of one constructor before which own fields had no value, with the
+// assignments to those fields after them, and the fields some path after a call finishes the
+// constructor without assigning.
+public final class LateSuper {
+    public List<LateCall> calls;
+    public List<LateWrite> writes;
+    public List<Field> partial;
+
+    public constructor() {
+        this.calls = new List<LateCall>();
+        this.writes = new List<LateWrite>();
+        this.partial = new List<Field>();
+    }
+
+    public span() -> Span {
+        return this.calls.get(0).call.span();
+    }
+
+    // Whether an assignment to 'field' after 'call' is kept already.
+    public covers(Field field, LateCall call) -> bool {
+        for (let write in this.writes) {
+            if (write.written == field && write.calls.contains(call)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // The own fields with no value before any of the calls, in the order the calls name them.
+    public lacking() -> List<Field> {
+        let fields = new List<Field>();
+        for (let call in this.calls) {
+            for (let field in call.fields) {
+                if (!fields.contains(field)) {
+                    fields.push(field);
+                }
+            }
+        }
+        return fields;
+    }
+
+    // The fields of 'lacking' that a path after a call before which they had no value finishes the
+    // constructor without, or that no assignment after such a call is kept for.
+    public unwritten(List<Field> lacking) -> List<Field> {
+        let missing = new List<Field>();
+        for (let field in lacking) {
+            if (this.partial.contains(field)) {
+                missing.push(field);
+                continue;
+            }
+            for (let call in this.calls) {
+                if (call.fields.contains(field) && !this.covers(field, call)) {
+                    missing.push(field);
+                    break;
+                }
+            }
+        }
+        return missing;
+    }
+
+    // The calls before which one of 'fields' had no value.
+    public callsLacking(List<Field> fields) -> List<LateCall> {
+        let lacking = new List<LateCall>();
+        for (let call in this.calls) {
+            for (let field in fields) {
+                if (call.fields.contains(field) && !lacking.contains(call)) {
+                    lacking.push(call);
+                }
+            }
+        }
+        return lacking;
+    }
+}
+
+// The refusal of the 'super(...)' calls of a constructor of 'owner' before which own fields had no
+// value, reported once for the constructor. Where each such field is assigned on every path after
+// the calls, the statements to move above them are named, and one whose value needs the base class
+// says what to write instead.
+public lateFieldsRefusal(Type owner, LateSuper late, TypeNames names) -> string {
+    let fields = late.lacking();
+    string base = baseOfOwner(owner, names);
+    string why = "A subclass assigns its own fields before 'super(...)', so they have values when "
+        + "the constructor of {base} runs.";
+    let unwritten = late.unwritten(fields);
+    if (unwritten.length() > 0) {
+        string have = "have";
+        string them = "them";
+        if (fields.length() == 1) {
+            have = "has";
+            them = "it";
+        }
+        string before = callsNamed(late.callsLacking(unwritten), late, "");
+        return "{fieldListSubject(fields)} of {kindAndName(owner, names)} {have} no value when "
+            + "'super(...)' is called. {why} Assign {them} before {before}, for example "
+            + "'{firstValue(unwritten.get(0))}'.";
+    }
+    string are = "are";
+    if (fields.length() == 1) {
+        are = "is";
+    }
+    string text = "{fieldListSubject(fields)} of {kindAndName(owner, names)} {are} assigned after "
+        + "'super(...)'. {why}";
+    let moved = new List<LateWrite>();
+    for (let write in late.writes) {
+        if (write.movable()) {
+            moved.push(write);
+        }
+    }
+    while (moved.length() > 0) {
+        let first = moved.get(0);
+        let statements = new List<string>();
+        let rest = new List<LateWrite>();
+        for (let write in moved) {
+            if (write.alsoAssigned == first.alsoAssigned && sameCalls(write.calls, first.calls)) {
+                for (let declaration in write.declarations) {
+                    if (!statements.contains(declaration)) {
+                        statements.push(declaration);
+                    }
+                }
+                statements.push(write.statement);
+            } else {
+                rest.push(write);
+            }
+        }
+        string listed = diagnostics.andJoined(statements.toArray());
+        string above = callsNamed(first.calls, late, "each of ");
+        if (first.alsoAssigned) {
+            text = "{text} Write {listed} above {above} as well.";
+        } else {
+            text = "{text} Move {listed} above {above}.";
+        }
+        moved = rest;
+    }
+    for (let write in late.writes) {
+        if (!write.movable()) {
+            text = "{text} {blockedMove(write, late, base)}";
+        }
+    }
+    return text;
+}
+
+// What to write for 'write', whose statement does not do the same before its calls as it is
+// written: the statement computed from parameters where it can be, and otherwise a first value for
+// the field above the calls. The reason is given where the statement needs the base class.
+blockedMove(LateWrite write, LateSuper late, string base) -> string {
+    let field = write.written;
+    string name = field.name();
+    string statement = capitalized(write.statement);
+    string above = callsNamed(write.calls, late, "each of ");
+    string reason = "";
+    string avoided = "";
+    let other = write.otherUse;
+    let uses = write.baseUses;
+    let written = uses.writtenNames;
+    let reads = uses.reads();
+    if (write.laterLocal.length > 0) {
+        reason = "{statement} reads '{write.laterLocal}', which is declared after {above}. ";
+        avoided = " without reading '{write.laterLocal}'";
+    } else if (other != null) {
+        reason = "{statement} {useClause(other)}, and {useReader(other)} may read the fields of "
+            + "{base}. ";
+        avoided = " without using 'this'";
+    } else if (written.length() > 0) {
+        string fields = "'{written.get(0)}', a field of base class {base} that";
+        if (written.length() > 1) {
+            fields = "{wording.quotedList(written)}, fields of base class {base} that";
+        }
+        reason = "{statement} also {uses.writeVerb()} {fields} cannot be assigned until {base} is "
+            + "constructed. ";
+        avoided = " without assigning the fields of {base}";
+    } else if (reads.length() > 0) {
+        string fields = "'{reads.get(0)}', a field of base class {base} that has";
+        if (reads.length() > 1) {
+            fields = "{wording.quotedList(reads)}, fields of base class {base} that have";
+        }
+        reason = "{statement} reads {fields} no value until {base} is constructed. ";
+        avoided = " without reading the fields of {base}";
+        let rewritten = write.rewritten();
+        if (rewritten != null) {
+            string fix = "and move it above {above}";
+            if (write.alsoAssigned) {
+                fix = "and write it above {above} as well";
+            }
+            let fieldNames = new List<string>();
+            fieldNames.push(name);
+            return "{reason}{computedFrom(fieldNames, rewritten.parameters)}, as in "
+                + "'{rewritten.statement}', {fix}.";
+        }
+    }
+    if (field.isConst()) {
+        return "{reason}'{name}' is 'const', so it is assigned only once: compute its value above "
+            + "{above}{avoided}.";
+    }
+    return "{reason}Give '{name}' a first value above {above}, as in '{firstValue(field)}'.";
+}
+
+// What 'use', a use of 'this' that needs every field, does, as a clause after the statement that
+// holds it: "calls 'describe' on 'this'".
+useClause(ThisUse use) -> string {
+    switch (use.kind()) {
+        ThisUseKind.MethodCall, ThisUseKind.BehaviorCall -> {
+            return "calls '{use.detail()}' on 'this'";
+        },
+        ThisUseKind.BaseMethodCall -> {
+            return "calls '{use.detail()}'";
+        },
+        ThisUseKind.TextForm -> {
+            return "writes '\{this\}', which calls 'toString'";
+        },
+        ThisUseKind.EqualsReceiver, ThisUseKind.EqualsArgument -> {
+            return "compares 'this' with '{use.detail()}', which calls 'equals'";
+        },
+        ThisUseKind.Argument -> {
+            return "passes 'this' to {use.detail()}";
+        },
+        ThisUseKind.StoredInLocal -> {
+            return "stores 'this' in '{use.detail()}'";
+        },
+        ThisUseKind.StoredInField -> {
+            return "stores 'this' in field '{use.detail()}'";
+        },
+        ThisUseKind.ArrayElement -> {
+            return "puts 'this' in an array";
+        },
+        ThisUseKind.LambdaCapture -> {
+            return "creates a lambda that uses 'this'";
+        },
+        default -> {
+            return "uses 'this' as a value";
+        },
+    }
+}
+
+// What may read a field through 'use', for the clause 'useClause' writes.
+useReader(ThisUse use) -> string {
+    switch (use.kind()) {
+        ThisUseKind.MethodCall, ThisUseKind.BehaviorCall -> {
+            return "'{use.detail()}'";
+        },
+        ThisUseKind.TextForm -> {
+            return "'toString'";
+        },
+        ThisUseKind.EqualsReceiver, ThisUseKind.EqualsArgument -> {
+            return "'equals'";
+        },
+        ThisUseKind.Argument -> {
+            return use.detail();
+        },
+        ThisUseKind.StoredInLocal, ThisUseKind.StoredInField -> {
+            return "code that uses '{use.detail()}'";
+        },
+        ThisUseKind.ArrayElement -> {
+            return "code that reads the array";
+        },
+        ThisUseKind.LambdaCapture -> {
+            return "calling it";
+        },
+        default -> {
+            return "the code it runs";
+        },
+    }
+}
+
+// The calls 'calls' as listedCalls names them, or "this call" for the one call the refusal of
+// 'late' is reported at where 'several' is empty.
+callsNamed(List<LateCall> calls, LateSuper late, string several) -> string {
+    if (calls.length() == 1 && calls.get(0) == late.calls.get(0) && several.length == 0) {
+        return "this call";
+    }
+    return listedCalls(calls, several);
+}
+
+sameCalls(List<LateCall> first, List<LateCall> second) -> bool {
+    if (first.length() != second.length()) {
+        return false;
+    }
+    for (let call in first) {
+        if (!second.contains(call)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The assignment that gives 'field' a first value, as in 'this.label = "";'.
+public firstValue(Field field) -> string {
+    return "this.{field.name()} = {wording.placeholderLiteral(field.type()) ?? "..."};";
+}
+
+capitalized(string text) -> string {
+    if (text.startsWith("the ")) {
+        return "The " + text.substring(4);
+    }
+    return text;
+}
+
+// The refusal of a path that finishes a constructor of 'owner' before 'super(...)' builds the base
+// class on it: at a 'return' where 'isReturn' says so, and otherwise at the end of the body.
+// 'onSomePaths' says a 'super(...)' may have run on another path reaching here.
+public unbuiltBaseRefusal(Type owner, bool isReturn, bool onSomePaths, TypeNames names) -> string {
+    string base = baseOfOwner(owner, names);
+    string quotedOwner = quotedClassName(owner, names);
+    if (!isReturn) {
+        return "'super(...)' is not called on every path through the constructor of {quotedOwner}, "
+            + "and base class {base} must be constructed before the constructor finishes. Call "
+            + "'super(...)' on the path that skips it.";
+    }
+    if (onSomePaths) {
+        return "This 'return' can end the constructor of {quotedOwner} on a path where base class "
+            + "{base} is not constructed. Call 'super(...)' on every path before this 'return'.";
+    }
+    return "This 'return' ends the constructor of {quotedOwner} before base class {base} is "
+        + "constructed. Call 'super(...)' before this 'return'.";
+}
+
+// The base class of 'owner' quoted, as in "'Named'".
+baseOfOwner(Type owner, TypeNames names) -> string {
+    let base = hierarchy.baseOf(owner);
+    if (base == null) {
+        return "the base class";
+    }
+    return quotedClassName(base, names);
+}
+
+// The class that declares 'field' quoted, as in "'Named'".
+quotedOwnerOf(Field field, TypeNames names) -> string {
+    return quotedClassName(field.definingType(), names);
+}
+
+// 'type' quoted by the name its declaration has, without type arguments.
+quotedClassName(Type type, TypeNames names) -> string {
+    let authority = types.authorityOf(type);
+    if (authority != null) {
+        return names.quotedName(authority);
+    }
+    return names.quoted(type);
+}
+
+// "class 'Probe'" or "struct 'Point'".
+kindAndName(Type owner, TypeNames names) -> string {
+    string kindWord = "class";
+    let authority = types.authorityOf(owner);
+    if (authority != null) {
+        kindWord = typenames.kindWordOf(authority);
+    }
+    return "{kindWord} {quotedClassName(owner, names)}";
 }
 
 // What a call of the method of 'use' on 'this' runs that may read 'field': the method itself where
@@ -178,12 +1215,11 @@ placeholderLambda(FunctionType type) -> string? {
     return "({names[parameters.length]}) -> {returned}";
 }
 
-// The refusal of a use in a catch clause that can run with 'missing' unassigned, when 'callee'
-// throws 'thrown', or when a 'throw' statement of the body does where 'callee' is null. An inherited
-// field is missing where the arguments of 'super(...)' throw, before the constructor of
-// 'quotedBase' runs.
+// The refusal of a use in a catch clause that can run with 'missing' unassigned, when 'callee', or a
+// 'throw' statement where it is null, throws 'thrown' before the field, or the base class
+// 'quotedBase' for an inherited one, has a value. 'onlyThrow' says the clause catches only that.
 public catchRefusal(ThisUse use, Field missing, bool inherited, string? callee, string thrown,
-        string quotedBase, TypeNames names) -> string {
+        bool inSuperArguments, bool onlyThrow, string quotedBase, TypeNames names) -> string {
     string named = namedField(missing, inherited, names);
     string subject = "Field {named}";
     string name = missing.name();
@@ -191,11 +1227,23 @@ public catchRefusal(ThisUse use, Field missing, bool inherited, string? callee, 
     string unassigned = unassignedWhen(callee, thrown, name);
     string fix = "Assign '{name}' in the clause before {usePlace(use)}, for example "
         + "'this.{name} = ...;'.";
-    if (inherited) {
-        unassigned = "When {thrower} throws {thrown} in the arguments of 'super(...)', the "
-            + "constructor of {quotedBase} has not run yet.";
-        fix = "Remove {removedPlace(use)}, or move the call to {thrower} into a function that "
-            + "catches {thrown} and returns a value to pass to 'super(...)'.";
+    string moved = "move the call to {thrower}";
+    if (onlyThrow) {
+        moved = "remove this 'catch' clause and move the call to {thrower}";
+    }
+    if (inherited && inSuperArguments) {
+        unassigned = "When {thrower} throws {thrown} in the arguments of 'super(...)', "
+            + "{quotedBase} is not constructed yet.";
+        fix = "Remove {removedPlace(use)}, or {moved} into a function that catches {thrown} and "
+            + "returns a value to pass to 'super(...)'.";
+    } else if (inherited) {
+        unassigned = "When {thrower} throws {thrown} before 'super(...)', {quotedBase} is not "
+            + "constructed yet.";
+        fix = "Remove {removedPlace(use)}.";
+        if (callee != null) {
+            fix = "Remove {removedPlace(use)}, or {moved} into a function that catches {thrown} and "
+                + "returns a fallback value.";
+        }
     }
     switch (use.kind()) {
         ThisUseKind.Read -> {

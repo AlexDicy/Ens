@@ -1,0 +1,693 @@
+// Whether code of a constructor does the same on the other side of a 'super(...)' call, where a fix
+// moves it: above the call, after it, or into its arguments. Only code that calls nothing and
+// changes nothing but locals of plain types and fields given their first value moves or is crossed.
+import Expression from @ens.frontend.syntax.generated.nodes;
+import BlockNode from @ens.frontend.syntax.generated.nodes;
+import ExpressionStatementNode from @ens.frontend.syntax.generated.nodes;
+import IfStatementNode from @ens.frontend.syntax.generated.nodes;
+import ElseClauseNode from @ens.frontend.syntax.generated.nodes;
+import VariableDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import FunctionDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import ParameterNode from @ens.frontend.syntax.generated.nodes;
+import NamedArgumentNode from @ens.frontend.syntax.generated.nodes;
+import LiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
+import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ParenthesizedExpressionNode from @ens.frontend.syntax.generated.nodes;
+import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SafeMemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import BinaryExpressionNode from @ens.frontend.syntax.generated.nodes;
+import AssignmentExpressionNode from @ens.frontend.syntax.generated.nodes;
+import PrefixExpressionNode from @ens.frontend.syntax.generated.nodes;
+import PostfixExpressionNode from @ens.frontend.syntax.generated.nodes;
+import CastExpressionNode from @ens.frontend.syntax.generated.nodes;
+import TypeTestExpressionNode from @ens.frontend.syntax.generated.nodes;
+import TernaryExpressionNode from @ens.frontend.syntax.generated.nodes;
+import NullCoalesceExpressionNode from @ens.frontend.syntax.generated.nodes;
+import InterpolatedStringExpressionNode from @ens.frontend.syntax.generated.nodes;
+import InterpolationPartNode from @ens.frontend.syntax.generated.nodes;
+import ListNode from @ens.frontend.syntax.generated.nodes;
+import SyntaxNode from @ens.frontend.syntax.node;
+import model.convert;
+import model.typemembers;
+import model.types;
+import Type from model.types;
+import PrimitiveType from model.types;
+import StringType from model.types;
+import EnumType from model.types;
+import NullType from model.types;
+import ArrayType from model.types;
+import SemaResult from result;
+import LateCall from phases.bodies.unassigneduses;
+import BaseRun from phases.bodies.unassigneduses;
+import phases.bodies.thisuses;
+import phases.bodies.wording;
+import support.syntax;
+import List from @std.collections.list;
+
+// The fields code may change and read through 'this': the own fields it may assign whole with '=',
+// and the fields it may read.
+final class Access {
+    List<string> assigned;
+    List<string> read;
+
+    constructor(this.assigned, this.read);
+}
+
+// The checked body of a constructor of 'owner', judged for where its code can move. 'implicitBase'
+// is what the base constructor its class runs by default does.
+public final class Reordering {
+    SemaResult result;
+    Type owner;
+    BaseRun implicitBase;
+
+    public constructor(this.result, this.owner, this.implicitBase);
+
+    // Whether 'held', with the declarations 'declarations' that move with it, does the same above
+    // each of 'calls' as where it is written.
+    public movesAbove(SyntaxNode held, List<VariableDeclarationNode> declarations,
+            List<LateCall> calls) -> bool {
+        let moved = new List<SyntaxNode>();
+        for (let declaration in declarations) {
+            moved.push(declaration);
+        }
+        moved.push(held);
+        for (let call in calls) {
+            let between = statementsBetween(call.call, held);
+            if (between == null) {
+                return false;
+            }
+            let assigned = new List<string>();
+            for (let field in call.fields) {
+                assigned.push(field.name());
+            }
+            if (!this.movesPast(moved, crossed(without(between, moved), call), call.run, assigned)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Whether the statements 'moved', the first of which is in a block a later statement of which
+    // holds 'call', do the same right after the call. 'assigned' is the own fields they assign.
+    public movesAfter(List<SyntaxNode> moved, LateCall call, List<string> assigned) -> bool {
+        if (moved.length() == 0) {
+            return false;
+        }
+        let between = pathBetween(moved.get(0), call.call);
+        if (between == null) {
+            return false;
+        }
+        return this.movesPast(moved, crossed(without(between, moved), call), call.run, assigned);
+    }
+
+    // Whether the statements 'moved' do the same after the base constructor the class runs by
+    // default, called right before them.
+    public movesPastImplicitBase(List<SyntaxNode> moved, List<string> assigned) -> bool {
+        return this.movesPast(moved, new List<SyntaxNode>(), this.implicitBase, assigned);
+    }
+
+    // Whether 'value', assigned by a statement of its own in a block a later statement of which
+    // holds 'call', has the same value passed to the call as its argument 'index' instead.
+    public passesAlike(Expression value, LateCall call, long index) -> bool {
+        let assignment = thisuses.enclosing(thisuses.parenthesized(value));
+        let written = statementOf(value);
+        if (!(assignment is AssignmentExpressionNode) || written == null
+                || !(written is ExpressionStatementNode)
+                || !thisuses.isNode(syntax.unwrapParentheses(written.expression()), assignment)) {
+            return false;
+        }
+        let between = pathBetween(written, call.call);
+        let arguments = call.call.arguments();
+        if (between == null || index >= arguments.argumentsCount()) {
+            return false;
+        }
+        let replaced = arguments.arguments(index);
+        if (!(replaced is SyntaxNode) || writes(replaced)) {
+            return false;
+        }
+        let moved = new List<SyntaxNode>();
+        moved.push(value);
+        return this.quiet(value, new Access(new List<string>(), new List<string>()))
+            && this.crosses(moved, crossed(between, call), new List<string>(), false);
+    }
+
+    // Whether the code 'moved', which may assign the own fields 'assigned' but not read them, does
+    // the same on the other side of 'staying' and of a base constructor that does what 'run' says.
+    movesPast(List<SyntaxNode> moved, List<SyntaxNode> staying, BaseRun run, List<string> assigned)
+            -> bool {
+        let read = new List<string>();
+        for (let name in this.fieldNames(0)) {
+            if (!assigned.contains(name)) {
+                read.push(name);
+            }
+        }
+        let access = new Access(this.freshFields(assigned, moved.get(0), run.lendsThis), read);
+        for (let node in moved) {
+            if (!this.quiet(node, access) || this.readsChangeable(node, run)) {
+                return false;
+            }
+        }
+        return this.crosses(moved, staying, assigned, run.lendsThis);
+    }
+
+    // Whether each piece of 'staying' is quiet, changes no local or field 'moved' uses, and uses no
+    // local it changes nor the fields of 'assigned' it assigns. 'lendsThis' says a base constructor
+    // the code crosses lets 'this' reach code.
+    crosses(List<SyntaxNode> moved, List<SyntaxNode> staying, List<string> assigned, bool lendsThis)
+            -> bool {
+        if (staying.length() == 0) {
+            return true;
+        }
+        let own = this.fieldNames(typemembers.baseFieldCount(this.owner));
+        let fresh = this.freshFields(own, staying.get(0), lendsThis);
+        let access = new Access(fresh, this.fieldNames(0));
+        let locals = new List<string>();
+        for (let node in moved) {
+            localsUsed(node, locals);
+        }
+        let fields = new List<string>();
+        let written = new List<string>();
+        for (let name in this.fieldNames(0)) {
+            for (let node in moved) {
+                if (mentionsField(node, name) && !fields.contains(name)) {
+                    fields.push(name);
+                }
+            }
+            if (fields.contains(name) && assigned.contains(name)) {
+                written.push(name);
+            }
+        }
+        let changed = new List<string>();
+        for (let name in locals) {
+            for (let node in moved) {
+                if (thisuses.assignsName(node, name) && !changed.contains(name)) {
+                    changed.push(name);
+                }
+            }
+        }
+        for (let node in staying) {
+            if (!this.quiet(node, access)) {
+                return false;
+            }
+            for (let name in locals) {
+                if (thisuses.assignsName(node, name)) {
+                    return false;
+                }
+            }
+            for (let name in changed) {
+                if (wording.usesName(node.green(), name)) {
+                    return false;
+                }
+            }
+            for (let name in fields) {
+                if (thisuses.assignsField(node, name)) {
+                    return false;
+                }
+            }
+            for (let name in written) {
+                if (mentionsField(node, name)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    // The names of the fields of the class being built, from the field 'first' on.
+    fieldNames(long first) -> List<string> {
+        let names = new List<string>();
+        let fields = typemembers.fieldsOf(this.owner);
+        if (fields != null) {
+            for (long i = first; i < fields.length(); i++) {
+                names.push(fields.get(i).name());
+            }
+        }
+        return names;
+    }
+
+    // Whether 'node' reads what a base constructor that does what 'run' says can change: a member of
+    // an object through a reference where it runs code, and an own field where it lets 'this' reach
+    // code, such as an override that assigns it.
+    readsChangeable(SyntaxNode node, BaseRun run) -> bool {
+        Expression? object = null;
+        if (node is AssignmentExpressionNode
+                && syntax.unwrapParentheses(node.target()) is MemberExpressionNode) {
+            return this.readsChangeable(node.value(), run);
+        }
+        if (node is MemberExpressionNode) {
+            object = node.object();
+            let field = typemembers.inheritedOrOwnField(this.owner, node.member().text());
+            if (run.lendsThis && thisuses.thisOf(object) != null && field != null
+                    && !typemembers.isInheritedField(this.owner, field)) {
+                return true;
+            }
+        } else if (node is SafeMemberExpressionNode) {
+            object = node.object();
+        }
+        if (run.runsCode && object != null && thisuses.thisOf(object) == null
+                && !namesType(this.result, object)
+                && !holdsOwnValue(this.result.typeOf(object.green()))) {
+            return true;
+        }
+        for (let child in node.childNodes()) {
+            if (this.readsChangeable(child, run)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // The own fields among 'names' whose assignment in the constructor around 'node' releases no
+    // value a destructor could run for: those of a type that shares no part with another value, and
+    // those with no default that the constructor writes in one place, unless 'lendsThis' says a
+    // base constructor lets 'this' reach code that could assign them too.
+    freshFields(List<string> names, SyntaxNode node, bool lendsThis) -> List<string> {
+        let fresh = new List<string>();
+        let declaration = constructorAround(node);
+        for (let name in names) {
+            let field = typemembers.inheritedOrOwnField(this.owner, name);
+            if (field != null && !typemembers.isInheritedField(this.owner, field)
+                    && (typemembers.sharesNoPart(field.type()) || !lendsThis && !field.hasDefault()
+                    && declaration != null && fieldWrites(declaration, name) == 1)) {
+                fresh.push(name);
+            }
+        }
+        return fresh;
+    }
+
+    // Whether running 'node' calls nothing, creates nothing and cannot stop the program, and
+    // changes only locals of plain types and the fields 'access' lets it assign, reading through
+    // 'this' only the fields it lets it read.
+    quiet(SyntaxNode node, Access access) -> bool {
+        switch (node) {
+            is LiteralExpressionNode ignored -> {
+                return true;
+            },
+            is IdentifierExpressionNode identifier -> {
+                return this.result.bindingOf(identifier.green()) != null;
+            },
+            is MemberExpressionNode member -> {
+                return this.quietMember(member, access);
+            },
+            is SafeMemberExpressionNode member -> {
+                return thisuses.thisOf(member.object()) == null && this.quiet(member.object(), access);
+            },
+            is AssignmentExpressionNode assignment -> {
+                string operator = assignment.operator().text();
+                return operator != "/=" && operator != "%="
+                    && this.writable(assignment.target(), operator == "=", access)
+                    && this.quiet(assignment.value(), access);
+            },
+            is PrefixExpressionNode prefix -> {
+                string operator = prefix.operator().text();
+                if (operator == "++" || operator == "--") {
+                    return this.writable(prefix.operand(), false, access);
+                }
+            },
+            is PostfixExpressionNode postfix -> {
+                string operator = postfix.operator().text();
+                return (operator == "++" || operator == "--")
+                    && this.writable(postfix.operand(), false, access);
+            },
+            is VariableDeclarationNode declaration -> {
+                let binding = this.result.bindingOf(declaration.green());
+                let initializer = declaration.initializer();
+                return binding != null && typemembers.sharesNoPart(binding.type())
+                    && (initializer == null || this.quiet(initializer.value(), access));
+            },
+            is BinaryExpressionNode binary -> {
+                if (!quietOperator(this.result, binary)) {
+                    return false;
+                }
+            },
+            is CastExpressionNode cast -> {
+                return this.result.typeOf(cast.value().green()) is PrimitiveType
+                    && this.quiet(cast.value(), access);
+            },
+            is TypeTestExpressionNode test -> {
+                return this.quiet(test.value(), access);
+            },
+            is InterpolatedStringExpressionNode interpolated -> {
+                if (!isLanguageValue(this.result.typeOf(interpolated.firstHole().green()))) {
+                    return false;
+                }
+                for (long i = 0; i < interpolated.continuationsCount(); i++) {
+                    let hole = interpolated.continuations(i).hole();
+                    if (!isLanguageValue(this.result.typeOf(hole.green()))) {
+                        return false;
+                    }
+                }
+            },
+            is ParenthesizedExpressionNode ignored -> { },
+            is TernaryExpressionNode ignored -> { },
+            is NullCoalesceExpressionNode ignored -> { },
+            is InterpolationPartNode ignored -> { },
+            is NamedArgumentNode ignored -> { },
+            is ListNode ignored -> { },
+            is ExpressionStatementNode ignored -> { },
+            is BlockNode ignored -> { },
+            is IfStatementNode ignored -> { },
+            is ElseClauseNode ignored -> { },
+            default -> {
+                return false;
+            },
+        }
+        for (let child in node.childNodes()) {
+            if (!this.quiet(child, access)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Whether reading 'member' is quiet: a field 'access' lets the code read through 'this', an
+    // enum constant or a static const, or a field of a quiet value.
+    quietMember(MemberExpressionNode member, Access access) -> bool {
+        if (this.result.methodOf(member.green()) != null) {
+            return false;
+        }
+        if (thisuses.thisOf(member.object()) != null) {
+            return access.read.contains(member.member().text());
+        }
+        if (namesType(this.result, member.object())) {
+            let constant = this.result.staticConstFieldOf(member.green());
+            return this.result.enumConstantOf(member.green()) != null
+                || constant != null && !constant.isLazy();
+        }
+        return this.quiet(member.object(), access);
+    }
+
+    // Whether writing 'target' changes a local of a plain type or, with '=' where 'whole' says so,
+    // a field 'access' lets the code assign.
+    writable(Expression target, bool whole, Access access) -> bool {
+        let written = syntax.unwrapParentheses(target);
+        if (written is IdentifierExpressionNode) {
+            let binding = this.result.bindingOf(written.green());
+            return binding != null && typemembers.sharesNoPart(binding.type());
+        }
+        return whole && written is MemberExpressionNode && thisuses.thisOf(written.object()) != null
+            && access.assigned.contains(written.member().text());
+    }
+}
+
+// 'staying' with the arguments of 'call' added, which run between the two places of code moved
+// across it.
+crossed(List<SyntaxNode> staying, LateCall call) -> List<SyntaxNode> {
+    let arguments = call.call.arguments();
+    for (long i = 0; i < arguments.argumentsCount(); i++) {
+        let argument = arguments.arguments(i);
+        if (argument is SyntaxNode) {
+            staying.push(argument);
+        }
+    }
+    return staying;
+}
+
+// The statements that run after the one holding 'earlier' and before 'later', a statement of a block
+// around 'earlier', or null where no such block has 'later' as a statement.
+statementsBetween(SyntaxNode earlier, SyntaxNode later) -> List<SyntaxNode>? {
+    let between = new List<SyntaxNode>();
+    SyntaxNode current = earlier;
+    let block = thisuses.enclosingBlock(earlier);
+    while (block != null) {
+        let statement = thisuses.statementIn(block, current);
+        bool after = false;
+        for (long i = 0; i < block.statementsCount(); i++) {
+            let candidate = block.statements(i);
+            if (thisuses.isNode(candidate, later)) {
+                return between;
+            }
+            if (after) {
+                between.push(candidate);
+            }
+            after = after || thisuses.isNode(candidate, statement);
+        }
+        current = block;
+        block = thisuses.enclosingBlock(block);
+    }
+    return null;
+}
+
+// The code that runs after the statement 'earlier' and before 'call', which a later statement of the
+// block of 'earlier' holds, or null where that cannot be told from the syntax.
+pathBetween(SyntaxNode earlier, SyntaxNode call) -> List<SyntaxNode>? {
+    let block = thisuses.enclosing(earlier);
+    if (!(block is BlockNode)) {
+        return null;
+    }
+    let between = new List<SyntaxNode>();
+    bool after = false;
+    for (long i = 0; i < block.statementsCount(); i++) {
+        let candidate = block.statements(i);
+        if (after && holds(candidate, call)) {
+            return codeBefore(candidate, call, between);
+        }
+        if (after) {
+            between.push(candidate);
+        }
+        after = after || thisuses.isNode(candidate, earlier);
+    }
+    return null;
+}
+
+// 'pieces' with the code of 'statement' added that runs on the way to 'call', which it holds, or
+// null where that cannot be told from the syntax.
+codeBefore(SyntaxNode statement, SyntaxNode call, List<SyntaxNode> pieces) -> List<SyntaxNode>? {
+    SyntaxNode current = statement;
+    while (true) {
+        switch (current) {
+            is ExpressionStatementNode written -> {
+                if (thisuses.isNode(syntax.unwrapParentheses(written.expression()), call)) {
+                    return pieces;
+                }
+                return null;
+            },
+            is BlockNode block -> {
+                SyntaxNode? next = null;
+                for (long i = 0; i < block.statementsCount() && next == null; i++) {
+                    let candidate = block.statements(i);
+                    if (holds(candidate, call)) {
+                        next = candidate;
+                    } else {
+                        pieces.push(candidate);
+                    }
+                }
+                if (next == null) {
+                    return null;
+                }
+                current = next;
+            },
+            is IfStatementNode branch -> {
+                pieces.push(branch.condition());
+                let otherwise = branch.elseClause()?.body();
+                if (holds(branch.thenBranch(), call)) {
+                    current = branch.thenBranch();
+                } else if (otherwise is SyntaxNode) {
+                    current = otherwise;
+                } else {
+                    return null;
+                }
+            },
+            default -> {
+                return null;
+            },
+        }
+    }
+}
+
+// Whether 'node' is written inside 'outer'.
+holds(SyntaxNode outer, SyntaxNode node) -> bool {
+    return node.span().start >= outer.span().start && node.span().end() <= outer.span().end();
+}
+
+// The statement of a block that holds 'node', or null outside a block.
+statementOf(SyntaxNode node) -> SyntaxNode? {
+    SyntaxNode current = node;
+    SyntaxNode? holder = thisuses.enclosing(node);
+    while (holder != null && !(holder is BlockNode)) {
+        current = holder;
+        holder = thisuses.enclosing(holder);
+    }
+    if (holder == null) {
+        return null;
+    }
+    return current;
+}
+
+// The constructor whose code holds 'node', or null.
+constructorAround(SyntaxNode node) -> FunctionDeclarationNode? {
+    SyntaxNode? holder = thisuses.enclosing(node);
+    while (holder != null) {
+        if (holder is FunctionDeclarationNode) {
+            return holder;
+        }
+        holder = thisuses.enclosing(holder);
+    }
+    return null;
+}
+
+// 'nodes' without the nodes of 'removed'.
+without(List<SyntaxNode> nodes, List<SyntaxNode> removed) -> List<SyntaxNode> {
+    let kept = new List<SyntaxNode>();
+    for (let node in nodes) {
+        bool found = false;
+        for (let other in removed) {
+            found = found || thisuses.isNode(node, other);
+        }
+        if (!found) {
+            kept.push(node);
+        }
+    }
+    return kept;
+}
+
+// Adds to 'locals' each name 'node' reads or writes as a local or a parameter.
+localsUsed(SyntaxNode node, List<string> locals) {
+    if (node is IdentifierExpressionNode) {
+        string name = node.name().text();
+        if (!locals.contains(name)) {
+            locals.push(name);
+        }
+    }
+    for (let child in node.childNodes()) {
+        localsUsed(child, locals);
+    }
+}
+
+// Whether 'node' assigns anything, or changes it with '++' or '--'.
+writes(SyntaxNode node) -> bool {
+    if (node is AssignmentExpressionNode || node is PostfixExpressionNode) {
+        return true;
+    }
+    if (node is PrefixExpressionNode) {
+        string operator = node.operator().text();
+        if (operator == "++" || operator == "--") {
+            return true;
+        }
+    }
+    for (let child in node.childNodes()) {
+        if (writes(child)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The number of places in 'node' that write the field 'name' through 'this', a 'this.name'
+// parameter included.
+fieldWrites(SyntaxNode node, string name) -> long {
+    long count = 0;
+    switch (node) {
+        is ParameterNode parameter -> {
+            if (parameter.thisPrefix() != null && parameter.name().text() == name) {
+                count = 1;
+            }
+        },
+        is AssignmentExpressionNode assignment -> {
+            if (thisuses.changesField(assignment.target(), name)) {
+                count = 1;
+            }
+        },
+        is PrefixExpressionNode prefix -> {
+            string operator = prefix.operator().text();
+            if ((operator == "++" || operator == "--")
+                    && thisuses.changesField(prefix.operand(), name)) {
+                count = 1;
+            }
+        },
+        is PostfixExpressionNode postfix -> {
+            if (thisuses.changesField(postfix.operand(), name)) {
+                count = 1;
+            }
+        },
+        default -> { },
+    }
+    for (let child in node.childNodes()) {
+        count = count + fieldWrites(child, name);
+    }
+    return count;
+}
+
+// Whether 'node' reaches the field 'name' through 'this'.
+mentionsField(SyntaxNode node, string name) -> bool {
+    if (node is MemberExpressionNode && thisuses.thisOf(node.object()) != null
+            && node.member().text() == name) {
+        return true;
+    }
+    for (let child in node.childNodes()) {
+        if (mentionsField(child, name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Whether 'binary' runs no code of the program and cannot stop the program: it divides nothing, and
+// '==' or '!=' compares values whose equality the language defines.
+quietOperator(SemaResult result, BinaryExpressionNode binary) -> bool {
+    string operator = binary.operator().text();
+    if (operator == "/" || operator == "%") {
+        return false;
+    }
+    if (operator != "==" && operator != "!=") {
+        return true;
+    }
+    if (wording.isNullLiteral(syntax.unwrapParentheses(binary.left()))
+            || wording.isNullLiteral(syntax.unwrapParentheses(binary.right()))) {
+        return true;
+    }
+    return isLanguageValue(result.typeOf(binary.left().green()))
+        && isLanguageValue(result.typeOf(binary.right().green()));
+}
+
+// Whether the language alone gives values of 'type' their text form and their equality: a
+// primitive, a string, an enum, null, or a nullable one.
+isLanguageValue(Type? type) -> bool {
+    if (type == null) {
+        return false;
+    }
+    let core = convert.coreOf(type);
+    return core is PrimitiveType || core is StringType || core is EnumType || core is NullType;
+}
+
+// Whether 'object' is the name of a type rather than a value.
+namesType(SemaResult result, Expression object) -> bool {
+    return object is IdentifierExpressionNode && result.bindingOf(object.green()) == null;
+}
+
+// Whether a member of a value of 'type' is part of the value itself, as in a struct, or cannot
+// change, as the length of a string or an array.
+holdsOwnValue(Type? type) -> bool {
+    if (type == null) {
+        return false;
+    }
+    let core = convert.coreOf(type);
+    return types.isStructLike(core) || core is StringType || core is ArrayType;
+}
+
+// Whether 'node' runs no code of the program and cannot stop it, judged from its syntax alone, as
+// for the default of a field: only literals, names and operators that cannot fail.
+public runsNothing(SyntaxNode node) -> bool {
+    switch (node) {
+        is BinaryExpressionNode binary -> {
+            string operator = binary.operator().text();
+            if (operator == "/" || operator == "%" || operator == "==" || operator == "!=") {
+                return false;
+            }
+        },
+        is LiteralExpressionNode ignored -> { },
+        is IdentifierExpressionNode ignored -> { },
+        is ParenthesizedExpressionNode ignored -> { },
+        is PrefixExpressionNode ignored -> { },
+        is TernaryExpressionNode ignored -> { },
+        default -> {
+            return false;
+        },
+    }
+    for (let child in node.childNodes()) {
+        if (!runsNothing(child)) {
+            return false;
+        }
+    }
+    return true;
+}

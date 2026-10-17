@@ -11,6 +11,7 @@ import Span from @ens.frontend.support.source;
 import @ens.sema.model.hierarchy;
 import Field from @ens.sema.model.typemembers;
 import Method from @ens.sema.model.typemembers;
+import Parameter from @ens.sema.model.typemembers;
 import @ens.sema.model.typemembers;
 import @ens.sema.model.typenames;
 import DeclaredType from @ens.sema.model.types;
@@ -24,6 +25,7 @@ import EirLoadSlot from eir.model;
 import layout.vtables;
 import LoweringContext from lower.context;
 import lower.calls;
+import @ens.sema.support.syntax;
 import lower.conversions;
 import lower.defaults;
 import lower.expressions;
@@ -31,6 +33,7 @@ import lower.ownership;
 import lower.places;
 import lower.records;
 import lower.stores;
+import Operand from lower.stores;
 import lower.symbols;
 import lower.throwing;
 import lower.weakfields;
@@ -171,11 +174,10 @@ public implementationOn(Type receiver, Method interfaceMethod) -> Method? {
     return null;
 }
 
-// 'new C(args)': a zeroed object whose header names its destructor, then the declared field
-// defaults of the whole chain, then the constructor over the same reference. An argument that
-// throws abandons the construction. A class declaring no constructor of its own still runs the
-// nearest inherited one callable with no arguments; only a chain with no constructor at all is
-// complete once its defaults are in place.
+// 'new C(args)': a zeroed object whose header names its destructor, then the constructor over the
+// same reference, which computes the defaults of its class, or the abandoned object where an
+// argument throws. A class declaring no constructor runs the nearest inherited one callable with no
+// arguments after the defaults of the classes below it, or only those defaults where none exists.
 public lowerNew(LoweringContext lowering, NewExpressionNode node) -> long {
     let type = lowering.typeOf(node);
     if (type == null) {
@@ -189,14 +191,18 @@ public lowerNew(LoweringContext lowering, NewExpressionNode node) -> long {
     let builder = lowering.builder();
     long object = builder.newTemp(type);
     builder.append(new EirClassNew(object, type, destructorSymbol(classType)));
-    if (!defaults.applyClassDefaults(lowering, object, classType, node.span())) {
-        return -1;
-    }
     Method? initializer = lowering.result().methodOf(node.green());
     if (initializer != null) {
         initializer = resolveConcreteMethod(lowering, classType, initializer);
     } else {
         initializer = typemembers.implicitBaseConstructor(classType).chosen();
+    }
+    Type? constructing = null;
+    if (initializer != null) {
+        constructing = initializer.definingType();
+    }
+    if (!defaults.applyLevels(lowering, object, classType, classType, constructing, node.span())) {
+        return -1;
     }
     if (initializer == null) {
         return object;
@@ -227,8 +233,8 @@ public lowerNew(LoweringContext lowering, NewExpressionNode node) -> long {
 }
 
 // Builds the base part of the receiver with the base constructor its class's implicit chain runs,
-// if any. This stands in for a missing 'super(...)' and for a 'super()' on a base that declares no
-// constructor.
+// after the defaults of the base classes that declare no constructor, nearest first. This stands in
+// for a missing 'super(...)' and for a 'super()' on a base that declares no constructor.
 public lowerImplicitBaseConstructor(LoweringContext lowering, GreenNode orderKey, Span span) {
     let receiverType = lowering.info().receiverType();
     if (receiverType == null || types.classOf(receiverType) == null) {
@@ -236,21 +242,129 @@ public lowerImplicitBaseConstructor(LoweringContext lowering, GreenNode orderKey
     }
     let chain = typemembers.implicitBaseConstructor(receiverType);
     let owner = chain.owner();
+    if (!defaults.applyLevels(lowering, 0, receiverType, vtables.baseClassOf(receiverType), owner,
+            span)) {
+        return;
+    }
     let baseConstructor = chain.chosen();
-    if (owner == null || baseConstructor == null) {
+    if (owner != null && baseConstructor != null) {
+        let info = lowering.index().infoFor(baseConstructor.signature());
+        if (info == null) {
+            lowering.internalError("the implicit base constructor of '{typenames.display(owner)}' "
+                + "resolves to no indexed function", span);
+            return;
+        }
+        string described = "base constructor of {lowering.names().quoted(owner)}";
+        if (!calls.supportedCallee(lowering, info, described, span)) {
+            return;
+        }
+        let ignored = calls.lowerInvocation(lowering, info, null, orderKey, span, owner, 0);
+    }
+    let ignored = bindInheritedParameters(lowering);
+}
+
+// Assigns the field a 'this.field' parameter names. The incoming value is borrowed, so the field
+// retains what it takes and releases what it held, exactly as a written assignment would.
+public bindParameterField(LoweringContext lowering, Parameter parameter, long slot, long incoming)
+        -> bool {
+    let receiverType = lowering.info().receiverType();
+    if (receiverType == null) {
+        lowering.internalError("a 'this.{parameter.name()}' parameter outside a constructor",
+            parameter.span());
+        return false;
+    }
+    let parameterType = lowering.substituted(parameter.type());
+    let fields = records.fieldsOf(receiverType);
+    long index = typemembers.inheritedOrOwnFieldIndex(receiverType, parameter.name());
+    if (fields == null || index < 0) {
+        lowering.internalError("'{typenames.display(receiverType)}' has no field "
+            + "'{parameter.name()}' for its constructor parameter to assign", parameter.span());
+        return false;
+    }
+    let field = fields.get(index);
+    long destination = 0;
+    long address = records.fieldAddressIn(lowering, destination, receiverType, field.type(),
+        index);
+    long source = -1;
+    if (!primitives.isReferenceType(parameterType) && primitives.hasArcContent(parameterType)) {
+        source = ownership.slotAddress(lowering, slot, parameterType);
+    }
+    let operand = new Operand(incoming, false, source);
+    if (field.isWeak()) {
+        weakfields.store(lowering, address, operand);
+        return true;
+    }
+    if (!stores.assignThroughAddress(lowering, address, field.type(), operand)) {
+        lowering.internalError("the constructor parameter '{parameter.name()}' borrows a struct "
+            + "with no storage to retain", parameter.span());
+        return false;
+    }
+    return true;
+}
+
+// Whether 'parameter', a 'this.field' parameter of the constructor being lowered, assigns a field
+// its class inherits, which it does once the base class is built.
+public bindsInheritedField(LoweringContext lowering, Parameter parameter) -> bool {
+    let receiverType = lowering.info().receiverType();
+    if (receiverType == null) {
+        return false;
+    }
+    long index = typemembers.inheritedOrOwnFieldIndex(receiverType, parameter.name());
+    return index >= 0 && index < typemembers.baseFieldCount(receiverType);
+}
+
+// Assigns the inherited fields the 'this.field' parameters of the constructor being lowered name,
+// where its base class has just been built.
+public bindInheritedParameters(LoweringContext lowering) -> bool {
+    let info = lowering.info();
+    let declaration = info.declaration();
+    if (!info.isConstructor() || declaration == null) {
+        return true;
+    }
+    let parameters = info.signature().parameters();
+    let parameterList = declaration.parameters();
+    for (long i = 0; i < parameters.length && i < parameterList.parametersCount(); i++) {
+        let parameter = parameters[i];
+        if (!parameter.bindsField() || !bindsInheritedField(lowering, parameter)) {
+            continue;
+        }
+        let binding = lowering.result().bindingOf(parameterList.parameters(i).green());
+        long? slot = null;
+        if (binding != null) {
+            slot = lowering.slotFor(binding);
+        }
+        if (slot == null) {
+            lowering.internalError("parameter '{parameter.name()}' has no slot", parameter.span());
+            return false;
+        }
+        if (!bindParameterField(lowering, parameter, slot, i + 1)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Builds the base part where a constructor that writes no 'super(...)' finishes normally: at the
+// end of its body, at a 'return' and at the end of a catch clause.
+public finishImplicitConstruction(LoweringContext lowering) {
+    let info = lowering.info();
+    let declaration = info.declaration();
+    if (!info.isConstructor() || declaration == null || syntax.callsSuper(declaration.body())) {
         return;
     }
-    let info = lowering.index().infoFor(baseConstructor.signature());
-    if (info == null) {
-        lowering.internalError("the implicit base constructor of '{typenames.display(owner)}' "
-            + "resolves to no indexed function", span);
+    lowerImplicitBaseConstructor(lowering, declaration.green(), info.signature().nameSpan());
+}
+
+// Computes the defaults of the class whose constructor is being lowered, which it does before
+// anything else.
+public startConstruction(LoweringContext lowering) {
+    let info = lowering.info();
+    let receiverType = info.receiverType();
+    if (!info.isConstructor() || receiverType == null || types.classOf(receiverType) == null) {
         return;
     }
-    string described = "base constructor of {lowering.names().quoted(owner)}";
-    if (!calls.supportedCallee(lowering, info, described, span)) {
-        return;
-    }
-    let ignored = calls.lowerInvocation(lowering, info, null, orderKey, span, owner, 0);
+    let ignored = defaults.applyLevels(lowering, 0, receiverType, receiverType,
+        vtables.baseClassOf(receiverType), info.signature().nameSpan());
 }
 
 // 'value.field' as an address, or -1 when the base names no class field.

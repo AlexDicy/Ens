@@ -44,6 +44,7 @@ import support.syntax;
 import phases.bodies.declarations;
 import BodyChecker from phases.bodies;
 import NamespaceName from phases.bodies;
+import BaseArgument from phases.bodies.unassigneduses;
 
 public analyzeMemberCall(BodyChecker checker, CallExpressionNode node, MemberExpressionNode member,
                          Type? expected) -> Type {
@@ -230,26 +231,74 @@ public safeResultOf(BodyChecker checker, Type value) -> Type {
     return checker.store().optionalOf(value);
 }
 
-// The 'super(...)' a constructor starts with constructs the base class once its arguments are
+// A 'super(...)' in a constructor's body constructs the base class once its arguments are
 // evaluated.
 public analyzeSuperCall(BodyChecker checker, CallExpressionNode node, SuperExpressionNode chained) -> Type {
+    let outer = checker.assignment().enterSuperArguments();
     Type analyzed = resolveSuperCall(checker, node, chained);
-    if (startsConstructor(checker, node)) {
-        checker.assignment().markBaseConstructed();
+    checker.assignment().leaveSuperArguments(outer);
+    let frame = checker.frame();
+    let declaration = frame.callableSyntax();
+    if (!frame.inConstructor() || frame.innermostLambda() != null || frame.inCatchClause()
+            || !(declaration is FunctionDeclarationNode)) {
+        return analyzed;
     }
+    if (!syntax.isStatementCall(node)) {
+        checker.assignment().noteMisplacedSuperCall(node.span());
+        return checker.store().errorType();
+    }
+    if (syntax.insideLoop(node)) {
+        checker.assignment().noteMisplacedSuperCall(node.span());
+        return analyzed;
+    }
+    let first = syntax.chainingSuperCall(declaration.body());
+    let chosen = checker.result().methodOf(chained.green());
+    checker.assignment().noteSuperCall(node,
+        first != null && first.span().start == node.span().start, thisuses.statementSpelling(node),
+        baseArguments(checker, node, declaration, chosen),
+        thisuses.baseRunOf(chosen));
     return analyzed;
 }
 
-// Whether this 'super(...)' is the statement the body of the constructor being checked starts with.
-startsConstructor(BodyChecker checker, CallExpressionNode node) -> bool {
-    let frame = checker.frame();
-    let declaration = frame.callableSyntax();
-    if (!frame.inConstructor() || frame.innermostLambda() != null
-            || !(declaration is FunctionDeclarationNode)) {
-        return false;
+// The base fields that the base constructor 'chosen' sets from its 'this.field' parameters, with
+// the argument of the call 'node' each comes from and whether the field holds that argument once
+// the call returns. A parameter of 'declaration', the constructor being checked, is named where the
+// field then holds its value: it is never assigned, and its type is exactly the field's and shares
+// no part with another value.
+baseArguments(BodyChecker checker, CallExpressionNode node, FunctionDeclarationNode declaration,
+        Method? chosen) -> List<BaseArgument> {
+    let found = new List<BaseArgument>();
+    let receiver = checker.frame().thisType();
+    if (chosen == null || receiver == null) {
+        return found;
     }
-    let chaining = syntax.chainingSuperCall(declaration.body());
-    return chaining != null && chaining.span().start == node.span().start;
+    let parameters = chosen.signature().parameters();
+    let arguments = node.arguments();
+    for (long i = 0; i < arguments.argumentsCount() && i < parameters.length; i++) {
+        let parameter = parameters[i];
+        let field = typemembers.inheritedOrOwnField(receiver, parameter.name());
+        if (!parameter.bindsField() || field == null) {
+            continue;
+        }
+        string name = "";
+        let argument = arguments.arguments(i);
+        if (argument is IdentifierExpressionNode) {
+            let binding = checker.result().bindingOf(argument.green());
+            if (binding != null && checker.frame().parametersInReach().contains(binding)
+                    && !thisuses.assignsName(declaration, argument.name().text())
+                    && binding.type() == field.type() && typemembers.sharesNoPart(field.type())) {
+                name = argument.name().text();
+            }
+        }
+        bool kept = thisuses.keepsBoundField(chosen, parameter.name())
+            && !checker.assignment().bindsBaseField(parameter.name());
+        Type? argumentType = null;
+        if (argument is Expression) {
+            argumentType = checker.result().typeOf(argument.green());
+        }
+        found.push(new BaseArgument(parameter.name(), i, argumentType, name, kept));
+    }
+    return found;
 }
 
 resolveSuperCall(BodyChecker checker, CallExpressionNode node, SuperExpressionNode chained) -> Type {
@@ -336,7 +385,7 @@ resolveSuperCall(BodyChecker checker, CallExpressionNode node, SuperExpressionNo
 superCallOutsideConstructorRefusal(BodyChecker checker, CallExpressionNode node, Type base,
         string quotedBase) -> string {
     string text = "'super(...)' runs the constructor of base class {quotedBase}, so it can only be "
-        + "the first statement of a constructor. Remove this call.";
+        + "called in a constructor. Remove this call.";
     let declaration = checker.frame().callableSyntax();
     if (!(declaration is FunctionDeclarationNode)) {
         return text;
@@ -394,8 +443,8 @@ fitsParameters(Method candidate, List<Type> arguments) -> bool {
 }
 
 // Refuses this 'super(...)' in a constructor where it cannot run, and returns whether it is
-// misplaced. One in a 'catch' clause is refused by the exceptions phase, which knows what the clause
-// catches.
+// misplaced. A second call on a path is refused where the path is checked, and one in a 'catch'
+// clause by the exceptions phase, which knows what the clause catches.
 refuseMisplacedSuperCall(BodyChecker checker, CallExpressionNode node, Type receiver,
         string quotedBase) -> bool {
     let frame = checker.frame();
@@ -405,40 +454,47 @@ refuseMisplacedSuperCall(BodyChecker checker, CallExpressionNode node, Type rece
     if (authority != null) {
         owner = checker.names().quotedName(authority);
     }
-    CallExpressionNode? chaining = null;
-    if (declaration is FunctionDeclarationNode) {
-        chaining = syntax.chainingSuperCall(declaration.body());
-    }
     if (frame.innermostLambda() != null) {
-        if (chaining != null) {
+        if (declaration is FunctionDeclarationNode && syntax.callsSuper(declaration.body())) {
             checker.reporter().report("'super(...)' cannot be called inside a lambda, and the "
-                + "constructor of {owner} already calls it in its first statement. Remove this call.",
-                node.span());
+                + "constructor of {owner} already calls it. Remove this call.", node.span());
         } else {
             checker.reporter().report("'super(...)' cannot be called inside a lambda, because a "
-                + "lambda can run later or not at all. Call it as the first statement of the "
-                + "constructor of {owner} instead.", node.span());
+                + "lambda can run later or not at all. Call it in the body of the constructor of "
+                + "{owner}.", node.span());
         }
         return true;
-    }
-    if (chaining == null) {
-        checker.reporter().report("'super(...)' must be the first statement of the constructor of "
-            + "{owner}, so that base class {quotedBase} is constructed before anything else in the "
-            + "body runs. Move this call to the start of the constructor's body, and compute its "
-            + "arguments inside the parentheses.", node.span());
-        return true;
-    }
-    if (startsConstructor(checker, node)) {
-        return false;
     }
     if (frame.inCatchClause()) {
         checker.assignment().noteSuperCallInCatch(node.span());
         return true;
     }
-    checker.reporter().report("The constructor of {owner} already calls 'super(...)' in its first "
-        + "statement, and base class {quotedBase} is constructed only once. Remove this call.",
-        node.span());
-    return true;
+    if (!syntax.isStatementCall(node)) {
+        string arguments = wording.greenSpelling(node.arguments().green());
+        string written = "it as 'super{arguments};'";
+        let arm = syntax.armHolding(node);
+        if (arm != null) {
+            written = "the arm as '{wording.armHead(arm)} -> \{ super{arguments}; \}'";
+        }
+        if (arguments.length > wording.quotedCodeLimit()) {
+            written = "it as a statement of its own";
+        }
+        checker.reporter().report("'super(...)' constructs base class {quotedBase}, so it is a "
+            + "statement of its own. Write {written}.", node.span());
+        return true;
+    }
+    if (syntax.inLoopInitializer(node)) {
+        checker.reporter().report("'super(...)' is a statement of its own, so it cannot be the "
+            + "initializer of a 'for' loop. Move it above the loop.", node.span());
+        return true;
+    }
+    if (syntax.insideLoop(node)) {
+        checker.reporter().report("'super(...)' cannot be called inside a loop, because a loop can "
+            + "run it more than once or not at all. Move it out of the loop, to where it runs once on "
+            + "each path.", node.span());
+        return true;
+    }
+    return false;
 }
 
 // The built-in members of strings, arrays, and primitives, intercepted before general
