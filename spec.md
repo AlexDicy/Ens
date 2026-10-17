@@ -1810,9 +1810,10 @@ Memory is managed automatically through Automatic Reference Counting (ARC).
 - **Classes** are heap-allocated reference types. Each instance carries a refcount; when the last reference goes out of scope, the instance is freed.
 - **Structs** are value types. They are copied on assignment and passed by value.
 
-Atomics happen only at allocation, at assignment of class-typed fields, at scope exit, around a call or type switch that uses a reference read out of a field or an array element, and around a value read out of a local, a field or an array element that a later assignment in the same expression replaces.
-A reference read out of a field or an array element is retained until the call returns or the switch ends, because the code that runs meanwhile could overwrite that field or element and release the object while the call or switch still uses it.
-A value a later assignment replaces is retained until its use is done: an argument until its call returns, the value a type switch tests until the switch ends, and an operand until its operator is applied.
+Atomics happen only at allocation, at assignment of class-typed fields, at scope exit, and around a value read out of a local, a field or an array element when code that runs while the value is still in use could overwrite where it was read from.
+Such a value is retained until its use is done: an argument or a receiver until its call returns, a value in an interpolation until its text is made, the value a type switch tests until the switch ends, and an operand until its operator is applied.
+A local is overwritten only by an assignment to it or by a `mutating` method called on it.
+A field or an array element can also be overwritten by any code that runs meanwhile, such as a call, a constructor, a destructor, a user's `equals`, `hash` or `toString`, the first read of a `lazy const`, or the default of a field a struct literal leaves out.
 
 ```ens
 class Texture { /* ... */ }

@@ -2,10 +2,11 @@
 // location, and the value stays in use until whatever consumes it is done. When a part of the same
 // expression that runs in that window may replace what the location holds, the replacement would
 // release the value while it is still in use, so the read retains it instead and reports it owned.
-// Here the replacement is an assignment, to a local or through any path to a field, an element or a
-// mutating struct method's receiver; a lambda copies what it captures, so nothing it runs assigns a
-// local. The set is computed once per full expression, from its root down, before the expression
-// is lowered.
+// A local is replaced only by an assignment to it, because a lambda copies what it captures; a
+// field, an element or a mutating struct method's receiver is replaced by an assignment through any
+// path, and by any code a call, a constructor, a destructor or a user's 'equals', 'hash' or
+// 'toString' runs. The set is computed once per full expression, from its root down, before the
+// expression is lowered.
 import Expression from @ens.frontend.syntax.generated.nodes;
 import Statement from @ens.frontend.syntax.generated.nodes;
 import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
@@ -53,9 +54,17 @@ import GreenNode from @ens.frontend.syntax.green;
 import SyntaxKind from @ens.frontend.syntax.generated.kind;
 import LocalBinding from @ens.sema.model.scopes;
 import Field from @ens.sema.model.typemembers;
+import Method from @ens.sema.model.typemembers;
+import @ens.sema.model.typemembers;
+import OptionalType from @ens.sema.model.types;
 import Type from @ens.sema.model.types;
+import TypeStore from @ens.sema.model.types;
+import layout.behaviors;
 import LoweringContext from lower.context;
+import lower.builtins;
 import lower.classes;
+import lower.rawarrays;
+import lower.records;
 import support.primitives;
 import List from @std.collections.list;
 import Set from @std.collections.set;
@@ -93,12 +102,13 @@ public ofExpression(LoweringContext lowering, Expression root) -> OwnedReads {
 }
 
 // What a location's root is: a local or parameter, a field of a class, an element of an array of
-// one type, or the storage a mutating struct method runs over.
+// one type, the storage a mutating struct method runs over, or a field a field default reads.
 enum LocationRoot {
     Local,
     Field,
     Element,
     Receiver,
+    Sibling,
 }
 
 // Storage a read borrows from or a write replaces: a root and the struct fields reached from it.
@@ -136,18 +146,27 @@ final class Location {
         }
         return true;
     }
+
+    // True when code running somewhere else, such as a called function, can replace it.
+    isShared() -> bool {
+        return this.root != LocationRoot.Local;
+    }
 }
 
-// What evaluating part of an expression may replace: the locations it assigns.
+// What evaluating part of an expression may replace: the locations it assigns, and every shared
+// location once it runs code that could assign any of them.
 final class Writes {
+    bool anyShared;
     List<Location> locations;
 
     constructor() {
+        this.anyShared = false;
         this.locations = new List<Location>();
     }
 
     with(Writes other) -> Writes {
         let joined = new Writes();
+        joined.anyShared = this.anyShared || other.anyShared;
         joined.locations.pushAll(this.locations);
         joined.locations.pushAll(other.locations);
         return joined;
@@ -156,6 +175,9 @@ final class Writes {
     // True when one of these writes can replace a location on the way to a read's value.
     reaches(List<Location> chain) -> bool {
         for (let location in chain) {
+            if (this.anyShared && location.isShared()) {
+                return true;
+            }
             for (let written in this.locations) {
                 if (written.overlaps(location)) {
                     return true;
@@ -164,6 +186,12 @@ final class Writes {
         }
         return false;
     }
+}
+
+codeRuns() -> Writes {
+    let writes = new Writes();
+    writes.anyShared = true;
+    return writes;
 }
 
 final class Analysis {
@@ -204,7 +232,7 @@ final class Analysis {
                 }
             },
             is ForEachStatementNode loop -> {
-                let ignored = this.visit(loop.iterable(), new Writes());
+                let ignored = this.visitIterable(loop);
             },
             is ReturnStatementNode returned -> {
                 let value = returned.value();
@@ -223,6 +251,16 @@ final class Analysis {
             },
             default -> { },
         }
+    }
+
+    // A loop over an array keeps its own reference to it, and any other iterable is read once, to
+    // call the method that makes its iterator.
+    visitIterable(ForEachStatementNode loop) -> Writes {
+        let type = this.typeOf(loop.iterable());
+        if (type == null || primitives.arrayOf(type) != null) {
+            return this.visit(loop.iterable(), new Writes());
+        }
+        return codeRuns().with(this.visit(loop.iterable(), codeRuns()));
     }
 
     // Visits `node`, whose value stays in use while `after` runs, and returns what evaluating it
@@ -300,10 +338,9 @@ final class Analysis {
                 return this.visitStructLiteral(literal);
             },
             is InterpolatedStringExpressionNode interpolated -> {
-                let holes = this.visit(interpolated.firstHole(), new Writes());
+                let holes = this.visitHole(interpolated.firstHole());
                 for (long i = 0; i < interpolated.continuationsCount(); i++) {
-                    holes = holes.with(this.visit(interpolated.continuations(i).hole(),
-                        new Writes()));
+                    holes = holes.with(this.visitHole(interpolated.continuations(i).hole()));
                 }
                 return holes;
             },
@@ -348,9 +385,14 @@ final class Analysis {
         }
     }
 
-    // A member read takes its value out of the object or struct it is read from at once.
+    // A member read takes its value out of the object or struct it is read from at once. A lazy
+    // static runs its initializer the first time it is read.
     visitMember(MemberExpressionNode member) -> Writes {
-        if (this.lowering.result().staticConstFieldOf(member.green()) != null) {
+        let staticField = this.lowering.result().staticConstFieldOf(member.green());
+        if (staticField != null) {
+            if (staticField.isLazy()) {
+                return codeRuns();
+            }
             return new Writes();
         }
         return this.visitPlace(member.object(), new Writes());
@@ -374,8 +416,9 @@ final class Analysis {
         return target.with(value).with(stored);
     }
 
-    // What writing a target replaces: its location. A weak field holds no reference, so writing one
-    // releases nothing.
+    // What writing a target replaces: its location, and every shared location once the release of
+    // what it held may run a destructor. A weak field holds no reference, so writing one releases
+    // nothing.
     writtenBy(Expression target) -> Writes {
         let writes = new Writes();
         let type = this.typeOf(target);
@@ -390,21 +433,61 @@ final class Analysis {
         if (location != null) {
             writes.locations.push(location);
         }
+        writes.anyShared = releaseRunsCode(type, new List<Type>());
         return writes;
     }
 
     // The left operand stays in use while the right one is evaluated and the two are combined.
     visitBinary(BinaryExpressionNode binary) -> Writes {
-        let right = this.visit(binary.right(), new Writes());
-        let left = this.visit(binary.left(), right);
-        return left.with(right);
+        let operator = binary.operator().kind();
+        let combined = new Writes();
+        if (operator == SyntaxKind.EqualsEquals || operator == SyntaxKind.NotEquals) {
+            let type = this.comparedType(binary);
+            if (type == null || this.behaviorRunsCode(type, "equals", new List<Type>())) {
+                combined = codeRuns();
+            }
+        }
+        let right = this.visit(binary.right(), combined);
+        let left = this.visit(binary.left(), right.with(combined));
+        return left.with(right).with(combined);
     }
 
-    // A literal moves each value into its field as it is read.
+    comparedType(BinaryExpressionNode binary) -> Type? {
+        let left = this.typeOf(binary.left());
+        let right = this.typeOf(binary.right());
+        if (left == null || right == null) {
+            return null;
+        }
+        if (primitives.isNullType(left)) {
+            return right;
+        }
+        return left;
+    }
+
+    // A hole's text is made as soon as it is read, by the type's 'toString' when it has one.
+    visitHole(Expression hole) -> Writes {
+        let type = this.typeOf(hole);
+        let rendering = new Writes();
+        if (type == null || this.behaviorRunsCode(type, "toString", new List<Type>())) {
+            rendering = codeRuns();
+        }
+        return this.visit(hole, rendering).with(rendering);
+    }
+
+    // A literal moves each value into its field as it is read, and a field it leaves out takes its
+    // declared default, which may call anything.
     visitStructLiteral(StructLiteralExpressionNode literal) -> Writes {
         let fieldValues = new Writes();
         for (long i = 0; i < literal.fieldsCount(); i++) {
             fieldValues = fieldValues.with(this.visit(literal.fields(i).value(), new Writes()));
+        }
+        let type = this.typeOf(literal);
+        if (type == null) {
+            return fieldValues.with(codeRuns());
+        }
+        let fields = records.fieldsOf(type);
+        if (fields == null || literal.fieldsCount() < fields.length()) {
+            return fieldValues.with(codeRuns());
         }
         return fieldValues;
     }
@@ -422,7 +505,7 @@ final class Analysis {
             }
             return sizes;
         }
-        return this.visitArguments(created.arguments(), new Writes());
+        return this.visitArguments(created.arguments(), codeRuns()).with(codeRuns());
     }
 
     // The arguments in the order they are written, each in use until the call has returned, and
@@ -486,10 +569,34 @@ final class Analysis {
         return this.visit(receiver, untilReturn);
     }
 
-    // What running a call assigns: the receiver's storage, for a mutating method.
+    // What running a call may replace: nothing for a member the compiler implements, unless it is
+    // a 'hash' or 'toString' that reaches one a user wrote; every shared location for anything
+    // else; and the receiver's storage for a mutating method.
     callEffect(CallExpressionNode call) -> Writes {
         let callee = call.callee();
-        let effect = new Writes();
+        if (callee is MemberExpressionNode && builtins.resolvesStructurally(this.lowering, callee)) {
+            let type = this.typeOf(callee.object());
+            string name = callee.member().text();
+            if (type != null && name == "slice" && primitives.arrayOf(type) != null) {
+                return new Writes();
+            }
+            if (type != null && (name == "hash" || name == "toString")
+                    && !this.behaviorRunsCode(type, name, new List<Type>())) {
+                return new Writes();
+            }
+            return codeRuns();
+        }
+        let method = this.lowering.result().methodOf(callee.green());
+        if (method != null && method.intrinsic() != null) {
+            return new Writes();
+        }
+        if (method != null && callee is MemberExpressionNode) {
+            let receiverType = this.typeOf(callee.object());
+            if (receiverType != null && rawarrays.isIntercepted(receiverType, method)) {
+                return rawStoreEffect(this.lowering.store(), method.name(), receiverType);
+            }
+        }
+        let effect = codeRuns();
         if (callee is MemberExpressionNode && this.isMutatingCall(callee)) {
             let location = this.locationOf(callee.object());
             if (location != null) {
@@ -610,8 +717,7 @@ final class Analysis {
                 return writes;
             },
             is ForEachStatementNode loop -> {
-                return this.visit(loop.iterable(), new Writes())
-                    .with(this.statementWrites(loop.body()));
+                return this.visitIterable(loop).with(this.statementWrites(loop.body()));
             },
             is ReturnStatementNode returned -> {
                 let value = returned.value();
@@ -730,6 +836,11 @@ final class Analysis {
                 if (binding == null) {
                     return null;
                 }
+                if (this.lowering.slotFor(binding) == null
+                        && this.lowering.fieldDefaultOwner() != null) {
+                    return new Location(LocationRoot.Sibling, binding, null, "",
+                        new List<string>());
+                }
                 return new Location(LocationRoot.Local, binding, null, "", new List<string>());
             },
             is ThisExpressionNode receiver -> {
@@ -768,6 +879,39 @@ final class Analysis {
         }
     }
 
+    // True when the language's 'equals', 'hash' or 'toString' over a value of this type may run a
+    // method a user wrote.
+    behaviorRunsCode(Type type, string behavior, List<Type> visiting) -> bool {
+        if (type is OptionalType) {
+            return this.behaviorRunsCode(type.inner(), behavior, visiting);
+        }
+        let array = primitives.arrayOf(type);
+        if (array != null) {
+            return this.behaviorRunsCode(array.element(), behavior, visiting);
+        }
+        let structType = primitives.structOf(type);
+        if (structType != null) {
+            if (visiting.indexOf(structType) >= 0) {
+                return false;
+            }
+            if (declaresMethod(structType, behavior)) {
+                return true;
+            }
+            visiting.push(structType);
+            let fields = records.fieldsOf(structType) ?? new List<Field>();
+            for (let field in fields) {
+                if (this.behaviorRunsCode(field.type(), behavior, visiting)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if (primitives.classOf(type) != null || primitives.interfaceOf(type) != null) {
+            return behaviors.subtreeDeclares(this.lowering.index(), type, behavior);
+        }
+        return false;
+    }
+
     // True when the function being lowered is a mutating struct method. Its caller hands it the
     // storage itself, which code it calls may replace; any other method runs over storage its caller
     // keeps unchanged until it returns, a copy whenever anything else could replace it.
@@ -801,9 +945,66 @@ single(Location? location) -> List<Location>? {
     return chain;
 }
 
+// A raw store's 'read' and 'length' run no code, and its 'write' and 'clear' replace one of its
+// cells the way an element assignment does.
+rawStoreEffect(TypeStore store, string name, Type receiverType) -> Writes {
+    let writes = new Writes();
+    let element = rawarrays.elementOf(receiverType);
+    if (element == null || (name != "write" && name != "clear")) {
+        return writes;
+    }
+    if (primitives.hasArcContent(element)) {
+        writes.locations.push(new Location(LocationRoot.Element, null, store.arrayOf(element), "",
+            new List<string>()));
+    }
+    writes.anyShared = releaseRunsCode(element, new List<Type>());
+    return writes;
+}
+
 fieldLocation(Field field) -> Location {
     return new Location(LocationRoot.Field, null, field.definingType(), field.name(),
         new List<string>());
+}
+
+declaresMethod(Type structType, string name) -> bool {
+    let methods = typemembers.methodsOf(structType) ?? new List<Method>();
+    for (let method in methods) {
+        if (method.name() == name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// True when releasing a value of this type may run a destructor a user wrote: a class or
+// interface reference and a function value may be the last reference to an object with one, and
+// text never is.
+releaseRunsCode(Type type, List<Type> visiting) -> bool {
+    if (!primitives.hasArcContent(type) || primitives.isStringType(type)) {
+        return false;
+    }
+    if (type is OptionalType) {
+        return releaseRunsCode(type.inner(), visiting);
+    }
+    let array = primitives.arrayOf(type);
+    if (array != null) {
+        return releaseRunsCode(array.element(), visiting);
+    }
+    let structType = primitives.structOf(type);
+    if (structType == null) {
+        return true;
+    }
+    if (visiting.indexOf(structType) >= 0) {
+        return false;
+    }
+    visiting.push(structType);
+    let fields = records.fieldsOf(structType) ?? new List<Field>();
+    for (let field in fields) {
+        if (releaseRunsCode(field.type(), visiting)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 statementArms(SwitchStatementNode switched) -> List<SwitchArm> {
