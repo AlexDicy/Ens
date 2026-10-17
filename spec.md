@@ -289,7 +289,6 @@ public class Greeting extends Named {
 
 An own field needs a value when it has no default and its type has no default value, or when it is `const` and has no default.
 Every own field that needs a value is assigned on every path before `super(...)`, and a `this.field` parameter counts.
-A constructor that begins with `super(...)` may still assign its own fields after it.
 A constructor that writes `super(...)` calls it exactly once on every path that finishes it, as a statement of its own.
 It may call it in each branch of an `if` or a `switch`, but not inside a loop, a lambda or a `catch` clause, and a `return` before it is an error.
 Before `super(...)` returns, `this` may only be used to assign the subclass's own fields, to read those that have values, and to test its type with `is`, and a field the base class declares can neither be read nor assigned.
