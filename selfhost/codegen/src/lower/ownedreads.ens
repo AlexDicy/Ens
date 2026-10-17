@@ -1,0 +1,823 @@
+// The reads of a full expression that own the value they read. A read borrows its value from a
+// location, and the value stays in use until whatever consumes it is done. When a part of the same
+// expression that runs in that window may replace what the location holds, the replacement would
+// release the value while it is still in use, so the read retains it instead and reports it owned.
+// Here the replacement is an assignment, to a local or through any path to a field, an element or a
+// mutating struct method's receiver; a lambda copies what it captures, so nothing it runs assigns a
+// local. The set is computed once per full expression, from its root down, before the expression
+// is lowered.
+import Expression from @ens.frontend.syntax.generated.nodes;
+import Statement from @ens.frontend.syntax.generated.nodes;
+import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ThisExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ParenthesizedExpressionNode from @ens.frontend.syntax.generated.nodes;
+import TryExpressionNode from @ens.frontend.syntax.generated.nodes;
+import CastExpressionNode from @ens.frontend.syntax.generated.nodes;
+import CheckedCastExpressionNode from @ens.frontend.syntax.generated.nodes;
+import TypeTestExpressionNode from @ens.frontend.syntax.generated.nodes;
+import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SubscriptExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SafeMemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SafeSubscriptExpressionNode from @ens.frontend.syntax.generated.nodes;
+import AssignmentExpressionNode from @ens.frontend.syntax.generated.nodes;
+import PrefixExpressionNode from @ens.frontend.syntax.generated.nodes;
+import PostfixExpressionNode from @ens.frontend.syntax.generated.nodes;
+import BinaryExpressionNode from @ens.frontend.syntax.generated.nodes;
+import TernaryExpressionNode from @ens.frontend.syntax.generated.nodes;
+import NullCoalesceExpressionNode from @ens.frontend.syntax.generated.nodes;
+import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
+import NewExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ArgumentListNode from @ens.frontend.syntax.generated.nodes;
+import NamedArgumentNode from @ens.frontend.syntax.generated.nodes;
+import ArrayLiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
+import StructLiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
+import InterpolatedStringExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SwitchExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SwitchArm from @ens.frontend.syntax.generated.nodes;
+import ArmBody from @ens.frontend.syntax.generated.nodes;
+import ElseBody from @ens.frontend.syntax.generated.nodes;
+import ValueArmNode from @ens.frontend.syntax.generated.nodes;
+import TypeArmNode from @ens.frontend.syntax.generated.nodes;
+import DefaultArmNode from @ens.frontend.syntax.generated.nodes;
+import BlockNode from @ens.frontend.syntax.generated.nodes;
+import VariableDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import IfStatementNode from @ens.frontend.syntax.generated.nodes;
+import WhileStatementNode from @ens.frontend.syntax.generated.nodes;
+import ForStatementNode from @ens.frontend.syntax.generated.nodes;
+import ForEachStatementNode from @ens.frontend.syntax.generated.nodes;
+import ReturnStatementNode from @ens.frontend.syntax.generated.nodes;
+import ExpressionStatementNode from @ens.frontend.syntax.generated.nodes;
+import ThrowStatementNode from @ens.frontend.syntax.generated.nodes;
+import SwitchStatementNode from @ens.frontend.syntax.generated.nodes;
+import GreenNode from @ens.frontend.syntax.green;
+import SyntaxKind from @ens.frontend.syntax.generated.kind;
+import LocalBinding from @ens.sema.model.scopes;
+import Field from @ens.sema.model.typemembers;
+import Type from @ens.sema.model.types;
+import LoweringContext from lower.context;
+import lower.classes;
+import support.primitives;
+import List from @std.collections.list;
+import Set from @std.collections.set;
+
+// The reads of one full expression that retain the value they read.
+public final class OwnedReads {
+    Set<GreenNode> reads;
+
+    public constructor() {
+        this.reads = new Set<GreenNode>();
+    }
+
+    public contains(Expression node) -> bool {
+        return this.reads.contains(node.green());
+    }
+
+    protected add(Expression node) {
+        this.reads.add(node.green());
+    }
+}
+
+// The owned reads of the full expressions a statement evaluates itself. A statement nested inside
+// it, in a block or an arm, is lowered under owned reads of its own.
+public ofStatement(LoweringContext lowering, Statement statement) -> OwnedReads {
+    let analysis = new Analysis(lowering);
+    analysis.visitRoots(statement);
+    return analysis.owned;
+}
+
+// The owned reads of one expression whose value is consumed where nothing else runs after it.
+public ofExpression(LoweringContext lowering, Expression root) -> OwnedReads {
+    let analysis = new Analysis(lowering);
+    let ignored = analysis.visit(root, new Writes());
+    return analysis.owned;
+}
+
+// What a location's root is: a local or parameter, a field of a class, an element of an array of
+// one type, or the storage a mutating struct method runs over.
+enum LocationRoot {
+    Local,
+    Field,
+    Element,
+    Receiver,
+}
+
+// Storage a read borrows from or a write replaces: a root and the struct fields reached from it.
+final class Location {
+    LocationRoot root;
+    LocalBinding? binding;
+    Type? owner;
+    string name;
+    List<string> path;
+
+    constructor(this.root, this.binding, this.owner, this.name, this.path);
+
+    // The same root, one struct field further in.
+    projected(string field) -> Location {
+        let extended = new List<string>();
+        extended.pushAll(this.path);
+        extended.push(field);
+        return new Location(this.root, this.binding, this.owner, this.name, extended);
+    }
+
+    // True when replacing one of the two replaces part of the other.
+    overlaps(Location other) -> bool {
+        if (this.root != other.root || this.binding != other.binding || this.owner != other.owner
+                || this.name != other.name) {
+            return false;
+        }
+        long shared = this.path.length();
+        if (other.path.length() < shared) {
+            shared = other.path.length();
+        }
+        for (long i = 0; i < shared; i++) {
+            if (this.path.get(i) != other.path.get(i)) {
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
+// What evaluating part of an expression may replace: the locations it assigns.
+final class Writes {
+    List<Location> locations;
+
+    constructor() {
+        this.locations = new List<Location>();
+    }
+
+    with(Writes other) -> Writes {
+        let joined = new Writes();
+        joined.locations.pushAll(this.locations);
+        joined.locations.pushAll(other.locations);
+        return joined;
+    }
+
+    // True when one of these writes can replace a location on the way to a read's value.
+    reaches(List<Location> chain) -> bool {
+        for (let location in chain) {
+            for (let written in this.locations) {
+                if (written.overlaps(location)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+}
+
+final class Analysis {
+    LoweringContext lowering;
+    OwnedReads owned;
+
+    constructor(LoweringContext lowering) {
+        this.lowering = lowering;
+        this.owned = new OwnedReads();
+    }
+
+    visitRoots(Statement statement) {
+        switch (statement) {
+            is VariableDeclarationNode declaration -> {
+                let initializer = declaration.initializer();
+                if (initializer != null) {
+                    let ignored = this.visit(initializer.value(), new Writes());
+                }
+            },
+            is IfStatementNode conditional -> {
+                let ignored = this.visit(conditional.condition(), new Writes());
+            },
+            is WhileStatementNode loop -> {
+                let ignored = this.visit(loop.condition(), new Writes());
+            },
+            is ForStatementNode loop -> {
+                let initializer = loop.initializer();
+                if (initializer is Statement) {
+                    this.visitRoots(initializer);
+                }
+                let condition = loop.condition();
+                if (condition != null) {
+                    let ignoredCondition = this.visit(condition, new Writes());
+                }
+                let update = loop.update();
+                if (update != null) {
+                    let ignoredUpdate = this.visit(update, new Writes());
+                }
+            },
+            is ForEachStatementNode loop -> {
+                let ignored = this.visit(loop.iterable(), new Writes());
+            },
+            is ReturnStatementNode returned -> {
+                let value = returned.value();
+                if (value != null) {
+                    let ignored = this.visit(value, new Writes());
+                }
+            },
+            is ThrowStatementNode thrown -> {
+                let ignored = this.visit(thrown.value(), new Writes());
+            },
+            is ExpressionStatementNode expression -> {
+                let ignored = this.visit(expression.expression(), new Writes());
+            },
+            is SwitchStatementNode switched -> {
+                let ignored = this.visitSwitch(switched.scrutinee(), statementArms(switched));
+            },
+            default -> { },
+        }
+    }
+
+    // Visits `node`, whose value stays in use while `after` runs, and returns what evaluating it
+    // may replace.
+    visit(Expression node, Writes after) -> Writes {
+        let chain = this.chainOf(node);
+        if (chain != null && after.reaches(chain)) {
+            this.owned.add(node);
+        }
+        switch (node) {
+            is ParenthesizedExpressionNode parenthesized -> {
+                return this.visit(parenthesized.inner(), after);
+            },
+            is TryExpressionNode tried -> {
+                return this.visit(tried.operand(), after);
+            },
+            is CastExpressionNode cast -> {
+                return this.visit(cast.value(), after);
+            },
+            is CheckedCastExpressionNode cast -> {
+                return this.visit(cast.value(), new Writes());
+            },
+            is TypeTestExpressionNode test -> {
+                return this.visit(test.value(), new Writes());
+            },
+            is PrefixExpressionNode prefix -> {
+                return this.visitUpdate(prefix.operator().kind(), prefix.operand());
+            },
+            is PostfixExpressionNode postfix -> {
+                return this.visitUpdate(postfix.operator().kind(), postfix.operand());
+            },
+            is MemberExpressionNode member -> {
+                return this.visitMember(member);
+            },
+            is SubscriptExpressionNode subscript -> {
+                let index = this.visit(subscript.index(), new Writes());
+                return index.with(this.visit(subscript.object(), index));
+            },
+            is SafeMemberExpressionNode safeMember -> {
+                return this.visit(safeMember.object(), new Writes());
+            },
+            is SafeSubscriptExpressionNode safeSubscript -> {
+                let index = this.visit(safeSubscript.index(), new Writes());
+                return index.with(this.visit(safeSubscript.object(), index));
+            },
+            is AssignmentExpressionNode assignment -> {
+                return this.visitAssignment(assignment);
+            },
+            is BinaryExpressionNode binary -> {
+                return this.visitBinary(binary);
+            },
+            is TernaryExpressionNode ternary -> {
+                return this.visit(ternary.condition(), new Writes())
+                    .with(this.visit(ternary.thenValue(), new Writes()))
+                    .with(this.visit(ternary.elseValue(), new Writes()));
+            },
+            is NullCoalesceExpressionNode coalesce -> {
+                return this.visit(coalesce.left(), new Writes())
+                    .with(this.visit(coalesce.right(), new Writes()));
+            },
+            is CallExpressionNode call -> {
+                return this.visitCall(call);
+            },
+            is NewExpressionNode created -> {
+                return this.visitNew(created);
+            },
+            is ArrayLiteralExpressionNode literal -> {
+                let elements = new Writes();
+                for (long i = 0; i < literal.elementsCount(); i++) {
+                    elements = elements.with(this.visit(literal.elements(i), new Writes()));
+                }
+                return elements;
+            },
+            is StructLiteralExpressionNode literal -> {
+                return this.visitStructLiteral(literal);
+            },
+            is InterpolatedStringExpressionNode interpolated -> {
+                let holes = this.visit(interpolated.firstHole(), new Writes());
+                for (long i = 0; i < interpolated.continuationsCount(); i++) {
+                    holes = holes.with(this.visit(interpolated.continuations(i).hole(),
+                        new Writes()));
+                }
+                return holes;
+            },
+            is SwitchExpressionNode switched -> {
+                return this.visitSwitch(switched.scrutinee(), expressionArms(switched));
+            },
+            default -> {
+                return new Writes();
+            },
+        }
+    }
+
+    // A place a write lands in or a mutating method runs over, used as storage until `after` has
+    // run: only the objects its storage is inside have to stay alive, so the references to them
+    // are what stay in use.
+    visitPlace(Expression node, Writes after) -> Writes {
+        switch (node) {
+            is ParenthesizedExpressionNode parenthesized -> {
+                return this.visitPlace(parenthesized.inner(), after);
+            },
+            is IdentifierExpressionNode ignored -> {
+                return new Writes();
+            },
+            is ThisExpressionNode ignored -> {
+                return new Writes();
+            },
+            is MemberExpressionNode member -> {
+                let objectType = this.typeOf(member.object());
+                if (classes.fieldOf(this.lowering, member) == null && objectType != null
+                        && primitives.isStructType(objectType)) {
+                    return this.visitPlace(member.object(), after);
+                }
+                return this.visit(member.object(), after);
+            },
+            is SubscriptExpressionNode subscript -> {
+                let index = this.visit(subscript.index(), new Writes());
+                return index.with(this.visit(subscript.object(), index.with(after)));
+            },
+            default -> {
+                return this.visit(node, after);
+            },
+        }
+    }
+
+    // A member read takes its value out of the object or struct it is read from at once.
+    visitMember(MemberExpressionNode member) -> Writes {
+        if (this.lowering.result().staticConstFieldOf(member.green()) != null) {
+            return new Writes();
+        }
+        return this.visitPlace(member.object(), new Writes());
+    }
+
+    // '++' and '--' replace a number, which releases nothing; the other prefix operators read
+    // their operand and consume it.
+    visitUpdate(SyntaxKind operator, Expression operand) -> Writes {
+        if (operator == SyntaxKind.PlusPlus || operator == SyntaxKind.MinusMinus) {
+            return this.visitPlace(operand, new Writes());
+        }
+        return this.visit(operand, new Writes());
+    }
+
+    // The target's address is computed first and used once the value is evaluated, by the write,
+    // which retains the value before it releases what the target held.
+    visitAssignment(AssignmentExpressionNode assignment) -> Writes {
+        let value = this.visit(assignment.value(), new Writes());
+        let stored = this.writtenBy(assignment.target());
+        let target = this.visitPlace(assignment.target(), value.with(stored));
+        return target.with(value).with(stored);
+    }
+
+    // What writing a target replaces: its location. A weak field holds no reference, so writing one
+    // releases nothing.
+    writtenBy(Expression target) -> Writes {
+        let writes = new Writes();
+        let type = this.typeOf(target);
+        if (type == null || !primitives.hasArcContent(type)) {
+            return writes;
+        }
+        let field = classes.fieldOf(this.lowering, unwrapped(target));
+        if (field != null && field.isWeak()) {
+            return writes;
+        }
+        let location = this.locationOf(target);
+        if (location != null) {
+            writes.locations.push(location);
+        }
+        return writes;
+    }
+
+    // The left operand stays in use while the right one is evaluated and the two are combined.
+    visitBinary(BinaryExpressionNode binary) -> Writes {
+        let right = this.visit(binary.right(), new Writes());
+        let left = this.visit(binary.left(), right);
+        return left.with(right);
+    }
+
+    // A literal moves each value into its field as it is read.
+    visitStructLiteral(StructLiteralExpressionNode literal) -> Writes {
+        let fieldValues = new Writes();
+        for (long i = 0; i < literal.fieldsCount(); i++) {
+            fieldValues = fieldValues.with(this.visit(literal.fields(i).value(), new Writes()));
+        }
+        return fieldValues;
+    }
+
+    // An array's sizes are numbers; an object's arguments stay in use until its constructor
+    // returns.
+    visitNew(NewExpressionNode created) -> Writes {
+        if (created.dimensionsCount() > 0) {
+            let sizes = new Writes();
+            for (long i = 0; i < created.dimensionsCount(); i++) {
+                let size = created.dimensions(i).size();
+                if (size != null) {
+                    sizes = sizes.with(this.visit(size, new Writes()));
+                }
+            }
+            return sizes;
+        }
+        return this.visitArguments(created.arguments(), new Writes());
+    }
+
+    // The arguments in the order they are written, each in use until the call has returned, and
+    // what evaluating them may replace.
+    visitArguments(ArgumentListNode? arguments, Writes call) -> Writes {
+        let written = new Writes();
+        if (arguments == null) {
+            return written;
+        }
+        for (long i = arguments.argumentsCount() - 1; i >= 0; i--) {
+            switch (arguments.arguments(i)) {
+                is NamedArgumentNode named -> {
+                    written = written.with(this.visit(named.value(), written.with(call)));
+                },
+                is Expression value -> {
+                    written = written.with(this.visit(value, written.with(call)));
+                },
+                default -> { },
+            }
+        }
+        return written;
+    }
+
+    // The receiver, then the arguments, then the call; each stays in use until the call returns.
+    // A mutating struct method writes into the storage its receiver names, so only the objects
+    // that storage is inside have to stay alive.
+    visitCall(CallExpressionNode call) -> Writes {
+        let callee = call.callee();
+        let effect = this.callEffect(call);
+        let untilReturn = this.visitArguments(call.arguments(), effect).with(effect);
+        switch (callee) {
+            is MemberExpressionNode member -> {
+                if (this.isStaticAccess(member)) {
+                    return untilReturn;
+                }
+                if (this.callsFieldValue(member)) {
+                    return untilReturn.with(this.visit(member, untilReturn));
+                }
+                return untilReturn.with(this.visitReceiver(member, member.object(),
+                    untilReturn));
+            },
+            is SafeMemberExpressionNode safeMember -> {
+                return untilReturn.with(this.visitReceiver(safeMember, safeMember.object(),
+                    untilReturn));
+            },
+            default -> {
+                let calleeType = this.typeOf(callee);
+                if (calleeType != null && primitives.functionOf(calleeType) != null) {
+                    return untilReturn.with(this.visit(callee, untilReturn));
+                }
+                return untilReturn;
+            },
+        }
+    }
+
+    visitReceiver(Expression callee, Expression receiver, Writes untilReturn) -> Writes {
+        let type = this.typeOf(receiver);
+        if (type != null && primitives.isStructType(type) && this.isMutatingCall(callee)) {
+            return this.visitPlace(receiver, untilReturn);
+        }
+        return this.visit(receiver, untilReturn);
+    }
+
+    // What running a call assigns: the receiver's storage, for a mutating method.
+    callEffect(CallExpressionNode call) -> Writes {
+        let callee = call.callee();
+        let effect = new Writes();
+        if (callee is MemberExpressionNode && this.isMutatingCall(callee)) {
+            let location = this.locationOf(callee.object());
+            if (location != null) {
+                effect.locations.push(location);
+            }
+        }
+        return effect;
+    }
+
+    isMutatingCall(Expression callee) -> bool {
+        let method = this.lowering.result().methodOf(callee.green());
+        return method != null && method.isMutating();
+    }
+
+    // True when the callee is a field holding a function value rather than a method.
+    callsFieldValue(MemberExpressionNode member) -> bool {
+        let type = this.typeOf(member);
+        return this.lowering.result().methodOf(member.green()) == null
+            && type != null && primitives.functionOf(type) != null;
+    }
+
+    isStaticAccess(MemberExpressionNode member) -> bool {
+        let method = this.lowering.result().methodOf(member.green());
+        return method != null && method.isStatic();
+    }
+
+    // A switch reads its scrutinee to compare it with each label, and a type switch's arms read it
+    // through the names they bind, so it stays in use through them.
+    visitSwitch(Expression scrutinee, List<SwitchArm> arms) -> Writes {
+        let labels = new Writes();
+        let bodies = new Writes();
+        bool bindsScrutinee = false;
+        for (let arm in arms) {
+            switch (arm) {
+                is ValueArmNode valueArm -> {
+                    for (long l = 0; l < valueArm.labelsCount(); l++) {
+                        labels = labels.with(this.visit(valueArm.labels(l), new Writes()));
+                    }
+                    bodies = bodies.with(this.visitArmBody(valueArm.body()));
+                },
+                is TypeArmNode typeArm -> {
+                    bindsScrutinee = true;
+                    bodies = bodies.with(this.visitArmBody(typeArm.body()));
+                },
+                is DefaultArmNode defaultArm -> {
+                    bodies = bodies.with(this.visitArmBody(defaultArm.body()));
+                },
+                default -> { },
+            }
+        }
+        let inUse = labels;
+        if (bindsScrutinee) {
+            inUse = labels.with(bodies);
+        }
+        return this.visit(scrutinee, inUse).with(labels).with(bodies);
+    }
+
+    // An arm written as an expression is part of this expression; one written as a block runs
+    // statements lowered under owned reads of their own, so only what they may replace counts.
+    visitArmBody(ArmBody body) -> Writes {
+        switch (body) {
+            is Expression value -> {
+                return this.visit(value, new Writes());
+            },
+            is BlockNode block -> {
+                return new Analysis(this.lowering).statementWrites(block);
+            },
+            default -> {
+                return new Writes();
+            },
+        }
+    }
+
+    // What running a statement, and every statement inside it, may replace.
+    statementWrites(Statement statement) -> Writes {
+        switch (statement) {
+            is BlockNode block -> {
+                let writes = new Writes();
+                for (long i = 0; i < block.statementsCount(); i++) {
+                    writes = writes.with(this.statementWrites(block.statements(i)));
+                }
+                return writes;
+            },
+            is VariableDeclarationNode declaration -> {
+                let initializer = declaration.initializer();
+                if (initializer == null) {
+                    return new Writes();
+                }
+                return this.visit(initializer.value(), new Writes());
+            },
+            is IfStatementNode conditional -> {
+                let writes = this.visit(conditional.condition(), new Writes())
+                    .with(this.statementWrites(conditional.thenBranch()));
+                let elseClause = conditional.elseClause();
+                if (elseClause == null) {
+                    return writes;
+                }
+                return writes.with(this.elseWrites(elseClause.body()));
+            },
+            is WhileStatementNode loop -> {
+                return this.visit(loop.condition(), new Writes())
+                    .with(this.statementWrites(loop.body()));
+            },
+            is ForStatementNode loop -> {
+                let writes = this.statementWrites(loop.body());
+                let initializer = loop.initializer();
+                if (initializer is Statement) {
+                    writes = writes.with(this.statementWrites(initializer));
+                }
+                let condition = loop.condition();
+                if (condition != null) {
+                    writes = writes.with(this.visit(condition, new Writes()));
+                }
+                let update = loop.update();
+                if (update != null) {
+                    writes = writes.with(this.visit(update, new Writes()));
+                }
+                return writes;
+            },
+            is ForEachStatementNode loop -> {
+                return this.visit(loop.iterable(), new Writes())
+                    .with(this.statementWrites(loop.body()));
+            },
+            is ReturnStatementNode returned -> {
+                let value = returned.value();
+                if (value == null) {
+                    return new Writes();
+                }
+                return this.visit(value, new Writes());
+            },
+            is ThrowStatementNode thrown -> {
+                return this.visit(thrown.value(), new Writes());
+            },
+            is ExpressionStatementNode expression -> {
+                return this.visit(expression.expression(), new Writes());
+            },
+            is SwitchStatementNode switched -> {
+                return this.visitSwitch(switched.scrutinee(), statementArms(switched));
+            },
+            default -> {
+                return new Writes();
+            },
+        }
+    }
+
+    elseWrites(ElseBody body) -> Writes {
+        switch (body) {
+            is Statement statement -> {
+                return this.statementWrites(statement);
+            },
+            default -> {
+                return new Writes();
+            },
+        }
+    }
+
+    // The locations a read takes its value from, from the one it starts at to the one the value
+    // sits in, or null when the expression owns its value or reads it from storage nothing
+    // replaces while it runs.
+    chainOf(Expression node) -> List<Location>? {
+        let type = this.typeOf(node);
+        if (type == null || !primitives.hasArcContent(type)) {
+            return null;
+        }
+        return this.borrowedChain(node);
+    }
+
+    borrowedChain(Expression node) -> List<Location>? {
+        switch (node) {
+            is IdentifierExpressionNode identifier -> {
+                return single(this.locationOf(identifier));
+            },
+            is ThisExpressionNode receiver -> {
+                return single(this.locationOf(receiver));
+            },
+            is MemberExpressionNode member -> {
+                return this.memberChain(member);
+            },
+            is SubscriptExpressionNode subscript -> {
+                let location = this.locationOf(subscript);
+                if (location == null) {
+                    return null;
+                }
+                let chain = this.borrowedChain(subscript.object()) ?? new List<Location>();
+                chain.push(location);
+                return chain;
+            },
+            is AssignmentExpressionNode assignment -> {
+                let field = classes.fieldOf(this.lowering, unwrapped(assignment.target()));
+                if (field != null && field.isWeak()) {
+                    return null;
+                }
+                return this.borrowedChain(unwrapped(assignment.target()));
+            },
+            default -> {
+                return null;
+            },
+        }
+    }
+
+    // A class field sits in the object, which the reference read before it keeps alive; a 'const'
+    // one is never replaced once the object is built. A struct field is part of the struct's own
+    // storage, one field further in.
+    memberChain(MemberExpressionNode member) -> List<Location>? {
+        let field = classes.fieldOf(this.lowering, member);
+        if (field != null) {
+            if (field.isWeak()) {
+                return null;
+            }
+            let chain = this.borrowedChain(member.object()) ?? new List<Location>();
+            if (!field.isConst()) {
+                chain.push(fieldLocation(field));
+            }
+            return chain;
+        }
+        let objectType = this.typeOf(member.object());
+        if (objectType == null || !primitives.isStructType(objectType)) {
+            return null;
+        }
+        let chain = this.borrowedChain(member.object());
+        if (chain == null || chain.isEmpty()) {
+            return null;
+        }
+        let last = chain.pop();
+        chain.push(last.projected(member.member().text()));
+        return chain;
+    }
+
+    // The storage an expression names, or null when it names none or names storage that never
+    // changes, such as a class method's receiver.
+    locationOf(Expression node) -> Location? {
+        switch (node) {
+            is ParenthesizedExpressionNode parenthesized -> {
+                return this.locationOf(parenthesized.inner());
+            },
+            is IdentifierExpressionNode identifier -> {
+                let binding = this.lowering.result().bindingOf(identifier.green());
+                if (binding == null) {
+                    return null;
+                }
+                return new Location(LocationRoot.Local, binding, null, "", new List<string>());
+            },
+            is ThisExpressionNode receiver -> {
+                let type = this.typeOf(receiver);
+                if (type == null || !primitives.isStructType(type) || !this.writesReceiver()) {
+                    return null;
+                }
+                return new Location(LocationRoot.Receiver, null, null, "", new List<string>());
+            },
+            is MemberExpressionNode member -> {
+                let field = classes.fieldOf(this.lowering, member);
+                if (field != null) {
+                    return fieldLocation(field);
+                }
+                let objectType = this.typeOf(member.object());
+                if (objectType == null || !primitives.isStructType(objectType)) {
+                    return null;
+                }
+                let base = this.locationOf(member.object());
+                if (base == null) {
+                    return null;
+                }
+                return base.projected(member.member().text());
+            },
+            is SubscriptExpressionNode subscript -> {
+                let arrayType = this.typeOf(subscript.object());
+                if (arrayType == null) {
+                    return null;
+                }
+                return new Location(LocationRoot.Element, null,
+                    primitives.underOptionals(arrayType), "", new List<string>());
+            },
+            default -> {
+                return null;
+            },
+        }
+    }
+
+    // True when the function being lowered is a mutating struct method. Its caller hands it the
+    // storage itself, which code it calls may replace; any other method runs over storage its caller
+    // keeps unchanged until it returns, a copy whenever anything else could replace it.
+    writesReceiver() -> bool {
+        let method = this.lowering.info().method();
+        return method != null && method.isMutating();
+    }
+
+    typeOf(Expression node) -> Type? {
+        let recorded = this.lowering.result().typeOf(node.green());
+        if (recorded == null) {
+            return null;
+        }
+        return this.lowering.substituted(recorded);
+    }
+}
+
+unwrapped(Expression node) -> Expression {
+    if (node is ParenthesizedExpressionNode) {
+        return unwrapped(node.inner());
+    }
+    return node;
+}
+
+single(Location? location) -> List<Location>? {
+    if (location == null) {
+        return null;
+    }
+    let chain = new List<Location>();
+    chain.push(location);
+    return chain;
+}
+
+fieldLocation(Field field) -> Location {
+    return new Location(LocationRoot.Field, null, field.definingType(), field.name(),
+        new List<string>());
+}
+
+statementArms(SwitchStatementNode switched) -> List<SwitchArm> {
+    let arms = new List<SwitchArm>();
+    for (long i = 0; i < switched.armsCount(); i++) {
+        arms.push(switched.arms(i));
+    }
+    return arms;
+}
+
+expressionArms(SwitchExpressionNode switched) -> List<SwitchArm> {
+    let arms = new List<SwitchArm>();
+    for (long i = 0; i < switched.armsCount(); i++) {
+        arms.push(switched.arms(i));
+    }
+    return arms;
+}

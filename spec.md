@@ -1376,6 +1376,8 @@ const int max = 100;    // immutable, explicit type
 limit = 11;             // error: cannot assign to constant 'limit'
 ```
 
+An assignment is itself an expression, and its value is the value its target holds after the write.
+
 A **compound assignment** folds an operator into the store: `a += b` means `a = a + b`, and the same holds for `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=`, and `>>>=`.
 The target is evaluated once, so in `xs[next()] += 1` the index `next()` runs a single time and serves both the read and the write.
 Each form applies wherever its operator does: the arithmetic ones (`+= -= *= /= %=`) to numeric targets, the bitwise and shift ones (`&= |= ^= <<= >>= >>>=`) to integer targets, and `+=` also to a string, where it appends the right side just as `+` concatenates.
@@ -1808,8 +1810,9 @@ Memory is managed automatically through Automatic Reference Counting (ARC).
 - **Classes** are heap-allocated reference types. Each instance carries a refcount; when the last reference goes out of scope, the instance is freed.
 - **Structs** are value types. They are copied on assignment and passed by value.
 
-Atomics happen only at allocation, at assignment of class-typed fields, at scope exit, and around a call or type switch that uses a reference read out of a field or an array element.
-Such a reference is retained until the call returns or the switch ends, because the code that runs meanwhile could overwrite that field or element and release the object while the call or switch still uses it.
+Atomics happen only at allocation, at assignment of class-typed fields, at scope exit, around a call or type switch that uses a reference read out of a field or an array element, and around a value read out of a local, a field or an array element that a later assignment in the same expression replaces.
+A reference read out of a field or an array element is retained until the call returns or the switch ends, because the code that runs meanwhile could overwrite that field or element and release the object while the call or switch still uses it.
+A value a later assignment replaces is retained until its use is done: an argument until its call returns, the value a type switch tests until the switch ends, and an operand until its operator is applied.
 
 ```ens
 class Texture { /* ... */ }

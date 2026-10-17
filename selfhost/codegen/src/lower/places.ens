@@ -20,6 +20,7 @@ import TryExpressionNode from @ens.frontend.syntax.generated.nodes;
 import PostfixExpressionNode from @ens.frontend.syntax.generated.nodes;
 import CastExpressionNode from @ens.frontend.syntax.generated.nodes;
 import NullCoalesceExpressionNode from @ens.frontend.syntax.generated.nodes;
+import AssignmentExpressionNode from @ens.frontend.syntax.generated.nodes;
 import SyntaxKind from @ens.frontend.syntax.generated.kind;
 import Span from @ens.frontend.support.source;
 import Type from @ens.sema.model.types;
@@ -31,14 +32,20 @@ import lower.arrays;
 import lower.classes;
 import lower.conversions;
 import lower.defaults;
+import lower.expressions;
 import lower.ownership;
 import lower.structs;
 import support.primitives;
+import @ens.sema.support.syntax;
 
 // True when the expression returns a reference it owns, so a binding may take it without
-// retaining. Everything read out of storage is borrowed; everything freshly built is owned. A
-// value that never returns is read out of the slot that stands in for it.
+// retaining. Everything read out of storage is borrowed, unless a later part of its expression may
+// replace it while it is in use; everything freshly built is owned. A value that never returns is
+// read out of the slot that stands in for it.
 public producesOwnedValue(LoweringContext lowering, Expression node) -> bool {
+    if (lowering.ownsRead(node)) {
+        return true;
+    }
     if (lowering.result().isNeverReturningValue(node.green())) {
         return false;
     }
@@ -48,6 +55,10 @@ public producesOwnedValue(LoweringContext lowering, Expression node) -> bool {
         },
         is TryExpressionNode tried -> {
             return producesOwnedValue(lowering, tried.operand());
+        },
+        // A conversion passes the value on as it is, so it owns what its operand owns.
+        is CastExpressionNode cast -> {
+            return producesOwnedValue(lowering, cast.value());
         },
         // A safe call parks its merged result in a slot the scope owns, so the value read back
         // is borrowed, unlike a plain call's owned result.
@@ -84,6 +95,10 @@ public producesOwnedValue(LoweringContext lowering, Expression node) -> bool {
         is MemberExpressionNode member -> {
             return classes.readsWeakField(lowering, member);
         },
+        // An assignment reads its target back, and reading a weak field upgrades it.
+        is AssignmentExpressionNode assignment -> {
+            return classes.readsWeakField(lowering, syntax.unwrapParentheses(assignment.target()));
+        },
         // 'as?' retains what it returns, so a binding may take the result as its own.
         is CheckedCastExpressionNode ignored -> {
             return true;
@@ -117,6 +132,10 @@ public readsSharedStorage(LoweringContext lowering, Expression node) -> bool {
         is IdentifierExpressionNode identifier -> {
             let binding = lowering.result().bindingOf(identifier.green());
             return binding != null && lowering.slotFor(binding) == null;
+        },
+        // An assignment reads its target back after the write.
+        is AssignmentExpressionNode assignment -> {
+            return readsSharedStorage(lowering, syntax.unwrapParentheses(assignment.target()));
         },
         is ThisExpressionNode receiver -> {
             let type = lowering.result().typeOf(receiver.green());
@@ -225,4 +244,50 @@ public loadFrom(LoweringContext lowering, long address, Type type) -> long {
 public readFrom(LoweringContext lowering, long address, Type recordedType, Span span) -> long {
     long value = loadFrom(lowering, address, lowering.builder().tempType(address));
     return conversions.convert(lowering, value, recordedType, span);
+}
+
+// Reads what a read names and retains it, for a read that a later part of its expression may
+// replace while the value is in use. A value holding references inside fields or behind a tag is
+// retained through the storage it was read from.
+public lowerRetained(LoweringContext lowering, Expression node) -> long {
+    let type = lowering.typeOf(node);
+    if (type == null) {
+        return -1;
+    }
+    if (primitives.isReferenceType(type)) {
+        long value = expressions.lowerForm(lowering, node);
+        if (value >= 0) {
+            ownership.retainValue(lowering, value);
+        }
+        return value;
+    }
+    long address = lowerAddress(lowering, node, EirAccess.Read);
+    if (address < 0) {
+        if (!lowering.failed()) {
+            lowering.internalError("a retained read names no storage", node.span());
+        }
+        return -1;
+    }
+    long value = readFrom(lowering, address, type, node.span());
+    ownership.retainAt(lowering, address, lowering.builder().tempType(address));
+    return value;
+}
+
+// True when the read an expression evaluates to, under any parentheses, 'try' or conversion,
+// retains what it reads.
+public retainsRead(LoweringContext lowering, Expression node) -> bool {
+    switch (node) {
+        is ParenthesizedExpressionNode parenthesized -> {
+            return retainsRead(lowering, parenthesized.inner());
+        },
+        is TryExpressionNode tried -> {
+            return retainsRead(lowering, tried.operand());
+        },
+        is CastExpressionNode cast -> {
+            return retainsRead(lowering, cast.value());
+        },
+        default -> {
+            return lowering.ownsRead(node);
+        },
+    }
 }

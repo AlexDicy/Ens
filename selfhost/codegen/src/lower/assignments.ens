@@ -1,6 +1,7 @@
 // Assignment lowering: the plain store into a slot-backed target, and the read-modify-write a
 // compound assignment expands into. A string '+=' joins rather than computes, so it writes the
-// joined result back through the barrier a plain assignment uses.
+// joined result back through the barrier a plain assignment uses. The write takes what the value
+// holds, so an assignment read as a value reads its target back after the write.
 import Expression from @ens.frontend.syntax.generated.nodes;
 import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
 import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
@@ -12,6 +13,7 @@ import Type from @ens.sema.model.types;
 import EirAccess from eir.model;
 import EirBinaryOp from eir.model;
 import EirBinary from eir.model;
+import EirLoadPtr from eir.model;
 import EirLoadSlot from eir.model;
 import EirStoreSlot from eir.model;
 import EirStorePtr from eir.model;
@@ -20,6 +22,7 @@ import Operand from lower.stores;
 import lower.classes;
 import lower.conversions;
 import lower.expressions;
+import lower.ownership;
 import lower.places;
 import lower.stores;
 import lower.strings;
@@ -27,26 +30,79 @@ import lower.weakfields;
 import support.primitives;
 import @ens.sema.support.syntax;
 
+// What an assignment wrote: its target, as a slot or an address, the target's type, and the
+// value it computed, which is the assignment's value where that type holds no reference.
+final class Written {
+    long slot;
+    long address;
+    Type type;
+    bool weakField;
+    long value;
+
+    constructor(this.slot, this.address, this.type, this.weakField, this.value);
+}
+
+// Lowers an assignment whose value is read. A target holding references is read back after the
+// write, so the value is borrowed from the target like any other read of it, retained when a later
+// part of the expression may replace it, and a weak field reads back as the strong reference its
+// upgrade owns.
 public lower(LoweringContext lowering, AssignmentExpressionNode assignment) -> long {
+    let written = write(lowering, assignment);
+    if (written == null) {
+        return -1;
+    }
+    if (!primitives.hasArcContent(written.type)) {
+        return written.value;
+    }
+    if (written.weakField) {
+        return weakfields.load(lowering, written.address, written.type);
+    }
+    let builder = lowering.builder();
+    long value = builder.newTemp(written.type);
+    if (written.slot >= 0) {
+        builder.append(new EirLoadSlot(value, written.type, written.slot));
+    } else {
+        builder.append(new EirLoadPtr(value, written.type, written.address));
+    }
+    if (!lowering.ownsRead(assignment)) {
+        return value;
+    }
+    if (primitives.isReferenceType(written.type)) {
+        ownership.retainValue(lowering, value);
+    } else if (written.slot >= 0) {
+        ownership.retainAt(lowering, ownership.slotAddress(lowering, written.slot, written.type),
+            written.type);
+    } else {
+        ownership.retainAt(lowering, written.address, written.type);
+    }
+    return value;
+}
+
+// Lowers an assignment whose value nothing reads.
+public lowerDiscarded(LoweringContext lowering, AssignmentExpressionNode assignment) {
+    let ignored = write(lowering, assignment);
+}
+
+write(LoweringContext lowering, AssignmentExpressionNode assignment) -> Written? {
     // Parentheses around the target name the same place, so the routes below read through them.
     let target = syntax.unwrapParentheses(assignment.target());
     if (target is SubscriptExpressionNode || target is MemberExpressionNode) {
-        return lowerThroughAddress(lowering, assignment, target);
+        return writeThroughAddress(lowering, assignment, target);
     }
     if (!(target is IdentifierExpressionNode)) {
         lowering.internalError("an assignment target is neither an identifier, a field, nor an "
             + "element", assignment.span());
-        return -1;
+        return null;
     }
     let binding = lowering.result().bindingOf(target.green());
     if (binding == null) {
         lowering.internalError("assignment target has no binding", assignment.span());
-        return -1;
+        return null;
     }
     let slot = lowering.slotFor(binding);
     if (slot == null) {
         lowering.internalError("assignment target has no storage slot", assignment.span());
-        return -1;
+        return null;
     }
     let builder = lowering.builder();
     let targetType = lowering.substituted(binding.type());
@@ -54,14 +110,14 @@ public lower(LoweringContext lowering, AssignmentExpressionNode assignment) -> l
     if (operator == SyntaxKind.Equals) {
         let operand = stores.lowerOperand(lowering, assignment.value(), targetType);
         if (operand == null) {
-            return -1;
+            return null;
         }
         if (!stores.assignSlot(lowering, slot, targetType, operand)) {
             lowering.internalError("the assigned value borrows a struct with no storage to "
                 + "retain", assignment.span());
-            return -1;
+            return null;
         }
-        return operand.value();
+        return new Written(slot, -1, targetType, false, operand.value());
     }
     let computeType = primitives.underOptionals(targetType);
     if (operator == SyntaxKind.PlusEquals && primitives.isStringType(computeType)) {
@@ -69,127 +125,127 @@ public lower(LoweringContext lowering, AssignmentExpressionNode assignment) -> l
         builder.append(new EirLoadSlot(current, targetType, slot));
         long narrowed = conversions.convert(lowering, current, computeType, assignment.span());
         if (narrowed < 0) {
-            return -1;
+            return null;
         }
         long joined = strings.lowerAppend(lowering, narrowed, assignment.value());
         if (joined < 0) {
-            return -1;
+            return null;
         }
         long widened = conversions.convert(lowering, joined, targetType, assignment.span());
         if (widened < 0) {
-            return -1;
+            return null;
         }
         if (!stores.assignSlot(lowering, slot, targetType, new Operand(widened, true, -1))) {
             lowering.internalError("the joined text could not be stored", assignment.span());
-            return -1;
+            return null;
         }
-        return joined;
+        return new Written(slot, -1, targetType, false, joined);
     }
     long loaded = builder.newTemp(targetType);
     builder.append(new EirLoadSlot(loaded, targetType, slot));
     long current = conversions.convert(lowering, loaded, computeType, assignment.span());
     if (current < 0) {
-        return -1;
+        return null;
     }
     long operandValue = expressions.lowerConverted(lowering, assignment.value(), computeType);
     if (operandValue < 0) {
-        return -1;
+        return null;
     }
     let op = compoundOperator(lowering, operator, assignment.operator().text(), computeType,
         assignment.span());
     if (op == null) {
-        return -1;
+        return null;
     }
     long combined = builder.newTemp(computeType);
     builder.append(new EirBinary(combined, computeType, op, current, operandValue));
     long stored = conversions.convert(lowering, combined, targetType, assignment.span());
     if (stored < 0) {
-        return -1;
+        return null;
     }
     builder.append(new EirStoreSlot(slot, stored));
-    return combined;
+    return new Written(slot, -1, targetType, false, combined);
 }
 
 // Assigning through a place that is not a plain local: the address is computed once, then read
 // for a compound operator and written back.
-lowerThroughAddress(LoweringContext lowering, AssignmentExpressionNode assignment,
-                    Expression target) -> long {
+writeThroughAddress(LoweringContext lowering, AssignmentExpressionNode assignment,
+                    Expression target) -> Written? {
     let targetType = lowering.typeOf(target);
     if (targetType == null) {
-        return -1;
+        return null;
     }
     long address = places.lowerAddress(lowering, target, EirAccess.Write);
     if (address < 0) {
         if (!lowering.failed()) {
             lowering.internalError("no address for an assignment target sema admitted", assignment.span());
         }
-        return -1;
+        return null;
     }
     let builder = lowering.builder();
     SyntaxKind operator = assignment.operator().kind();
     if (operator == SyntaxKind.Equals) {
         let operand = stores.lowerOperand(lowering, assignment.value(), targetType);
         if (operand == null) {
-            return -1;
+            return null;
         }
         // A weak field points at the object without owning it, so its write retires the entry it
         // held and releases a reference the value was produced owning.
         let field = classes.fieldOf(lowering, target);
         if (field != null && field.isWeak()) {
             weakfields.store(lowering, address, operand);
-            return operand.value();
+            return new Written(-1, address, targetType, true, operand.value());
         }
         if (!stores.assignThroughAddress(lowering, address, targetType, operand)) {
             lowering.internalError("the assigned value borrows a struct with no storage to "
                 + "retain", assignment.span());
-            return -1;
+            return null;
         }
-        return operand.value();
+        return new Written(-1, address, targetType, false, operand.value());
     }
     let computeType = primitives.underOptionals(targetType);
     if (operator == SyntaxKind.PlusEquals && primitives.isStringType(computeType)) {
         long narrowed = conversions.convert(lowering,
             places.loadFrom(lowering, address, targetType), computeType, assignment.span());
         if (narrowed < 0) {
-            return -1;
+            return null;
         }
         long joined = strings.lowerAppend(lowering, narrowed, assignment.value());
         if (joined < 0) {
-            return -1;
+            return null;
         }
         long widened = conversions.convert(lowering, joined, targetType, assignment.span());
         if (widened < 0) {
-            return -1;
+            return null;
         }
         if (!stores.assignThroughAddress(lowering, address, targetType,
                 new Operand(widened, true, -1))) {
             lowering.internalError("the joined text could not be stored", assignment.span());
-            return -1;
+            return null;
         }
-        return joined;
+        return new Written(-1, address, targetType, false, joined);
     }
     long current = conversions.convert(lowering,
         places.loadFrom(lowering, address, targetType), computeType, assignment.span());
     if (current < 0) {
-        return -1;
+        return null;
     }
     long operandValue = expressions.lowerConverted(lowering, assignment.value(), computeType);
     if (operandValue < 0) {
-        return -1;
+        return null;
     }
     let op = compoundOperator(lowering, operator, assignment.operator().text(), computeType,
         assignment.span());
     if (op == null) {
-        return -1;
+        return null;
     }
     long combined = builder.newTemp(computeType);
     builder.append(new EirBinary(combined, computeType, op, current, operandValue));
     long stored = conversions.convert(lowering, combined, targetType, assignment.span());
     if (stored < 0) {
-        return -1;
+        return null;
     }
     builder.append(new EirStorePtr(address, stored));
-    return combined;
+    return new Written(-1, address, targetType, false, combined);
 }
 
 compoundOperator(LoweringContext lowering, SyntaxKind operator, string operatorText,
