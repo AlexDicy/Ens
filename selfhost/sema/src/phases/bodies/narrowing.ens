@@ -19,6 +19,12 @@ import model.typenames;
 import TypeTestExpressionNode from @ens.frontend.syntax.generated.nodes;
 import AssignmentExpressionNode from @ens.frontend.syntax.generated.nodes;
 import ParenthesizedExpressionNode from @ens.frontend.syntax.generated.nodes;
+import WhileStatementNode from @ens.frontend.syntax.generated.nodes;
+import ForStatementNode from @ens.frontend.syntax.generated.nodes;
+import ForEachStatementNode from @ens.frontend.syntax.generated.nodes;
+import VariableDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import ExpressionStatementNode from @ens.frontend.syntax.generated.nodes;
+import GreenNode from @ens.frontend.syntax.green;
 import SyntaxKind from @ens.frontend.syntax.generated.kind;
 import Span from @ens.frontend.support.source;
 import LocalBinding from model.scopes;
@@ -642,59 +648,351 @@ public invalidateForWrite(BodyChecker checker, Expression target) {
     }
 }
 
-// Loop-entry pre-clearing: before the loop body is analyzed, drop every narrowing whose
-// storage the body may write, so a fact a later body write kills cannot be read stale on a
-// following iteration. The condition re-establishes its own narrowing each iteration, so a
-// condition-derived fact is not pre-cleared. Roots resolve by name against the current scope,
-// since the body nodes are not analyzed yet, and resolving one is not a read, so no lambda
-// captures it.
-public preClearLoopBodyWrites(BodyChecker checker, SyntaxNode node) {
+// The narrowings a pass over a loop watches on the locals and parameters it may write: the type each
+// still holds with after the writes seen so far, the ones a write left without a proof, and whether a
+// write changed either.
+public final class LoopWatch {
+    protected Map<NarrowingPath, Type> held;
+    protected List<NarrowingPath> broken;
+    protected bool changed;
+
+    protected constructor(this.held) {
+        this.broken = new List<NarrowingPath>();
+        this.changed = false;
+    }
+}
+
+// What the passes over one loop have learned about where it starts: the type each narrowing it watches
+// keeps there, and the ones it drops. Each pass over an enclosing loop declares the locals inside that
+// loop again, so a narrowing is found by where its path is declared.
+final class LoopStart {
+    protected Map<NarrowingPath, Type> kept;
+    protected List<NarrowingPath> dropped;
+
+    protected constructor() {
+        this.kept = new Map<NarrowingPath, Type>();
+        this.dropped = new List<NarrowingPath>();
+    }
+
+    protected keptType(NarrowingPath path) -> Type? {
+        for (let key in this.kept.keys()) {
+            if (key.sameDeclaration(path)) {
+                return this.kept.get(key);
+            }
+        }
+        return null;
+    }
+
+    protected drops(NarrowingPath path) -> bool {
+        for (let key in this.dropped) {
+            if (key.sameDeclaration(path)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    protected keep(NarrowingPath path, Type type) {
+        this.kept.removeWhere((key, kept) -> key.sameDeclaration(path));
+        this.kept.set(path, type);
+    }
+
+    protected drop(NarrowingPath path) {
+        this.kept.removeWhere((key, kept) -> key.sameDeclaration(path));
+        if (!this.drops(path)) {
+            this.dropped.push(path);
+        }
+    }
+}
+
+// What the passes over a loop and the loops inside it have learned about where each loop a pass reaches
+// starts, which is final once 'settled'.
+public final class LoopSettlement {
+    protected Map<GreenNode, LoopStart> starts;
+    protected bool changed;
+    protected bool settled;
+
+    protected constructor() {
+        this.starts = new Map<GreenNode, LoopStart>();
+        this.changed = false;
+        this.settled = false;
+    }
+}
+
+// The parts of the loop 'loop' that each pass through it runs: the condition, the body and a 'for'
+// loop's update.
+public loopParts(SyntaxNode loop) -> List<SyntaxNode> {
+    let parts = new List<SyntaxNode>();
+    switch (loop) {
+        is WhileStatementNode node -> {
+            parts.push(node.condition());
+            parts.push(node.body());
+        },
+        is ForStatementNode node -> {
+            let condition = node.condition();
+            if (condition != null) {
+                parts.push(condition);
+            }
+            parts.push(node.body());
+            let update = node.update();
+            if (update != null) {
+                parts.push(update);
+            }
+        },
+        is ForEachStatementNode node -> {
+            parts.push(node.body());
+        },
+        default -> { },
+    }
+    return parts;
+}
+
+// Analyzes 'loop' with 'walk', starting it with the narrowings every write in it proves again, which
+// trial passes find by watching the writes until a pass changes nothing. The loops inside it are
+// settled by the same passes, so a pass analyzes each of them once. A loop those passes never reach,
+// such as one in a lambda that a trial does not check, is settled on its own.
+public settleLoop(BodyChecker checker, SyntaxNode loop, (BodyChecker) -> void walk) {
+    let enclosing = checker.loopSettlement();
+    if (enclosing != null && (!enclosing.settled || enclosing.starts.get(loop.green()) != null)) {
+        passLoop(checker, enclosing, loop, walk);
+        return;
+    }
+    let settlement = new LoopSettlement();
+    if (startLoop(checker, settlement, loop).isEmpty()) {
+        walk(checker);
+        return;
+    }
+    while (true) {
+        settlement.changed = false;
+        let trial = checker.trial();
+        trial.setLoopSettlement(settlement);
+        passLoop(trial, settlement, loop, walk);
+        checker.endTrial();
+        if (!settlement.changed) {
+            break;
+        }
+    }
+    settlement.settled = true;
+    checker.setLoopSettlement(settlement);
+    passLoop(checker, settlement, loop, walk);
+    checker.setLoopSettlement(enclosing);
+}
+
+// One pass over 'loop', which starts with what 'settlement' has learned for it. Until the passes are
+// settled, the writes in the loop are watched and what they do is learned.
+passLoop(BodyChecker checker, LoopSettlement settlement, SyntaxNode loop, (BodyChecker) -> void walk) {
+    let held = startLoop(checker, settlement, loop);
+    if (settlement.settled) {
+        walk(checker);
+        return;
+    }
+    let watch = new LoopWatch(held);
+    checker.loopWatches().push(watch);
+    walk(checker);
+    checker.loopWatches().pop();
+    learnLoop(settlement, loop.green(), watch);
+}
+
+// Starts 'loop' with what 'settlement' has learned for it, which widens or drops a narrowing it watches,
+// and returns the narrowings it watches with the types they start with.
+startLoop(BodyChecker checker, LoopSettlement settlement, SyntaxNode loop) -> Map<NarrowingPath, Type> {
+    let written = new List<LocalBinding>();
+    for (let name in loopWriteNames(checker, loop)) {
+        addWrittenName(checker, name, written);
+    }
+    let learned = settlement.starts.get(loop.green());
+    let held = new Map<NarrowingPath, Type>();
+    let entry = checker.narrowing().flatten();
+    for (let path in entry.keys()) {
+        let proven = entry.get(path);
+        let root = path.root();
+        if (proven == null || root == null || !written.contains(root)) {
+            continue;
+        }
+        Type? start = proven;
+        let kept = learned?.keptType(path);
+        if (learned != null && learned.drops(path)) {
+            start = null;
+        } else if (kept != null) {
+            start = unifyNarrowed(checker, proven, kept);
+        }
+        if (start != proven) {
+            checker.narrowing().clearPath(path);
+        }
+        if (start != null) {
+            if (start != proven) {
+                checker.narrowing().narrow(path, start);
+            }
+            held.set(path, start);
+        }
+    }
+    return held;
+}
+
+// Records in 'settlement' that a pass reached the loop 'loop', and what 'watch' saw on it: the type
+// each narrowing it watches keeps, and the ones it drops.
+learnLoop(LoopSettlement settlement, GreenNode loop, LoopWatch watch) {
+    let learned = settlement.starts.get(loop) ?? new LoopStart();
+    settlement.starts.set(loop, learned);
+    if (!watch.changed) {
+        return;
+    }
+    settlement.changed = true;
+    for (let path in watch.held.keys()) {
+        let type = watch.held.get(path);
+        if (type != null) {
+            learned.keep(path, type);
+        }
+    }
+    for (let path in watch.broken) {
+        learned.drop(path);
+    }
+}
+
+// After a write to or under the local or parameter 'root', null for a place under neither, widens each
+// narrowing under it that a loop being settled watches to the type a proof now gives it where that
+// type is wider, and marks it broken where no proof of a related type holds any more.
+public noteLoopWrite(BodyChecker checker, LocalBinding? root) {
+    if (root == null) {
+        return;
+    }
+    for (let watch in checker.loopWatches()) {
+        for (let path in watch.held.keys()) {
+            let held = watch.held.get(path);
+            if (path.root() != root || held == null || watch.broken.contains(path)) {
+                continue;
+            }
+            let proven = checker.narrowing().provenType(path);
+            Type? kept = null;
+            if (proven != null) {
+                kept = unifyNarrowed(checker, held, proven);
+            }
+            if (kept == null) {
+                watch.broken.push(path);
+                watch.changed = true;
+            } else if (kept != held) {
+                watch.held.set(path, kept);
+                watch.changed = true;
+            }
+        }
+    }
+}
+
+// The local or parameter a write to 'target' stores into or under, or null where it has none.
+public writtenRoot(BodyChecker checker, Expression target) -> LocalBinding? {
+    if (target is IdentifierExpressionNode) {
+        return checker.result().bindingOf(target.green());
+    }
+    if (target is MemberExpressionNode) {
+        let path = buildNarrowingPath(checker, target);
+        if (path != null) {
+            return path.root();
+        }
+    }
+    return null;
+}
+
+// The names of the locals and the parameters 'loop' may write, which one walk over the parts each pass
+// through it runs records for it and for each loop inside it.
+loopWriteNames(BodyChecker checker, SyntaxNode loop) -> List<string> {
+    return checker.loopWrites().get(loop.green()) ?? collectLoopNames(loop, checker.loopWrites());
+}
+
+// Records in 'recorded', for 'loop' and for each loop inside it, the names of the locals and the
+// parameters it may write, and returns the names 'loop' may write.
+collectLoopNames(SyntaxNode loop, Map<GreenNode, List<string>> recorded) -> List<string> {
+    let names = new List<string>();
+    for (let part in loopParts(loop)) {
+        collectWrittenNames(part, recorded, names);
+    }
+    recorded.set(loop.green(), names);
+    return names;
+}
+
+// Adds to 'names' each local and parameter 'node' may write by an assignment, '++', '--' or 'out'. A loop
+// inside records its own names, and its initializer or iterable is written once, outside it.
+collectWrittenNames(SyntaxNode node, Map<GreenNode, List<string>> recorded, List<string> names) {
     switch (node) {
+        is WhileStatementNode ignored -> {
+            addNames(names, collectLoopNames(node, recorded));
+            return;
+        },
+        is ForStatementNode loop -> {
+            switch (loop.initializer()) {
+                is VariableDeclarationNode declaration -> {
+                    collectWrittenNames(declaration, recorded, names);
+                },
+                is ExpressionStatementNode statement -> {
+                    collectWrittenNames(statement, recorded, names);
+                },
+                default -> { },
+            }
+            addNames(names, collectLoopNames(node, recorded));
+            return;
+        },
+        is ForEachStatementNode loop -> {
+            collectWrittenNames(loop.iterable(), recorded, names);
+            addNames(names, collectLoopNames(node, recorded));
+            return;
+        },
         is AssignmentExpressionNode assignment -> {
-            preClearWrite(checker, assignment.target());
+            addTargetName(assignment.target(), names);
         },
         is PrefixExpressionNode prefix -> {
             let operator = prefix.operator().kind();
             if (operator == SyntaxKind.PlusPlus || operator == SyntaxKind.MinusMinus) {
-                preClearWrite(checker, prefix.operand());
+                addTargetName(prefix.operand(), names);
             }
         },
         is PostfixExpressionNode postfix -> {
             let operator = postfix.operator().kind();
             if (operator == SyntaxKind.PlusPlus || operator == SyntaxKind.MinusMinus) {
-                preClearWrite(checker, postfix.operand());
+                addTargetName(postfix.operand(), names);
             }
         },
         is OutArgumentNode outArgument -> {
-            preClearName(checker, outArgument.name().text());
+            addName(names, outArgument.name().text());
         },
         default -> { },
     }
     for (let child in node.childNodes()) {
-        preClearLoopBodyWrites(checker, child);
+        collectWrittenNames(child, recorded, names);
     }
 }
 
 // Only a local or a parameter can be written in a loop and hold a narrowing, since a 'const'
 // field takes no write there and nothing else narrows. Parentheses name the place they hold.
-preClearWrite(BodyChecker checker, Expression target) {
-    Expression written = syntax.unwrapParentheses(target);
-    if (written is IdentifierExpressionNode) {
-        preClearName(checker, written.name().text());
+addTargetName(Expression target, List<string> names) {
+    Expression place = syntax.unwrapParentheses(target);
+    if (place is IdentifierExpressionNode) {
+        addName(names, place.name().text());
     }
 }
 
-// Drops the narrowings of the local or parameter 'name' names, unless every write to it is refused.
-// A 'const' local never changes, and neither does a name the scopes of the lambda being checked do
+addNames(List<string> names, List<string> added) {
+    for (let name in added) {
+        addName(names, name);
+    }
+}
+
+addName(List<string> names, string name) {
+    if (!names.contains(name)) {
+        names.push(name);
+    }
+}
+
+// Adds to 'written' the local or parameter 'name' names here. Names resolve against the current
+// scope, since the loop is not analyzed yet, and resolving one is not a read, so no lambda captures
+// it. A 'const' local never changes, and neither does a name the scopes of the lambda being checked do
 // not declare, since that is a capture.
-preClearName(BodyChecker checker, string name) {
+addWrittenName(BodyChecker checker, string name, List<LocalBinding> written) {
     let current = checker.currentScope();
     if (current == null) {
         return;
     }
     let binding = current.lookup(name);
-    if (binding != null && !binding.isConst()) {
-        checker.narrowing().clearForRoot(binding);
+    if (binding != null && !binding.isConst() && !written.contains(binding)) {
+        written.push(binding);
     }
 }
 

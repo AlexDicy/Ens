@@ -1225,7 +1225,10 @@ Narrowing is dropped when the analyzer can't prove the narrowed value is still n
 A call drops nothing that a stable place proved, whether the place is the call's receiver (`x.method()`, `r.door.open()`), one of its arguments (`use(x)`), or an argument of a constructor (`new T(x)`).
 A callee cannot reassign the caller's binding, the binding's own reference keeps the narrowed object alive, and no callee can write a `const` field.
 
-Inside a loop a narrowing must hold on every iteration, so a narrowing established before the loop is dropped at the loop's entry when any statement in the body (or a `for` update) could write its path: a later write would otherwise leave an earlier read in the body using a value that is already stale on the next pass.
+Inside a loop a narrowing must hold on every iteration.
+A narrowing established before the loop holds inside it when every write in the loop that could change its path, in the condition, the body or a `for` update, proves it again, as `name = "b";` proves that a `string?` local holds a `string`.
+A write that proves only part of it keeps that part: storing a `Square` into a `Shape?` local narrowed to `Circle` leaves the local a `Shape` that is not null where the loop starts.
+Any other write, such as `name = pick();` where `pick` returns `string?`, or passing the local as `out`, drops the narrowing at the loop's entry: an earlier read in the loop would otherwise use, on the next pass, the value that write stored.
 A narrowing the loop condition or an in-body guard clause re-establishes on each iteration is unaffected, so `while (x != null)` loops and guard-narrowed loops keep working.
 
 A write to a narrowed local is checked against its declared type, not the narrowed one, so nulling out a just-checked local (`x = null`) or storing a base value over an `is`-narrowed one is allowed, and the local keeps only what the write proves.
