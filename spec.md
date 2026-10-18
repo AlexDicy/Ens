@@ -552,7 +552,7 @@ A local a lambda captures must already be assigned where the lambda is created.
 A capture takes the local's declared type, not what the surrounding code narrowed it to.
 A narrowing made outside a lambda never reaches its body, so the body checks a place again on its own.
 A check inside the body narrows a captured local or parameter wherever the check holds, as it narrows the body's own locals.
-Assigning to a captured local inside the lambda is an error, because the write would land on the copy and leave the local outside it unchanged; return the value the lambda computes instead, or keep the value in an object the lambda can reach.
+Assigning to a captured local inside the lambda, or passing it as `out`, is an error, because the write would land on the copy and leave the local outside it unchanged; return the value the lambda computes instead, or keep the value in an object the lambda can reach.
 A field of a captured struct is part of that copy, so writing `point.x = 1;` inside the lambda is the same error.
 The lambda's own parameters and locals are ordinary storage and may be written freely.
 
