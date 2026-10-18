@@ -23,6 +23,8 @@ import phases.layout;
 import phases.valuecycles;
 import ValueComponent from phases.valuecycles;
 import phases.members;
+import phases.bodies.wording;
+import phases.bodies.definiteassignment;
 import model.convert;
 import model.hierarchy;
 import model.typemembers;
@@ -821,16 +823,17 @@ class ModuleChecks {
 
     // ---- Field default ordering ----
 
-    // A field default may only reference fields declared before it. The rule is syntactic:
-    // an identifier in a default that names this type's own field at the same or a later
-    // position, and nothing else visible at module scope, cannot resolve.
+    // A field default may only reference fields declared before it, and only those that have a
+    // value when defaults are computed. The rule is syntactic: an identifier in a default that
+    // names this type's own field at the same or a later position, and nothing else visible at
+    // module scope, cannot resolve.
     checkFieldDefaultOrder() {
         for (long i = 0; i < this.structNodes.length(); i++) {
             let node = this.structNodes.get(i);
             let structType = this.structFor(node);
             if (structType != null) {
                 this.within(structType);
-                this.checkDefaultOrderIn(node.body());
+                this.checkDefaultOrderIn(structType, node.body());
             }
         }
         for (long i = 0; i < this.classNodes.length(); i++) {
@@ -838,7 +841,7 @@ class ModuleChecks {
             let classType = this.classFor(node);
             if (classType != null) {
                 this.within(classType);
-                this.checkDefaultOrderIn(node.body());
+                this.checkDefaultOrderIn(classType, node.body());
             }
         }
     }
@@ -846,35 +849,39 @@ class ModuleChecks {
     // Type-level fields stay out on both sides. A static const's initializer is a compile-time
     // constant the constants phase owns, and a lazy const's runs on the first read, so neither
     // is part of an instance's initialization order.
-    checkDefaultOrderIn(MemberListNode body) {
-        let fieldNames = new List<string>();
+    checkDefaultOrderIn(DeclaredType owner, MemberListNode body) {
+        let declarations = new List<FieldDeclarationNode>();
         for (long i = 0; i < body.membersCount(); i++) {
             let member = body.members(i);
             if (member is FieldDeclarationNode && !members.isTypeLevelField(member)) {
-                fieldNames.push(member.name().text());
+                declarations.push(member);
             }
         }
-        long fieldIndex = 0;
-        for (long i = 0; i < body.membersCount(); i++) {
-            let member = body.members(i);
-            if (member is FieldDeclarationNode && !members.isTypeLevelField(member)) {
-                let defaultValue = member.defaultValue();
-                if (defaultValue != null) {
-                    this.checkDefaultReferences(member.name().text(), fieldIndex,
-                        defaultValue.value(), fieldNames);
-                }
-                fieldIndex++;
+        let fieldNames = new List<string>();
+        for (let declaration in declarations) {
+            fieldNames.push(declaration.name().text());
+        }
+        for (long i = 0; i < declarations.length(); i++) {
+            let defaultValue = declarations.get(i).defaultValue();
+            if (defaultValue != null) {
+                this.checkDefaultReferences(owner, fieldNames.get(i), i, defaultValue.value(),
+                    declarations, fieldNames);
             }
         }
     }
 
-    checkDefaultReferences(string fieldName, long fieldIndex, Expression value, List<string> fieldNames) {
+    checkDefaultReferences(DeclaredType owner, string fieldName, long fieldIndex, Expression value,
+            List<FieldDeclarationNode> declarations, List<string> fieldNames) {
         let found = new List<FoundIdentifier>();
         collectIdentifiers(value.green(), value.fullSpan().start, found);
         for (long i = 0; i < found.length(); i++) {
             let identifier = found.get(i);
             long named = firstIndexOf(fieldNames, identifier.name);
+            if (named < 0) {
+                continue;
+            }
             if (named < fieldIndex) {
+                this.checkEarlierFieldHasValue(owner, fieldName, declarations.get(named), identifier);
                 continue;
             }
             if (this.visibleAtModuleScope(identifier.name)) {
@@ -893,6 +900,30 @@ class ModuleChecks {
                     identifier.span);
             }
         }
+    }
+
+    // An earlier field a default reads must have a value when the default is computed. A class
+    // and a struct that declares a constructor compute their defaults before any field is assigned,
+    // while a struct literal first assigns the fields it lists.
+    checkEarlierFieldHasValue(DeclaredType owner, string fieldName, FieldDeclarationNode earlier,
+            FoundIdentifier identifier) {
+        let field = typemembers.inheritedOrOwnField(owner, identifier.name);
+        if (field == null || field.type() is ErrorType || definiteassignment.defaultCanRead(owner, field)) {
+            return;
+        }
+        string name = identifier.name;
+        string refusal = "The default value of field '{fieldName}' uses '{name}', which has no value "
+            + "yet. Defaults are computed before a constructor of {this.names.quotedName(owner)} "
+            + "runs, and '{name}' has no default of its own.";
+        string moved = "the default of '{fieldName}' and set '{fieldName}' in the constructor after "
+            + "'{name}' is assigned.";
+        let given = defaultedSpelling(earlier, field);
+        if (given == null) {
+            this.reporter.report("{refusal} Remove {moved}", identifier.span);
+            return;
+        }
+        this.reporter.report("{refusal} Give '{name}' a default, as in '{given}', or remove {moved}",
+            identifier.span);
     }
 
     // Names a default-value identifier could still resolve to when it is not an earlier
@@ -2075,4 +2106,20 @@ collectIdentifiers(GreenNode node, long fullStart, List<FoundIdentifier> out) {
             offset = offset + child.fullLength();
         }
     }
+}
+
+// The declaration 'declaration' of 'field' with a default value, as in 'protected string first = "";',
+// or null where a 'const' field could no longer be assigned by a constructor or no literal has the
+// field's type.
+defaultedSpelling(FieldDeclarationNode declaration, Field field) -> string? {
+    let literal = wording.placeholderLiteral(field.type());
+    if (field.isConst() || literal == null) {
+        return null;
+    }
+    string written = "";
+    for (long i = 0; i < declaration.modifiersCount(); i++) {
+        written = written + declaration.modifiers(i).text() + " ";
+    }
+    return "{written}{wording.greenSpelling(declaration.declaredType().green())} {field.name()} = "
+        + "{literal};";
 }

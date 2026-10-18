@@ -253,6 +253,10 @@ Like a `toString` on a struct, one written `override` follows its class's visibi
 Inside a method, a constructor, or a destructor, a struct's or a class's own fields and methods are reached through `this`, as in `this.width` and `this.area()`, because a bare name there is a local, a parameter, or a top-level declaration and never a member.
 A field's default value is the one place a member is named on its own: a default may read the fields declared before it in the same class, as `string name = "{width}x{height}";` does.
 A default reads those fields and assigns none of them, so `int b = (a = 5);` is an error where `a` is a sibling field.
+A class computes the defaults of its fields before its constructor runs, and so does a struct that declares a constructor.
+In such a type a default may read an earlier field only when that field has a default of its own, or when its type has a default value, such as a number or a nullable type, and it is not `const`.
+A struct literal assigns the fields it lists before it computes the defaults of the others, so in a struct that declares no constructor a default may read any earlier field.
+`this` is not available in a default, since the object is still being built.
 
 `super.method(...)` calls the base class's implementation, bypassing any override. A constructor may call `super(...)` as its first statement to run the base constructor; if it does not, the base class must be constructible with no arguments. `protected` members (see above) are reachable from subclasses.
 A `super(...)` written anywhere else is an error: after another statement, inside a branch, a `catch` clause, a lambda, or a method, and a second time in the same constructor.

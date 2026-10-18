@@ -15,6 +15,7 @@ import phases.bodies.memberaccess;
 import phases.bodies.narrowing;
 import phases.bodies.functionvalues;
 import phases.bodies.thisuses;
+import phases.bodies.definiteassignment;
 import NamePosition from phases.bodies.memberaccess;
 import MissingMember from phases.bodies.memberaccess;
 import FieldMember from phases.bodies.memberaccess;
@@ -23,6 +24,7 @@ import LambdaFit from phases.bodies.functionvalues;
 import model.narrow;
 import model.hierarchy;
 import model.typemembers;
+import Field from model.typemembers;
 import Signature from model.typemembers;
 import model.typenames;
 import model.types;
@@ -754,7 +756,11 @@ inheritedStaticWithoutType(BodyChecker checker, string name, Type declaring, Dec
 public analyzeThis(BodyChecker checker, ThisExpressionNode node) -> Type {
     let receiver = checker.frame().thisType();
     if (receiver == null) {
-        if (checker.frame().inStaticMethod()) {
+        let defaulted = checker.frame().fieldDefaultName();
+        if (defaulted != null) {
+            checker.reporter().report(thisInDefaultRefusal(checker, defaulted,
+                thisuses.memberReadThrough(node)), node.thisKeyword().span());
+        } else if (checker.frame().inStaticMethod()) {
             checker.reporter().report("'this' is the object a method was called on, and a static method "
                 + "is not called on an object. Take the object as a parameter, or remove 'static'.",
                 node.thisKeyword().span());
@@ -777,6 +783,50 @@ public analyzeThis(BodyChecker checker, ThisExpressionNode node) -> Type {
         return narrowing.readType(checker, narrow.bindingPath(binding), receiver);
     }
     return receiver;
+}
+
+// The refusal of 'this' in the default of field 'defaulted', where 'member' is the member read
+// through it, or null where it is used on its own. A default reads an earlier field that has a
+// value by its name alone, and a constructor can set the field once what it reads has a value.
+thisInDefaultRefusal(BodyChecker checker, string defaulted, string? member) -> string {
+    string why = "'this' is not available in the default of field '{defaulted}', because the object "
+        + "is still being built when defaults are computed.";
+    let owner = checker.frame().enclosingOwner();
+    if (owner == null) {
+        return why;
+    }
+    Field? read = null;
+    if (member != null) {
+        read = typemembers.inheritedOrOwnField(owner, member);
+    }
+    let current = typemembers.inheritedOrOwnField(owner, defaulted);
+    bool firstAssigned = definiteassignment.computesDefaultsFirst(owner);
+    if (read != null && current != null && !typemembers.isInheritedField(owner, read)) {
+        bool above = read.nameSpan().start < current.nameSpan().start;
+        if (above && definiteassignment.defaultCanRead(owner, read)) {
+            return why + " A default reads the fields declared above it by their names alone, so "
+                + "write '{read.name()}' instead of 'this.{read.name()}'.";
+        }
+        if (!above && !firstAssigned) {
+            return why + " Declare '{defaulted}' below '{read.name()}', and write '{read.name()}' "
+                + "instead of 'this.{read.name()}'.";
+        }
+    }
+    if (!firstAssigned) {
+        return why;
+    }
+    string after = "after the fields it reads have values";
+    if (read != null && definiteassignment.needsAssignment(read)) {
+        after = "after '{read.name()}' has a value";
+    } else if (read != null) {
+        after = "where 'this' is available";
+    }
+    string quotedOwner = checker.names().quoted(owner);
+    let authority = types.authorityOf(owner);
+    if (authority != null) {
+        quotedOwner = checker.names().quotedName(authority);
+    }
+    return why + " Set '{defaulted}' in a constructor of {quotedOwner} instead, {after}.";
 }
 
 public analyzeSuper(BodyChecker checker, SuperExpressionNode node) -> Type {
