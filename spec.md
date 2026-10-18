@@ -1104,6 +1104,7 @@ The idiom is to read the value into a local and check the local, as in `let door
 Assigning in only one branch of an `if` refines the value below only when every other branch proves it non-null too (see the join rule below): `if (ready) { x = fallback(); }` leaves `x` nullable below, because on the path that skips the assignment nothing has made `x` non-null.
 
 Because narrowing governs only the reads, `== null`, `!= null`, `??`, `?.`, and `?[` on a binding whose declared type is nullable stay legal even where the value has already been proven non-null; the redundant check is simply constant at runtime.
+A `?.` there reads the members of the type the value was narrowed to, so `shape?.radius` compiles where `shape is Circle` holds.
 A binding whose declared type is not nullable still rejects these operators.
 
 Narrowing also follows the short-circuit operators and conditions: `x != null && x.ready()` narrows `x` on the right of `&&`, `x == null || x.ready()` narrows on the right of `||`, a conjunction of checks narrows the whole `if` branch or ternary branch, and a loop condition narrows the loop body.
