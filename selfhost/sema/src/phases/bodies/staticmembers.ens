@@ -1,6 +1,7 @@
 // Statics written after a type name, as in 'Counter.limit' or 'Box<int>.make()': the type before
 // the '.', the static calls and the type arguments inferred for them, and the texts that show the
 // type arguments a call leaves out.
+import LambdaExpressionNode from @ens.frontend.syntax.generated.nodes;
 import Expression from @ens.frontend.syntax.generated.nodes;
 import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
 import GenericNameExpressionNode from @ens.frontend.syntax.generated.nodes;
@@ -40,6 +41,7 @@ import FailedConstraint from model.hierarchy;
 import model.typemembers;
 import Method from model.typemembers;
 import Parameter from model.typemembers;
+import phases.bodies.argumentshapes;
 import Signature from model.typemembers;
 import model.typenames;
 import model.types;
@@ -716,18 +718,17 @@ analyzeInferredStaticCall(BodyChecker checker, CallExpressionNode node, MemberEx
         functioncalls.analyzeArgumentsOnly(checker, arguments);
         return checker.store().errorType();
     }
-    let argumentTypes = new List<Type>();
-    bool refusedArgument = false;
-    for (long i = 0; i < arguments.argumentsCount(); i++) {
-        let argument = arguments.arguments(i);
-        if (argument is Expression) {
-            Type analyzed = checker.analyzeExpression(argument);
-            refusedArgument = refusedArgument || analyzed is ErrorType;
-            argumentTypes.push(functioncalls.offeredType(checker, argument, analyzed));
-        } else {
-            argumentTypes.push(checker.store().errorType());
-        }
+    // A lambda or an aggregate literal waits for the parameter it fills, and the arguments are
+    // analyzed in the order they are written, as in a generic function's call.
+    let signatures = new List<Signature>();
+    for (let index in indexes) {
+        signatures.push(templateStatics.get(index).signature());
     }
+    let offered = functioncalls.offeredTypes(checker, arguments, signatures, false);
+    let argumentTypes = offered.argumentTypes();
+    bool refusedArgument = offered.anyRefused();
+    long waiting = offered.pending();
+    Parameter[] noParameters = [];
     let owner = template.declaration();
     TypeParamType[] typeParameters = template.typeParameterTypes();
     long arity = typeParameters.length;
@@ -755,14 +756,27 @@ analyzeInferredStaticCall(BodyChecker checker, CallExpressionNode node, MemberEx
         }
     }
     if (completedIndexes.length() == 0 && refusedArgument) {
+        functioncalls.analyzeRefusedArguments(checker, arguments, waiting, false, noParameters, null);
         return checker.store().errorType();
     }
     if (completedIndexes.length() == 0) {
         let refusal = countRefusal(checker, templateStatics, indexes, name, node, argumentTypes);
         if (refusal != null) {
             checker.reporter().report(refusal, node.span());
+            functioncalls.analyzeRefusedArguments(checker, arguments, waiting, false, noParameters, null);
             return checker.store().errorType();
         }
+    }
+    bool untyped = false;
+    TypeArgumentInference? sole = null;
+    if (completedIndexes.length() == 0 && indexes.length() == 1) {
+        Parameter[] parameters = templateStatics.get(indexes.get(0)).signature().parameters();
+        let inference = openInferences.get(0);
+        sole = inference;
+        untyped = voidtypearguments.inferFromLambdas(checker, arguments, parameters, inference);
+        functioncalls.analyzeRefusedArguments(checker, arguments, waiting, false, parameters, inference);
+    } else if (completedIndexes.length() == 0) {
+        functioncalls.analyzeRefusedArguments(checker, arguments, waiting, false, noParameters, null);
     }
     if (completedIndexes.length() == 0) {
         for (long c = 0; c < indexes.length(); c++) {
@@ -777,8 +791,14 @@ analyzeInferredStaticCall(BodyChecker checker, CallExpressionNode node, MemberEx
         string quotedTemplate = checker.names().quotedName(template);
         string listed = concreteTypeArguments(template.typeParameters().length,
             exampleTypeArgument(arguments));
-        string example = checker.names().quotedNamedCode(["",
-            "<{listed}>.{name}{functioncalls.argumentsSpelling(arguments)}"], [template]);
+        if (sole != null) {
+            listed = writtenTypeArguments(checker, sole, arity, arguments);
+        }
+        string example = "";
+        if (!untyped) {
+            example = checker.names().quotedNamedCode(["",
+                "<{listed}>.{name}{functioncalls.argumentsSpelling(arguments)}"], [template]);
+        }
         checker.reporter().report(unshownTypeArguments(quotedTemplate, template.typeParameters(), example),
             node.span());
         return checker.store().errorType();
@@ -820,15 +840,16 @@ analyzeInferredStaticCall(BodyChecker checker, CallExpressionNode node, MemberEx
                     vector, failed), node.span());
             }
         }
+        functioncalls.analyzeRefusedArguments(checker, arguments, waiting, false, noParameters, null);
         return checker.store().errorType();
     }
     if (boundedIndexes.length() == 1) {
         return checkInferredStaticCall(checker, node, member, template,
-            boundedIndexes.get(0), boundedArguments.get(0), argumentTypes,
+            boundedIndexes.get(0), boundedArguments.get(0), argumentTypes, waiting,
             templateStatics.get(boundedIndexes.get(0)), boundedInferences.get(0));
     }
     return selectInferredStaticCall(checker, node, member, template, name, boundedIndexes,
-        boundedArguments, argumentTypes);
+        boundedArguments, argumentTypes, waiting);
 }
 
 // The first constraint a conditional static fails at this inferred type-argument vector, or
@@ -858,19 +879,24 @@ inferTypeArguments(BodyChecker checker, Method candidate, GreenNode owner, long 
     return inference;
 }
 
-// The single inferred candidate: instantiate, then check the arguments against the
-// substituted signature the way a generic function call does, without re-analyzing them.
+// The single inferred candidate: instantiate, then check the arguments against the substituted
+// signature the way a generic function call does. An argument analyzed to infer the type arguments
+// is not analyzed again, and one that waits for its parameter, such as a lambda, is analyzed here.
 checkInferredStaticCall(BodyChecker checker, CallExpressionNode node, MemberExpressionNode member,
                         DeclaredType template, long staticIndex, Type[] typeArguments,
-                        List<Type> argumentTypes, Method templateCandidate,
+                        List<Type> argumentTypes, long waiting, Method templateCandidate,
                         TypeArgumentInference inference) -> Type {
+    let arguments = node.arguments();
+    Parameter[] noParameters = [];
     if (!checker.resolver().acceptsKeyType(template, typeArguments, node.span())) {
+        functioncalls.analyzeRefusedArguments(checker, arguments, waiting, false, noParameters, null);
         return checker.store().errorType();
     }
     let instantiation = checker.store().instantiationOf(template, typeArguments);
     checker.resolver().recordInstantiationMention(instantiation, node.span());
     let resolved = staticAtIndex(checker, instantiation, staticIndex);
     if (resolved == null) {
+        functioncalls.analyzeRefusedArguments(checker, arguments, waiting, false, noParameters, null);
         return checker.store().errorType();
     }
     checker.result().setType(member.object().green(), instantiation);
@@ -879,7 +905,6 @@ checkInferredStaticCall(BodyChecker checker, CallExpressionNode node, MemberExpr
     checker.result().setMethod(member.green(), resolved);
     let signature = resolved.signature();
     Parameter[] parameters = signature.parameters();
-    let arguments = node.arguments();
     long count = arguments.argumentsCount();
     long required = calls.requiredArgumentCount(signature);
     if (count < required || count > parameters.length) {
@@ -891,13 +916,23 @@ checkInferredStaticCall(BodyChecker checker, CallExpressionNode node, MemberExpr
         if (argument is Expression) {
             Type parameterType = parameters[i].type();
             let origin = literalfixes.argumentOrigin(checker, argument, signature, i, parameterType);
-            literaltyping.adaptIntegerLiteral(checker, argument, parameterType, origin);
-            literaltyping.adaptCharLiteral(checker, argument, parameterType, origin);
-            literaltyping.adaptFloatLiteral(checker, argument, parameterType, origin);
             Type actual = argumentTypes.get(i);
-            let updated = checker.result().typeOf(argument.green());
-            if (updated != null) {
-                actual = checker.readAs(argument, updated, parameterType);
+            if (argument is LambdaExpressionNode && checker.inTrial()) {
+                continue;
+            }
+            if (functioncalls.waitsForParameter(argument, false)) {
+                actual = checker.analyzeExpressionAdapt(argument, parameterType, origin);
+            } else {
+                if (i >= waiting) {
+                    actual = checker.analyzeExpression(argument);
+                }
+                literaltyping.adaptIntegerLiteral(checker, argument, parameterType, origin);
+                literaltyping.adaptCharLiteral(checker, argument, parameterType, origin);
+                literaltyping.adaptFloatLiteral(checker, argument, parameterType, origin);
+                let updated = checker.result().typeOf(argument.green());
+                if (updated != null) {
+                    actual = checker.readAs(argument, updated, parameterType);
+                }
             }
             let noValue = voidcalls.argumentRefusal(checker, argument, actual,
                 "'{resolved.name()}'", parameterType);
@@ -918,20 +953,33 @@ checkInferredStaticCall(BodyChecker checker, CallExpressionNode node, MemberExpr
             }
         }
     }
+    long extra = parameters.length;
+    if (extra < waiting) {
+        extra = waiting;
+    }
+    functioncalls.analyzeRefusedArguments(checker, arguments, extra, false, noParameters, null);
     return signature.returnType();
 }
 
-// Several candidates inferred complete vectors: rank their substituted signatures over the
-// already-analyzed arguments and let overload resolution pick.
+// Several candidates inferred complete vectors: rank their substituted signatures over the types the
+// arguments offered and let overload resolution pick. An argument that waits for its parameter is
+// shaped by what is written, and the arguments from 'waiting', the first that waits, on are analyzed
+// once a candidate is chosen.
 selectInferredStaticCall(BodyChecker checker, CallExpressionNode node, MemberExpressionNode member,
                          DeclaredType template, string name, List<long> staticIndexes,
-                         List<Type[]> vectors, List<Type> argumentTypes) -> Type {
+                         List<Type[]> vectors, List<Type> argumentTypes, long waiting) -> Type {
     let arguments = node.arguments();
     let shape = new CallShape();
     let values = new List<Expression?>();
+    Parameter[] noParameters = [];
     for (long i = 0; i < arguments.argumentsCount(); i++) {
         switch (arguments.arguments(i)) {
             is Expression value -> {
+                if (functioncalls.waitsForParameter(value, false)) {
+                    shape.positional().push(argumentshapes.writtenShape(checker, value));
+                    values.push(value);
+                    continue;
+                }
                 Type analyzed = argumentTypes.get(i);
                 let updated = checker.result().typeOf(value.green());
                 if (updated != null) {
@@ -948,12 +996,13 @@ selectInferredStaticCall(BodyChecker checker, CallExpressionNode node, MemberExp
             },
         }
     }
-    let built = new BuiltShape(shape, values);
+    let built = new BuiltShape(shape, values, waiting);
     let callCandidates = new List<CallCandidate>();
     let resolvedMethods = new List<Method>();
     let resolvedOwners = new List<Type>();
     for (long c = 0; c < staticIndexes.length(); c++) {
         if (!checker.resolver().acceptsKeyType(template, vectors.get(c), node.span())) {
+            functioncalls.analyzeRefusedArguments(checker, arguments, waiting, false, noParameters, null);
             return checker.store().errorType();
         }
         let instantiation = checker.store().instantiationOf(template, vectors.get(c));
@@ -968,6 +1017,7 @@ selectInferredStaticCall(BodyChecker checker, CallExpressionNode node, MemberExp
             memberaccess.isAccessAllowed(checker, resolved.visibility(), resolved.definingType())));
     }
     if (callCandidates.length() == 0) {
+        functioncalls.analyzeRefusedArguments(checker, arguments, waiting, false, noParameters, null);
         return checker.store().errorType();
     }
     let resolution = functioncalls.resolveBuiltCall(checker, callCandidates, built,
@@ -1155,18 +1205,36 @@ public concreteTypeArguments(long count, string example = "int") -> string {
 }
 
 // The refusal of a call to the generic 'subject' that shows none of its type arguments 'parameters',
-// with 'example', the call written with them, in quotes.
+// with 'example', the call written with them, in quotes, or empty where no example can name them.
 public unshownTypeArguments(string subject, string[] parameters, string example) -> string {
     if (parameters.length == 1) {
-        return "{subject} is generic, and this call does not show what its type argument '{parameters[0]}' "
-            + "is. Write it, as in {example}.";
+        string unshown = "{subject} is generic, and this call does not show what its type argument "
+            + "'{parameters[0]}' is.";
+        return example.length == 0 ? unshown : "{unshown} Write it, as in {example}.";
     }
     let quoted = new List<string>();
     for (let parameter in parameters) {
         quoted.push(parameter);
     }
-    return "{subject} is generic, and this call does not show what its type arguments "
-        + "{wording.quotedList(quoted)} are. Write them, as in {example}.";
+    string unshown = "{subject} is generic, and this call does not show what its type arguments "
+        + "{wording.quotedList(quoted)} are.";
+    return example.length == 0 ? unshown : "{unshown} Write them, as in {example}.";
+}
+
+// The type arguments an example of a generic call writes, separated by commas: each one the call's
+// arguments give, and 'exampleTypeArgument' for each other.
+public writtenTypeArguments(BodyChecker checker, TypeArgumentInference inference, long arity,
+                            ArgumentListNode arguments) -> string {
+    let written = new List<string>();
+    for (long i = 0; i < arity; i++) {
+        let known = inference.binding(i);
+        if (known != null && checker.names().canSpell(known)) {
+            written.push(checker.names().of(known));
+        } else {
+            written.push(exampleTypeArgument(arguments));
+        }
+    }
+    return string.joined(written.toArray(), ", ");
 }
 
 // Whether a call with 'count' arguments can reach 'method', counting its optional parameters.
