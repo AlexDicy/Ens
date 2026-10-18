@@ -6,6 +6,16 @@ import Expression from @ens.frontend.syntax.generated.nodes;
 import LambdaExpressionNode from @ens.frontend.syntax.generated.nodes;
 import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
 import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ParenthesizedExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ArrayLiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
+import StructLiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
+import StructLiteralFieldNode from @ens.frontend.syntax.generated.nodes;
+import NamedArgumentNode from @ens.frontend.syntax.generated.nodes;
+import ArgumentListNode from @ens.frontend.syntax.generated.nodes;
+import ListNode from @ens.frontend.syntax.generated.nodes;
+import AssignmentExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SyntaxNode from @ens.frontend.syntax.node;
+import SyntaxKind from @ens.frontend.syntax.generated.kind;
 import Span from @ens.frontend.support.source;
 import Scope from model.scopes;
 import LocalBinding from model.scopes;
@@ -36,7 +46,16 @@ import PrimitiveType from model.types;
 import List from @std.collections.list;
 import StringBuilder from @std.text.stringbuilder;
 import BodyChecker from phases.bodies;
+import AssignmentFlow from phases.bodies.definiteassignment;
 import support.syntax;
+
+// What holds where a lambda is created, which its body starts from where the call the lambda is passed
+// to checks it after the arguments written after it: the locals and the fields assigned there.
+public final class LambdaStart {
+    protected AssignmentFlow assigned;
+
+    public constructor(this.assigned);
+}
 
 // One lambda whose body is being checked: the scope outside it, the receiver outside it, and
 // what its body has read from either so far. The captures accumulate in first-read order, which
@@ -246,8 +265,23 @@ checkLambdaShape(BodyChecker checker, LambdaExpressionNode node, FunctionType ta
     return matched;
 }
 
-// Walks the lambda's body under its own checker state and returns what it captured.
+// Walks the lambda's body under its own checker state and returns what it captured. A lambda its call
+// checks after the arguments written after it is checked against what holds where it is created.
 checkLambdaBody(BodyChecker checker, LambdaExpressionNode node, Signature signature) -> LambdaCapture[] {
+    let start = checker.takeLambdaStart(node);
+    if (start == null) {
+        return checkLambdaBodyHere(checker, node, signature);
+    }
+    let here = checker.assignment().snapshot();
+    checker.assignment().restore(start.assigned);
+    let captures = checkLambdaBodyHere(checker, node, signature);
+    checker.assignment().restore(here);
+    return captures;
+}
+
+// Walks the lambda's body against what holds here and returns what it captured.
+checkLambdaBodyHere(BodyChecker checker, LambdaExpressionNode node, Signature signature)
+        -> LambdaCapture[] {
     let lambdaFrame = new LambdaFrame(checker.currentScope(), checker.frame().thisType());
     let outerFrame = checker.frame();
     let outerDeferred = checker.targets().deferredFixes();
@@ -266,7 +300,7 @@ checkLambdaBody(BodyChecker checker, LambdaExpressionNode node, Signature signat
         let parameter = parameters[i];
         let binding = new LocalBinding(parameter.name(), parameter.type(),
             BindingKind.Parameter, false, parameter.span());
-        checker.frame().parametersInReach().push(binding);
+        checker.frame().addParameterInReach(binding);
         if (lambdaScope != null && !lambdaScope.define(binding)) {
             checker.reporter().report("Parameter '{parameter.name()}' is declared twice in this lambda. "
                 + "Rename one of the two.", parameter.span());
@@ -336,6 +370,54 @@ public isOuterName(BodyChecker checker, string name) -> bool {
 public outerBinding(BodyChecker checker, string name) -> LocalBinding? {
     for (long i = checker.lambdaFrames().length() - 1; i >= 0; i--) {
         let found = checker.lambdaFrames().get(i).lookupOuter(name);
+        if (found != null) {
+            return found;
+        }
+    }
+    return null;
+}
+
+// The assignment to 'binding' that an argument of the call the lambda being checked is passed to makes
+// after the lambda, which the lambda's copy of 'binding' does not see, or null where no argument does or
+// 'binding' is no capture of it.
+public laterAssignmentInCall(BodyChecker checker, LocalBinding binding) -> AssignmentExpressionNode? {
+    let lambda = checker.frame().innermostLambda();
+    let scope = checker.currentScope();
+    if (lambda == null || scope == null || scope.lookup(binding.name()) == binding) {
+        return null;
+    }
+    SyntaxNode? holder = lambda.parent();
+    while (holder != null && holdsArgumentPart(holder)) {
+        holder = holder.parent();
+    }
+    if (!(holder is ArgumentListNode)) {
+        return null;
+    }
+    return assignmentAfter(holder, binding.name(), lambda.span().end());
+}
+
+// Whether 'node' is a part of an argument that holds another: parentheses, an array or a '{...}'
+// literal, a field of one, a named argument, or the list of them a node holds.
+holdsArgumentPart(SyntaxNode node) -> bool {
+    return node is ListNode || node is ParenthesizedExpressionNode || node is ArrayLiteralExpressionNode
+        || node is StructLiteralFieldNode || node is StructLiteralExpressionNode || node is NamedArgumentNode;
+}
+
+// The first '=' assignment to the local 'name' inside 'node' that starts at 'after' or later,
+// outside any lambda, or null where there is none.
+assignmentAfter(SyntaxNode node, string name, long after) -> AssignmentExpressionNode? {
+    if (node is LambdaExpressionNode || node.span().end() <= after) {
+        return null;
+    }
+    if (node is AssignmentExpressionNode && node.span().start >= after
+            && node.operator().kind() == SyntaxKind.Equals) {
+        Expression target = syntax.unwrapParentheses(node.target());
+        if (target is IdentifierExpressionNode && target.name().text() == name) {
+            return node;
+        }
+    }
+    for (let child in node.childNodes()) {
+        let found = assignmentAfter(child, name, after);
         if (found != null) {
             return found;
         }

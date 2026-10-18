@@ -47,6 +47,7 @@ import phases.bodies.literaltyping;
 import phases.bodies.nullguidance;
 import phases.bodies.wording;
 import phases.bodies.argumentshapes;
+import ArgumentOrder from phases.bodies.argumentshapes;
 import phases.bodies.voidcalls;
 import phases.bodies.voidtypearguments;
 import ArgumentShape from phases.calls;
@@ -68,6 +69,9 @@ import ExternalType from model.types;
 import InstantiationType from model.types;
 import Visibility from model.types;
 import List from @std.collections.list;
+import Map from @std.collections.map;
+import model.narrow;
+import NarrowingPath from model.narrow;
 import phases.bodies.methodcalls;
 import phases.bodies.memberaccess;
 import phases.bodies.identifiers;
@@ -88,13 +92,41 @@ public final class ChosenParameter {
     protected constructor(this.span, this.origin);
 }
 
+// The candidate a trial chose for a call, with the narrowing that held where the call starts there.
+public final class TrialChoice {
+    protected Map<NarrowingPath, Type> entry;
+    protected Signature chosen;
+
+    protected constructor(this.entry, this.chosen);
+}
+
 // The call shape paired with each argument's written expression, positional first and named
-// after, so resolved calls can adapt literals in place. An 'out' misuse leaves a null hole.
+// after, so resolved calls can adapt literals in place. An 'out' misuse leaves a null hole. The
+// arguments from 'pendingFrom' on were ranked from a trial and are analyzed once a candidate is chosen,
+// and in a trial, 'entry' is the narrowing where the call starts.
 public final class BuiltShape {
     protected CallShape callShape;
     protected List<Expression?> values;
+    protected List<NamedArgumentNode?> named;
+    protected long pendingFrom;
+    protected bool single;
+    protected GreenNode? call;
+    protected Map<NarrowingPath, Type>? entry;
 
-    public constructor(this.callShape, this.values);
+    // A shape over arguments that are all analyzed already.
+    public constructor(this.callShape, this.values) {
+        this.named = new List<NamedArgumentNode?>();
+        for (long i = 0; i < this.values.length(); i++) {
+            this.named.push(null);
+        }
+        this.pendingFrom = this.values.length();
+        this.single = false;
+        this.call = null;
+        this.entry = null;
+    }
+
+    protected constructor(this.callShape, this.values, this.named, this.pendingFrom, this.single, this.call,
+                          this.entry);
 
     public shape() -> CallShape {
         return this.callShape;
@@ -115,15 +147,26 @@ public analyzeTry(BodyChecker checker, TryExpressionNode node) -> Type {
     return analyzed;
 }
 
-// The shape of the arguments of 'call'. With a 'single' candidate, an argument holding a literal too
-// large for 'float' waits for its parameter, so its refusal can name it.
-public buildCallShape(BodyChecker checker, Expression call, ArgumentListNode arguments, bool single)
-        -> BuiltShape {
+// The shape of the arguments of 'call' for 'candidates', analyzed in written order as ArgumentOrder
+// describes. With a single candidate, an argument holding a literal too large for 'float' waits for its
+// parameter, so its refusal can name it.
+public buildCallShape(BodyChecker checker, Expression call, ArgumentListNode arguments,
+                      List<CallCandidate> candidates) -> BuiltShape {
+    bool single = candidates.length() == 1;
     let shape = new CallShape();
     shape.setLocalNamer((base) -> nullguidance.freeLocalName(checker, "", base));
     let positionalValues = new List<Expression?>();
     let namedValues = new List<Expression?>();
+    let namedArguments = new List<NamedArgumentNode?>();
+    Map<NarrowingPath, Type>? entry = null;
+    if (checker.inTrial()) {
+        entry = checker.narrowing().flatten();
+    }
+    let targets = parameterTargets(checker, chosenInTrial(checker, call, candidates), arguments);
+    let order = new ArgumentOrder(checker, targets == null || positionalAfterNamed(arguments));
     for (long i = 0; i < arguments.argumentsCount(); i++) {
+        order.reach(i);
+        ArgumentValue? added = null;
         switch (arguments.arguments(i)) {
             is NamedArgumentNode named -> {
                 string name = named.name().text();
@@ -135,26 +178,11 @@ public buildCallShape(BodyChecker checker, Expression call, ArgumentListNode arg
                         break;
                     }
                 }
-                let shaped = shapedArgumentOf(checker, name, named.value(), single);
-                if (shaped != null) {
-                    if (shaped.holdsError()) {
-                        shape.markErrorArgument();
-                    }
-                    shape.named().push(shaped);
-                } else if (single && carriesOverflowingFloat(named.value())) {
-                    shape.named().push(targetTypedArgument(checker, name, named.value()));
-                } else {
-                    bool outerAwaiting = checker.targets().awaitingParameter();
-                    checker.targets().setAwaitingParameter(!single);
-                    Type analyzed = checker.analyzeExpression(named.value());
-                    checker.targets().setAwaitingParameter(outerAwaiting);
-                    checker.result().setType(named.green(), analyzed);
-                    if (analyzed is ErrorType) {
-                        shape.markErrorArgument();
-                    }
-                    shape.named().push(argumentValueOf(checker, name, named.value(), analyzed));
-                }
+                let shaped = shapeArgument(order, name, named.value(), named, single, targets, i);
+                shape.named().push(shaped);
                 namedValues.push(named.value());
+                namedArguments.push(named);
+                added = shaped;
             },
             is OutArgumentNode outArgument -> {
                 checker.reporter().report("'out' can only be used when calling an external "
@@ -183,38 +211,185 @@ public buildCallShape(BodyChecker checker, Expression call, ArgumentListNode arg
                         value.span());
                     shape.markMalformed();
                 }
-                let shaped = shapedArgumentOf(checker, "", value, single);
-                if (shaped != null) {
-                    if (shaped.holdsError()) {
-                        shape.markErrorArgument();
-                    }
-                    shape.positional().push(shaped);
-                } else if (single && carriesOverflowingFloat(value)) {
-                    shape.positional().push(targetTypedArgument(checker, "", value));
-                } else {
-                    bool outerAwaiting = checker.targets().awaitingParameter();
-                    checker.targets().setAwaitingParameter(!single);
-                    Type analyzed = checker.analyzeExpression(value);
-                    checker.targets().setAwaitingParameter(outerAwaiting);
-                    if (analyzed is ErrorType) {
-                        shape.markErrorArgument();
-                    }
-                    shape.positional().push(argumentValueOf(checker, "", value, analyzed));
-                }
+                let shaped = shapeArgument(order, "", value, null, single, targets, i);
+                shape.positional().push(shaped);
                 positionalValues.push(value);
+                added = shaped;
             },
             default -> { },
         }
+        if (added != null && added.holdsError()) {
+            shape.markErrorArgument();
+        }
     }
     let values = new List<Expression?>();
+    let named = new List<NamedArgumentNode?>();
     for (long i = 0; i < positionalValues.length(); i++) {
         values.push(positionalValues.get(i));
+        named.push(null);
     }
     for (long i = 0; i < namedValues.length(); i++) {
         values.push(namedValues.get(i));
+        named.push(namedArguments.get(i));
     }
-    markEndingCallPlace(checker, call, shape, values);
-    return new BuiltShape(shape, values);
+    markEndingCallPlace(order.analyzer(), call, shape, values);
+    long pendingFrom = order.finish(values.length());
+    return new BuiltShape(shape, values, named, pendingFrom, single, call.green(), entry);
+}
+
+// The candidates of 'call' that can take its arguments: the one a trial chose for it where the narrowing
+// the trial started from holds here, and otherwise every one of 'candidates'.
+chosenInTrial(BodyChecker checker, Expression call, List<CallCandidate> candidates)
+        -> List<CallCandidate> {
+    if (checker.inTrial()) {
+        return candidates;
+    }
+    let choice = checker.takeTrialChoice(call.green());
+    if (choice == null || !narrow.sameProofs(choice.entry, checker.narrowing().flatten())) {
+        return candidates;
+    }
+    let chosen = new List<CallCandidate>();
+    for (let candidate in candidates) {
+        if (candidate.signature() == choice.chosen) {
+            chosen.push(candidate);
+        }
+    }
+    if (chosen.isEmpty()) {
+        return candidates;
+    }
+    return chosen;
+}
+
+// The parameter each argument of a call fills where every one of 'candidates' that takes the
+// arguments gives it the same type, before any argument is analyzed, or null where no candidate takes
+// them.
+public final class ParameterTargets {
+    // The type of each parameter, or null where two candidates give the argument different types.
+    protected List<Type?> types;
+    // The parameter of the only candidate that takes the arguments, which a fix can name, or null where
+    // more than one does.
+    protected List<LiteralOrigin?> origins;
+
+    protected constructor(this.types, this.origins);
+}
+
+// The parameters the arguments of a call to 'candidates' fill, read from the names and the count of
+// the arguments, or null where no candidate takes them.
+parameterTargets(BodyChecker checker, List<CallCandidate> candidates, ArgumentListNode arguments)
+        -> ParameterTargets? {
+    let written = new CallShape();
+    for (long i = 0; i < arguments.argumentsCount(); i++) {
+        let argument = arguments.arguments(i);
+        if (argument is NamedArgumentNode) {
+            written.named().push(new ArgumentValue(argument.name().text(), checker.store().errorType(),
+                false, false, 0, false, argument.span()));
+        } else {
+            written.positional().push(new ArgumentValue("", checker.store().errorType(), false, false, 0,
+                false, arguments.span()));
+        }
+    }
+    let takers = calls.takingCandidates(candidates, written);
+    if (takers.isEmpty()) {
+        return null;
+    }
+    let types = new List<Type?>();
+    let origins = new List<LiteralOrigin?>();
+    for (long i = 0; i < written.argumentCount(); i++) {
+        Type? agreed = takers.get(0).parameterType(i);
+        for (let taker in takers) {
+            if (taker.parameterType(i) != agreed) {
+                agreed = null;
+            }
+        }
+        types.push(agreed);
+        LiteralOrigin? origin = null;
+        let value = argumentValue(arguments.arguments(i));
+        if (takers.length() == 1 && agreed != null && value != null) {
+            let sole = takers.get(0);
+            origin = literalfixes.argumentOrigin(checker, value, sole.candidate().signature(),
+                sole.parameterIndex(i), agreed, constructedName(checker, sole.candidate()));
+        }
+        origins.push(origin);
+    }
+    return new ParameterTargets(types, origins);
+}
+
+// The expression an argument passes, or null for an 'out' argument.
+argumentValue(Argument argument) -> Expression? {
+    switch (argument) {
+        is NamedArgumentNode named -> {
+            return named.value();
+        },
+        is Expression value -> {
+            return value;
+        },
+        default -> {
+            return null;
+        },
+    }
+}
+
+// The quoted type 'candidate' constructs, with its type arguments, or empty where it is no
+// constructor.
+constructedName(BodyChecker checker, CallCandidate candidate) -> string {
+    let method = candidate.method();
+    if (method != null && method.isConstructor()) {
+        return checker.names().quoted(method.definingType());
+    }
+    return "";
+}
+
+// The argument 'value' at 'index', named 'name' or positional with an empty name, as resolution reads
+// it: by what is written, where that decides the parameters it fits, and otherwise by its type, which
+// it is analyzed for now. 'written' is the named argument it is written in, or null for a positional
+// one, and 'targets' the parameters the arguments fill, where they are known.
+shapeArgument(ArgumentOrder order, string name, Expression value, NamedArgumentNode? written, bool single,
+              ParameterTargets? targets, long index) -> ArgumentValue {
+    Type? target = null;
+    LiteralOrigin? origin = null;
+    if (targets != null && index < targets.types.length()) {
+        target = targets.types.get(index);
+        origin = targets.origins.get(index);
+    }
+    let checker = order.analyzer();
+    let shaped = shapedArgumentOf(order, name, value, single, target);
+    if (shaped != null) {
+        return shaped;
+    }
+    if (single && carriesOverflowingFloat(value)) {
+        let argument = targetTypedArgument(checker, name, value);
+        order.place(value, target, origin);
+        return argument;
+    }
+    return argumentValueOf(checker, name, value, analyzeRankedArgument(checker, value, written, single));
+}
+
+// Analyzes 'value', an argument with a type of its own of a call whose candidates are ranked, written
+// in the named argument 'written', or positional where that is null.
+analyzeRankedArgument(BodyChecker checker, Expression value, NamedArgumentNode? written, bool single)
+        -> Type {
+    bool outerAwaiting = checker.targets().awaitingParameter();
+    checker.targets().setAwaitingParameter(!single);
+    Type analyzed = checker.analyzeExpression(value);
+    checker.targets().setAwaitingParameter(outerAwaiting);
+    if (written != null) {
+        checker.result().setType(written.green(), analyzed);
+    }
+    return analyzed;
+}
+
+// Whether a positional argument is written after a named one.
+positionalAfterNamed(ArgumentListNode arguments) -> bool {
+    bool named = false;
+    for (long i = 0; i < arguments.argumentsCount(); i++) {
+        let argument = arguments.arguments(i);
+        if (argument is NamedArgumentNode) {
+            named = true;
+        } else if (named) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Marks on 'shape', when one of the arguments of 'call' never returns, what the refusal of the call
@@ -289,21 +464,31 @@ isEffectFree(BodyChecker checker, Expression value) -> bool {
 }
 
 // The argument 'value' shaped by what is written, with its parts analyzed as the call's other arguments
-// are, or null where it has a type of its own.
-shapedArgumentOf(BodyChecker checker, string name, Expression value, bool single) -> ArgumentValue? {
+// are, or null where it has a type of its own. 'target' is the type of the parameter it fills, where
+// it is known before a candidate is chosen.
+shapedArgumentOf(ArgumentOrder order, string name, Expression value, bool single, Type? target)
+        -> ArgumentValue? {
+    let checker = order.analyzer();
     bool outerAwaiting = checker.targets().awaitingParameter();
     checker.targets().setAwaitingParameter(!single);
-    let shaped = argumentshapes.shapedArgument(checker, name, value);
+    let shaped = argumentshapes.shapedArgument(order, name, value, target);
     checker.targets().setAwaitingParameter(outerAwaiting);
     return shaped;
 }
 
 // Resolves the call over 'candidates'. Where none is chosen, a method or function name among the
-// arguments is refused on its own, because resolution reports nothing for a call that passes one.
+// arguments is refused on its own, because resolution reports nothing for a call that passes one, and
+// the arguments analyzed only in a trial are analyzed, since no candidate types them.
 public resolveBuiltCall(BodyChecker checker, List<CallCandidate> candidates, BuiltShape built, Span span,
                         string displayName, string kindWord) -> CallResolution {
     let resolution = calls.resolveCall(candidates, built.shape(), checker.reporter(), span, displayName,
         kindWord, checker.names());
+    let chosen = resolution.chosen();
+    let call = built.call;
+    let entry = built.entry;
+    if (chosen != null && call != null && entry != null) {
+        checker.recordTrialChoice(call, new TrialChoice(entry, chosen.signature()));
+    }
     if (resolution.failed()) {
         string takers = "'{displayName}'";
         if (kindWord == "Constructor" || kindWord == "Base constructor") {
@@ -312,12 +497,63 @@ public resolveBuiltCall(BodyChecker checker, List<CallCandidate> candidates, Bui
         for (long i = 0; i < built.values.length(); i++) {
             let value = built.values.get(i);
             if (value != null) {
+                if (i >= built.pendingFrom) {
+                    analyzeUnchosenArgument(checker, built, built.shape().argumentAt(i), value, i);
+                }
                 refuseHeldNames(checker, built.shape().argumentAt(i), value,
                     parametersAt(candidates, built.shape(), i), takers);
             }
         }
     }
     return resolution;
+}
+
+// Analyzes, where no candidate is chosen, the arguments from the one a trial started in, which were
+// analyzed only in that trial.
+public analyzeUnchosenArguments(BodyChecker checker, BuiltShape built) {
+    for (long i = built.pendingFrom; i < built.values.length(); i++) {
+        let value = built.values.get(i);
+        if (value != null) {
+            analyzeUnchosenArgument(checker, built, built.shape().argumentAt(i), value, i);
+        }
+    }
+}
+
+// Analyzes the parts of 'value', the argument at 'index' or -1 for an array element, that were analyzed
+// only in a trial and that no candidate is chosen to type. A '{...}' literal is analyzed against no type.
+analyzeUnchosenArgument(BodyChecker checker, BuiltShape built, ArgumentValue argument, Expression value,
+                        long index) {
+    Expression written = syntax.unwrapParentheses(value);
+    if (checker.takePlaced(written)) {
+        return;
+    }
+    switch (argument.shape()) {
+        ArrayLiteral -> {
+            if (written is ArrayLiteralExpressionNode) {
+                for (long i = 0; i < written.elementsCount() && i < argument.elements().length; i++) {
+                    analyzeUnchosenArgument(checker, built, argument.elements()[i], written.elements(i), -1);
+                }
+            }
+        },
+        StructLiteral -> {
+            let ignored = checker.analyzeExpressionAdapt(value, checker.store().errorType());
+        },
+        Lambda, Name -> { },
+        default -> {
+            if (checker.takeRanked(value)) {
+                return;
+            }
+            NamedArgumentNode? named = null;
+            if (index >= 0) {
+                named = built.named.get(index);
+            }
+            if (argument.needsTarget()) {
+                let ignored = checker.analyzeExpressionAdapt(value, checker.store().errorType());
+            } else {
+                let ignored = analyzeRankedArgument(checker, value, named, built.single);
+            }
+        },
+    }
 }
 
 // The parameters the candidates declare for the argument at 'index', positional or named.
@@ -442,7 +678,8 @@ literalArgumentOf(string name, Expression value, Type analyzed) -> ArgumentValue
 }
 
 // Final argument checking against the chosen candidate: adapt untyped literals to the
-// parameter types and verify assignability, mirroring the single-candidate path.
+// parameter types and verify assignability, mirroring the single-candidate path. The arguments ranked
+// from a trial are analyzed here in written order, and a trial checks no argument that waits.
 public checkResolvedArguments(BodyChecker checker, BuiltShape built, CallResolution resolution,
                               GreenNode callNode) -> Type {
     let chosen = resolution.chosen();
@@ -467,6 +704,12 @@ public checkResolvedArguments(BodyChecker checker, BuiltShape built, CallResolut
                 chosen.signature().name(), parameterType);
             chosenOrigin.setQuotedConstructed(constructed);
             checker.targets().chosenParameters().push(new ChosenParameter(value.span(), chosenOrigin));
+        }
+        if (value != null && i >= built.pendingFrom && !argument.needsTarget()) {
+            let ignored = analyzeRankedArgument(checker, value, built.named.get(i), built.single);
+        }
+        if (value != null && argument.needsTarget() && checker.inTrial()) {
+            continue;
         }
         if (value != null && argument.needsTarget()) {
             finalType = checker.analyzeExpressionAdapt(value, parameterType,
@@ -950,11 +1193,11 @@ dispatchFunctionCall(BodyChecker checker, CallExpressionNode node, IdentifierExp
         return analyzeGenericCall(checker, node, first, name);
     }
     if (entries.length() > 1 || usesNamedArguments(node.arguments())) {
-        let built = buildCallShape(checker, node, node.arguments(), entries.length() == 1);
         let candidates = new List<CallCandidate>();
         for (long i = 0; i < entries.length(); i++) {
             candidates.push(new CallCandidate(entries.get(i).signature(), null, true));
         }
+        let built = buildCallShape(checker, node, node.arguments(), candidates);
         let resolved = resolveBuiltCall(checker, candidates, built, node.span(), name, "Function");
         if (resolved.failed()) {
             return checker.store().errorType();
@@ -985,7 +1228,6 @@ public analyzeNamespaceFunctionCall(BodyChecker checker, CallExpressionNode node
     string targetPackagePrefix = target.module().packagePrefix();
     checker.result().setCallableFile(member.green(), target.module().filePath());
     if (entries.length() > 1 || usesNamedArguments(node.arguments())) {
-        let built = buildCallShape(checker, node, node.arguments(), entries.length() == 1);
         let candidates = new List<CallCandidate>();
         for (long i = 0; i < entries.length(); i++) {
             let entry = entries.get(i);
@@ -993,6 +1235,7 @@ public analyzeNamespaceFunctionCall(BodyChecker checker, CallExpressionNode node
                 types.isVisibleFrom(entry.visibility(), targetPath, targetPackagePrefix,
                     checker.modulePath(), checker.packagePrefix())));
         }
+        let built = buildCallShape(checker, node, node.arguments(), candidates);
         let resolved = resolveBuiltCall(checker, candidates, built,
             node.span(), memberName, "Function");
         if (resolved.failed()) {
@@ -1013,6 +1256,7 @@ public analyzeNamespaceFunctionCall(BodyChecker checker, CallExpressionNode node
             checker.reporter().report(types.notVisibleMessage("Function", memberName,
                 chosenVisibility, targetPath, targetPackagePrefix, checker.packagePrefix(),
                 target.module().isEditable()), member.member().span());
+            analyzeUnchosenArguments(checker, built);
             return checker.store().errorType();
         }
         return checkResolvedArguments(checker, built, resolved, node.green());
@@ -1121,21 +1365,11 @@ analyzeGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry e
         }
     }
 
-    // A value with no type of its own, a lambda or an aggregate literal, waits for the
-    // parameter it fills, which is known once the type arguments are resolved. It offers
-    // nothing to infer them from either.
-    let argumentTypes = new List<Type>();
-    bool refusedArgument = false;
-    for (long i = 0; i < arguments.argumentsCount(); i++) {
-        let argument = arguments.arguments(i);
-        if (argument is Expression && !waitsForParameter(argument, explicitList != null)) {
-            Type analyzed = checker.analyzeExpression(argument);
-            refusedArgument = refusedArgument || analyzed is ErrorType;
-            argumentTypes.push(offeredType(checker, argument, analyzed));
-        } else {
-            argumentTypes.push(checker.store().errorType());
-        }
-    }
+    bool typesWritten = explicitList != null;
+    let offered = offeredTypes(checker, arguments, signature, typesWritten);
+    let argumentTypes = offered.types;
+    bool refusedArgument = offered.refused;
+    long waiting = offered.pendingFrom;
 
     Parameter[] parameters = signature.parameters();
     let inference = new TypeArgumentInference(checker.store(), owner, arity);
@@ -1152,6 +1386,7 @@ analyzeGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry e
     for (long i = 0; i < arity; i++) {
         let argument = typeArguments.get(i);
         if (argument == null && refusedArgument) {
+            analyzeRefusedArguments(checker, arguments, waiting, typesWritten, parameters, null);
             return checker.store().errorType();
         }
         // A call with the wrong number of arguments is refused for the count first: an argument it leaves out
@@ -1159,14 +1394,14 @@ analyzeGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry e
         if (argument == null && !calls.acceptsArgumentCount(signature, arguments.argumentsCount())) {
             checker.reporter().report(calls.arityRefusal("Function '{name}'", signature,
                 arguments.argumentsCount()), node.span());
+            analyzeRefusedArguments(checker, arguments, waiting, typesWritten, parameters, null);
             return checker.store().errorType();
         }
         if (argument == null) {
-            bool untyped = voidtypearguments.inferFromLambdas(checker, arguments, parameters,
-                inference);
+            bool untyped = voidtypearguments.inferFromLambdas(checker, arguments, parameters, inference);
+            analyzeRefusedArguments(checker, arguments, waiting, typesWritten, parameters, inference);
             bool refusedVoid = voidtypearguments.reportVoidTypeArgument(checker, arguments, parameters,
                 argumentTypes, inference, typeParameters, "'{name}'");
-            voidtypearguments.checkLambdaBodies(checker, arguments, parameters, inference);
             if (refusedVoid) {
                 return checker.store().errorType();
             }
@@ -1227,9 +1462,15 @@ analyzeGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry e
             Type parameterType = checker.store().substitute(parameters[i].type(), owner, resolvedArguments);
             Type actual = argumentTypes.get(i);
             let origin = literalfixes.argumentOrigin(checker, argument, signature, i, parameterType);
-            if (waitsForParameter(argument, explicitList != null)) {
+            if (argument is LambdaExpressionNode && checker.inTrial()) {
+                continue;
+            }
+            if (waitsForParameter(argument, typesWritten)) {
                 actual = checker.analyzeExpressionAdapt(argument, parameterType, origin);
             } else {
+                if (i >= waiting) {
+                    actual = checker.analyzeExpression(argument);
+                }
                 literaltyping.adaptIntegerLiteral(checker, argument, parameterType, origin);
                 literaltyping.adaptCharLiteral(checker, argument, parameterType, origin);
                 literaltyping.adaptFloatLiteral(checker, argument, parameterType, origin);
@@ -1254,6 +1495,11 @@ analyzeGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry e
             }
         }
     }
+    long extra = parameters.length;
+    if (extra < waiting) {
+        extra = waiting;
+    }
+    analyzeRefusedArguments(checker, arguments, extra, typesWritten, parameters, null);
 
     if (bounded) {
         checker.result().setCallTypeArguments(node.green(), resolvedArguments);
@@ -1430,9 +1676,95 @@ overflowsFloatWithin(Expression value) -> bool {
     return carriesOverflowingFloat(core);
 }
 
+// The types the arguments of a generic call offer the inference of its type arguments, the error type
+// for each one that offers none, whether one of them is refused, and the index of the argument from
+// which on they are analyzed again once the type arguments are known.
+public final class OfferedTypes {
+    protected List<Type> types;
+    protected bool refused;
+    protected long pendingFrom;
+
+    protected constructor(this.types, this.refused, this.pendingFrom);
+}
+
+// Analyzes the arguments of a generic call to 'signature' in written order, as ArgumentOrder does, and
+// returns the types they offer. With the type arguments 'written', the arguments from the first that
+// waits and is no lambda on are analyzed once those types are resolved.
+public offeredTypes(BodyChecker checker, ArgumentListNode arguments, Signature signature, bool written)
+        -> OfferedTypes {
+    Parameter[] parameters = signature.parameters();
+    let types = new List<Type>();
+    bool refused = false;
+    long count = arguments.argumentsCount();
+    let order = new ArgumentOrder(checker, false);
+    for (long i = 0; i < count; i++) {
+        order.reach(i);
+        let argument = arguments.arguments(i);
+        let analyzer = order.analyzer();
+        Type offered = checker.store().errorType();
+        if (argument is LambdaExpressionNode) {
+            analyzer.noteLambdaStart(argument);
+        } else if (argument is Expression && waitsForParameter(argument, written)) {
+            if (written) {
+                return new OfferedTypes(paddedTypes(checker, types, count), refused, i);
+            }
+            if (i >= parameters.length) {
+                let ignored = analyzer.placeArgument(argument, checker.store().errorType());
+            } else if (!convert.containsTypeParam(parameters[i].type())) {
+                Type parameterType = parameters[i].type();
+                order.place(argument, parameterType,
+                    literalfixes.argumentOrigin(analyzer, argument, signature, i, parameterType));
+            } else {
+                order.place(argument, null);
+            }
+        } else if (argument is Expression) {
+            Type analyzed = analyzer.analyzeExpression(argument);
+            refused = refused || analyzed is ErrorType;
+            offered = offeredType(analyzer, argument, analyzed);
+        }
+        types.push(offered);
+    }
+    return new OfferedTypes(types, refused, order.finish(count));
+}
+
+// 'types' with the error type added for each argument up to 'count' it has no type for.
+paddedTypes(BodyChecker checker, List<Type> types, long count) -> List<Type> {
+    while (types.length() < count) {
+        types.push(checker.store().errorType());
+    }
+    return types;
+}
+
+// Analyzes the arguments of a refused generic call that no parameter types, so their problems are
+// reported with the refusal: from 'from' on, the ones not analyzed yet, and outside a trial, each lambda
+// whose parameter types 'inference' settles from 'parameters'.
+public analyzeRefusedArguments(BodyChecker checker, ArgumentListNode arguments, long from, bool written,
+                               Parameter[] parameters, TypeArgumentInference? inference) {
+    for (long i = 0; i < arguments.argumentsCount(); i++) {
+        let argument = arguments.arguments(i);
+        if (argument is LambdaExpressionNode) {
+            if (inference != null && i < parameters.length && !checker.inTrial()) {
+                voidtypearguments.checkRefusedLambda(checker, argument, parameters[i], inference);
+            }
+        } else if (argument is Expression && i >= from && !checker.takePlaced(argument)) {
+            let ignored = analyzeWithoutParameter(checker, argument, written);
+        }
+    }
+}
+
+// Analyzes the argument 'value' of a generic call where it is checked against no parameter: one with a
+// type of its own for that type, and one that waits for its parameter against no type, which checks
+// what is inside it and reports nothing about the value itself.
+analyzeWithoutParameter(BodyChecker checker, Expression value, bool written) -> Type {
+    if (waitsForParameter(value, written)) {
+        return checker.analyzeExpressionAdapt(value, checker.store().errorType());
+    }
+    return checker.analyzeExpression(value);
+}
+
 // Whether an argument of a generic call is analyzed once its parameter type is known. With the type
 // arguments 'written', an array literal is too, so that its literals take the element type.
-waitsForParameter(Expression value, bool written) -> bool {
+public waitsForParameter(Expression value, bool written) -> bool {
     return needsTargetType(value) || (written && value is ArrayLiteralExpressionNode);
 }
 

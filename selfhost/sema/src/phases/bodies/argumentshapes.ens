@@ -12,6 +12,7 @@ import StructLiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
 import phases.calls;
 import ArgumentValue from phases.calls;
 import ArgumentShape from phases.calls;
+import model.convert;
 import model.typemembers;
 import Method from model.typemembers;
 import Signature from model.typemembers;
@@ -31,30 +32,102 @@ import phases.bodies.narrowing;
 import phases.bodies.staticmembers;
 import phases.bodies.wording;
 import BodyChecker from phases.bodies;
+import LiteralOrigin from phases.bodies.literaltargets;
 import FunctionName from phases.bodies;
 import NamespaceName from phases.bodies;
 import TypeName from phases.bodies;
 import support.syntax;
 
+// Analyzes a call's arguments in written order while it shapes them: a lambda is checked once the
+// candidate is known, from what holds where it is created, and any other part that waits for its
+// parameter is analyzed where it is written. Where the candidates give that part different types, the
+// arguments after it are ranked from a trial and analyzed again once the candidate is chosen.
+public final class ArgumentOrder {
+    protected BodyChecker checker;
+    protected BodyChecker analyzing;
+    protected bool refused;
+    // The argument being shaped, and the one the trial started in, or -1 before a trial starts.
+    protected long current;
+    protected long trialFrom;
+
+    // The order of the arguments of a call 'checker' analyzes, which no candidate takes where 'refused'.
+    public constructor(BodyChecker checker, bool refused) {
+        this.checker = checker;
+        this.analyzing = checker;
+        this.refused = refused;
+        this.current = 0;
+        this.trialFrom = -1;
+    }
+
+    // The checker that analyzes the parts of arguments now: the call's checker, or the trial.
+    public analyzer() -> BodyChecker {
+        return this.analyzing;
+    }
+
+    // Starts shaping the argument at 'index'.
+    public reach(long index) {
+        this.current = index;
+    }
+
+    // Analyzes 'part', which waits for its parameter, where it is written: against 'target', with the fix
+    // 'origin' names, or against no type where the parameter's type is not known yet.
+    public place(Expression part, Type? target, LiteralOrigin? origin = null) {
+        if (target != null) {
+            let ignored = this.analyzing.placeArgument(part, target, origin);
+            return;
+        }
+        Type none = this.checker.store().errorType();
+        if (this.refused) {
+            let ignored = this.analyzing.analyzeExpressionAdapt(part, none);
+            return;
+        }
+        if (!this.analyzing.inTrial()) {
+            this.analyzing = this.checker.trial();
+            this.trialFrom = this.current;
+        }
+        let ignored = this.analyzing.placeArgument(part, none);
+    }
+
+    // Ends the trial, if one started, and returns the index of the argument it started in, from which
+    // on the arguments are analyzed again once the candidate is chosen, or 'count' where none started.
+    public finish(long count) -> long {
+        if (this.trialFrom < 0) {
+            return count;
+        }
+        this.checker.endTrial();
+        return this.trialFrom;
+    }
+}
+
 // The argument 'value', named 'name' or positional with an empty name, where what is written decides
-// the parameters it fits, or null where it has a type of its own. The parts of it that have a type of
-// their own are analyzed now.
-public shapedArgument(BodyChecker checker, string name, Expression value) -> ArgumentValue? {
+// the parameters it fits, or null where it has a type of its own. Its parts are analyzed as 'order'
+// says, against 'target', the parameter's type where it is known.
+public shapedArgument(ArgumentOrder order, string name, Expression value, Type? target) -> ArgumentValue? {
+    let checker = order.analyzer();
     let argument = new ArgumentValue(name, checker.store().errorType(), false, false, 0, false, value.span());
     Expression written = syntax.unwrapParentheses(value);
     switch (written) {
         is LambdaExpressionNode lambda -> {
             argument.markLambda(lambda.parametersCount());
+            checker.noteLambdaStart(lambda);
         },
         is ArrayLiteralExpressionNode array -> {
+            Type? element = null;
+            if (target != null) {
+                Type core = convert.coreOf(target);
+                if (core is ArrayType) {
+                    element = core.element();
+                }
+            }
             let elements = new List<ArgumentValue>();
             for (long i = 0; i < array.elementsCount(); i++) {
-                elements.push(elementValue(checker, array.elements(i)));
+                elements.push(elementValue(order, array.elements(i), element));
             }
-            argument.markArrayLiteral(elements.toArray(), aloneType(checker, elements));
+            argument.markArrayLiteral(elements.toArray(), aloneType(order.analyzer(), elements));
         },
-        is StructLiteralExpressionNode ignored -> {
+        is StructLiteralExpressionNode literal -> {
             argument.markStructLiteral();
+            order.place(literal, target);
         },
         default -> {
             let counts = namedParameterCounts(checker, written);
@@ -69,11 +142,13 @@ public shapedArgument(BodyChecker checker, string name, Expression value) -> Arg
 }
 
 // An element of an array literal argument, shaped as an argument is, or else analyzed for its own type.
-elementValue(BodyChecker checker, Expression element) -> ArgumentValue {
-    let shaped = shapedArgument(checker, "", element);
+// 'target' is the type of the elements of the parameter the array fills, where it is known.
+elementValue(ArgumentOrder order, Expression element, Type? target) -> ArgumentValue {
+    let shaped = shapedArgument(order, "", element, target);
     if (shaped != null) {
         return shaped;
     }
+    let checker = order.analyzer();
     Type analyzed = checker.analyzeBeforeChoosing(element);
     return functioncalls.argumentValueOf(checker, "", element, analyzed);
 }

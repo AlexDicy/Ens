@@ -913,3 +913,177 @@ test "a generic call with the wrong number of arguments is refused for the argum
         + "type argument 'T' is. Write it, as in 'make<int>()'.");
     try testing.assertEqual(found.length, 3L);
 }
+
+// A call analyzes its arguments in the order it writes them. One that waits for its parameter, a
+// lambda or a '{...}' literal, is typed once the type arguments or the candidate are known, but a
+// write in a later argument reaches none of the arguments before it: not the field values of a
+// literal, and not the locals a lambda copies, which must be assigned where the lambda is created. A
+// refused call reports the problems of the arguments after the one that waits, each once.
+test "a write in a later argument does not reach an argument held back for its parameter" {
+    let analysis = try sema_support.analyzeOne("struct Count \{\n"
+        + "    long n;\n"
+        + "\}\n"
+        + "class Box \{\n"
+        + "    protected constructor(() -> long body, long other);\n"
+        + "    protected constructor(() -> long body, string other);\n"
+        + "\}\n"
+        + "take<T>(Count count, T value) -> long \{ return count.n; \}\n"
+        + "apply<T, U>(() -> T body, U value) -> T \{ return body(); \}\n"
+        + "run(Count count, string? value) -> long \{ return count.n; \}\n"
+        + "run(Count count, int value) -> long \{ return count.n; \}\n"
+        + "named(() -> long body, long value) -> long \{ return body() + value; \}\n"
+        + "pick() -> string? \{ return null; \}\n"
+        + "main() -> int \{\n"
+        + "    string? held = pick();\n"
+        + "    let generic = take(\{ n: held.length \}, held = \"abc\");\n"
+        + "    string? other = pick();\n"
+        + "    let overloaded = run(\{ n: other.length \}, other = \"abc\");\n"
+        + "    long first;\n"
+        + "    let captured = apply<long, long>(() -> first, first = 5);\n"
+        + "    long second;\n"
+        + "    let built = new Box(() -> second, second = 5);\n"
+        + "    long third;\n"
+        + "    let byName = named(body: () -> third, value: third = 5);\n"
+        + "    let refused = take(\{ n: 1 \}, missing);\n"
+        + "    let unresolved = run(\{ n: 1 \}, missing);\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let found = analysis.bodyDiagnostics();
+    string file = "/proj/src/main.ens";
+    string member = "Cannot read a member of 'string?' because it may be null here.";
+    string unassigned = "is used before it is assigned a value. The lambda copies";
+    try sema_support.assertDiagnostic(found, 0, file, "{member} Check 'held' for null first "
+        + "('if (held != null)').");
+    try sema_support.assertDiagnostic(found, 1, file, "{member} Check 'other' for null first "
+        + "('if (other != null)').");
+    for (long i = 0; i < 3; i++) {
+        string name = ["first", "second", "third"][i];
+        try sema_support.assertDiagnostic(found, 2 + i, file, "Variable '{name}' {unassigned} '{name}' "
+            + "when it is created. The assignment '{name} = 5' comes later in the same call. Assign '{name}' "
+            + "before the call, for example '{name} = 5;'.");
+    }
+    string undefined = "Undefined name 'missing'. Check the spelling, or declare it before it is used.";
+    try sema_support.assertDiagnostic(found, 5, file, undefined);
+    try sema_support.assertDiagnostic(found, 6, file, undefined);
+    try testing.assertEqual(found.length, 7L);
+}
+
+// A write in an argument that waits for its parameter happens before the arguments after it, so it
+// narrows them, or ends a narrowing they would read.
+test "a write in an argument held back for its parameter reaches the arguments after it" {
+    let analysis = try sema_support.analyzeOne("struct Count \{\n"
+        + "    long n;\n"
+        + "\}\n"
+        + "class Box \{\n"
+        + "    protected constructor(Count count, long other);\n"
+        + "    protected constructor(Count count, string other);\n"
+        + "\}\n"
+        + "take<T>(Count count, T value) -> long \{ return count.n; \}\n"
+        + "run(Count count, long value) -> long \{ return count.n; \}\n"
+        + "run(Count count, string value) -> long \{ return count.n; \}\n"
+        + "named(Count count, long value) -> long \{ return count.n + value; \}\n"
+        + "measure(string? text) -> long \{ return 0; \}\n"
+        + "pick() -> string? \{ return null; \}\n"
+        + "narrowed() -> long \{\n"
+        + "    string? held = pick();\n"
+        + "    let generic = take(\{ n: measure(held = \"abc\") \}, held.length);\n"
+        + "    string? other = pick();\n"
+        + "    let overloaded = run(\{ n: measure(other = \"abc\") \}, other.length);\n"
+        + "    string? boxed = pick();\n"
+        + "    let built = new Box(\{ n: measure(boxed = \"abc\") \}, boxed.length);\n"
+        + "    string? byName = pick();\n"
+        + "    return named(count: \{ n: measure(byName = \"abc\") \}, value: byName.length);\n"
+        + "\}\n"
+        + "ended() -> long \{\n"
+        + "    string? held = \"abc\";\n"
+        + "    let generic = take(\{ n: (held = pick()) == null ? 0 : 1 \}, held.length);\n"
+        + "    string? other = \"abc\";\n"
+        + "    return run(\{ n: (other = pick()) == null ? 0 : 1 \}, other.length);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let found = analysis.bodyDiagnostics();
+    string file = "/proj/src/main.ens";
+    string member = "Cannot read a member of 'string?' because it may be null here.";
+    try sema_support.assertDiagnostic(found, 0, file, "{member} Check 'held' for null first "
+        + "('if (held != null)').");
+    try sema_support.assertDiagnostic(found, 1, file, "{member} Check 'other' for null first "
+        + "('if (other != null)').");
+    try testing.assertEqual(found.length, 2L);
+}
+
+// The elements of an array literal argument are analyzed in the order they are written too, so an
+// element that waits for its parameter reads nothing a later element writes, and a later element
+// reads what an earlier one writes. That holds whether every candidate gives the literal the same
+// type or each gives it its own, for a function and for a method alike.
+test "the elements of an array literal argument are analyzed in the order they are written" {
+    let analysis = try sema_support.analyzeOne("struct Count \{\n"
+        + "    long n;\n"
+        + "\}\n"
+        + "class Runner \{\n"
+        + "    protected constructor();\n"
+        + "    protected run((() -> long)[] bodies) -> long \{ return 0; \}\n"
+        + "    protected run(long[] values) -> long \{ return 0; \}\n"
+        + "\}\n"
+        + "pick() -> string? \{ return null; \}\n"
+        + "countOf(string? text) -> Count \{ return \{ n: 0 \}; \}\n"
+        + "make(long value) -> () -> long \{ return () -> value; \}\n"
+        + "consume(Count[] counts, long other) -> long \{ return 0; \}\n"
+        + "consume(long[] values, string other) -> long \{ return 0; \}\n"
+        + "same(Count[] counts, long other) -> long \{ return 0; \}\n"
+        + "same(Count[] counts, string other) -> long \{ return 0; \}\n"
+        + "run((() -> long)[] bodies) -> long \{ return 0; \}\n"
+        + "run(long[] values) -> long \{ return 0; \}\n"
+        + "main() -> int \{\n"
+        + "    string? held = pick();\n"
+        + "    let different = consume([\{ n: held.length \}, countOf(held = \"abc\")], 1);\n"
+        + "    string? other = pick();\n"
+        + "    let agreed = same([\{ n: other.length \}, countOf(other = \"abc\")], 1);\n"
+        + "    string? earlier = pick();\n"
+        + "    let ordered = consume([countOf(earlier = \"abc\"), \{ n: earlier.length \}], 1);\n"
+        + "    long first;\n"
+        + "    let captured = run([() -> first, make(first = 5)]);\n"
+        + "    long second;\n"
+        + "    let method = new Runner().run([() -> second, make(second = 5)]);\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let found = analysis.bodyDiagnostics();
+    string file = "/proj/src/main.ens";
+    string member = "Cannot read a member of 'string?' because it may be null here.";
+    try sema_support.assertDiagnostic(found, 0, file, "{member} Check 'held' for null first "
+        + "('if (held != null)').");
+    try sema_support.assertDiagnostic(found, 1, file, "{member} Check 'other' for null first "
+        + "('if (other != null)').");
+    for (long i = 0; i < 2; i++) {
+        string name = ["first", "second"][i];
+        try sema_support.assertDiagnostic(found, 2 + i, file, "Variable '{name}' is used before it is "
+            + "assigned a value. The lambda copies '{name}' when it is created. The assignment '{name} = 5' "
+            + "comes later in the same call. Assign '{name}' before the call, for example '{name} = 5;'.");
+    }
+    try testing.assertEqual(found.length, 4L);
+}
+
+// Calls nested in the arguments of calls whose candidates give a '{...}' literal different types are
+// ranked from trials, and each one reports its own problems once, wherever it is nested.
+test "a call nested in arguments ranked from a trial reports its problems once" {
+    let analysis = try sema_support.analyzeOne("struct Count \{\n"
+        + "    long n;\n"
+        + "\}\n"
+        + "struct Other \{\n"
+        + "    long n;\n"
+        + "\}\n"
+        + "f(Count count, long value) -> long \{ return value; \}\n"
+        + "f(Other other, string value) -> long \{ return 0; \}\n"
+        + "main() -> int \{\n"
+        + "    let later = f(\{ n: 1 \}, f(\{ n: 1 \}, f(\{ n: missing \}, 1)));\n"
+        + "    let inside = f(\{ n: f(\{ n: f(\{ n: 1 \}, absent) \}, 1) \}, 1);\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let found = analysis.bodyDiagnostics();
+    string file = "/proj/src/main.ens";
+    string undefined = "Check the spelling, or declare it before it is used.";
+    try sema_support.assertDiagnostic(found, 0, file, "Undefined name 'missing'. {undefined}");
+    try sema_support.assertDiagnostic(found, 1, file, "Undefined name 'absent'. {undefined}");
+    try testing.assertEqual(found.length, 2L);
+}
