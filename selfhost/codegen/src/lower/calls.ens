@@ -16,7 +16,6 @@ import Signature from @ens.sema.model.typemembers;
 import @ens.sema.model.typemembers;
 import Type from @ens.sema.model.types;
 import @ens.sema.model.types;
-import EirAccess from eir.model;
 import EirCallee from eir.model;
 import EirCall from eir.model;
 import EirTryCall from eir.model;
@@ -260,18 +259,45 @@ public lowerDispatchedInvocation(LoweringContext lowering, FunctionInfo info,
                                  ArgumentListNode? arguments, GreenNode orderKey, Span span,
                                  Type? receiverType, long receiver, long dispatchSlot,
                                  Type? dispatchInterface) -> long {
-    let temporaries = new List<long>();
+    let temporaries = new CallTemporaries();
     let values = lowerArguments(lowering, info, arguments, orderKey, span, temporaries);
     if (values == null) {
         return -1;
     }
     long result = emitCall(lowering, info, receiverType, receiver, values, dispatchSlot,
         dispatchInterface, span);
-    for (long i = 0; i < temporaries.length(); i++) {
-        lowering.unprotectValue(temporaries.get(i));
-        ownership.releaseValue(lowering, temporaries.get(i));
-    }
+    temporaries.release(lowering);
     return result;
+}
+
+// What the arguments of one call keep alive until it returns: the references they produced or read
+// retained, and the slots holding the structs they made or copied. Each is protected while the call
+// runs, so an unwind out of a later argument or the call itself releases it too.
+public final class CallTemporaries {
+    List<long> heldReferences;
+    List<long> heldCopies;
+
+    public constructor() {
+        this.heldReferences = new List<long>();
+        this.heldCopies = new List<long>();
+    }
+
+    public references() -> List<long> {
+        return this.heldReferences;
+    }
+
+    public copies() -> List<long> {
+        return this.heldCopies;
+    }
+
+    // Releases everything the arguments kept alive, once the call has returned.
+    public release(LoweringContext lowering) {
+        for (let value in this.heldReferences) {
+            lowering.unprotectValue(value);
+            ownership.releaseValue(lowering, value);
+        }
+        structs.releaseCopies(lowering, this.heldCopies);
+    }
 }
 
 // True when the callee's shape is one lowering can emit. 'described' names the callee the way the
@@ -328,10 +354,10 @@ calleeType(LoweringContext lowering, FunctionInfo info, Type declared) -> Type {
 }
 
 // The argument temps in parameter order: each written argument converted to its parameter's type,
-// then every parameter left unbound filled from its declared default. Every reference an argument
-// produced lands in 'temporaries' for the call site to release once the call has run.
+// then every parameter left unbound filled from its declared default. Every reference or struct an
+// argument produced lands in 'temporaries' for the call site to release once the call has run.
 lowerArguments(LoweringContext lowering, FunctionInfo info, ArgumentListNode? arguments,
-               GreenNode orderKey, Span span, List<long> temporaries) -> long[]? {
+               GreenNode orderKey, Span span, CallTemporaries temporaries) -> long[]? {
     Parameter[] parameters = info.signature().parameters();
     let writtenArguments = argumentExpressions(arguments);
     if (writtenArguments == null) {
@@ -372,15 +398,14 @@ lowerArguments(LoweringContext lowering, FunctionInfo info, ArgumentListNode? ar
     return slots;
 }
 
-// One argument at its parameter's type. A reference the argument produced, or one it read out of
-// storage the call could overwrite, is recorded so the call site releases it afterwards, and
-// protected so an unwind out of a later argument or the call itself releases it too; a struct it
-// produced goes into storage the enclosing scope releases, because a struct's +1 is in its fields
-// and only an address reaches them.
+// One argument at its parameter's type. A reference or a struct the argument produced, or one it
+// read out of storage the call could overwrite, is recorded in 'temporaries' for the call site to
+// release once the call returns. A struct is kept in a copy of its own, because a struct's +1 is
+// in its fields and only an address reaches them.
 public lowerArgument(LoweringContext lowering, Expression argument, Type parameterType,
-              List<long> temporaries) -> long {
+              CallTemporaries temporaries) -> long {
     if (primitives.isReferenceType(parameterType) && !places.producesOwnedValue(lowering, argument)) {
-        return classes.callOperand(lowering, argument, parameterType, temporaries);
+        return classes.callOperand(lowering, argument, parameterType, temporaries.references());
     }
     if (!primitives.hasArcContent(parameterType) || !places.producesOwnedValue(lowering, argument)) {
         return expressions.lowerConverted(lowering, argument, parameterType);
@@ -390,11 +415,11 @@ public lowerArgument(LoweringContext lowering, Expression argument, Type paramet
         if (value < 0) {
             return -1;
         }
-        temporaries.push(value);
+        temporaries.references().push(value);
         lowering.protectValue(value);
         return value;
     }
-    long address = structs.addressOf(lowering, argument, parameterType, EirAccess.Read);
+    long address = structs.callOperand(lowering, argument, parameterType, temporaries.copies());
     if (address < 0) {
         return -1;
     }
@@ -453,7 +478,7 @@ parameterTypesOf(LoweringContext lowering, FunctionInfo info, Signature signatur
 // A parameter left unbound takes its declared default, evaluated at the call site. The default
 // expression is in the callee's module, so its side tables come from there.
 lowerDefaultArgument(LoweringContext lowering, FunctionInfo callee, long parameterIndex,
-                     Type parameterType, Span callSpan, List<long> temporaries) -> long {
+                     Type parameterType, Span callSpan, CallTemporaries temporaries) -> long {
     let declaration = callee.declaration();
     if (declaration == null) {
         lowering.internalError("callee '{callee.signature().name()}' has no declaration for "
