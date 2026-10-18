@@ -611,7 +611,8 @@ test "unsound reads stay rejected under narrowing" {
         + "('if (d != null)').");
     try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
         "Function 'widened' returns 'int', but this value has type 'int?'. The value may be null here. "
-        + "Check 'n' for null first ('if (n != null)').");
+        + "'n' is assigned a value of type 'int?', which can be null. Check 'n' for null after the "
+        + "assignment ('if (n != null)').");
     try sema_support.assertDiagnostic(reported, 2, "/proj/src/main.ens",
         "'y' has type 'int', which can never be null, so the fallback after '??' is never used. Remove "
         + "'?? 3', or give 'y' a nullable type such as 'int?'.");
@@ -1204,9 +1205,251 @@ test "a capture's narrowing does not reach a lambda local that hides it or copie
         "Cannot read a member of 'string?' because it may be null here. Check 'held' for null first "
         + "('if (held != null)').");
     try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
-        "Cannot read a member of 'string?' because it may be null here. Check 'copy' for null first "
+        "Cannot read a member of 'string?' because it may be null here. 'copy' is assigned a value of "
+        + "type 'string?', which can be null. Check 'copy' for null after the assignment "
         + "('if (copy != null)').");
     try testing.assertEqual(reported.length, 2L);
+}
+
+// A read refused because a write ended the narrowing that covered it names the write, with a note at
+// it: an assignment of a value that can be null, an assignment of 'null', which no check can fix, a
+// write of a 'const' field in a constructor, an 'out' argument, and an assignment in a loop, which can
+// run before a later pass reaches the read, and before a read after the loop. A check that narrows
+// again ends the reason.
+test "a read whose narrowing a write ended names the write" {
+    let analysis = try sema_support.analyzeOne("external from libc \{\n"
+        + "    reset(out int? slot) -> int;\n"
+        + "\}\n"
+        + "pick() -> string? \{ return null; \}\n"
+        + "class Holder \{\n"
+        + "    protected const string? fixed = \"start\";\n"
+        + "\n"
+        + "    protected constructor() \{\n"
+        + "        if (this.fixed != null) \{\n"
+        + "            this.fixed = pick();\n"
+        + "            long size = this.fixed.length;\n"
+        + "        \}\n"
+        + "    \}\n"
+        + "\}\n"
+        + "assigned() -> long \{\n"
+        + "    string? name = \"start\";\n"
+        + "    name = pick();\n"
+        + "    return name.length;\n"
+        + "\}\n"
+        + "assignedNull() -> long \{\n"
+        + "    string? name = \"start\";\n"
+        + "    name = null;\n"
+        + "    return name.length;\n"
+        + "\}\n"
+        + "passedOut() -> int \{\n"
+        + "    int? count = 3;\n"
+        + "    let ignored = reset(out count);\n"
+        + "    return count;\n"
+        + "\}\n"
+        + "looped() -> long \{\n"
+        + "    string? name = \"start\";\n"
+        + "    long total = 0;\n"
+        + "    while (total < 9) \{\n"
+        + "        total = total + name.length;\n"
+        + "        name = pick();\n"
+        + "    \}\n"
+        + "    return total + name.length;\n"
+        + "\}\n"
+        + "checkedAgain() -> long \{\n"
+        + "    string? name = pick();\n"
+        + "    name = pick();\n"
+        + "    if (name == null) \{ return 0; \}\n"
+        + "    return name.length;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string file = "/proj/src/main.ens";
+    string member = "Cannot read a member of 'string?' because it may be null here.";
+    try sema_support.assertDiagnostic(reported, 0, file, "{member} 'this.fixed' is assigned a value of "
+        + "type 'string?', which can be null. Check 'this.fixed' for null after the assignment "
+        + "('if (this.fixed != null)').");
+    try testing.assertEqual((try sema_support.relatedOf(reported[0])).note(),
+        "'this.fixed' is assigned here");
+    try sema_support.assertDiagnostic(reported, 1, file, "{member} 'name' is assigned a value of type "
+        + "'string?', which can be null. Check 'name' for null after the assignment ('if (name != null)').");
+    try testing.assertEqual((try sema_support.relatedOf(reported[1])).note(), "'name' is assigned here");
+    try sema_support.assertDiagnostic(reported, 2, file, "{member} 'name' is assigned 'null'.");
+    try testing.assertEqual((try sema_support.relatedOf(reported[2])).note(), "'name' is assigned here");
+    try sema_support.assertDiagnostic(reported, 3, file, "Function 'passedOut' returns 'int', but this value "
+        + "has type 'int?'. The value may be null here. Passing 'out count' lets 'reset' write any value to "
+        + "'count'. Check 'count' for null after the call ('if (count != null)').");
+    try testing.assertEqual((try sema_support.relatedOf(reported[3])).note(),
+        "'reset' can write 'count' here");
+    try sema_support.assertDiagnostic(reported, 4, file, "{member} 'name' is not null when the loop "
+        + "starts, but the loop assigns it, so it may be null on a later pass. Check 'name' for null inside "
+        + "the loop ('if (name != null)').");
+    let write = try sema_support.relatedOf(reported[4]);
+    try testing.assertEqual(write.note(), "'name' is assigned here");
+    try testing.assertTrue(write.span().start > reported[4].span().start,
+        "the note points at the assignment after the read");
+    try sema_support.assertDiagnostic(reported, 5, file, "{member} 'name' is assigned a value of type "
+        + "'string?', which can be null. Check 'name' for null after the 'while' loop "
+        + "('if (name != null)').");
+    try testing.assertEqual((try sema_support.relatedOf(reported[5])).note(), "'name' is assigned here");
+    try testing.assertEqual(reported.length, 6L);
+}
+
+// A loop that drops a narrowing where it starts still names the write that runs before the read on the
+// same pass, in the body or the condition, and the latest write is the one named. A write of 'null' in a
+// branch, an arm or a loop the read comes after names where it is, with the check after that statement.
+test "a write earlier on the same pass, or in a branch or loop before the read, is named" {
+    string source = "pick() -> string? \{ return null; \}\n"
+        + "enum Mode \{ Plain, Empty, \}\n"
+        + "samePass(bool go) -> long \{\n"
+        + "    string? fresh = \"a\";\n"
+        + "    long total = 0;\n"
+        + "    while (go) \{\n"
+        + "        fresh = pick();\n"
+        + "        total = total + fresh.length;\n"
+        + "    \}\n"
+        + "    return total;\n"
+        + "\}\n"
+        + "conditionWrite() -> long \{\n"
+        + "    string? polled = \"a\";\n"
+        + "    long total = 0;\n"
+        + "    while ((polled = pick()) == null && total < 2) \{\n"
+        + "        total = total + polled.length;\n"
+        + "    \}\n"
+        + "    return total;\n"
+        + "\}\n"
+        + "latest() -> long \{\n"
+        + "    string? last = \"a\";\n"
+        + "    last = null;\n"
+        + "    last = pick();\n"
+        + "    return last.length;\n"
+        + "\}\n"
+        + "joinedNull(bool flag) -> long \{\n"
+        + "    string? cleared = \"start\";\n"
+        + "    if (flag) \{ cleared = null; \}\n"
+        + "    return cleared.length;\n"
+        + "\}\n"
+        + "breakNull(bool go) -> long \{\n"
+        + "    string? stopped = \"a\";\n"
+        + "    while (go) \{\n"
+        + "        stopped = null;\n"
+        + "        if (go) \{ break; \}\n"
+        + "        stopped = \"x\";\n"
+        + "    \}\n"
+        + "    return stopped.length;\n"
+        + "\}\n"
+        + "innerBreak(bool go) -> long \{\n"
+        + "    string? inner = \"a\";\n"
+        + "    long total = 0;\n"
+        + "    while (total < 3) \{\n"
+        + "        total = total + 1;\n"
+        + "        for (int i = 0; i < 2; i++) \{\n"
+        + "            inner = null;\n"
+        + "            break;\n"
+        + "        \}\n"
+        + "        total = total + inner.length;\n"
+        + "        inner = \"y\";\n"
+        + "    \}\n"
+        + "    return total;\n"
+        + "\}\n"
+        + "switched(Mode mode) -> long \{\n"
+        + "    string? chosen = \"start\";\n"
+        + "    switch (mode) \{\n"
+        + "        Plain -> \{ chosen = \"plain\"; \},\n"
+        + "        Empty -> \{ chosen = null; \},\n"
+        + "    \}\n"
+        + "    return chosen.length;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n";
+    let analysis = try sema_support.analyzeOne(source);
+    let reported = analysis.bodyDiagnostics();
+    string file = "/proj/src/main.ens";
+    string member = "Cannot read a member of 'string?' because it may be null here.";
+    for (long i = 0; i < 3; i++) {
+        string name = ["fresh", "polled", "last"][i];
+        try sema_support.assertDiagnostic(reported, i, file, "{member} '{name}' is assigned a value of type "
+            + "'string?', which can be null. Check '{name}' for null after the assignment "
+            + "('if ({name} != null)').");
+        try testing.assertEqual((try sema_support.relatedOf(reported[i])).note(), "'{name}' is assigned here");
+    }
+    try testing.assertEqual((try sema_support.relatedOf(reported[2])).span().start,
+        source.indexOf("last = pick()"));
+    try sema_support.assertDiagnostic(reported, 3, file, "{member} 'cleared' is assigned 'null' in one "
+        + "branch of the 'if' statement. Check 'cleared' for null after the 'if' statement "
+        + "('if (cleared != null)').");
+    try sema_support.assertDiagnostic(reported, 4, file, "{member} 'stopped' is assigned 'null' in the "
+        + "'while' loop. Check 'stopped' for null after the 'while' loop ('if (stopped != null)').");
+    try sema_support.assertDiagnostic(reported, 5, file, "{member} 'inner' is assigned 'null' in the 'for' "
+        + "loop. Check 'inner' for null after the 'for' loop ('if (inner != null)').");
+    try sema_support.assertDiagnostic(reported, 6, file, "{member} 'chosen' is assigned 'null' in one arm "
+        + "of the 'switch'. Check 'chosen' for null after the 'switch' ('if (chosen != null)').");
+    for (long i = 3; i < 7; i++) {
+        string name = ["cleared", "stopped", "inner", "chosen"][i - 3];
+        try testing.assertEqual((try sema_support.relatedOf(reported[i])).note(), "'{name}' is assigned here");
+    }
+    try testing.assertEqual(reported.length, 7L);
+}
+
+// A write in a branch that ends a narrowing is named after the join too, with the check written after
+// the statement whose branches meet, since the other branches reach the read as well. A write in the
+// statement that reads the value leaves no place for a check, so the refusal stops after the reason. A
+// loop that writes the local a field is read through names that write, and a read in the condition of a
+// 'while' gets the check written at the start of that condition.
+test "a read whose narrowing a write in a branch, a loop or the same statement ended names it" {
+    let analysis = try sema_support.analyzeOne("struct Pair \{\n"
+        + "    const string? fixed;\n"
+        + "\}\n"
+        + "pick() -> string? \{ return null; \}\n"
+        + "measure(string? text, long size) -> long \{ return size; \}\n"
+        + "joined(bool flag) -> long \{\n"
+        + "    string? name = \"start\";\n"
+        + "    if (flag) \{ name = pick(); \} else \{ name = pick(); \}\n"
+        + "    return name.length;\n"
+        + "\}\n"
+        + "sameStatement() -> long \{\n"
+        + "    string? name = \"start\";\n"
+        + "    return measure(name = pick(), name.length);\n"
+        + "\}\n"
+        + "rootWritten() -> long \{\n"
+        + "    Pair pair = \{ fixed: \"start\" \};\n"
+        + "    if (pair.fixed == null) \{ return 0; \}\n"
+        + "    long total = 0;\n"
+        + "    while (total < 9) \{\n"
+        + "        total = total + pair.fixed.length;\n"
+        + "        pair = \{ fixed: pick() \};\n"
+        + "    \}\n"
+        + "    return total;\n"
+        + "\}\n"
+        + "condition() -> long \{\n"
+        + "    string? name = \"start\";\n"
+        + "    long total = 0;\n"
+        + "    while (name.length < 5) \{\n"
+        + "        name = pick();\n"
+        + "        total++;\n"
+        + "    \}\n"
+        + "    return total;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string file = "/proj/src/main.ens";
+    string member = "Cannot read a member of 'string?' because it may be null here.";
+    string nullable = "'name' is assigned a value of type 'string?', which can be null.";
+    try sema_support.assertDiagnostic(reported, 0, file, "{member} {nullable} Check 'name' for null after the "
+        + "'if' statement ('if (name != null)').");
+    try sema_support.assertDiagnostic(reported, 1, file, "{member} {nullable}");
+    try sema_support.assertDiagnostic(reported, 2, file, "{member} 'pair.fixed' is not null when the loop "
+        + "starts, but the loop assigns 'pair', so 'pair.fixed' may be null on a later pass. Check "
+        + "'pair.fixed' for null inside the loop ('if (pair.fixed != null)').");
+    try testing.assertEqual((try sema_support.relatedOf(reported[2])).note(), "'pair' is assigned here");
+    try sema_support.assertDiagnostic(reported, 3, file, "{member} 'name' is not null when the loop "
+        + "starts, but the loop assigns it, so it may be null on a later pass. Check 'name' for null at "
+        + "the start of the condition, as in 'while (name != null && name.length < 5)'.");
+    try testing.assertEqual(reported.length, 4L);
 }
 
 // A write that is refused never runs, so the narrowing it would drop holds after it, and in a loop
@@ -1358,14 +1601,17 @@ test "a narrowing made before a loop holds there unless a write in the loop can 
     let reported = analysis.bodyDiagnostics();
     string file = "/proj/src/main.ens";
     string member = "Cannot read a member of 'string?' because it may be null here.";
-    try sema_support.assertDiagnostic(reported, 0, file,
-        "Type 'Shape' has no field or method named 'radius'.");
-    try sema_support.assertDiagnostic(reported, 1, file, "{member} Check 'name' for null first "
-        + "('if (name != null)').");
-    try sema_support.assertDiagnostic(reported, 2, file, "{member} Check 'text' for null first "
-        + "('if (text != null)').");
-    try sema_support.assertDiagnostic(reported, 3, file, "{member} Check 'first' for null first "
-        + "('if (first != null)').");
+    try sema_support.assertDiagnostic(reported, 0, file, "Type 'Shape' has no field or method named 'radius'. "
+        + "'shape' is a 'Circle' when the loop starts, but the loop assigns it a 'Square', so it may be any "
+        + "'Shape' on a later pass. Test 'shape' inside the loop, as in 'if (shape is Circle)'.");
+    try testing.assertEqual((try sema_support.relatedOf(reported[0])).note(), "'shape' is assigned here");
+    string later = "is not null when the loop starts, but the loop assigns it, so it may be null on a later "
+        + "pass.";
+    try sema_support.assertDiagnostic(reported, 1, file, "{member} 'name' {later} Check 'name' for null "
+        + "inside the loop ('if (name != null)').");
+    try sema_support.assertDiagnostic(reported, 2, file, "{member} 'text' {later}");
+    try sema_support.assertDiagnostic(reported, 3, file, "{member} 'first' {later} Check 'first' for null "
+        + "inside the loop ('if (first != null)').");
     try testing.assertEqual(reported.length, 4L);
 }
 
@@ -1430,12 +1676,14 @@ test "a loop inside a loop is settled with it" {
     let reported = analysis.bodyDiagnostics();
     string file = "/proj/src/main.ens";
     string member = "Cannot read a member of 'string?' because it may be null here.";
-    try sema_support.assertDiagnostic(reported, 0, file, "{member} Check 'outer' for null first "
-        + "('if (outer != null)').");
-    try sema_support.assertDiagnostic(reported, 1, file, "{member} Check 'inner' for null first "
-        + "('if (inner != null)').");
-    try sema_support.assertDiagnostic(reported, 2, file, "{member} Check 'first' for null first "
-        + "('if (first != null)').");
+    string later = "is not null when the loop starts, but the loop assigns it, so it may be null on a later "
+        + "pass.";
+    for (long i = 0; i < 3; i++) {
+        string name = ["outer", "inner", "first"][i];
+        try sema_support.assertDiagnostic(reported, i, file, "{member} '{name}' {later} Check '{name}' for "
+            + "null inside the loop ('if ({name} != null)').");
+        try testing.assertEqual((try sema_support.relatedOf(reported[i])).note(), "'{name}' is assigned here");
+    }
     try testing.assertEqual(reported.length, 3L);
 }
 
@@ -1511,10 +1759,12 @@ test "a local declared inside a loop settles, and a loop no pass reaches settles
     let reported = analysis.bodyDiagnostics();
     string file = "/proj/src/main.ens";
     string member = "Cannot read a member of 'string?' because it may be null here.";
-    try sema_support.assertDiagnostic(reported, 0, file, "{member} Check 'inner' for null first "
-        + "('if (inner != null)').");
-    try sema_support.assertDiagnostic(reported, 1, file, "{member} Check 'inner' for null first "
-        + "('if (inner != null)').");
+    for (long i = 0; i < 2; i++) {
+        try sema_support.assertDiagnostic(reported, i, file, "{member} 'inner' is not null when the loop "
+            + "starts, but the loop assigns it, so it may be null on a later pass. Check 'inner' for null "
+            + "inside the loop ('if (inner != null)').");
+        try testing.assertEqual((try sema_support.relatedOf(reported[i])).note(), "'inner' is assigned here");
+    }
     try testing.assertEqual(reported.length, 2L);
 }
 

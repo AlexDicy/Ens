@@ -24,6 +24,9 @@ import SubscriptExpressionNode from @ens.frontend.syntax.generated.nodes;
 import SafeSubscriptExpressionNode from @ens.frontend.syntax.generated.nodes;
 import TernaryExpressionNode from @ens.frontend.syntax.generated.nodes;
 import AssignmentExpressionNode from @ens.frontend.syntax.generated.nodes;
+import BinaryExpressionNode from @ens.frontend.syntax.generated.nodes;
+import Statement from @ens.frontend.syntax.generated.nodes;
+import WhileStatementNode from @ens.frontend.syntax.generated.nodes;
 import SyntaxKind from @ens.frontend.syntax.generated.kind;
 import GreenElement from @ens.frontend.syntax.green;
 import GreenNode from @ens.frontend.syntax.green;
@@ -35,6 +38,8 @@ import LiteralOrigin from phases.bodies.literaltargets;
 import phases.bodies.wording;
 import phases.bodies.narrowing;
 import phases.bodies.lambdas;
+import NarrowingEndKind from model.narrow;
+import NarrowingEnd from model.narrow;
 import model.hierarchy;
 import model.typemembers;
 import Field from model.typemembers;
@@ -120,6 +125,11 @@ public final class NullableOperand {
     // The assignment to the local the value is that comes later in the call the lambda being checked is
     // passed to, after the lambda copies the local, or empty where there is none.
     protected string laterAssignment = "";
+    // Where a write ended a proof that covered the value: why the value may be null here, carrying
+    // the note at the write, and where the check to write goes, as in "after the call", which is
+    // empty where no check helps. Empty anywhere else.
+    protected string endedReason = "";
+    protected string endedWhere = "";
 
     protected constructor(this.operandForm, this.levels, this.spelling, this.heldSpelling, this.localName,
                           this.declarationText, this.words, this.callee, this.writeBack, this.stores,
@@ -488,6 +498,9 @@ public classifyOperand(BodyChecker checker, Expression operand, long levels, str
     if (!writesBack && levels > 0) {
         noteLaterAssignment(checker, operand, classified);
     }
+    if (!writesBack && levels > 0 && form == OperandForm.Stable && classified.objectRead.length == 0) {
+        noteEndedNarrowing(checker, operand, classified);
+    }
     return classified;
 }
 
@@ -525,6 +538,114 @@ laterStoredType(BodyChecker checker, AssignmentExpressionNode later) -> Type {
     checker.endTrial();
     return stored;
 }
+
+// Records on 'classified' why 'operand' may be null here where a write ended a proof that covered
+// it: an assignment, an 'out' argument, or either of them in a loop, which can run it before a later
+// pass reaches the read, and before a read after the loop.
+noteEndedNarrowing(BodyChecker checker, Expression operand, NullableOperand classified) {
+    let path = narrowing.buildNarrowingPath(checker, operand);
+    if (path == null) {
+        return;
+    }
+    let end = checker.narrowing().endOf(path);
+    if (end == null) {
+        return;
+    }
+    string place = classified.held();
+    string callee = end.calleeName();
+    string note = "'{place}' is assigned here";
+    string write = "assigns it";
+    string outcome = "it may be null";
+    if (end.kind() == NarrowingEndKind.PassedOut) {
+        note = "'{callee}' can write '{place}' here";
+        write = "passes it as 'out' to '{callee}'";
+    } else if (end.place() != place) {
+        note = "'{end.place()}' is assigned here";
+        write = "assigns '{end.place()}'";
+        outcome = "'{place}' may be null";
+    }
+    string carried = diagnostics.carriedNote(end.at(), note);
+    let loop = end.loop();
+    let stored = end.stored();
+    if (loop != null && narrowing.within(operand.span(), loop)) {
+        string reason = "'{place}' is not null when the loop starts, but the loop {write}, so {outcome} "
+            + "on a later pass.{carried}";
+        if (checker.frame().inLoopCondition()) {
+            classified.endedReason = reason + loopConditionCheck(operand, place);
+        } else {
+            classified.endedReason = reason;
+            classified.endedWhere = "inside the loop";
+        }
+        return;
+    }
+    Span statement = enclosingStatement(operand).span();
+    bool sameStatement = loop == null && narrowing.within(end.at(), statement);
+    if (end.kind() == NarrowingEndKind.PassedOut) {
+        classified.endedReason = "Passing 'out {place}' lets '{callee}' write any value to "
+            + "'{place}'.{carried}";
+        classified.endedWhere = checkPlace(end, sameStatement, "after the call");
+    } else if (end.place() != place) {
+        return;
+    } else if (stored is NullType && end.inJoin()) {
+        classified.endedReason = "'{place}' is assigned 'null' in {end.joinedIn()}.{carried}";
+        classified.endedWhere = checkPlace(end, sameStatement, "");
+    } else if (stored is NullType) {
+        classified.endedReason = "'{place}' is assigned 'null'.{carried}";
+    } else if (stored is OptionalType) {
+        classified.endedReason = "'{place}' is assigned a value of type {checker.names().quoted(stored)}, "
+            + "which can be null.{carried}";
+        classified.endedWhere = checkPlace(end, sameStatement, "after the assignment");
+    }
+}
+
+// Where to check a value whose narrowing the write 'end' ended: after the statement whose branches meet
+// where the write is in one of them or in a loop the read comes after, and otherwise 'after', as in
+// "after the call". Empty where the write is in the statement that reads the value, since no check fits
+// between them.
+checkPlace(NarrowingEnd end, bool sameStatement, string after) -> string {
+    if (sameStatement) {
+        return "";
+    }
+    if (end.inJoin()) {
+        return "after the {end.joinedStatement()}";
+    }
+    return after;
+}
+
+// The statement 'node' is in.
+enclosingStatement(SyntaxNode node) -> SyntaxNode {
+    SyntaxNode current = node;
+    while (!(current is Statement)) {
+        let holder = current.parent();
+        if (holder == null) {
+            return current;
+        }
+        current = holder;
+    }
+    return current;
+}
+
+// The check to add to the condition of the 'while' loop that reads 'operand' in its condition, where
+// the loop can make 'place' null before a later pass reads it. Empty for another loop and where the
+// condition is too long to repeat.
+loopConditionCheck(Expression operand, string place) -> string {
+    let loop = enclosingStatement(operand);
+    if (!(loop is WhileStatementNode)) {
+        return "";
+    }
+    Expression condition = syntax.unwrapParentheses(loop.condition());
+    string spelled = wording.oneLineSpelling(condition);
+    if (spelled.length > wording.quotedCodeLimit()) {
+        return "";
+    }
+    if (condition is TernaryExpressionNode || condition is AssignmentExpressionNode
+            || (condition is BinaryExpressionNode && condition.operator().text() == "||")) {
+        spelled = "({spelled})";
+    }
+    return " Check '{place}' for null at the start of the condition, as in "
+        + "'while ({place} != null && {spelled})'.";
+}
+
 
 // Records on 'classified' the part of 'operand' that the lambda being checked reads from an object,
 // where a proof made where the lambda is created takes off the 'levels' of null the use needs but
@@ -869,7 +990,8 @@ operandsAdvice(NullableOperand[] operands, string operatorText = "") -> string? 
             && (operands[0].objectRead.length == 0) == (operands[1].objectRead.length == 0)
             && (operands[0].copyName.length == 0) == (operands[1].copyName.length == 0)
             && operands[0].objectTest.length == 0 && operands[1].objectTest.length == 0
-            && operands[0].laterAssignment.length == 0 && operands[1].laterAssignment.length == 0) {
+            && operands[0].laterAssignment.length == 0 && operands[1].laterAssignment.length == 0
+            && operands[0].endedReason.length == 0 && operands[1].endedReason.length == 0) {
         let paired = formAdvice(operands, operatorText);
         if (paired != null) {
             return paired;
@@ -905,6 +1027,9 @@ formAdvice(NullableOperand[] operands, string operatorText) -> string? {
     if (first.objectRead.length > 0) {
         return "{narrowing.objectReadReason(objectReads(operands))} {objectReadAdvice(operands)}";
     }
+    if (first.endedReason.length > 0) {
+        return endedAdvice(first);
+    }
     switch (first.form()) {
         Stable -> {
             string names = joinedValues(operands, false, "'", "'", " and ");
@@ -930,6 +1055,19 @@ formAdvice(NullableOperand[] operands, string operatorText) -> string? {
             return null;
         },
     }
+}
+
+// Why an operand whose proof a write ended may be null here, and the check to write where it helps.
+endedAdvice(NullableOperand operand) -> string {
+    if (operand.endedWhere.length == 0) {
+        return operand.endedReason;
+    }
+    string condition = "{operand.held()} != null";
+    string check = "Check '{operand.held()}' for null {operand.endedWhere}";
+    if (operand.levels == 1) {
+        return "{operand.endedReason} {check} ('if ({condition})').";
+    }
+    return "{operand.endedReason} {check}{repeatedCheck(condition, operand.levels, operand.everyLevel)}.";
 }
 
 // The parts of the operands that the lambda being checked reads from objects, each once.

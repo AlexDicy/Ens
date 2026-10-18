@@ -6,6 +6,7 @@ import Type from model.types;
 import LocalBinding from model.scopes;
 import List from @std.collections.list;
 import Map from @std.collections.map;
+import Span from @ens.frontend.support.source;
 
 // One field hop in a narrowing path.
 public class PathSegment {
@@ -153,23 +154,171 @@ public typeLevelPath(Field root) -> NarrowingPath {
     return new NarrowingPath(null, root, new List<PathSegment>());
 }
 
-// The proven types, one map layer per branch of control flow. Establishment writes the top
-// layer; lookup prefers the innermost layer; invalidation erases from every layer, since a
-// write inside a branch may have happened by any later read.
+// What a write that ended a proof did: an assignment, or a call that the place is passed to as 'out'.
+public enum NarrowingEndKind {
+    Assigned,
+    PassedOut,
+}
+
+// The write that ended the proofs of a path: what it did, where it is written, the type an assignment
+// stores, the function an 'out' argument is passed to and the place written, as the code spells it.
+// A write found before a loop runs, because the loop can write the path on a later pass, also records
+// where the loop is written, and where the write leaves a wider proof, the narrower type it ended.
+public final class NarrowingEnd {
+    protected NarrowingEndKind endKind;
+    protected Span writeSpan;
+    protected Type? storedType;
+    protected string callee;
+    protected string writtenPlace;
+    protected Span? loopSpan;
+    protected string joined = "";
+    protected string joinedPart = "";
+    protected Type? narrowerType = null;
+
+    public constructor(this.endKind, this.writeSpan, this.storedType, this.callee, this.writtenPlace,
+                       this.loopSpan);
+
+    public kind() -> NarrowingEndKind {
+        return this.endKind;
+    }
+
+    public at() -> Span {
+        return this.writeSpan;
+    }
+
+    public stored() -> Type? {
+        return this.storedType;
+    }
+
+    public calleeName() -> string {
+        return this.callee;
+    }
+
+    public place() -> string {
+        return this.writtenPlace;
+    }
+
+    public loop() -> Span? {
+        return this.loopSpan;
+    }
+
+    // Whether the write is in a part of a statement that a read after the statement can be reached
+    // without: one branch of a join, or a loop.
+    public inJoin() -> bool {
+        return this.joined.length > 0;
+    }
+
+    // The statement whose branches meet after the write, as in "'if' statement", or empty where none do.
+    public joinedStatement() -> string {
+        return this.joined;
+    }
+
+    // The part of that statement the write is in, as in "one branch of the 'if' statement".
+    public joinedIn() -> string {
+        return this.joinedPart;
+    }
+
+    // The narrower type the write ended where it leaves a wider proof, or null where it leaves none.
+    public narrower() -> Type? {
+        return this.narrowerType;
+    }
+
+    // The same write, found where the branches of 'statement', as in "'if' statement", meet, from 'part',
+    // the part of it the write is in, as in "the 'while' loop".
+    public throughJoin(string statement, string part) -> NarrowingEnd {
+        let copied = this.copy();
+        copied.joined = statement;
+        copied.joinedPart = part;
+        return copied;
+    }
+
+    // The same write, found before the loop written at 'loop' runs.
+    public inLoop(Span loop) -> NarrowingEnd {
+        let copied = this.copy();
+        copied.loopSpan = loop;
+        return copied;
+    }
+
+    // The same write, which leaves a wider proof where a proof of 'narrower' held.
+    public narrowedFrom(Type narrower) -> NarrowingEnd {
+        let copied = this.copy();
+        copied.narrowerType = narrower;
+        return copied;
+    }
+
+    copy() -> NarrowingEnd {
+        let copied = new NarrowingEnd(this.endKind, this.writeSpan, this.storedType, this.callee,
+            this.writtenPlace, this.loopSpan);
+        copied.joined = this.joined;
+        copied.joinedPart = this.joinedPart;
+        copied.narrowerType = this.narrowerType;
+        return copied;
+    }
+}
+
+// The proofs one branch of control flow establishes, the writes there that ended proofs, and the writes
+// that left the wider proofs it holds where narrower ones held.
+public final class NarrowingLayer {
+    protected Map<NarrowingPath, Type> proofs;
+    protected Map<NarrowingPath, NarrowingEnd> ends;
+    protected Map<NarrowingPath, NarrowingEnd> widenings;
+
+    protected constructor() {
+        this.proofs = new Map<NarrowingPath, Type>();
+        this.ends = new Map<NarrowingPath, NarrowingEnd>();
+        this.widenings = new Map<NarrowingPath, NarrowingEnd>();
+    }
+
+    protected copy() -> NarrowingLayer {
+        let copied = new NarrowingLayer();
+        for (let key in this.proofs.keys()) {
+            let proven = this.proofs.get(key);
+            if (proven != null) {
+                copied.proofs.set(key, proven);
+            }
+        }
+        for (let key in this.ends.keys()) {
+            let ended = this.ends.get(key);
+            if (ended != null) {
+                copied.ends.set(key, ended);
+            }
+        }
+        for (let key in this.widenings.keys()) {
+            let widening = this.widenings.get(key);
+            if (widening != null) {
+                copied.widenings.set(key, widening);
+            }
+        }
+        return copied;
+    }
+}
+
+// The proven types, one layer per branch of control flow. Establishment writes the top layer;
+// lookup prefers the innermost layer; invalidation erases from every layer, since a write inside a
+// branch may have happened by any later read, and records the write that ended each proof in the top
+// layer.
 public class NarrowingState {
-    List<Map<NarrowingPath, Type>> layers;
+    List<NarrowingLayer> layers;
 
     public constructor() {
-        this.layers = new List<Map<NarrowingPath, Type>>();
-        this.layers.push(new Map<NarrowingPath, Type>());
+        this.layers = new List<NarrowingLayer>();
+        this.layers.push(new NarrowingLayer());
     }
 
     // A state whose one layer holds the proofs in 'proven'.
     public constructor(Map<NarrowingPath, Type> proven) {
-        this.layers = copyLayers(List.of([proven]));
+        this.layers = new List<NarrowingLayer>();
+        let layer = new NarrowingLayer();
+        for (let key in proven.keys()) {
+            let type = proven.get(key);
+            if (type != null) {
+                layer.proofs.set(key, type);
+            }
+        }
+        this.layers.push(layer);
     }
 
-    // A state with the same proofs in copies of the same layers.
+    // A state with the same proofs and ends in copies of the same layers.
     public copy() -> NarrowingState {
         let copied = new NarrowingState();
         copied.layers = copyLayers(this.layers);
@@ -177,7 +326,7 @@ public class NarrowingState {
     }
 
     public push() {
-        this.layers.push(new Map<NarrowingPath, Type>());
+        this.layers.push(new NarrowingLayer());
     }
 
     public pop() {
@@ -187,12 +336,36 @@ public class NarrowingState {
     }
 
     public narrow(NarrowingPath path, Type proven) {
-        this.layers.get(this.layers.length() - 1).set(path, proven);
+        let top = this.layers.get(this.layers.length() - 1);
+        top.proofs.set(path, proven);
+        top.ends.remove(path);
+        top.widenings.remove(path);
+    }
+
+    // Records 'widening' as the write that left the proof of 'path' here, where a narrower one held.
+    public noteWidening(NarrowingPath path, NarrowingEnd widening) {
+        this.layers.get(this.layers.length() - 1).widenings.set(path, widening);
+    }
+
+    // The write that left the proof of 'path' that holds here where a narrower one held, or null where the
+    // proof that holds is not one a write left.
+    public wideningOf(NarrowingPath path) -> NarrowingEnd? {
+        for (long i = this.layers.length() - 1; i >= 0; i--) {
+            let layer = this.layers.get(i);
+            let widening = layer.widenings.get(path);
+            if (widening != null) {
+                return widening;
+            }
+            if (layer.proofs.get(path) != null) {
+                return null;
+            }
+        }
+        return null;
     }
 
     public provenType(NarrowingPath path) -> Type? {
         for (long i = this.layers.length() - 1; i >= 0; i--) {
-            let found = this.layers.get(i).get(path);
+            let found = this.layers.get(i).proofs.get(path);
             if (found != null) {
                 return found;
             }
@@ -200,27 +373,103 @@ public class NarrowingState {
         return null;
     }
 
-    public clearForRoot(LocalBinding root) {
+    // The write that ended the last proof of 'path', or null where a proof holds or none was ended.
+    public endOf(NarrowingPath path) -> NarrowingEnd? {
+        for (long i = this.layers.length() - 1; i >= 0; i--) {
+            let layer = this.layers.get(i);
+            if (layer.proofs.get(path) != null) {
+                return null;
+            }
+            let ended = layer.ends.get(path);
+            if (ended != null) {
+                return ended;
+            }
+        }
+        return null;
+    }
+
+    // The write that ended the last proof of each path whose proofs a write ended and no proof holds again,
+    // as endOf finds it.
+    public ends() -> Map<NarrowingPath, NarrowingEnd> {
+        let found = new Map<NarrowingPath, NarrowingEnd>();
+        for (let layer in this.layers) {
+            for (let key in layer.proofs.keys()) {
+                found.remove(key);
+            }
+            for (let key in layer.ends.keys()) {
+                let ended = layer.ends.get(key);
+                if (ended != null) {
+                    found.set(key, ended);
+                }
+            }
+        }
+        return found;
+    }
+
+    // Erases the narrowing of 'path', which the write 'end' ended, and records 'end' as what ended it where
+    // an earlier write is recorded.
+    public endProof(NarrowingPath path, NarrowingEnd end) {
+        this.clearWhere((key) -> key == path, end);
+        this.renewWhere((key) -> key == path, end);
+    }
+
+    // Erases every narrowing whose path starts at 'root', which the write 'end' replaces.
+    public clearForRoot(LocalBinding root, NarrowingEnd end) {
+        this.clearWhere((key) -> key.root() == root, end);
+    }
+
+    // Erases every narrowing whose path starts with the written path, since the write 'end' replaces
+    // the storage those paths read.
+    public clearPrefixedBy(NarrowingPath written, NarrowingEnd end) {
+        this.clearWhere((key) -> startsWith(key, written), end);
+    }
+
+    // Records 'end' as what ended each path from 'root' that holds no proof, where an earlier write is
+    // recorded as what ended it, so a read after 'end' names it.
+    public renewForRoot(LocalBinding root, NarrowingEnd end) {
+        this.renewWhere((key) -> key.root() == root, end);
+    }
+
+    // Records 'end' as what ended each path that starts with the written path and holds no proof, where
+    // an earlier write is recorded as what ended it.
+    public renewPrefixedBy(NarrowingPath written, NarrowingEnd end) {
+        this.renewWhere((key) -> startsWith(key, written), end);
+    }
+
+    // Erases every narrowing 'cleared' accepts, and records 'end' as what ended it in the layer that held
+    // it, which can outlast the branch the write is in.
+    clearWhere((NarrowingPath) -> bool cleared, NarrowingEnd end) {
         for (long i = 0; i < this.layers.length(); i++) {
-            this.layers.get(i).removeWhere((key, proven) -> key.root() == root);
+            let layer = this.layers.get(i);
+            for (let key in layer.proofs.keys()) {
+                if (cleared(key)) {
+                    layer.ends.set(key, end);
+                }
+            }
+            layer.proofs.removeWhere((key, proven) -> cleared(key));
+            layer.widenings.removeWhere((key, widening) -> cleared(key));
         }
     }
 
-    // Erases every narrowing whose path starts with the written path, since the write replaces
-    // the storage those paths read.
-    public clearPrefixedBy(NarrowingPath written) {
-        for (long i = 0; i < this.layers.length(); i++) {
-            this.layers.get(i).removeWhere((key, proven) -> startsWith(key, written));
+    // Replaces with 'end' the earlier write each layer records as what ended a path 'renewed' accepts
+    // that holds no proof.
+    renewWhere((NarrowingPath) -> bool renewed, NarrowingEnd end) {
+        for (let layer in this.layers) {
+            for (let key in layer.ends.keys()) {
+                if (renewed(key) && this.provenType(key) == null) {
+                    layer.ends.set(key, end);
+                }
+            }
         }
     }
 
     // A deep copy of every layer, so a branch can be analyzed and then rolled back to the
     // state before it: the alternative arms of a merge each start from the same entry.
-    public snapshotLayers() -> List<Map<NarrowingPath, Type>> {
+    public snapshotLayers() -> List<NarrowingLayer> {
         return copyLayers(this.layers);
     }
 
-    public restoreLayers(List<Map<NarrowingPath, Type>> snapshot) {
+    public restoreLayers(List<NarrowingLayer> snapshot) {
         this.layers = copyLayers(snapshot);
     }
 
@@ -229,7 +478,7 @@ public class NarrowingState {
     public flatten() -> Map<NarrowingPath, Type> {
         let merged = new Map<NarrowingPath, Type>();
         for (long i = 0; i < this.layers.length(); i++) {
-            let layer = this.layers.get(i);
+            let layer = this.layers.get(i).proofs;
             for (let key in layer.keys()) {
                 let value = layer.get(key);
                 if (value != null) {
@@ -242,7 +491,8 @@ public class NarrowingState {
 
     public clearPath(NarrowingPath path) {
         for (long i = 0; i < this.layers.length(); i++) {
-            this.layers.get(i).remove(path);
+            this.layers.get(i).proofs.remove(path);
+            this.layers.get(i).widenings.remove(path);
         }
     }
 }
@@ -260,18 +510,10 @@ public sameProofs(Map<NarrowingPath, Type> left, Map<NarrowingPath, Type> right)
     return true;
 }
 
-copyLayers(List<Map<NarrowingPath, Type>> layers) -> List<Map<NarrowingPath, Type>> {
-    let copy = new List<Map<NarrowingPath, Type>>();
+copyLayers(List<NarrowingLayer> layers) -> List<NarrowingLayer> {
+    let copy = new List<NarrowingLayer>();
     for (long i = 0; i < layers.length(); i++) {
-        let layer = layers.get(i);
-        let duplicate = new Map<NarrowingPath, Type>();
-        for (let key in layer.keys()) {
-            let value = layer.get(key);
-            if (value != null) {
-                duplicate.set(key, value);
-            }
-        }
-        copy.push(duplicate);
+        copy.push(layers.get(i).copy());
     }
     return copy;
 }

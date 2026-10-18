@@ -5,6 +5,8 @@ import BindingKind from model.scopes;
 import model.narrow;
 import NarrowingPath from model.narrow;
 import NarrowingState from model.narrow;
+import NarrowingEnd from model.narrow;
+import NarrowingEndKind from model.narrow;
 import PathSegment from model.narrow;
 import Field from model.typemembers;
 import Type from model.types;
@@ -26,6 +28,11 @@ fieldPath(LocalBinding root, string field) -> NarrowingPath {
     let segments = new List<PathSegment>();
     segments.push(narrow.fieldSegment(field));
     return new NarrowingPath(root, segments);
+}
+
+// An assignment written at offset 'at'.
+write(long at) -> NarrowingEnd {
+    return new NarrowingEnd(NarrowingEndKind.Assigned, source.makeSpan(at, 1), null, "", "value", null);
 }
 
 test "paths compare and hash by content" {
@@ -109,7 +116,7 @@ test "invalidation erases across every layer" {
     state.narrow(narrow.bindingPath(root), intType);
     state.narrow(fieldPath(unrelated, "door"), intType);
 
-    state.clearForRoot(root);
+    state.clearForRoot(root, write(0));
     try testing.assertTrue(state.provenType(narrow.bindingPath(root)) == null,
         "a root clear drops the binding's own narrowing");
     try testing.assertTrue(state.provenType(fieldPath(root, "door")) == null,
@@ -133,7 +140,7 @@ test "a deeper write drops the paths it prefixes and nothing shorter" {
     let written = new List<PathSegment>();
     written.push(narrow.fieldSegment("room"));
     written.push(narrow.fieldSegment("door"));
-    state.clearPrefixedBy(pathOf(house, written));
+    state.clearPrefixedBy(pathOf(house, written), write(0));
     try testing.assertTrue(state.provenType(fieldPath(house, "room")) == intType,
         "writing house.room.door keeps the shorter house.room narrowing");
     let reread = new List<PathSegment>();
@@ -143,13 +150,13 @@ test "a deeper write drops the paths it prefixes and nothing shorter" {
         "writing house.room.door drops house.room.door itself");
 
     state.narrow(pathOf(house, roomDoor), intType);
-    state.clearPrefixedBy(fieldPath(house, "room"));
+    state.clearPrefixedBy(fieldPath(house, "room"), write(0));
     try testing.assertTrue(state.provenType(pathOf(house, roomDoor)) == null,
         "writing house.room drops the deeper house.room.door narrowing");
 
     let other = binding("other", intType);
     state.narrow(fieldPath(house, "room"), intType);
-    state.clearPrefixedBy(fieldPath(other, "room"));
+    state.clearPrefixedBy(fieldPath(other, "room"), write(0));
     try testing.assertTrue(state.provenType(fieldPath(house, "room")) == intType,
         "a write under another root keeps the path");
 }
@@ -186,8 +193,8 @@ test "a type-level root compares by field identity and clears only its own paths
     let state = new NarrowingState();
     state.narrow(narrow.typeLevelPath(label).extended(name), intType);
     state.narrow(narrow.typeLevelPath(other).extended(name), intType);
-    state.clearPrefixedBy(narrow.typeLevelPath(other));
-    state.clearForRoot(local);
+    state.clearPrefixedBy(narrow.typeLevelPath(other), write(0));
+    state.clearForRoot(local, write(0));
     try testing.assertTrue(state.provenType(narrow.typeLevelPath(label).extended(name)) == intType,
         "clearing another field or a binding should keep this field's path");
     try testing.assertTrue(state.provenType(narrow.typeLevelPath(other).extended(name)) == null,
@@ -205,14 +212,14 @@ test "a type-level path and a binding path never prefix each other" {
 
     state.narrow(narrow.typeLevelPath(label).extended(name), intType);
     state.narrow(narrow.bindingPath(local).extended(name), intType);
-    state.clearPrefixedBy(narrow.bindingPath(local));
+    state.clearPrefixedBy(narrow.bindingPath(local), write(0));
     try testing.assertTrue(state.provenType(narrow.typeLevelPath(label).extended(name)) == intType,
         "a write to a binding should keep a type-level path under a field of the same name");
     try testing.assertTrue(state.provenType(narrow.bindingPath(local).extended(name)) == null,
         "a write to a binding should drop the paths it prefixes");
 
     state.narrow(narrow.bindingPath(local).extended(name), intType);
-    state.clearPrefixedBy(narrow.typeLevelPath(label));
+    state.clearPrefixedBy(narrow.typeLevelPath(label), write(0));
     try testing.assertTrue(state.provenType(narrow.bindingPath(local).extended(name)) == intType,
         "clearing a type-level path should keep a binding path of the same name");
     try testing.assertTrue(state.provenType(narrow.typeLevelPath(label).extended(name)) == null,
@@ -271,4 +278,81 @@ test "a state starts from given proofs, and a copy keeps its own layers" {
         "popping a copy leaves the original's layers");
     try testing.assertTrue(copied.provenType(narrow.bindingPath(root)) == intType,
         "a copy keeps the outer proofs");
+}
+
+test "a write that drops a proof is recorded until a proof of the path holds again" {
+    let store = new TypeStore();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let root = binding("value", store.optionalOf(intType));
+    let untouched = binding("other", store.optionalOf(intType));
+    let path = narrow.bindingPath(root);
+    let state = new NarrowingState();
+
+    state.clearForRoot(untouched, write(3));
+    try testing.assertTrue(state.endOf(narrow.bindingPath(untouched)) == null,
+        "a write that drops no proof is not recorded");
+
+    state.narrow(path, intType);
+    state.push();
+    state.clearForRoot(root, write(5));
+    let ended = state.endOf(path);
+    try testing.assertTrue(ended != null, "the write that dropped the proof is recorded");
+    if (ended != null) {
+        try testing.assertEqual(ended.at().start, 5L);
+        try testing.assertTrue(ended.kind() == NarrowingEndKind.Assigned, "the write is an assignment");
+    }
+    let snapshot = state.snapshotLayers();
+    state.push();
+    state.narrow(path, intType);
+    try testing.assertTrue(state.endOf(path) == null, "a proof made after the write hides it");
+    state.pop();
+    try testing.assertTrue(state.endOf(path) != null, "popping that proof shows the write again");
+    state.restoreLayers(snapshot);
+    try testing.assertTrue(state.endOf(path) != null, "a snapshot keeps the write");
+    state.pop();
+    try testing.assertTrue(state.endOf(path) != null,
+        "a write in a branch that drops a proof made outside it is recorded outside it too");
+
+    let inner = narrow.bindingPath(untouched);
+    state.push();
+    state.narrow(inner, intType);
+    state.clearForRoot(untouched, write(7));
+    try testing.assertTrue(state.endOf(inner) != null, "the write that dropped the inner proof is recorded");
+    state.pop();
+    try testing.assertTrue(state.endOf(inner) == null,
+        "a write that drops a proof made in a branch ends with the branch");
+}
+
+// A later write to a path whose proof an earlier write ended is what a read after it is told about,
+// in the layer that records the earlier write, so it outlasts the branch it is in. A path that holds a
+// proof again keeps the write that ended its proof before.
+test "a later write is recorded as what ended a path no proof holds for" {
+    let store = new TypeStore();
+    let intType = store.primitive(PrimitiveKind.Int);
+    let root = binding("value", store.optionalOf(intType));
+    let path = narrow.bindingPath(root);
+    let state = new NarrowingState();
+
+    state.renewForRoot(root, write(2));
+    try testing.assertTrue(state.endOf(path) == null,
+        "a write records nothing where no write ended a proof");
+    state.narrow(path, intType);
+    state.clearForRoot(root, write(4));
+    state.push();
+    state.renewForRoot(root, write(6));
+    state.pop();
+    let renewed = state.endOf(path);
+    try testing.assertTrue(renewed != null, "the later write is recorded");
+    if (renewed != null) {
+        try testing.assertEqual(renewed.at().start, 6L);
+    }
+    state.push();
+    state.narrow(path, intType);
+    state.renewForRoot(root, write(8));
+    state.pop();
+    let kept = state.endOf(path);
+    if (kept != null) {
+        try testing.assertEqual(kept.at().start, 6L);
+    }
+    try testing.assertTrue(kept != null, "a write where a proof holds leaves the earlier one recorded");
 }
