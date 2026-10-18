@@ -23,6 +23,7 @@ import lower.places;
 import lower.records;
 import lower.stores;
 import support.primitives;
+import List from @std.collections.list;
 
 // The address of one field inside the struct another address names.
 public fieldAddressAt(LoweringContext lowering, long base, Type fieldType, long index) -> long {
@@ -86,6 +87,44 @@ public addressOf(LoweringContext lowering, Expression node, Type structType,
         }
         return -1;
     }
+    long slot = materialized(lowering, node, structType);
+    if (slot < 0) {
+        return -1;
+    }
+    ownership.trackSlot(lowering, slot, structType);
+    return ownership.slotAddress(lowering, slot, structType);
+}
+
+// The address a struct method runs over: the storage the receiver names, or, for a receiver with
+// no storage of its own or one read retained, a copy the call owns. A copy is recorded in `copies`
+// for the caller to release with releaseCopies once the call returns.
+callReceiver(LoweringContext lowering, Expression node, Type structType, List<long> copies)
+        -> long {
+    if (!places.retainsRead(lowering, node)) {
+        long address = places.lowerAddress(lowering, node, EirAccess.Read);
+        if (address >= 0) {
+            return address;
+        }
+    }
+    long slot = materialized(lowering, node, structType);
+    if (slot < 0) {
+        return -1;
+    }
+    lowering.protectStorage(slot);
+    copies.push(slot);
+    return ownership.slotAddress(lowering, slot, structType);
+}
+
+releaseCopies(LoweringContext lowering, List<long> copies, Type structType) {
+    for (let slot in copies) {
+        lowering.unprotectStorage(slot);
+        ownership.releaseSlotContents(lowering, slot, structType);
+    }
+}
+
+// The value of a struct expression in a slot of its own that owns what it holds, or -1 when
+// lowering failed.
+materialized(LoweringContext lowering, Expression node, Type structType) -> long {
     let operand = stores.lowerOperand(lowering, node, structType);
     if (operand == null) {
         return -1;
@@ -97,8 +136,7 @@ public addressOf(LoweringContext lowering, Expression node, Type structType,
             + "'let {localNameFor(lowering.names().of(structType))} = ...;'.");
         return -1;
     }
-    ownership.trackSlot(lowering, slot, structType);
-    return ownership.slotAddress(lowering, slot, structType);
+    return slot;
 }
 
 // A local variable's name for a value of the named type, as in 'point' for 'Point', or 'value'
@@ -213,7 +251,8 @@ public lowerConstructorCall(LoweringContext lowering, CallExpressionNode call, M
 }
 
 // 'value.method(args)': the receiver is the address of the storage the receiver expression names,
-// so what the method writes into 'this' lands in the caller's own aggregate.
+// so what the method writes into 'this' lands in the caller's own aggregate. A receiver with no
+// storage of its own runs over a copy released once the call returns.
 public lowerMethodCall(LoweringContext lowering, CallExpressionNode call,
                        MemberExpressionNode member, Method method) -> long {
     let receiverType = lowering.typeOf(member.object());
@@ -247,14 +286,17 @@ public lowerMethodCall(LoweringContext lowering, CallExpressionNode call,
     if (!calls.supportedCallee(lowering, info, "method {path}", call.span())) {
         return -1;
     }
-    long receiver = addressOf(lowering, member.object(), receiverType, EirAccess.Read);
+    let copies = new List<long>();
+    long receiver = callReceiver(lowering, member.object(), receiverType, copies);
     if (receiver < 0) {
         if (!lowering.failed()) {
             lowering.unsupported("calling '{method.name()}' on this expression", call.span());
         }
         return -1;
     }
-    return calls.lowerCall(lowering, info, call, receiverType, receiver);
+    long result = calls.lowerCall(lowering, info, call, receiverType, receiver);
+    releaseCopies(lowering, copies, receiverType);
+    return result;
 }
 
 // The 'toString' a struct declares for itself, called over the address of the storage the

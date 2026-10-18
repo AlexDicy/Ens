@@ -77,7 +77,7 @@ public lower(LoweringContext lowering, Expression node) -> long {
 
 // Lowers 'node', which never returns but is written where a value of its recorded type is read.
 // The path ends after it, and the code after it, which nothing reaches, reads a value of that type
-// from a slot no path writes; a '?:' or a switch gives the one its merge holds instead.
+// from a slot no path writes.
 lowerNeverReturningValue(LoweringContext lowering, Expression node) -> long {
     long value = lowerForm(lowering, node);
     let valueType = lowering.typeOf(node);
@@ -89,7 +89,7 @@ lowerNeverReturningValue(LoweringContext lowering, Expression node) -> long {
         builder.terminate(new EirUnreachable());
     }
     builder.moveTo(builder.newBlock("unreachable"));
-    long slot = ownership.defineMergeSlot(lowering, "unreachable", valueType);
+    long slot = ownership.defineStandInSlot(lowering, "unreachable", valueType);
     long temp = builder.newTemp(valueType);
     builder.append(new EirLoadSlot(temp, valueType, slot));
     return temp;
@@ -347,18 +347,20 @@ lowerTernary(LoweringContext lowering, TernaryExpressionNode ternary) -> long {
     let builder = lowering.builder();
     long slot = -1;
     if (valued) {
-        slot = ownership.defineMergeSlot(lowering, "ternary", resultType);
+        slot = ownership.defineJoinSlot(lowering, "ternary", resultType);
     }
     long thenBlock = builder.newBlock("ternary.then");
     long elseBlock = builder.newBlock("ternary.else");
     long merge = builder.newBlock("ternary.end");
     builder.terminate(new EirBranch(condition, thenBlock, elseBlock));
+    bool joined = false;
     builder.moveTo(thenBlock);
     if (!lowerJoinValue(lowering, slot, resultType, ternary.thenValue())) {
         return -1;
     }
     if (!builder.terminated()) {
         builder.terminate(new EirJump(merge));
+        joined = true;
     }
     builder.moveTo(elseBlock);
     if (!lowerJoinValue(lowering, slot, resultType, ternary.elseValue())) {
@@ -366,14 +368,13 @@ lowerTernary(LoweringContext lowering, TernaryExpressionNode ternary) -> long {
     }
     if (!builder.terminated()) {
         builder.terminate(new EirJump(merge));
+        joined = true;
     }
     builder.moveTo(merge);
-    if (!valued) {
+    if (!valued || !joined) {
         return -1;
     }
-    long temp = builder.newTemp(resultType);
-    builder.append(new EirLoadSlot(temp, resultType, slot));
-    return temp;
+    return ownership.moveOutOf(lowering, slot, resultType);
 }
 
 // Lowers one value of a '?:' or of a switch used as a value into 'slot', the place the values
@@ -388,8 +389,8 @@ public lowerJoinValue(LoweringContext lowering, long slot, Type resultType, Expr
     return storeArm(lowering, slot, resultType, value);
 }
 
-// Writes one arm's value into the slot the branches merge through. The slot owns its contents,
-// so the write goes through the same barrier a reassignment uses.
+// Writes one arm's value into the slot the branches merge through, which holds nothing yet and
+// takes the value's own reference.
 public storeArm(LoweringContext lowering, long slot, Type resultType, Expression value) -> bool {
     let operand = stores.lowerOperand(lowering, value, resultType);
     if (operand == null) {
@@ -399,7 +400,7 @@ public storeArm(LoweringContext lowering, long slot, Type resultType, Expression
         lowering.builder().append(new EirStoreSlot(slot, operand.value()));
         return true;
     }
-    if (!stores.assignSlot(lowering, slot, resultType, operand)) {
+    if (!stores.initializeSlot(lowering, slot, resultType, operand)) {
         lowering.internalError("a branch yields a struct with no storage to retain",
             value.span());
         return false;
