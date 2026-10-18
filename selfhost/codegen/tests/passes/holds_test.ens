@@ -3,10 +3,15 @@
 // whenever something can: the callee itself, an override reached through dispatch, a closure of
 // the called type, a destructor a release can run, or the span itself writing the way to it.
 import @std.testing;
+import TestFailure from @std.testing;
+import List from @std.collections.list;
+import Set from @std.collections.set;
 import OptimizationLevel from settings;
 import EirFunction from eir.model;
 import eir.dump;
 import passes.holds;
+import passes.inlining;
+import passes.optimize;
 import support;
 import LoweredProgram from support;
 
@@ -202,6 +207,50 @@ test "a local copied out of a field borrows when nothing in its scope can write 
         "nothing is counted: {text}");
 }
 
+test "a hold on a value read through an inlined argument stays when the call made the argument" {
+    try assertReadHeld(borrowedProgram("    return show(held(plan(\"made\"))).length as int;\n"),
+        true);
+}
+
+test "a hold on a value read through an inlined argument stays when it was renamed on the way in" {
+    try assertReadHeld(borrowedProgram(
+        "    return show(heldOf(plan(\"upcast\"))).length as int;\n"), true);
+}
+
+test "a hold on a value read through an inlined argument stays when 'new' built the argument" {
+    try assertReadHeld(borrowedProgram(
+        "    return show(heldOf(new Context(new Program(\"new\")))).length as int;\n"), true);
+}
+
+test "a hold on a value read through an inlined argument stays when an identity call returned it" {
+    try assertReadHeld(borrowedProgram(
+        "    return show(heldOf(same(plan(\"same\")))).length as int;\n"), true);
+}
+
+test "a hold on a value read through an inlined argument stays when an upcast returned it" {
+    try assertReadHeld(borrowedProgram(
+        "    return show(heldOf(asBase(plan(\"upcast\")))).length as int;\n"), true);
+}
+
+test "a hold on a value read through an inlined argument stays when a later argument replaced it" {
+    try assertReadHeld(borrowedProgram("    let box = new Box(plan(\"boxed\"));\n"
+        + "    return show(heldBeside(box.base, box.replace())).length as int;\n"), true);
+}
+
+test "a hold on a value read through an inlined argument goes while a local keeps the argument" {
+    try assertReadHeld(borrowedProgram("    let context = plan(\"local\");\n"
+        + "    return show(heldOf(context)).length as int;\n"), false);
+}
+
+test "a hold on a value read through an inlined argument goes while a local keeps what it returned" {
+    try assertReadHeld(borrowedProgram("    let context = plan(\"local\");\n"
+        + "    return show(heldOf(same(context))).length as int;\n"), false);
+}
+
+test "a hold on a value read through an inlined argument goes while the call's result is alive" {
+    try assertReadHeld(borrowedProgram("    return showHeld(plan(\"made\"));\n"), false);
+}
+
 test "the account names the pass and what it removed" {
     let program = try support.lowerWholeProgram(holderProgram(
         "    protected measure() -> int \{\n"
@@ -345,6 +394,94 @@ switchProgram(string methodArm, string functionArm) -> string {
         + "    let holder = new Holder(new Circle(4));\n"
         + "    return holder.pick() + pickFrom(holder);\n"
         + "\}\n";
+}
+
+// A program whose 'main' shows the program read out of a context, where the context is the only
+// owner of that program, with the body of 'main' filled in. Every function is small enough to be
+// inlined into 'main'.
+borrowedProgram(string mainBody) -> string {
+    return "class Program \{\n"
+        + "    protected string label;\n"
+        + "    protected constructor(this.label);\n"
+        + "\}\n"
+        + "class Base \{\n"
+        + "    protected Program held;\n"
+        + "    protected constructor(this.held);\n"
+        + "\}\n"
+        + "class Context extends Base \{\n"
+        + "    protected constructor(Program held) \{\n"
+        + "        super(held);\n"
+        + "    \}\n"
+        + "\}\n"
+        + "class Box \{\n"
+        + "    protected Base base;\n"
+        + "    protected constructor(this.base);\n"
+        + "    protected replace() -> int \{\n"
+        + "        this.base = plan(\"replacement\");\n"
+        + "        return 0;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "plan(string label) -> Context \{\n"
+        + "    return new Context(new Program(label));\n"
+        + "\}\n"
+        + "same(Context context) -> Context \{\n"
+        + "    return context;\n"
+        + "\}\n"
+        + "asBase(Context context) -> Base \{\n"
+        + "    return context;\n"
+        + "\}\n"
+        + "held(Context context) -> Program \{\n"
+        + "    return context.held;\n"
+        + "\}\n"
+        + "heldOf(Base base) -> Program \{\n"
+        + "    return base.held;\n"
+        + "\}\n"
+        + "heldBeside(Base base, int ignored) -> Program \{\n"
+        + "    return base.held;\n"
+        + "\}\n"
+        + "show(Program program) -> string \{\n"
+        + "    return program.label;\n"
+        + "\}\n"
+        + "showHeld(Base base) -> int \{\n"
+        + "    return show(base.held).length as int;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + mainBody
+        + "\}\n";
+}
+
+// Asserts the program read out of the context is retained in 'main' once everything is inlined,
+// and whether it still is after hold elision: it is when the context is released while the
+// program is in use.
+assertReadHeld(string programText, bool keptAfter) throws {
+    let program = try support.lowerWholeProgram(programText);
+    let before = dump.dumpFunction(try support.inlinedFunction(program, "ens.main"));
+    try testing.assertTrue(before.indexOf(": Program\n  retain %") >= 0,
+        "the program read out of the context is held before the pass: {before}");
+    string text = dump.dumpFunction(try afterInlinedHolds(program, "ens.main"));
+    bool kept = text.indexOf(": Program\n  retain %") >= 0;
+    try testing.assertTrue(kept == keptAfter,
+        "the program read out of the context must keep its hold exactly when the context is "
+        + "released while it is in use: {text}");
+}
+
+// One function of the program once the whole program is inlined and hold elision ran over it,
+// with the effects computed over the inlined program the way a build computes them.
+afterInlinedHolds(LoweredProgram program, string symbol) -> EirFunction throws {
+    let inlined = new List<EirFunction>();
+    for (let module in inlining.inlineProgram(support.grouped(program), program.plans,
+            new Set<string>())) {
+        inlined.pushAll(module);
+    }
+    let effects = optimize.planProgram(inlined, program.plans).effects();
+    for (let function in inlined) {
+        if (function.symbol() == symbol) {
+            let after = holds.run(function, effects);
+            try support.assertOptimized(after, symbol);
+            return after;
+        }
+    }
+    throw new TestFailure("no function with symbol '{symbol}'");
 }
 
 afterHolds(LoweredProgram program, string symbol) -> EirFunction throws {

@@ -21,15 +21,17 @@ import EirLoadSlot from eir.model;
 import EirStoreSlot from eir.model;
 import EirTakeSlot from eir.model;
 import EirSlotAddress from eir.model;
-import EirCast from eir.model;
-import EirCastOp from eir.model;
 import EirCheckedCast from eir.model;
+import EirConstString from eir.model;
+import EirConstNull from eir.model;
+import EirJump from eir.model;
 import EirReturn from eir.model;
 import EirPropagate from eir.model;
 import EirUnreachable from eir.model;
 import Type from @ens.sema.model.types;
 import AddressPlaces from eir.place;
 import PlaceRoot from eir.place;
+import eir.ownership;
 import eir.place;
 import eir.walk;
 import ProgramEffects from passes.effects;
@@ -59,27 +61,32 @@ anyRetain(EirFunction function) -> bool {
 }
 
 // The storage a held reference was read through: the shared places on the way from a stable root,
-// and the slots of this function the way starts from. The reference stays alive while none of the
-// places is written and none of the slots is written, released or handed out by address.
+// the slots of this function the way starts from, and the temps on the way that hold a +1 of their
+// own. The reference stays alive while none of the places is written, none of the slots is
+// written, released or handed out by address, and none of the temps is released.
 final class Chain {
     protected List<long> places;
     protected bool[] slots;
+    protected bool[] owners;
 
-    protected constructor(long slotCount) {
+    protected constructor(long slotCount, long tempCount) {
         this.places = new List<long>();
         this.slots = new bool[slotCount];
+        this.owners = new bool[tempCount];
     }
 }
 
-// The code that runs between a hold's retain and its releases: the instructions, the terminators
-// crossed, the releases that end it, and the blocks it runs through.
+// The code that runs between a hold's retain and its releases: where it starts, the instructions,
+// the terminators crossed, the releases that end it, and the blocks it runs through.
 final class Region {
+    protected long startBlock;
+    protected long startIndex;
     protected List<EirInstruction> instructions;
     protected List<EirTerminator> terminators;
     protected List<EirInstruction> ends;
     protected bool[] visited;
 
-    protected constructor(long blockCount) {
+    protected constructor(long blockCount, this.startBlock, this.startIndex) {
         this.instructions = new List<EirInstruction>();
         this.terminators = new List<EirTerminator>();
         this.ends = new List<EirInstruction>();
@@ -102,7 +109,15 @@ final class Elision {
     EirInstruction?[] defs;
     List<List<EirInstruction>> users;
     bool[] terminatorUsed;
+    bool[] terminatorDefined;
+    bool[] retained;
+    long[] definedBlock;
+    long[] definedIndex;
+    long[] predecessorCount;
+    bool[] beingExtended;
     AddressPlaces places;
+    List<List<long>> borrowedValues;
+    bool[] addressed;
     List<EirInstruction> dropped;
     bool[] flipped;
 
@@ -112,9 +127,61 @@ final class Elision {
         this.defs = scan.definitionsOf(function);
         this.users = scan.usersOf(function);
         this.terminatorUsed = scan.terminatorUses(function);
+        this.terminatorDefined = new bool[function.tempTypes().length()];
+        this.retained = new bool[function.tempTypes().length()];
+        this.definedBlock = new long[function.tempTypes().length()];
+        this.definedIndex = new long[function.tempTypes().length()];
+        this.predecessorCount = new long[function.blocks().length()];
+        this.beingExtended = new bool[function.tempTypes().length()];
         this.places = place.addressPlaces(function);
+        this.borrowedValues = new List<List<long>>();
+        this.addressed = new bool[function.slots().length()];
         this.dropped = new List<EirInstruction>();
         this.flipped = new bool[function.slots().length()];
+        this.indexFunction();
+    }
+
+    // The values each borrowing slot is stored with, the slots reached by address, the temps a
+    // terminator defines or a retain gives a +1 of their own, where each temp an instruction
+    // defines is defined, and how many edges lead into each block.
+    indexFunction() {
+        let slots = this.function.slots();
+        for (long x = 0; x < slots.length(); x++) {
+            this.borrowedValues.push(new List<long>());
+        }
+        let blocks = this.function.blocks();
+        for (long b = 0; b < blocks.length(); b++) {
+            let block = blocks.get(b);
+            let instructions = block.instructions();
+            for (long i = 0; i < instructions.length(); i++) {
+                let instruction = instructions.get(i);
+                long result = walk.resultOf(instruction);
+                if (result >= 0 && result < this.definedBlock.length) {
+                    this.definedBlock[result] = b;
+                    this.definedIndex[result] = i;
+                }
+                if (instruction is EirStoreSlot && slots.get(instruction.slot).borrows()) {
+                    this.borrowedValues.get(instruction.slot).push(instruction.value);
+                }
+                if (instruction is EirSlotAddress) {
+                    this.addressed[instruction.slot] = true;
+                }
+                if (instruction is EirRetain) {
+                    this.retained[instruction.value] = true;
+                }
+            }
+            let terminator = block.terminator();
+            if (terminator != null) {
+                for (let defined in walk.terminatorResultsOf(terminator)) {
+                    this.terminatorDefined[defined] = true;
+                }
+            }
+            for (let successor in walk.successorsOf(block)) {
+                if (successor >= 0 && successor < blocks.length()) {
+                    this.predecessorCount[successor]++;
+                }
+            }
+        }
     }
 
     // Every retain that holds a value for the calls up to its releases.
@@ -136,14 +203,13 @@ final class Elision {
         if (!this.isCallHold(value)) {
             return;
         }
-        let chain = this.chainOf(value);
-        if (chain == null) {
-            return;
-        }
         let region = this.walkRegion(block, index + 1,
             (EirInstruction candidate) -> candidate is EirRelease && candidate.value == value);
-        if (region == null || region.ends.length() != this.releaseCount(value, region.visited)
-                || !this.regionKeepsChain(region, chain)) {
+        if (region == null || region.ends.length() != this.releaseCount(value, region.visited)) {
+            return;
+        }
+        let chain = this.chainOf(value, region);
+        if (chain == null || !this.regionKeepsChain(region, chain)) {
             return;
         }
         this.dropped.push(retain);
@@ -275,13 +341,13 @@ final class Elision {
         if (retainIndex < 0 || !this.isSlotHold(value)) {
             return;
         }
-        let chain = this.chainOf(value);
-        if (chain == null) {
-            return;
-        }
         let region = this.walkRegion(storeBlock, storeIndex + 1,
             (EirInstruction candidate) -> this.releasesSlot(candidate, slot));
-        if (region == null || !this.regionKeepsChain(region, chain)) {
+        if (region == null) {
+            return;
+        }
+        let chain = this.chainOf(value, region);
+        if (chain == null || !this.regionKeepsChain(region, chain)) {
             return;
         }
         long barriers = 0;
@@ -363,67 +429,199 @@ final class Elision {
         return retains == 1 && stores == 1;
     }
 
-    // The storage a value was read through, back to a root that stays alive on its own: a value
-    // parameter or receiver, which the caller keeps alive, or a slot of this function. Null when
-    // the way runs through storage this function cannot name: an address it was passed, a weak
-    // field, a value it owns outright.
-    chainOf(long value) -> Chain? {
-        let chain = new Chain(this.function.slots().length());
-        long current = value;
-        for (long depth = 0; depth < 32; depth++) {
+    // The storage a value was read through, back to the roots that keep it alive on their own
+    // while a region runs: a value parameter or receiver, which the caller keeps alive, a literal,
+    // which the program keeps alive, a slot of this function that owns what it holds, or a +1 this
+    // function made or retained, which lasts until it is released. Null when the way runs through
+    // storage this function cannot name: an address it was passed, a weak field, a borrowing slot
+    // reached by address, or a +1 handed on to storage.
+    chainOf(long value, Region region) -> Chain? {
+        let chain = new Chain(this.function.slots().length(), this.defs.length);
+        bool[] followed = new bool[this.defs.length];
+        let pending = new List<long>();
+        pending.push(value);
+        while (!pending.isEmpty()) {
+            long current = pending.pop();
             if (current < 0 || current >= this.defs.length) {
                 return null;
             }
-            let definition = this.defs[current];
-            if (definition == null) {
-                if (current < this.function.entryTempCount()
-                        && !place.isOpaqueRoot(this.function, current)) {
-                    return chain;
-                }
+            if (followed[current]) {
+                continue;
+            }
+            followed[current] = true;
+            if (!this.follow(chain, region, value, current, pending)) {
                 return null;
             }
-            switch (definition) {
-                is EirCast cast -> {
-                    if (cast.op != EirCastOp.Reinterpret) {
-                        return null;
-                    }
-                    current = cast.operand;
-                },
-                is EirCheckedCast cast -> {
-                    current = cast.value;
-                },
-                is EirLoadSlot load -> {
-                    chain.slots[load.slot] = true;
-                    return chain;
-                },
-                is EirLoadPtr load -> {
-                    let named = this.places.placeOf(load.address);
-                    if (named == null) {
-                        return null;
-                    }
-                    switch (named.root()) {
-                        PlaceRoot.Slot -> {
-                            chain.slots[named.rootId()] = true;
-                            return chain;
-                        },
-                        PlaceRoot.Receiver -> {
-                            return null;
-                        },
-                        default -> {
-                            if (!this.addSharedPlace(chain, named.root(), named.rootId(),
-                                    named.steps().get(0).value())) {
-                                return null;
-                            }
-                            current = named.rootId();
-                        },
-                    }
-                },
-                default -> {
-                    return null;
-                },
+        }
+        return chain;
+    }
+
+    // Adds to a chain what keeps one value alive: the root it stays alive through, or the values
+    // it was read through, pushed onto the pending ones. A value a retain other than the hold's
+    // own gave a +1 is kept alive by what it was read through alone when that stays in place from
+    // the read to the region's end; otherwise the chain needs its +1 as well, since either can end
+    // first. False when that storage is not one a chain can name.
+    follow(Chain chain, Region region, long held, long current, List<long> pending) -> bool {
+        let definition = this.defs[current];
+        if (definition == null) {
+            if (this.terminatorDefined[current]) {
+                return this.addOwner(chain, current);
+            }
+            return current < this.function.entryTempCount()
+                && !place.isOpaqueRoot(this.function, current);
+        }
+        if (ownership.producesOwned(definition)) {
+            return this.addOwner(chain, current);
+        }
+        if (definition is EirConstString || definition is EirConstNull) {
+            return true;
+        }
+        if (current != held && this.retained[current]) {
+            if (this.keptWithoutItsRetain(current, region)) {
+                return true;
+            }
+            if (!this.addOwner(chain, current)) {
+                return false;
             }
         }
+        long carried = ownership.carriedFrom(definition);
+        if (carried >= 0) {
+            pending.push(carried);
+            return true;
+        }
+        switch (definition) {
+            is EirCheckedCast cast -> {
+                pending.push(cast.value);
+                return true;
+            },
+            is EirLoadSlot load -> {
+                return this.followSlot(chain, load.slot, pending);
+            },
+            is EirLoadPtr load -> {
+                let named = this.places.placeOf(load.address);
+                if (named == null) {
+                    return false;
+                }
+                switch (named.root()) {
+                    PlaceRoot.Slot -> {
+                        return this.followSlot(chain, named.rootId(), pending);
+                    },
+                    PlaceRoot.Receiver -> {
+                        return false;
+                    },
+                    default -> {
+                        if (!this.addSharedPlace(chain, named.root(), named.rootId(),
+                                named.steps().get(0).value())) {
+                            return false;
+                        }
+                        pending.push(named.rootId());
+                        return true;
+                    },
+                }
+            },
+            default -> {
+                return false;
+            },
+        }
+    }
+
+    // Whether what a value was read through keeps it alive from its definition to the end of a
+    // region on its own, so the +1 a retain gave it is not needed there.
+    keptWithoutItsRetain(long value, Region region) -> bool {
+        if (this.beingExtended[value]) {
+            return false;
+        }
+        let window = this.regionFrom(value, region);
+        if (window == null) {
+            return false;
+        }
+        this.beingExtended[value] = true;
+        let chain = this.chainOf(value, window);
+        this.beingExtended[value] = false;
+        return chain != null && this.regionKeepsChain(window, chain);
+    }
+
+    // A region extended back to just after a value's definition, or null when the code in between
+    // does not run straight into the region's start: past a branch, or into a block more than one
+    // edge leads into, the region can run again without the definition running before it.
+    regionFrom(long value, Region region) -> Region? {
+        let blocks = this.function.blocks();
+        long block = this.definedBlock[value];
+        long index = this.definedIndex[value] + 1;
+        let window = new Region(blocks.length(), block, index);
+        for (long steps = 0; steps <= blocks.length(); steps++) {
+            let instructions = blocks.get(block).instructions();
+            bool arrived = block == region.startBlock && index <= region.startIndex;
+            long end = arrived ? region.startIndex : instructions.length();
+            for (long i = index; i < end; i++) {
+                window.instructions.push(instructions.get(i));
+            }
+            if (arrived) {
+                window.instructions.pushAll(region.instructions);
+                window.terminators.pushAll(region.terminators);
+                return window;
+            }
+            let terminator = blocks.get(block).terminator();
+            if (!(terminator is EirJump) || this.predecessorCount[terminator.target] != 1) {
+                return null;
+            }
+            window.terminators.push(terminator);
+            block = terminator.target;
+            index = 0;
+        }
         return null;
+    }
+
+    // A slot that owns what it holds keeps it alive while it is left alone. A borrowing slot keeps
+    // nothing alive, so every value stored into it is followed instead, which needs every write
+    // to it to be a store this function makes, with no address of it taken.
+    followSlot(Chain chain, long slot, List<long> pending) -> bool {
+        if (!this.function.slots().get(slot).borrows()) {
+            chain.slots[slot] = true;
+            return true;
+        }
+        if (this.addressed[slot]) {
+            return false;
+        }
+        for (let stored in this.borrowedValues.get(slot)) {
+            pending.push(stored);
+        }
+        return true;
+    }
+
+    // A +1 this function made keeps what it names alive until it is released, through every temp
+    // it is carried on to. False when one of them hands it to an owning slot or to storage an
+    // address names, whose lifetime a chain does not follow.
+    addOwner(Chain chain, long owner) -> bool {
+        let carriers = new List<long>();
+        carriers.push(owner);
+        while (!carriers.isEmpty()) {
+            long carrier = carriers.pop();
+            if (chain.owners[carrier]) {
+                continue;
+            }
+            chain.owners[carrier] = true;
+            for (let user in this.users.get(carrier)) {
+                switch (user) {
+                    is EirStoreSlot store -> {
+                        if (!this.function.slots().get(store.slot).borrows()) {
+                            return false;
+                        }
+                    },
+                    is EirStorePtr store -> {
+                        if (store.value == carrier) {
+                            return false;
+                        }
+                    },
+                    default -> {
+                        if (ownership.carriedFrom(user) == carrier) {
+                            carriers.push(walk.resultOf(user));
+                        }
+                    },
+                }
+            }
+        }
+        return true;
     }
 
     // The shared place a field or element read goes through, when it is one some write names;
@@ -449,7 +647,7 @@ final class Elision {
     // or null when a path leaves the function or comes back around to the start without one.
     walkRegion(long startBlock, long startIndex, (EirInstruction) -> bool ends) -> Region? {
         let blocks = this.function.blocks();
-        let region = new Region(blocks.length());
+        let region = new Region(blocks.length(), startBlock, startIndex);
         bool[] visited = region.visited;
         let pending = new List<Continuation>();
         pending.push(new Continuation(startBlock, startIndex));
@@ -518,6 +716,9 @@ final class Elision {
         }
         for (let instruction in region.instructions) {
             if (this.touchesSlots(instruction, chain.slots)) {
+                return false;
+            }
+            if (instruction is EirRelease && chain.owners[instruction.value]) {
                 return false;
             }
         }
