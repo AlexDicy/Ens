@@ -1811,7 +1811,7 @@ Memory is managed automatically through Automatic Reference Counting (ARC).
 - **Structs** are value types. They are copied on assignment and passed by value.
 
 Atomics happen only at allocation, at assignment of class-typed fields, at scope exit, and around a value read out of a local, a field or an array element when code that runs while the value is still in use could overwrite where it was read from.
-Such a value is retained until its use is done: an argument or a receiver until its call returns, a value in an interpolation until its text is made, the value a type switch tests until the switch ends, and an operand until its operator is applied.
+Such a value is retained until its use is done: an argument or a receiver until its call returns, a value in an interpolation until its text is made, the value a type switch tests until the switch ends, the variable of a for-each loop over an array until its iteration ends, and an operand until its operator is applied.
 A local is overwritten only by an assignment to it or by a `mutating` method called on it.
 A field or an array element can also be overwritten by any code that runs meanwhile, such as a call, a constructor, a destructor, a user's `equals`, `hash` or `toString`, the first read of a `lazy const`, or the default of a field a struct literal leaves out.
 
