@@ -13,6 +13,7 @@ import Type from model.types;
 import ErrorType from model.types;
 import ConstructorCatch from result;
 import ThisUse from result;
+import ThisUseKind from result;
 import CatchThisUse from result;
 import EscapeGap from result;
 import CatchFinish from result;
@@ -340,6 +341,17 @@ public final class AssignmentState {
         return both;
     }
 
+    // The fields either set holds, those of 'first' first.
+    unitedFields(List<Field> first, List<Field> second) -> List<Field> {
+        let united = this.copyFields(first);
+        for (let field in second) {
+            if (!this.fieldsContain(united, field)) {
+                united.push(field);
+            }
+        }
+        return united;
+    }
+
     copyWrites(List<FieldWrite> set) -> List<FieldWrite> {
         let copy = new List<FieldWrite>();
         for (long i = 0; i < set.length(); i++) {
@@ -443,19 +455,16 @@ public final class AssignmentState {
     public checkThisFieldUse(ThisUse use) {
         let owner = this.fieldOwner;
         let field = use.field();
-        if (owner == null || this.flowTerminated || field.type() is ErrorType
+        if (owner == null || field == null || this.flowTerminated || !this.needsValue(owner, field)
                 || this.fieldsContain(this.assignedThisFields, field)
-                || this.fieldsContain(this.refusedThisFields, field)
                 || this.fieldsContain(this.reportedFields, field)) {
             return;
         }
         bool inherited = typemembers.isInheritedField(owner, field);
-        if (!inherited && !needsAssignment(field)) {
-            return;
-        }
         this.reportedFields.push(field);
         if (!this.onCatchPath) {
-            this.reporter.report(unassigneduses.refusal(use, inherited, this.names), use.span());
+            this.reporter.report(unassigneduses.refusal(use, owner, field, inherited, this.names),
+                use.span());
             this.markThisFieldRefused(field);
             return;
         }
@@ -468,6 +477,78 @@ public final class AssignmentState {
         if (gaps.length() > 0) {
             this.catchThisUses.push(new CatchThisUse(use, gaps.toArray()));
         }
+    }
+
+    // Refuses a use of 'this' other than reading or writing one of its fields, such as a method
+    // call, while a field has no value yet on the path reaching it, naming the first such field.
+    // In a catch clause the use is kept for the exceptions phase, with each place the body can
+    // throw from and the first field with no value there.
+    public checkThisUse(ThisUse use) {
+        let owner = this.fieldOwner;
+        if (owner == null || this.flowTerminated) {
+            return;
+        }
+        let missing = this.missingFieldFor(use, owner, this.assignedThisFields);
+        if (missing == null || this.fieldsContain(this.reportedFields, missing)) {
+            return;
+        }
+        this.reportedFields.push(missing);
+        if (!this.onCatchPath) {
+            bool inherited = typemembers.isInheritedField(owner, missing);
+            this.reporter.report(unassigneduses.refusal(use, owner, missing, inherited, this.names),
+                use.span());
+            this.markThisFieldRefused(missing);
+            return;
+        }
+        let gaps = new List<EscapeGap>();
+        for (let point in this.escapePoints) {
+            let missingThere = this.missingFieldFor(use, owner,
+                this.unitedFields(this.assignedThisFields, point.assigned));
+            if (missingThere != null) {
+                gaps.push(new EscapeGap(point.escape, missingThere,
+                    typemembers.isInheritedField(owner, missingThere)));
+            }
+        }
+        if (gaps.length() > 0) {
+            this.catchThisUses.push(new CatchThisUse(use, gaps.toArray()));
+        }
+    }
+
+    // The field 'use' is refused for where 'assigned' is what is assigned: the first field of
+    // 'owner' with no value, or null. A lambda stored in a field is refused for another field
+    // before that one, since the field it is stored in has no value until the lambda exists.
+    missingFieldFor(ThisUse use, Type owner, List<Field> assigned) -> Field? {
+        let first = this.firstMissingField(owner, assigned, "");
+        if (first == null || use.kind() != ThisUseKind.LambdaCapture || first.name() != use.detail()) {
+            return first;
+        }
+        return this.firstMissingField(owner, assigned, use.detail()) ?? first;
+    }
+
+    // The first field of 'owner' other than the one named 'skipped' that has no value where
+    // 'assigned' is what is assigned, or null.
+    firstMissingField(Type owner, List<Field> assigned, string skipped) -> Field? {
+        let fields = typemembers.fieldsOf(owner);
+        if (fields == null) {
+            return null;
+        }
+        for (let field in fields) {
+            if (field.name() != skipped && this.needsValue(owner, field)
+                    && !this.fieldsContain(assigned, field)) {
+                return field;
+            }
+        }
+        return null;
+    }
+
+    // Whether a field of 'owner' has no value until something gives it one: an inherited field
+    // until the base class is constructed, and an own field that needs an assignment until it is
+    // assigned. A field whose use or write is already refused is left out.
+    needsValue(Type owner, Field field) -> bool {
+        if (field.type() is ErrorType || this.fieldsContain(this.refusedThisFields, field)) {
+            return false;
+        }
+        return typemembers.isInheritedField(owner, field) || needsAssignment(field);
     }
 
     // A path finishes the constructor at the end of its body or of a catch clause, at span.

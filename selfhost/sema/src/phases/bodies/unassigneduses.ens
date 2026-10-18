@@ -2,19 +2,37 @@
 // yet: before every path assigns an own field, before the base class is constructed for an
 // inherited one, and in a catch clause that can run before either.
 import Field from model.typemembers;
+import Method from model.typemembers;
+import model.convert;
+import model.hierarchy;
+import model.overriding;
 import model.typenames;
 import TypeNames from model.typenames;
 import model.types;
 import Type from model.types;
+import FunctionType from model.types;
 import ThisUse from result;
 import ThisUseKind from result;
+import phases.bodies.wording;
 import List from @std.collections.list;
 
-// The refusal of a use the body reaches before the field has a value. An inherited field has none
-// until 'super(...)' finishes, so the use is in its arguments.
-public refusal(ThisUse use, bool inherited, TypeNames names) -> string {
-    let field = use.field();
-    string subject = fieldSubject(field, inherited, names);
+// The refusal of a use the body of a constructor of 'owner' reaches before 'missing' has a value.
+// An inherited field has none until 'super(...)' finishes, so the use is in its arguments.
+public refusal(ThisUse use, Type owner, Field missing, bool inherited, TypeNames names) -> string {
+    string named = namedField(missing, inherited, names);
+    string subject = "Field {named}";
+    string name = missing.name();
+    if (!readsField(use)) {
+        if (use.kind() == ThisUseKind.LambdaCapture && use.detail() == name) {
+            return storedLambdaRefusal(missing, named);
+        }
+        string fix = "Assign '{name}' before {usePlace(use)}, for example 'this.{name} = ...;'.";
+        if (inherited) {
+            fix = "Pass 'super(...)' a value that does not come from 'this', such as a parameter of "
+                + "the constructor.";
+        }
+        return "{everyFieldUse(use, owner, missing, named)} {fix}";
+    }
     if (inherited) {
         string refused = "read it";
         if (use.kind() == ThisUseKind.MemberWrite) {
@@ -24,12 +42,11 @@ public refusal(ThisUse use, bool inherited, TypeNames names) -> string {
             + "cannot {refused}. Pass a value that does not come from 'this', such as a parameter of "
             + "the constructor.";
     }
-    string name = field.name();
     string unassigned = "before every path through the constructor assigns it";
     switch (use.kind()) {
         ThisUseKind.CompoundAssignment -> {
-            return "{subject} {requirement(field)}, and '{use.detail()}' reads it first, {unassigned}. "
-                + "Assign it with '=' before this line on every path, for example "
+            return "{subject} {requirement(missing)}, and '{use.detail()}' reads it first, "
+                + "{unassigned}. Assign it with '=' before this line on every path, for example "
                 + "'this.{name} = ...;'.";
         },
         ThisUseKind.MemberWrite -> {
@@ -38,47 +55,258 @@ public refusal(ThisUse use, bool inherited, TypeNames names) -> string {
                 + "example 'this.{name} = \{...\};'.";
         },
         default -> {
-            return "{subject} {requirement(field)}, and it is read here {unassigned}. Assign it before "
-                + "this line on every path, for example 'this.{name} = ...;'.";
+            return "{subject} {requirement(missing)}, and it is read here {unassigned}. Assign it "
+                + "before this line on every path, for example 'this.{name} = ...;'.";
         },
     }
 }
 
-// The refusal of a use in a catch clause that can run with the field missing, when 'callee' throws
-// 'thrown', or when a 'throw' statement of the body does where 'callee' is null. An inherited field
-// is missing where the arguments of 'super(...)' throw, before the constructor of 'quotedBase' runs.
+// What a use that needs every field does in a constructor of 'owner' before field 'missing',
+// spelled 'named', has a value.
+everyFieldUse(ThisUse use, Type owner, Field missing, string named) -> string {
+    string before = "before field {named} has a value";
+    string name = missing.name();
+    switch (use.kind()) {
+        ThisUseKind.MethodCall -> {
+            return "'{use.detail()}' is called on 'this' {before}, and "
+                + "{readerOf(use, owner, missing)} may read '{name}'.";
+        },
+        ThisUseKind.BehaviorCall -> {
+            return "'{use.detail()}' is called on 'this' {before}, and '{use.detail()}' may read "
+                + "'{name}'.";
+        },
+        ThisUseKind.BaseMethodCall -> {
+            return "'{use.detail()}' is called {before}, and the code it runs may read '{name}'.";
+        },
+        ThisUseKind.TextForm -> {
+            return "'\{this\}' calls 'toString' on 'this' {before}, and 'toString' may read '{name}'.";
+        },
+        ThisUseKind.EqualsReceiver -> {
+            return "'{use.detail()}' calls 'equals' on 'this' {before}, and 'equals' may read '{name}'.";
+        },
+        ThisUseKind.EqualsArgument -> {
+            return "'{use.detail()}' passes 'this' to 'equals' {before}, and 'equals' may read "
+                + "'{name}'.";
+        },
+        ThisUseKind.Argument -> {
+            return "'this' is passed to {use.detail()} {before}, and {use.detail()} may read '{name}'.";
+        },
+        ThisUseKind.StoredInLocal -> {
+            return "'this' is stored in '{use.detail()}' {before}, and code that uses "
+                + "'{use.detail()}' may read '{name}'.";
+        },
+        ThisUseKind.StoredInField -> {
+            return "'this' is stored in field '{use.detail()}' {before}, and code that uses "
+                + "'{use.detail()}' may read '{name}'.";
+        },
+        ThisUseKind.ArrayElement -> {
+            return "'this' is put in an array {before}, and code that reads the array may read "
+                + "'{name}'.";
+        },
+        ThisUseKind.LambdaCapture -> {
+            return "This lambda uses 'this', and it is created {before}, so calling it may read "
+                + "'{name}'.";
+        },
+        default -> {
+            return "Until field {named} has a value, 'this' can only be used to read and write its "
+                + "fields and to test its type with 'is'.";
+        },
+    }
+}
+
+// What a call of the method of 'use' on 'this' runs that may read 'field': the method itself where
+// its own code can name the field or a subclass of 'owner' can replace it, and otherwise the code
+// it calls.
+readerOf(ThisUse use, Type owner, Field field) -> string {
+    let method = use.method();
+    if (method == null || overriding.subclassCanReplace(owner, method)
+            || hierarchy.isSubclassOf(method.definingType(), field.definingType())) {
+        return "'{use.detail()}'";
+    }
+    return "the code it runs";
+}
+
+// The refusal of a lambda that uses 'this' and is stored in field 'missing', spelled 'named', which
+// has no value until the lambda exists.
+storedLambdaRefusal(Field missing, string named) -> string {
+    string name = missing.name();
+    string refusal = "This lambda uses 'this', and it is created before field {named} has a value, "
+        + "because '{name}' gets its value from the lambda. Until every field has a value, 'this' "
+        + "can only be used to read and write its fields and to test its type with 'is'.";
+    if (missing.isConst()) {
+        return refusal;
+    }
+    string fix = " Give '{name}' a default value, so that every field has a value when the lambda "
+        + "is created.";
+    let example = defaultedDeclaration(missing);
+    if (example != null) {
+        fix = " Give '{name}' a default value, as in '{example}', so that every field has a value "
+            + "when the lambda is created.";
+    }
+    return refusal + fix;
+}
+
+// The declaration of 'field', a function value, with a default lambda that does nothing, as in
+// 'protected () -> string callback = () -> "";', or null where no such lambda can be spelled.
+defaultedDeclaration(Field field) -> string? {
+    let declaration = field.declaration();
+    let core = convert.coreOf(field.type());
+    if (declaration == null || !(core is FunctionType)) {
+        return null;
+    }
+    let placeholder = placeholderLambda(core);
+    string written = wording.greenSpelling(declaration);
+    if (placeholder == null || !written.endsWith(";")) {
+        return null;
+    }
+    return "{written.substring(0, written.length - 1)} = {placeholder};";
+}
+
+// A lambda of the function type 'type' that returns a default value, or null where the type has
+// too many parameters to name or returns a value with no literal to spell it.
+placeholderLambda(FunctionType type) -> string? {
+    let parameters = type.parameterTypes();
+    string[] names = ["", "value", "first, second", "first, second, third"];
+    if (parameters.length >= names.length) {
+        return null;
+    }
+    Type returnType = type.returnType();
+    let returned = types.isVoidType(returnType) ? "\{ \}" : wording.placeholderLiteral(returnType);
+    if (returned == null) {
+        return null;
+    }
+    return "({names[parameters.length]}) -> {returned}";
+}
+
+// The refusal of a use in a catch clause that can run with 'missing' unassigned, when 'callee'
+// throws 'thrown', or when a 'throw' statement of the body does where 'callee' is null. An inherited
+// field is missing where the arguments of 'super(...)' throw, before the constructor of
+// 'quotedBase' runs.
 public catchRefusal(ThisUse use, Field missing, bool inherited, string? callee, string thrown,
         string quotedBase, TypeNames names) -> string {
-    string subject = fieldSubject(missing, inherited, names);
-    if (inherited) {
-        string used = "reads it";
-        string removal = "Remove this read";
-        if (use.kind() == ThisUseKind.MemberWrite) {
-            used = "sets its field '{use.detail()}'";
-            removal = "Remove this write";
-        }
-        string thrower = callee ?? "the body";
-        return "{subject} may have no value where this 'catch' clause {used}. When {thrower} throws "
-            + "{thrown} in the arguments of 'super(...)', the constructor of {quotedBase} has not run "
-            + "yet. {removal}, or move the call to {thrower} into a function that catches {thrown} and "
-            + "returns a value to pass to 'super(...)'.";
-    }
+    string named = namedField(missing, inherited, names);
+    string subject = "Field {named}";
     string name = missing.name();
+    string thrower = callee ?? "the body";
     string unassigned = unassignedWhen(callee, thrown, name);
+    string fix = "Assign '{name}' in the clause before {usePlace(use)}, for example "
+        + "'this.{name} = ...;'.";
+    if (inherited) {
+        unassigned = "When {thrower} throws {thrown} in the arguments of 'super(...)', the "
+            + "constructor of {quotedBase} has not run yet.";
+        fix = "Remove {removedPlace(use)}, or move the call to {thrower} into a function that "
+            + "catches {thrown} and returns a value to pass to 'super(...)'.";
+    }
     switch (use.kind()) {
+        ThisUseKind.Read -> {
+            return "{subject} may have no value where this 'catch' clause reads it. {unassigned} {fix}";
+        },
         ThisUseKind.CompoundAssignment -> {
             return "{subject} may have no value where this 'catch' clause reads it with "
                 + "'{use.detail()}'. {unassigned} Assign '{name}' with '=' in the clause before this "
                 + "line, for example 'this.{name} = ...;'.";
         },
         ThisUseKind.MemberWrite -> {
+            if (inherited) {
+                return "{subject} may have no value where this 'catch' clause sets its field "
+                    + "'{use.detail()}'. {unassigned} {fix}";
+            }
             return "{subject} may have no value where this 'catch' clause sets its field "
                 + "'{use.detail()}'. {unassigned} Assign the whole struct in the clause first, for "
                 + "example 'this.{name} = \{...\};'.";
         },
         default -> {
-            return "{subject} may have no value where this 'catch' clause reads it. {unassigned} "
-                + "Assign '{name}' in the clause before this line, for example 'this.{name} = ...;'.";
+            return "{everyFieldUseInCatch(use, named)} {unassigned} {fix}";
+        },
+    }
+}
+
+// What a use that needs every field does in a catch clause where field 'named' may have no value.
+everyFieldUseInCatch(ThisUse use, string named) -> string {
+    string here = "in this 'catch' clause";
+    switch (use.kind()) {
+        ThisUseKind.MethodCall, ThisUseKind.BehaviorCall -> {
+            return "'{use.detail()}' is called on 'this' {here}, and '{use.detail()}' may read field "
+                + "{named}.";
+        },
+        ThisUseKind.BaseMethodCall -> {
+            return "'{use.detail()}' is called {here}, and the code it runs may read field {named}.";
+        },
+        ThisUseKind.TextForm -> {
+            return "'\{this\}' calls 'toString' on 'this' {here}, and 'toString' may read field {named}.";
+        },
+        ThisUseKind.EqualsReceiver -> {
+            return "'{use.detail()}' calls 'equals' on 'this' {here}, and 'equals' may read field "
+                + "{named}.";
+        },
+        ThisUseKind.EqualsArgument -> {
+            return "'{use.detail()}' passes 'this' to 'equals' {here}, and 'equals' may read field "
+                + "{named}.";
+        },
+        ThisUseKind.Argument -> {
+            return "'this' is passed to {use.detail()} {here}, and {use.detail()} may read field "
+                + "{named}.";
+        },
+        ThisUseKind.StoredInLocal -> {
+            return "'this' is stored in '{use.detail()}' {here}, and code that uses '{use.detail()}' "
+                + "may read field {named}.";
+        },
+        ThisUseKind.StoredInField -> {
+            return "'this' is stored in field '{use.detail()}' {here}, and code that uses "
+                + "'{use.detail()}' may read field {named}.";
+        },
+        ThisUseKind.ArrayElement -> {
+            return "'this' is put in an array {here}, and code that reads the array may read field "
+                + "{named}.";
+        },
+        ThisUseKind.LambdaCapture -> {
+            return "This lambda in a 'catch' clause uses 'this', so calling it may read field {named}.";
+        },
+        default -> {
+            return "Field {named} may have no value {here}, and until it has one, 'this' can only be "
+                + "used to read and write its fields and to test its type with 'is'.";
+        },
+    }
+}
+
+// Whether the use is of one field, which it reads.
+readsField(ThisUse use) -> bool {
+    return use.kind() == ThisUseKind.Read || use.kind() == ThisUseKind.CompoundAssignment
+        || use.kind() == ThisUseKind.MemberWrite;
+}
+
+// The place a fix moves an assignment before.
+usePlace(ThisUse use) -> string {
+    switch (use.kind()) {
+        ThisUseKind.MethodCall, ThisUseKind.BaseMethodCall, ThisUseKind.BehaviorCall -> {
+            return "this call";
+        },
+        ThisUseKind.LambdaCapture -> {
+            return "this lambda";
+        },
+        default -> {
+            return "this line";
+        },
+    }
+}
+
+// The code a fix removes.
+removedPlace(ThisUse use) -> string {
+    switch (use.kind()) {
+        ThisUseKind.Read -> {
+            return "this read";
+        },
+        ThisUseKind.MemberWrite -> {
+            return "this write";
+        },
+        ThisUseKind.MethodCall, ThisUseKind.BaseMethodCall, ThisUseKind.BehaviorCall -> {
+            return "this call";
+        },
+        ThisUseKind.LambdaCapture -> {
+            return "this lambda";
+        },
+        default -> {
+            return "this use of 'this'";
         },
     }
 }
@@ -93,8 +321,8 @@ unassignedWhen(string? callee, string thrown, string name) -> string {
     return "When {callee} throws {thrown}, the body has not assigned '{name}' yet.";
 }
 
-// "Field 'label' of class 'Probe'", or "of base class 'Named'" for an inherited field.
-fieldSubject(Field field, bool inherited, TypeNames names) -> string {
+// "'label' of class 'Probe'", or "'name' of base class 'Named'" for an inherited field.
+namedField(Field field, bool inherited, TypeNames names) -> string {
     Type owner = field.definingType();
     string quoted = names.quoted(owner);
     string kindWord = "class";
@@ -106,7 +334,7 @@ fieldSubject(Field field, bool inherited, TypeNames names) -> string {
     if (inherited) {
         kindWord = "base " + kindWord;
     }
-    return "Field '{field.name()}' of {kindWord} {quoted}";
+    return "'{field.name()}' of {kindWord} {quoted}";
 }
 
 // Why an own field must be assigned before it is read.

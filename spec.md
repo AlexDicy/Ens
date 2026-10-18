@@ -269,6 +269,10 @@ Such a field may be read through `this` only where every path reaching the read 
 A compound assignment such as `+=`, a write to a member of the field, and a call of the function value the field holds all read it.
 In a `catch` clause, a field counts as assigned only when the body assigns it before every point where the body can throw an exception the clause catches.
 The fields a base class declares have their values once `super(...)` finishes, so neither the arguments of `super(...)` nor a `catch` clause that catches what those arguments throw may read them.
+Until every field that needs a value has one, inherited fields included, a constructor may use `this` only to read and write its fields and to test its type with `is`.
+Before that point, calling a method on `this` or `super`, passing `this` to a call, storing it in a variable, a field or an array, and creating a lambda that uses `this` are errors, because the code they reach may read a field that has no value yet.
+A `switch` over `this` may test its type with `is` arms, but an arm that names the value, as `is Square square ->` does, stores `this` in that name.
+Writing `this` in an interpolation hole calls `toString` on it, and comparing it with `==` or `!=` calls `equals`, so both are errors there as well, unless the type is a `final` class and no class in its chain declares that method.
 When a constructor's `catch` clause catches an exception thrown by the arguments of `super(...)`, it runs before the base class is constructed.
 Such a clause may not reach its end or a `return`: every path through it ends by calling `panic` or another `noreturn` function, or loops forever.
 
@@ -934,7 +938,7 @@ caused by OpenError: could not open config.toml
 caused by ReadError: no such file or directory
 ```
 
-The text writes a bounded number of causes and ends with `and further causes` when the chain runs longer, so an error handed itself as its own cause still produces text.
+The text writes a bounded number of causes and ends with `and further causes` when the chain runs longer.
 `stackTrace`, `stackFrames`, and the text of an error's own type are provided by the compiler rather than by any body, so a subclass cannot replace them.
 
 Every `Error` carries a **stack trace** captured at the point it is thrown, recording the throwing call and each caller above it. The trace travels with the exception as it propagates, so a handler always sees where the error originated rather than where it was caught. `panic()` captures a trace the same way.

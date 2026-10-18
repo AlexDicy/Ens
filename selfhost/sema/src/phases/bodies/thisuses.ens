@@ -1,0 +1,339 @@
+// How code uses 'this', read from the syntax around it. A member access, an 'is' test, a
+// comparison with '==' or '!=', an interpolation hole and a switch judge what they do with a 'this'
+// written as their operand. Anywhere else 'this' is a value that leaves the code holding it, and
+// its use is named for where it goes.
+import Expression from @ens.frontend.syntax.generated.nodes;
+import ThisExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ParenthesizedExpressionNode from @ens.frontend.syntax.generated.nodes;
+import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SafeMemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import TypeTestExpressionNode from @ens.frontend.syntax.generated.nodes;
+import BinaryExpressionNode from @ens.frontend.syntax.generated.nodes;
+import InterpolatedStringExpressionNode from @ens.frontend.syntax.generated.nodes;
+import InterpolationPartNode from @ens.frontend.syntax.generated.nodes;
+import SwitchExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SwitchStatementNode from @ens.frontend.syntax.generated.nodes;
+import TernaryExpressionNode from @ens.frontend.syntax.generated.nodes;
+import NullCoalesceExpressionNode from @ens.frontend.syntax.generated.nodes;
+import CastExpressionNode from @ens.frontend.syntax.generated.nodes;
+import CheckedCastExpressionNode from @ens.frontend.syntax.generated.nodes;
+import TypeArmNode from @ens.frontend.syntax.generated.nodes;
+import ValueArmNode from @ens.frontend.syntax.generated.nodes;
+import DefaultArmNode from @ens.frontend.syntax.generated.nodes;
+import ArgumentListNode from @ens.frontend.syntax.generated.nodes;
+import NamedArgumentNode from @ens.frontend.syntax.generated.nodes;
+import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
+import NewExpressionNode from @ens.frontend.syntax.generated.nodes;
+import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
+import GenericNameExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SuperExpressionNode from @ens.frontend.syntax.generated.nodes;
+import InitializerNode from @ens.frontend.syntax.generated.nodes;
+import VariableDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import AssignmentExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ArrayLiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
+import StructLiteralFieldNode from @ens.frontend.syntax.generated.nodes;
+import LambdaExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ListNode from @ens.frontend.syntax.generated.nodes;
+import SwitchArm from @ens.frontend.syntax.generated.nodes;
+import SyntaxKind from @ens.frontend.syntax.generated.kind;
+import SyntaxNode from @ens.frontend.syntax.node;
+import Span from @ens.frontend.support.source;
+import model.overriding;
+import Method from model.typemembers;
+import model.types;
+import ThisUse from result;
+import ThisUseKind from result;
+import BodyChecker from phases.bodies;
+import phases.bodies.wording;
+import support.syntax;
+import List from @std.collections.list;
+
+// The 'this' that 'expression' is, inside any parentheses, or null.
+public thisOf(Expression expression) -> ThisExpressionNode? {
+    let core = syntax.unwrapParentheses(expression);
+    if (core is ThisExpressionNode) {
+        return core;
+    }
+    return null;
+}
+
+// The use of 'node' as a value, named for where it goes, or null where the code around it judges
+// what it does with it.
+public valueUseAt(ThisExpressionNode node) -> ThisUse? {
+    let written = parenthesized(node);
+    let around = enclosing(written);
+    if (judgesOperand(around, written)) {
+        return null;
+    }
+    return escapeAt(node.span(), written, around);
+}
+
+// The name of the field the lambda 'node' is assigned to, as in 'this.callback = () -> ...;', or
+// "" where it is assigned to none.
+public assignedFieldOf(LambdaExpressionNode node) -> string {
+    let value = parenthesized(node);
+    let around = enclosing(value);
+    if (!(around is AssignmentExpressionNode) || !isNode(around.value(), value)) {
+        return "";
+    }
+    let target = syntax.unwrapParentheses(around.target());
+    if (target is MemberExpressionNode && thisOf(target.object()) != null) {
+        return target.member().text();
+    }
+    return "";
+}
+
+// Judges the behavior 'name' the language provides for every type, which 'use' runs on 'this'. It
+// can read a field where a declaration of the program runs for it, and the form the language
+// provides for a struct reads every field.
+public checkBehaviorUse(BodyChecker checker, ThisUse use, string name) {
+    let receiver = checker.frame().thisType();
+    if (receiver != null && (types.isStructLike(receiver)
+            || overriding.runsDeclaredBehavior(receiver, name))) {
+        checker.assignment().checkThisUse(use);
+    }
+}
+
+// Judges a call of the behavior 'name' that the language provides, such as 'toString()', on
+// 'object' where it is 'this'.
+public checkBehaviorCall(BodyChecker checker, Expression object, string name) {
+    let self = thisOf(object);
+    if (self != null) {
+        checkBehaviorUse(checker, new ThisUse(ThisUseKind.BehaviorCall, null, name, self.span()), name);
+    }
+}
+
+// Judges '==' or '!=' in 'node' where a side is 'this': 'equals' is called on the left side with
+// the right side passed to it, and a comparison with null calls nothing.
+public checkComparedThis(BodyChecker checker, BinaryExpressionNode node) {
+    if (wording.isNullLiteral(syntax.unwrapParentheses(node.left()))
+            || wording.isNullLiteral(syntax.unwrapParentheses(node.right()))) {
+        return;
+    }
+    string operatorText = node.operator().text();
+    let left = thisOf(node.left());
+    if (left != null) {
+        checkBehaviorUse(checker, new ThisUse(ThisUseKind.EqualsReceiver, null, operatorText,
+            left.span()), "equals");
+    }
+    let right = thisOf(node.right());
+    if (right != null) {
+        checkBehaviorUse(checker, new ThisUse(ThisUseKind.EqualsArgument, null, operatorText,
+            right.span()), "equals");
+    }
+}
+
+// Judges a switch over 'scrutinee' where it is 'this'. An 'is' arm that names the value stores
+// 'this' in that name, and one that only tests the type reads no field.
+public checkSwitchedThis(BodyChecker checker, Expression scrutinee, List<SwitchArm> arms) {
+    if (thisOf(scrutinee) == null) {
+        return;
+    }
+    for (let arm in arms) {
+        if (arm is TypeArmNode) {
+            let binding = arm.binding();
+            if (binding != null) {
+                checker.assignment().checkThisUse(new ThisUse(ThisUseKind.StoredInLocal, null,
+                    binding.text(), binding.span()));
+                return;
+            }
+        }
+    }
+}
+
+// Judges the call 'call' of 'method' on 'object' where it is 'this' or 'super'.
+public checkMethodCall(BodyChecker checker, CallExpressionNode call, Expression object, Method method) {
+    let receiver = syntax.unwrapParentheses(object);
+    Span span = call.callee().span();
+    if (receiver is ThisExpressionNode) {
+        checker.assignment().checkThisUse(new ThisUse(ThisUseKind.MethodCall, method.name(), span,
+            method));
+    } else if (receiver is SuperExpressionNode) {
+        checker.assignment().checkThisUse(new ThisUse(ThisUseKind.BaseMethodCall,
+            superCallSpelling(call, method.name()), span, method));
+    }
+}
+
+// The call 'call' through 'super' of the method 'name' as code, as in 'super.describe()'.
+superCallSpelling(CallExpressionNode call, string name) -> string {
+    return wording.shortSpelling(call) ?? "super.{name}(...)";
+}
+
+// The outermost parentheses around 'node', or 'node' where none are around it.
+parenthesized(SyntaxNode node) -> SyntaxNode {
+    SyntaxNode written = node;
+    SyntaxNode? around = enclosing(node);
+    while (around is ParenthesizedExpressionNode) {
+        written = around;
+        around = enclosing(around);
+    }
+    return written;
+}
+
+// The node 'node' is written in, past the list that holds it.
+enclosing(SyntaxNode node) -> SyntaxNode? {
+    let parent = node.parent();
+    if (parent is ListNode) {
+        return parent.parent();
+    }
+    return parent;
+}
+
+// Whether 'first' and 'second' are the same node of the tree.
+isNode(SyntaxNode first, SyntaxNode second) -> bool {
+    return first.green() == second.green() && first.span().start == second.span().start;
+}
+
+// Whether 'around' judges what it does with 'written', an operand it holds, itself.
+judgesOperand(SyntaxNode? around, SyntaxNode written) -> bool {
+    switch (around) {
+        is MemberExpressionNode member -> {
+            return isNode(member.object(), written);
+        },
+        is SafeMemberExpressionNode member -> {
+            return isNode(member.object(), written);
+        },
+        is TypeTestExpressionNode ignored -> {
+            return true;
+        },
+        is BinaryExpressionNode binary -> {
+            SyntaxKind operator = binary.operator().kind();
+            return operator == SyntaxKind.EqualsEquals || operator == SyntaxKind.NotEquals;
+        },
+        is InterpolatedStringExpressionNode ignored -> {
+            return true;
+        },
+        is InterpolationPartNode ignored -> {
+            return true;
+        },
+        is SwitchExpressionNode switched -> {
+            return isNode(switched.scrutinee(), written);
+        },
+        is SwitchStatementNode switched -> {
+            return isNode(switched.scrutinee(), written);
+        },
+        default -> {
+            return false;
+        },
+    }
+}
+
+// The use of a 'this' at 'span' as a value, where 'written' is the outermost expression that holds
+// only it and 'around' is what that is written in. A value that '?:', '??', a cast or a switch arm
+// passes on is named for where the expression around it goes.
+escapeAt(Span span, SyntaxNode written, SyntaxNode? around) -> ThisUse {
+    SyntaxNode value = written;
+    SyntaxNode? holder = around;
+    while (holder != null && passesOn(holder, value)) {
+        value = holder;
+        holder = enclosing(holder);
+    }
+    switch (holder) {
+        is ArgumentListNode arguments -> {
+            return new ThisUse(ThisUseKind.Argument, null, calleeNamed(arguments), span);
+        },
+        is NamedArgumentNode named -> {
+            let list = enclosing(named);
+            if (list is ArgumentListNode) {
+                return new ThisUse(ThisUseKind.Argument, null, calleeNamed(list), span);
+            }
+        },
+        is InitializerNode initializer -> {
+            let declaration = enclosing(initializer);
+            if (declaration is VariableDeclarationNode) {
+                return new ThisUse(ThisUseKind.StoredInLocal, null, declaration.name().text(), span);
+            }
+        },
+        is AssignmentExpressionNode assignment -> {
+            let target = syntax.unwrapParentheses(assignment.target());
+            if (isNode(assignment.value(), value) && target is IdentifierExpressionNode) {
+                return new ThisUse(ThisUseKind.StoredInLocal, null, target.name().text(), span);
+            }
+            if (isNode(assignment.value(), value) && target is MemberExpressionNode) {
+                return new ThisUse(ThisUseKind.StoredInField, null, target.member().text(), span);
+            }
+        },
+        is ArrayLiteralExpressionNode ignored -> {
+            return new ThisUse(ThisUseKind.ArrayElement, null, "", span);
+        },
+        is StructLiteralFieldNode field -> {
+            return new ThisUse(ThisUseKind.StoredInField, null, field.name().text(), span);
+        },
+        default -> { },
+    }
+    return new ThisUse(ThisUseKind.Value, null, "", span);
+}
+
+// Whether 'holder' has the value of 'value', an expression it holds, as its own value.
+passesOn(SyntaxNode holder, SyntaxNode value) -> bool {
+    switch (holder) {
+        is ParenthesizedExpressionNode ignored -> {
+            return true;
+        },
+        is TernaryExpressionNode ternary -> {
+            return !isNode(ternary.condition(), value);
+        },
+        is NullCoalesceExpressionNode ignored -> {
+            return true;
+        },
+        is CastExpressionNode ignored -> {
+            return true;
+        },
+        is CheckedCastExpressionNode ignored -> {
+            return true;
+        },
+        is TypeArmNode ignored -> {
+            return true;
+        },
+        is ValueArmNode arm -> {
+            for (long i = 0; i < arm.labelsCount(); i++) {
+                if (isNode(arm.labels(i), value)) {
+                    return false;
+                }
+            }
+            return true;
+        },
+        is DefaultArmNode ignored -> {
+            return true;
+        },
+        is SwitchExpressionNode switched -> {
+            return !isNode(switched.scrutinee(), value);
+        },
+        default -> {
+            return false;
+        },
+    }
+}
+
+// The callee of the call whose arguments are 'arguments', as a text names it: "'show'", "the
+// constructor of 'Holder'", "'super(...)'", or "this call".
+calleeNamed(ArgumentListNode arguments) -> string {
+    let call = enclosing(arguments);
+    if (call is NewExpressionNode) {
+        return "the constructor of '{wording.greenSpelling(call.createdType().green())}'";
+    }
+    if (!(call is CallExpressionNode)) {
+        return "this call";
+    }
+    Expression callee = syntax.unwrapParentheses(call.callee());
+    if (callee is GenericNameExpressionNode) {
+        callee = syntax.unwrapParentheses(callee.head());
+    }
+    switch (callee) {
+        is IdentifierExpressionNode identifier -> {
+            return "'{identifier.name().text()}'";
+        },
+        is MemberExpressionNode member -> {
+            return "'{member.member().text()}'";
+        },
+        is SafeMemberExpressionNode member -> {
+            return "'{member.member().text()}'";
+        },
+        is SuperExpressionNode ignored -> {
+            return "'super(...)'";
+        },
+        default -> {
+            return "this call";
+        },
+    }
+}
