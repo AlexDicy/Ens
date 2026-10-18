@@ -1,17 +1,22 @@
-// Which locals and own fields are definitely assigned on each path, and the texts that name the
-// fields a constructor leaves unassigned.
+// Which locals and fields are definitely assigned on each path, and in a constructor the places
+// the body can throw from with the fields assigned there.
 import Span from @ens.frontend.support.source;
+import SyntaxNode from @ens.frontend.syntax.node;
+import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
 import Reporter from support.diagnostics;
 import LocalBinding from model.scopes;
 import model.convert;
 import model.typemembers;
 import Field from model.typemembers;
-import model.typenames;
 import TypeNames from model.typenames;
-import model.types;
 import Type from model.types;
 import ErrorType from model.types;
 import ConstructorCatch from result;
+import ThisUse from result;
+import CatchThisUse from result;
+import EscapeGap from result;
+import CatchFinish from result;
+import phases.bodies.unassigneduses;
 import List from @std.collections.list;
 
 // An assignment to one field of 'this', kept with the place that wrote it, so a second
@@ -25,6 +30,15 @@ public final class FieldWrite {
     public span() -> Span {
         return this.writeSpan;
     }
+}
+
+// A place the constructor body can throw from, a call or a 'throw' statement, with the fields
+// definitely assigned there.
+final class EscapePoint {
+    SyntaxNode escape;
+    List<Field> assigned;
+
+    constructor(this.escape, this.assigned);
 }
 
 // A snapshot of definite-assignment state at one program point: the locals and this-fields
@@ -57,17 +71,25 @@ public final class AssignmentState {
     LocalBinding? targetBinding;
 
     // The class whose constructor body is being analyzed, or null outside a constructor.
-    // assignedThisFields is the current flow's set of own fields definitely assigned, and
-    // ctorSeededThisWrites is the entry state each catch clause resets to on the exception path.
+    // assignedThisFields is the current flow's set of fields definitely assigned, which holds every
+    // inherited field once the base class is constructed, and ctorSeededThisWrites is the
+    // assignments made before the body runs.
     // maybeAssignedThisWrites is the assignments that may have run on some path reaching here,
     // which is what holds a 'const' field to one write and names the earlier place a second
     // assignment is reported against. ctorEscapedMaybeWrites accumulates that set wherever an
     // exception can leave the body, so a catch clause has what may already be written.
-    // refusedThisFields is the own fields with a write already refused anywhere in the body,
+    // refusedThisFields is the own fields with a write or a read already refused in the body,
     // which the end of a path does not report as unassigned. endReached and
     // finishingReturnSpans are how the paths checked since the body or the current catch clause
     // began finish the constructor normally: by reaching its end, and through each of those
     // returns, and catchSuperCallSpans is the 'super(...)' calls in the current catch clause.
+    // escapePoints is each place the body can throw from, with the fields assigned there.
+    // onCatchPath is whether a catch clause is being checked. There a field is missing only where
+    // the body threw before assigning it, which the exceptions phase judges against what the clause
+    // catches: catchThisUses is the uses of 'this' that need a field the body may not have
+    // assigned, and catchFinishes the places a path finishes the constructor without one.
+    // reportedFields is the fields whose missing value is already reported on the current path, so
+    // a field is reported once. triedCalls is the calls the innermost 'try' being checked covers.
     Type? fieldOwner;
     List<Field> assignedThisFields;
     List<FieldWrite> ctorSeededThisWrites;
@@ -77,6 +99,12 @@ public final class AssignmentState {
     bool endReached;
     List<Span> finishingReturnSpans;
     List<Span> catchSuperCallSpans;
+    List<EscapePoint> escapePoints;
+    bool onCatchPath;
+    List<CatchThisUse> catchThisUses;
+    List<Field> reportedFields;
+    List<CallExpressionNode> triedCalls;
+    List<CatchFinish> catchFinishes;
 
     public constructor(Reporter reporter, TypeNames names) {
         this.reporter = reporter;
@@ -96,6 +124,12 @@ public final class AssignmentState {
         this.endReached = false;
         this.finishingReturnSpans = new List<Span>();
         this.catchSuperCallSpans = new List<Span>();
+        this.escapePoints = new List<EscapePoint>();
+        this.onCatchPath = false;
+        this.catchThisUses = new List<CatchThisUse>();
+        this.reportedFields = new List<Field>();
+        this.triedCalls = new List<CallExpressionNode>();
+        this.catchFinishes = new List<CatchFinish>();
     }
 
     public reset() {
@@ -114,6 +148,12 @@ public final class AssignmentState {
         this.endReached = false;
         this.finishingReturnSpans = new List<Span>();
         this.catchSuperCallSpans = new List<Span>();
+        this.escapePoints = new List<EscapePoint>();
+        this.onCatchPath = false;
+        this.catchThisUses = new List<CatchThisUse>();
+        this.reportedFields = new List<Field>();
+        this.triedCalls = new List<CallExpressionNode>();
+        this.catchFinishes = new List<CatchFinish>();
     }
 
     // The state inside a lambda's body: the enclosing locals' assignments carry in, and it is
@@ -169,8 +209,30 @@ public final class AssignmentState {
         this.flowTerminated = true;
     }
 
-    public enterConstructor(Type receiver) {
+    // Starts the constructor of receiver. One that does not start with 'super(...)' has its base
+    // class constructed before its body runs.
+    public enterConstructor(Type receiver, bool chainsToBase) {
         this.fieldOwner = receiver;
+        if (!chainsToBase) {
+            this.markBaseConstructed();
+        }
+    }
+
+    // The base class is constructed here, so every field it declares has its value.
+    public markBaseConstructed() {
+        let owner = this.fieldOwner;
+        if (owner == null || this.flowTerminated) {
+            return;
+        }
+        let fields = typemembers.fieldsOf(owner);
+        if (fields == null) {
+            return;
+        }
+        for (long i = 0; i < typemembers.baseFieldCount(owner); i++) {
+            if (!this.fieldsContain(this.assignedThisFields, fields.get(i))) {
+                this.assignedThisFields.push(fields.get(i));
+            }
+        }
     }
 
     public seedField(Field field, Span span) {
@@ -184,14 +246,20 @@ public final class AssignmentState {
         this.maybeAssignedThisWrites = this.copyWrites(this.ctorSeededThisWrites);
     }
 
-    // The catch body runs on the exception path, where the try body may have thrown before
-    // assigning any local or field, so only the caught variable and the fields assigned
-    // before the body (the this-field parameters) carry in as definitely assigned. What may
-    // be assigned is the opposite union: everything written before any point the body could
-    // have thrown from.
+    // The catch body runs on the exception path, where the body may have thrown from any place it
+    // can throw from, so only the caught variable and the fields assigned at every one of those
+    // places carry in as definitely assigned. What may be assigned is the opposite union:
+    // everything written before any place the body could have thrown from.
     public enterCatchPath() {
         this.assignedLocals = new List<LocalBinding>();
-        this.assignedThisFields = this.writtenFields(this.ctorSeededThisWrites);
+        if (this.escapePoints.length() == 0) {
+            this.assignedThisFields = this.writtenFields(this.ctorSeededThisWrites);
+        } else {
+            this.assignedThisFields = this.copyFields(this.escapePoints.get(0).assigned);
+            for (let point in this.escapePoints) {
+                this.assignedThisFields = this.commonFields(this.assignedThisFields, point.assigned);
+            }
+        }
         this.maybeAssignedThisWrites = this.copyWrites(this.ctorSeededThisWrites);
         for (long i = 0; i < this.ctorEscapedMaybeWrites.length(); i++) {
             let escaped = this.ctorEscapedMaybeWrites.get(i);
@@ -204,12 +272,17 @@ public final class AssignmentState {
         this.endReached = false;
         this.finishingReturnSpans = new List<Span>();
         this.catchSuperCallSpans = new List<Span>();
+        this.onCatchPath = true;
+        this.catchThisUses = new List<CatchThisUse>();
+        this.catchFinishes = new List<CatchFinish>();
+        this.reportedFields = new List<Field>();
     }
 
-    // What the catch clause being checked does that needs the base class constructed.
+    // What the catch clause being checked does that depends on how far the body ran before it threw.
     public constructorCatch() -> ConstructorCatch {
         return new ConstructorCatch(this.endReached, this.finishingReturnSpans.toArray(),
-            this.catchSuperCallSpans.toArray());
+            this.catchSuperCallSpans.toArray(), this.catchThisUses.toArray(),
+            this.catchFinishes.toArray());
     }
 
     public noteSuperCallInCatch(Span span) {
@@ -254,6 +327,17 @@ public final class AssignmentState {
             copy.push(set.get(i));
         }
         return copy;
+    }
+
+    // The fields both sets hold, in the order of 'first'.
+    commonFields(List<Field> first, List<Field> second) -> List<Field> {
+        let both = new List<Field>();
+        for (let field in first) {
+            if (this.fieldsContain(second, field)) {
+                both.push(field);
+            }
+        }
+        return both;
     }
 
     copyWrites(List<FieldWrite> set) -> List<FieldWrite> {
@@ -311,10 +395,34 @@ public final class AssignmentState {
         }
     }
 
-    // Called where an exception can leave the constructor body: whatever may be assigned here
-    // may be assigned when a catch clause starts. A throw inside a catch clause leaves the
-    // constructor altogether, so it feeds no other clause's entry state.
-    public noteThrowEscapePoint(bool inCatchClause) {
+    // Starts the calls a 'try' covers and returns the ones an enclosing 'try' covers, which
+    // leaveTry restores.
+    public enterTry(List<CallExpressionNode> chain) -> List<CallExpressionNode> {
+        let outer = this.triedCalls;
+        this.triedCalls = chain;
+        return outer;
+    }
+
+    public leaveTry(List<CallExpressionNode> outer) {
+        this.triedCalls = outer;
+    }
+
+    // A call whose receiver and arguments are evaluated, which can throw from here when a 'try'
+    // covers it.
+    public noteCallFinished(CallExpressionNode call, bool inCatchClause) {
+        for (let tried in this.triedCalls) {
+            if (tried.span().start == call.span().start && tried.span().end() == call.span().end()) {
+                this.noteThrowEscapePoint(call, inCatchClause);
+                return;
+            }
+        }
+    }
+
+    // Called where an exception can leave the constructor body, at the call or 'throw' statement
+    // 'escape': whatever may be assigned here may be assigned when a catch clause starts, and what
+    // is assigned here is kept with the place. A throw inside a catch clause leaves the constructor
+    // altogether, so it feeds no other clause's entry state.
+    public noteThrowEscapePoint(SyntaxNode escape, bool inCatchClause) {
         if (this.flowTerminated || this.fieldOwner == null || inCatchClause) {
             return;
         }
@@ -323,6 +431,42 @@ public final class AssignmentState {
             if (!this.writesContain(this.ctorEscapedMaybeWrites, write.field)) {
                 this.ctorEscapedMaybeWrites.push(write);
             }
+        }
+        this.escapePoints.push(new EscapePoint(escape, this.copyFields(this.assignedThisFields)));
+    }
+
+    // Refuses a use of 'this' at a field that has no value yet on the path reaching it. An inherited
+    // field has its value once the base class is constructed, and an own field that needs one once
+    // it is assigned. A refused field is not reported again as unassigned at the end of a path. In
+    // a catch clause the use is kept for the exceptions phase, with each place the body can throw
+    // from without the field.
+    public checkThisFieldUse(ThisUse use) {
+        let owner = this.fieldOwner;
+        let field = use.field();
+        if (owner == null || this.flowTerminated || field.type() is ErrorType
+                || this.fieldsContain(this.assignedThisFields, field)
+                || this.fieldsContain(this.refusedThisFields, field)
+                || this.fieldsContain(this.reportedFields, field)) {
+            return;
+        }
+        bool inherited = typemembers.isInheritedField(owner, field);
+        if (!inherited && !needsAssignment(field)) {
+            return;
+        }
+        this.reportedFields.push(field);
+        if (!this.onCatchPath) {
+            this.reporter.report(unassigneduses.refusal(use, inherited, this.names), use.span());
+            this.markThisFieldRefused(field);
+            return;
+        }
+        let gaps = new List<EscapeGap>();
+        for (let point in this.escapePoints) {
+            if (!this.fieldsContain(point.assigned, field)) {
+                gaps.push(new EscapeGap(point.escape, field, inherited));
+            }
+        }
+        if (gaps.length() > 0) {
+            this.catchThisUses.push(new CatchThisUse(use, gaps.toArray()));
         }
     }
 
@@ -343,7 +487,9 @@ public final class AssignmentState {
 
     // Reports every own field left unassigned on the path reaching span when the field needed an
     // assignment, meaning a non-defaultable one or a 'const' one without a default, and credits
-    // them so the same field is not reported twice.
+    // them so the same field is not reported twice. In a catch clause a field can be missing only
+    // because the body threw before assigning it, so the fields are kept for the exceptions phase
+    // with each place the body can throw from without them.
     checkConstructorFieldsAssigned(Span span) {
         let owner = this.fieldOwner;
         if (owner == null || this.flowTerminated) {
@@ -354,55 +500,36 @@ public final class AssignmentState {
             return;
         }
         let missing = new List<Field>();
-        let missingConst = new List<Field>();
         for (long i = typemembers.baseFieldCount(owner); i < fields.length(); i++) {
             let field = fields.get(i);
-            if (field.type() is ErrorType) {
-                continue;
-            }
-            if (field.hasDefault()) {
-                continue;
-            }
-            if (this.fieldsContain(this.assignedThisFields, field)
-                    || this.fieldsContain(this.refusedThisFields, field)) {
-                continue;
-            }
-            if (field.isConst()) {
-                missingConst.push(field);
-            } else if (!convert.isDefaultable(field.type())) {
+            if (!(field.type() is ErrorType) && needsAssignment(field)
+                    && !this.fieldsContain(this.assignedThisFields, field)
+                    && !this.fieldsContain(this.refusedThisFields, field)) {
                 missing.push(field);
             }
         }
-        string owningName = this.names.quoted(owner);
-        string kindWord = "class";
-        let authority = types.authorityOf(owner);
-        if (authority != null) {
-            owningName = this.names.quotedName(authority);
-            kindWord = typenames.kindWordOf(authority);
+        if (missing.length() == 0) {
+            return;
         }
-        if (missing.length() > 0) {
-            string they = "they";
-            if (missing.length() == 1) {
-                they = "it";
+        if (this.onCatchPath) {
+            let gaps = new List<EscapeGap>();
+            for (let field in missing) {
+                for (let point in this.escapePoints) {
+                    if (!this.fieldsContain(point.assigned, field)) {
+                        gaps.push(new EscapeGap(point.escape, field, false));
+                    }
+                }
             }
-            this.reporter.report(fieldListSubject(missing) + " of {kindWord} {owningName} "
-                + "cannot be null, and {they} " + fieldListVerb(missing) + " not assigned on every "
-                + "path through this constructor. Assign " + fieldListPronoun(missing)
-                + " on every path, for example 'this.{missing.get(0).name()} = ...;'.", span);
+            if (gaps.length() > 0) {
+                this.catchFinishes.push(new CatchFinish(span, gaps.toArray()));
+            }
+        } else {
+            for (let text in unassigneduses.unassignedFieldRefusals(owner, missing, this.names)) {
+                this.reporter.report(text, span);
+            }
         }
-        if (missingConst.length() > 0) {
-            this.reporter.report(fieldListSubject(missingConst) + " of {kindWord} "
-                + "{owningName} " + fieldListVerb(missingConst) + " 'const' with no default "
-                + "value and " + fieldListVerb(missingConst) + " not assigned on every path "
-                + "through this constructor. Assign " + fieldListPronoun(missingConst)
-                + " on every path, for example 'this.{missingConst.get(0).name()} = ...;'.",
-                span);
-        }
-        for (long i = 0; i < missing.length(); i++) {
-            this.assignedThisFields.push(missing.get(i));
-        }
-        for (long i = 0; i < missingConst.length(); i++) {
-            this.assignedThisFields.push(missingConst.get(i));
+        for (let field in missing) {
+            this.assignedThisFields.push(field);
         }
     }
 
@@ -543,36 +670,8 @@ public bindingsContain(List<LocalBinding> set, LocalBinding binding) -> bool {
     return false;
 }
 
-// "Field 'a'" or "Fields 'a', 'b' and 'c'", for a diagnostic naming several fields at once.
-fieldListSubject(List<Field> fields) -> string {
-    string subject = "Fields ";
-    if (fields.length() == 1) {
-        subject = "Field ";
-    }
-    for (long i = 0; i < fields.length(); i++) {
-        if (i > 0) {
-            if (i + 1 == fields.length()) {
-                subject = subject + " and ";
-            } else {
-                subject = subject + ", ";
-            }
-        }
-        subject = subject + "'{fields.get(i).name()}'";
-    }
-    return subject;
-}
-
-fieldListVerb(List<Field> fields) -> string {
-    if (fields.length() == 1) {
-        return "is";
-    }
-    return "are";
-}
-
-// "it" or "them", so a fix worded for several fields agrees with fieldListSubject.
-fieldListPronoun(List<Field> fields) -> string {
-    if (fields.length() == 1) {
-        return "it";
-    }
-    return "them";
+// Whether an own field has no value until something assigns it: one without a default whose type
+// has no default value, or a 'const' one without a default.
+needsAssignment(Field field) -> bool {
+    return !field.hasDefault() && (field.isConst() || !convert.isDefaultable(field.type()));
 }

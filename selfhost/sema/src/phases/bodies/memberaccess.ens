@@ -4,6 +4,7 @@ import Expression from @ens.frontend.syntax.generated.nodes;
 import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
 import ArgumentListNode from @ens.frontend.syntax.generated.nodes;
 import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ThisExpressionNode from @ens.frontend.syntax.generated.nodes;
 import SafeMemberExpressionNode from @ens.frontend.syntax.generated.nodes;
 import SubscriptExpressionNode from @ens.frontend.syntax.generated.nodes;
 import SafeSubscriptExpressionNode from @ens.frontend.syntax.generated.nodes;
@@ -62,6 +63,8 @@ import NameResolution from phases.bodies;
 import TypeName from phases.bodies;
 import NamespaceName from phases.bodies;
 import support.syntax;
+import ThisUse from result;
+import ThisUseKind from result;
 
 // What a member name means on a receiver type.
 public sealed abstract class MemberLookup {
@@ -629,9 +632,11 @@ public checkConstructorAccess(BodyChecker checker, Type ownerType, Method chosen
 }
 
 // A covered access reports no method here. A call is covered because it takes the method
-// this resolves to from the side table this sets.
+// this resolves to from the side table this sets. 'writtenMember' names the member a write sets
+// on the field this reads, as 'left' in 'this.pair.left = ...'.
 public analyzeMemberValue(BodyChecker checker, MemberExpressionNode node,
-                          MemberPosition position = MemberPosition.Read) -> Type {
+                          MemberPosition position = MemberPosition.Read, string? writtenMember = null)
+        -> Type {
     let object = node.object();
     string name = node.member().text();
     let wanted = checker.targets().functionTargetOf(node.green());
@@ -666,7 +671,7 @@ public analyzeMemberValue(BodyChecker checker, MemberExpressionNode node,
     if (staticHead != null) {
         return staticmembers.analyzeStaticMemberValue(checker, node, object, staticHead, position, wanted);
     }
-    Type objectType = checker.analyzeExpression(object);
+    Type objectType = analyzeMemberObject(checker, object, position, name);
     if (objectType is ErrorType) {
         return checker.store().errorType();
     }
@@ -740,6 +745,15 @@ public analyzeMemberValue(BodyChecker checker, MemberExpressionNode node,
             if (!checkMemberAccess(checker, name, found.field.visibility(),
                     found.field.definingType(), node.member().span())) {
                 checker.result().markMemberAccessDenied(node.green());
+            }
+            bool throughThis = syntax.unwrapParentheses(object) is ThisExpressionNode;
+            if (position != MemberPosition.Write && throughThis) {
+                ThisUseKind kind = ThisUseKind.Read;
+                if (writtenMember != null) {
+                    kind = ThisUseKind.MemberWrite;
+                }
+                let use = new ThisUse(kind, found.field, writtenMember ?? "", node.span());
+                checker.assignment().checkThisFieldUse(use);
             }
             return narrowing.narrowedFieldType(checker, node, found.field.type());
         },
@@ -997,6 +1011,19 @@ memberUse(MemberPosition position, string name) -> string {
         MemberPosition.Covered -> "call '{name}' on",
         default -> "read '{name}' from",
     };
+}
+
+// The object a member is reached through. A write to a member of a field of 'this', as in
+// 'this.pair.left = ...', reads that field, and the read is named for the member it sets.
+analyzeMemberObject(BodyChecker checker, Expression object, MemberPosition position, string member)
+        -> Type {
+    if (position != MemberPosition.Write || !(object is MemberExpressionNode)
+            || !(syntax.unwrapParentheses(object.object()) is ThisExpressionNode)) {
+        return checker.analyzeExpression(object);
+    }
+    Type analyzed = analyzeMemberValue(checker, object, MemberPosition.Read, member);
+    checker.result().setType(object.green(), analyzed);
+    return analyzed;
 }
 
 public analyzeSafeMemberValue(BodyChecker checker, SafeMemberExpressionNode node,

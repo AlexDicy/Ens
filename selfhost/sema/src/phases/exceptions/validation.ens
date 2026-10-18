@@ -1,5 +1,6 @@
 import FunctionDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import FieldDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import CatchClauseNode from @ens.frontend.syntax.generated.nodes;
 import SyntaxNode from @ens.frontend.syntax.node;
 import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
 import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
@@ -17,6 +18,7 @@ import Reporter from support.diagnostics;
 import RelatedLocation from support.diagnostics;
 import support.diagnostics;
 import SemaResult from result;
+import ConstructorCatch from result;
 import phases.exceptions;
 import ModuleExceptions from phases.exceptions;
 import FunctionItem from phases.exceptions;
@@ -28,6 +30,7 @@ import phases.members;
 import model.hierarchy;
 import model.typemembers;
 import Method from model.typemembers;
+import Field from model.typemembers;
 import Signature from model.typemembers;
 import Parameter from model.typemembers;
 import model.typenames;
@@ -45,6 +48,7 @@ import StructType from model.types;
 import PrimitiveBinding from model.types;
 import List from @std.collections.list;
 import phases.bodies.wording;
+import phases.bodies.unassigneduses;
 import Set from @std.collections.set;
 import StringBuilder from @std.text.stringbuilder;
 import support.syntax;
@@ -345,7 +349,7 @@ public final class ThrowValidation {
         if (method != null && (method.isConstructor() || method.isDestructor())) {
             this.validateNoEscape(item, method, outward);
             if (method.isConstructor()) {
-                this.validateBaseConstruction(item);
+                this.validateConstructorCatches(item);
             }
         } else {
             this.validateContract(item, outward);
@@ -396,7 +400,7 @@ public final class ThrowValidation {
     // and what their arguments call. Where none of the covered calls can throw, the 'try' is refused,
     // or moved to the calls in their arguments that need it.
     validateTriedChain(CallExpressionNode call, Span triedAt, CallSite site, LambdaExpressionNode? lambda) {
-        let chain = exceptions.triedChain(call);
+        let chain = syntax.triedChain(call);
         bool raises = false;
         for (let covered in chain) {
             this.noteLambdaArguments(covered);
@@ -690,67 +694,130 @@ public final class ThrowValidation {
             + "Catch the exceptions with 'catch' clauses after the {word} body.", item.signature.nameSpan());
     }
 
-    // A catch clause that catches what the arguments of 'super(...)' throw runs before the base class
+    // What a constructor's catch clauses do that depends on how far the body ran before it threw.
+    // A clause that catches what the arguments of 'super(...)' throw runs before the base class
     // exists, so it must not finish the constructor normally, which returns the object. A
-    // 'super(...)' in a catch clause is refused for that call alone, naming the call to move where
-    // the clause catches what one throws.
-    validateBaseConstruction(FunctionItem item) {
+    // 'super(...)' in a clause is refused for that call alone, naming the call to move where the
+    // clause catches what one throws. A use of 'this' in a clause is refused where the clause
+    // catches what the body throws before a field the use needs has a value.
+    validateConstructorCatches(FunctionItem item) {
         let owner = item.owner;
         let declaration = item.declaration;
-        let chaining = syntax.chainingSuperCall(declaration.body());
-        if (owner == null || chaining == null || declaration.catchClausesCount() == 0) {
+        if (owner == null || declaration.catchClausesCount() == 0) {
             return;
         }
         let base = hierarchy.baseOf(owner);
-        if (base == null) {
-            return;
+        let chaining = syntax.chainingSuperCall(declaration.body());
+        let raised = new CallThrows();
+        if (chaining != null) {
+            raised = this.module.callThrowsUnder(chaining.arguments());
         }
-        let raised = this.module.callThrowsUnder(chaining.arguments());
         let clauseTypes = this.module.caughtClauseTypes(declaration);
         string quotedOwner = this.names.quotedName(owner);
-        string quotedBase = this.names.quoted(base);
+        string quotedBase = "";
+        if (base != null) {
+            quotedBase = this.names.quoted(base);
+        }
         for (long i = 0; i < declaration.catchClausesCount(); i++) {
             let clause = declaration.catchClauses(i);
             let facts = this.result.constructorCatchOf(clause.green());
+            let clauseType = clauseTypes.get(i);
             if (facts == null) {
                 continue;
             }
-            let clauseType = clauseTypes.get(i);
-            CaughtCall? caught = null;
-            if (clauseType != null && !this.shadowedByEarlier(clauseType, clauseTypes, i)) {
-                caught = this.firstCallCaught(raised, clauseType, clauseTypes, i);
-            }
-            for (let superCall in facts.superCalls()) {
-                string text = "'super(...)' cannot be called in a 'catch' clause, because the "
-                    + "constructor of {quotedOwner} already constructs base class {quotedBase} with "
-                    + "the 'super(...)' it starts with. Remove this call.";
-                if (caught != null) {
-                    text = text + " To construct {quotedBase} with a fallback value, move the call to "
-                        + "{calleePhrase(caught.call)} into a function that catches "
-                        + "{nameList(caught.thrown, this.names)} and returns a value to pass to the "
-                        + "first 'super(...)'.";
-                }
-                this.reporter.report(text, superCall);
-            }
-            if (caught == null || syntax.writesSuperCall(clause)) {
+            if (clauseType == null || this.shadowedByEarlier(clauseType, clauseTypes, i)) {
+                this.refuseSuperCallsInCatch(facts, null, quotedOwner, quotedBase);
                 continue;
             }
-            string callee = calleePhrase(caught.call);
-            string named = nameList(caught.thrown, this.names);
-            string escape = "{callee} can throw {named} in the arguments of 'super(...)', and this "
-                + "'catch' clause";
-            string fix = "Move the call into a function that catches {named} and returns a value to "
-                + "pass to 'super(...)'. If the program cannot continue without that value, ";
-            if (facts.reachesEnd()) {
-                this.reporter.report("The constructor of {quotedOwner} can return an object whose "
-                    + "base class {quotedBase} was never constructed: {escape} then reaches its end. "
-                    + fix + "end the clause with 'panic(...)'.", clause.catchKeyword().span());
+            let caught = this.firstCallCaught(raised, clauseType, clauseTypes, i);
+            this.refuseSuperCallsInCatch(facts, caught, quotedOwner, quotedBase);
+            if (caught != null && !syntax.writesSuperCall(clause)) {
+                this.refuseUnconstructedExits(clause, facts, caught, quotedOwner, quotedBase);
             }
-            for (let returned in facts.returns()) {
-                this.reporter.report("This 'return' can end the constructor of {quotedOwner} with an "
-                    + "object whose base class {quotedBase} was never constructed: {escape} catches "
-                    + "{pronounFor(caught.thrown)}. " + fix + "replace 'return;' with 'panic(...)'.",
-                    returned);
+            this.refuseCatchThisUses(facts, clauseType, clauseTypes, i, quotedBase);
+            this.refuseCatchFinishes(facts, clauseType, clauseTypes, i, owner);
+        }
+    }
+
+    refuseSuperCallsInCatch(ConstructorCatch facts, CaughtCall? caught, string quotedOwner,
+            string quotedBase) {
+        for (let superCall in facts.superCalls()) {
+            string text = "'super(...)' cannot be called in a 'catch' clause, because the constructor "
+                + "of {quotedOwner} already constructs base class {quotedBase} with the 'super(...)' "
+                + "it starts with. Remove this call.";
+            if (caught != null) {
+                text = text + " To construct {quotedBase} with a fallback value, move the call to "
+                    + "{calleePhrase(caught.call)} into a function that catches "
+                    + "{nameList(caught.thrown, this.names)} and returns a value to pass to the first "
+                    + "'super(...)'.";
+            }
+            this.reporter.report(text, superCall);
+        }
+    }
+
+    // A clause that catches what the arguments of 'super(...)' throw, from 'caught', and finishes
+    // the constructor normally returns an object whose base class was never constructed.
+    refuseUnconstructedExits(CatchClauseNode clause, ConstructorCatch facts, CaughtCall caught,
+            string quotedOwner, string quotedBase) {
+        string callee = calleePhrase(caught.call);
+        string named = nameList(caught.thrown, this.names);
+        string escape = "{callee} can throw {named} in the arguments of 'super(...)', and this "
+            + "'catch' clause";
+        string fix = "Move the call into a function that catches {named} and returns a value to "
+            + "pass to 'super(...)'. If the program cannot continue without that value, ";
+        if (facts.reachesEnd()) {
+            this.reporter.report("The constructor of {quotedOwner} can return an object whose base "
+                + "class {quotedBase} was never constructed: {escape} then reaches its end. " + fix
+                + "end the clause with 'panic(...)'.", clause.catchKeyword().span());
+        }
+        for (let returned in facts.returns()) {
+            this.reporter.report("This 'return' can end the constructor of {quotedOwner} with an "
+                + "object whose base class {quotedBase} was never constructed: {escape} catches "
+                + "{pronounFor(caught.thrown)}. " + fix + "replace 'return;' with 'panic(...)'.",
+                returned);
+        }
+    }
+
+    // Refuses each use of 'this' in the clause at 'index' at the first place the body can throw
+    // from, without a field the use needs, whose exception the clause catches.
+    refuseCatchThisUses(ConstructorCatch facts, Type clauseType, List<Type?> clauseTypes, long index,
+            string quotedBase) {
+        for (let deferred in facts.uses()) {
+            for (let gap in deferred.gaps()) {
+                let caught = this.caughtAtEscape(gap.escape(), clauseType, clauseTypes, index);
+                if (caught.isEmpty()) {
+                    continue;
+                }
+                string? callee = null;
+                let escape = gap.escape();
+                if (escape is CallExpressionNode) {
+                    callee = calleePhrase(escape);
+                }
+                this.reporter.report(unassigneduses.catchRefusal(deferred.use(), gap.missing(),
+                    gap.missingIsInherited(), callee, nameList(caught, this.names), quotedBase,
+                    this.names), deferred.use().span());
+                break;
+            }
+        }
+    }
+
+    // Refuses each place a path through the clause at 'index' finishes the constructor of 'owner'
+    // without the fields the body can throw before assigning, where the clause catches that throw.
+    refuseCatchFinishes(ConstructorCatch facts, Type clauseType, List<Type?> clauseTypes, long index,
+            Type owner) {
+        for (let finish in facts.finishes()) {
+            let missing = new List<Field>();
+            for (let gap in finish.gaps()) {
+                let field = gap.missing();
+                if (missing.contains(field)) {
+                    continue;
+                }
+                if (!this.caughtAtEscape(gap.escape(), clauseType, clauseTypes, index).isEmpty()) {
+                    missing.push(field);
+                }
+            }
+            for (let text in unassigneduses.unassignedFieldRefusals(owner, missing, this.names)) {
+                this.reporter.report(text, finish.span());
             }
         }
     }
@@ -767,6 +834,11 @@ public final class ThrowValidation {
             }
         }
         return null;
+    }
+
+    // What the clause at 'index' catches of what the body throws at 'escape'.
+    caughtAtEscape(SyntaxNode escape, Type clauseType, List<Type?> clauseTypes, long index) -> ThrowSet {
+        return this.caughtByClause(this.module.escapeThrows(escape), clauseType, clauseTypes, index);
     }
 
     // The types of 'raised' the clause at 'index' can catch, leaving out the ones an earlier
@@ -1163,7 +1235,7 @@ initializerReason(TypeItem item, FieldDeclarationNode member, TypeNames names) -
 
 // What a 'try' before 'call' covers that cannot throw: 'call' itself, or every call of its chain.
 coveredCannotThrow(CallExpressionNode call) -> string {
-    if (exceptions.triedChain(call).length() > 1) {
+    if (syntax.triedChain(call).length() > 1) {
         return "none of the calls it covers can throw";
     }
     return "{calleePhrase(call)} cannot throw";

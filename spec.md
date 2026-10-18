@@ -265,6 +265,10 @@ So inside `class Box<Tag>` a field may read `List<Tag> items = new List<Tag>();`
 A field whose type has no default value, such as a class, a string, an array, or a struct without one, and that is not made nullable, must be definitely assigned on every path through each constructor.
 A `this.field` parameter, a declared field default, and a `this.field = ...` assignment in the body all count, and assigning the field in every branch of an `if` or `switch` satisfies the rule exactly as a single unconditional assignment does.
 A constructor that leaves such a field unassigned on some path, for example by returning early before it is set, is a compile error, and a class that has such a field but declares no constructor at all is rejected the same way.
+Such a field may be read through `this` only where every path reaching the read has assigned it.
+A compound assignment such as `+=`, a write to a member of the field, and a call of the function value the field holds all read it.
+In a `catch` clause, a field counts as assigned only when the body assigns it before every point where the body can throw an exception the clause catches.
+The fields a base class declares have their values once `super(...)` finishes, so neither the arguments of `super(...)` nor a `catch` clause that catches what those arguments throw may read them.
 When a constructor's `catch` clause catches an exception thrown by the arguments of `super(...)`, it runs before the base class is constructed.
 Such a clause may not reach its end or a `return`: every path through it ends by calling `panic` or another `noreturn` function, or loops forever.
 
