@@ -25,17 +25,23 @@ import ForEachStatementNode from @ens.frontend.syntax.generated.nodes;
 import VariableDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import ExpressionStatementNode from @ens.frontend.syntax.generated.nodes;
 import GreenNode from @ens.frontend.syntax.green;
+import IfStatementNode from @ens.frontend.syntax.generated.nodes;
+import TernaryExpressionNode from @ens.frontend.syntax.generated.nodes;
+import Statement from @ens.frontend.syntax.generated.nodes;
 import SyntaxKind from @ens.frontend.syntax.generated.kind;
 import Span from @ens.frontend.support.source;
 import LocalBinding from model.scopes;
 import model.capabilities;
 import model.convert;
 import phases.bodies.nullguidance;
+import phases.bodies.lambdas;
+import LambdaFrame from phases.bodies.lambdas;
 import phases.bodies.literaltyping;
 import phases.bodies.wording;
 import phases.bodies.voidcalls;
 import model.narrow;
 import NarrowingPath from model.narrow;
+import model.hierarchy;
 import model.typemembers;
 import model.types;
 import Type from model.types;
@@ -53,6 +59,7 @@ import Map from @std.collections.map;
 import BodyChecker from phases.bodies;
 import LiteralOrigin from phases.bodies.literaltargets;
 import support.syntax;
+import support.diagnostics;
 
 // One fact a condition can prove: the storage path, the type the check proves for it, and
 // whether the proof holds where the condition is true or where it is false.
@@ -277,10 +284,282 @@ public final class ConditionSite {
     }
 }
 
+// The hop a cast hint adds after the path of the value it is about. It reads no field.
+final class CastHintHop {
+    static const string name = "as?";
+}
+
 // The path an 'as?' cast compared with null would narrow if it were an 'is' test, which holds the
 // cast's type where that comparison holds, for a read through the operand to name the test to write.
 castHintPath(NarrowingPath path) -> NarrowingPath {
-    return path.extended(narrow.fieldSegment("as?"));
+    return path.extended(narrow.fieldSegment(CastHintHop.name));
+}
+
+// The proofs in 'outside', made where a lambda is created, that hold inside its body, or with
+// 'carried' false the ones that do not.
+public lambdaNarrowings(Map<NarrowingPath, Type> outside, bool carried) -> Map<NarrowingPath, Type> {
+    let kept = new Map<NarrowingPath, Type>();
+    for (let path in outside.keys()) {
+        let proven = outside.get(path);
+        if (proven != null && (objectFieldHop(path) < 0) == carried) {
+            kept.set(path, proven);
+        }
+    }
+    return kept;
+}
+
+// The index of the first hop along 'path' that reads a field of a class object, or -1 where none
+// does. Nothing writes what a lambda copies, which is the locals, the parameters and the 'this' it
+// reads, and nothing writes a type-level 'const' either. A struct value holds its fields, so a proof
+// along fields of struct values holds inside the lambda. A field of a class object is read from the
+// object when the lambda runs, and a 'const' one can still change until its constructor ends.
+public objectFieldHop(NarrowingPath path) -> long {
+    Type held = path.rootType();
+    string[] names = path.fieldNames();
+    for (long i = 0; i < names.length; i++) {
+        if (names[i] == CastHintHop.name) {
+            return -1;
+        }
+        Type owner = convert.coreOf(held);
+        if (!types.isStructLike(owner)) {
+            return i;
+        }
+        let read = typemembers.inheritedOrOwnField(owner, names[i]);
+        if (read == null) {
+            return i;
+        }
+        held = read.type();
+    }
+    return -1;
+}
+
+// The part of 'place', whose path is 'path', that ends at the first field read from a class object.
+public objectReadSpelling(Expression place, NarrowingPath path) -> string {
+    Expression read = syntax.unwrapParentheses(place);
+    long hop = objectFieldHop(path);
+    for (long i = path.fieldNames().length - 1; i > hop; i--) {
+        if (read is MemberExpressionNode) {
+            read = syntax.unwrapParentheses(read.object());
+        }
+    }
+    return wording.oneLineSpelling(read);
+}
+
+// Why a proof made where the lambda being checked is created does not hold for 'reads', the fields
+// the lambda reads from class objects, as a sentence.
+public objectReadReason(string[] reads) -> string {
+    string constructed = "and a 'const' field can still change until its object's constructor ends.";
+    if (reads.length == 1) {
+        return "The lambda reads '{reads[0]}' from the object when the lambda runs, {constructed}";
+    }
+    let quoted = new List<string>();
+    for (let read in reads) {
+        quoted.push("'{read}'");
+    }
+    return "The lambda reads {diagnostics.andJoined(quoted.toArray())} from their objects when the lambda "
+        + "runs, {constructed}";
+}
+
+// The fix for reading 'places' inside the lambda being checked, which a proof made where the lambda
+// is created covers there: copying each one into a local before the lambda, with the statements
+// 'copies', changing the tests 'retests' names so that they test the locals, and reading the locals
+// inside it. With 'named', each place is the one the reason names.
+public objectCopyAdvice(string[] places, string[] copies, bool named, string[] retests) -> string {
+    string written = string.joined(copies, " ");
+    bool single = places.length == 1;
+    string subject = single ? "it" : "them";
+    if (!named) {
+        let quoted = new List<string>();
+        for (let place in places) {
+            quoted.push("'{place}'");
+        }
+        subject = diagnostics.andJoined(quoted.toArray());
+    }
+    string locals = single ? "a local" : "locals";
+    string read = single ? "the local" : "the locals";
+    string copy = "Copy {subject} into {locals} before the lambda, as in '{written}'";
+    if (retests.length == 0) {
+        return "{copy}, and read {read} inside the lambda.";
+    }
+    return "{copy}. Change {diagnostics.andJoined(retests)}, and read {read} inside the lambda.";
+}
+
+// The changes to the tests that prove what holds for 'place' where the lambda of 'frame' is created,
+// between the lambda and the statement it is in, where 'place' is copied into the local 'local' before
+// that statement: each test then has to test the local, as in "the test 'this.fixed != null' to
+// 'fixed != null'". Such a test is the condition of a '?:' the lambda is a branch of, or the left side
+// of a '&&' or a '||' the lambda is the right side of. Null where one of them tests a part of 'place',
+// which the copy then reads before the test holds.
+public copyRetests(BodyChecker checker, Expression place, LambdaFrame frame, string local) -> string[]? {
+    let path = buildNarrowingPath(checker, place);
+    if (path == null) {
+        return [];
+    }
+    let retests = new List<string>();
+    SyntaxNode inner = frame.lambda();
+    SyntaxNode? holder = inner.parent();
+    while (holder != null && !(holder is Statement)) {
+        if (holder is TernaryExpressionNode && holder.condition().span() != inner.span()) {
+            bool inThen = holder.thenValue().span() == inner.span();
+            if (!addRetests(checker, holder.condition(), inThen, path, local, retests)) {
+                return null;
+            }
+        } else if (holder is BinaryExpressionNode && holder.right().span() == inner.span()) {
+            SyntaxKind operator = holder.operator().kind();
+            bool both = operator == SyntaxKind.AmpersandAmpersand;
+            if ((both || operator == SyntaxKind.PipePipe)
+                    && !addRetests(checker, holder.left(), both, path, local, retests)) {
+                return null;
+            }
+        }
+        inner = holder;
+        holder = holder.parent();
+    }
+    return retests.toArray();
+}
+
+// Adds to 'retests' the change to each test in 'condition' that proves something of 'path' where the
+// condition is 'holds', as collectNarrowings reads the condition. False where a test proves something
+// of a part of 'path'.
+addRetests(BodyChecker checker, Expression condition, bool holds, NarrowingPath path, string local,
+           List<string> retests) -> bool {
+    Expression core = syntax.unwrapParentheses(condition);
+    if (core is PrefixExpressionNode && core.operator().kind() == SyntaxKind.Exclamation) {
+        return addRetests(checker, core.operand(), !holds, path, local, retests);
+    }
+    if (core is BinaryExpressionNode) {
+        SyntaxKind operator = core.operator().kind();
+        if ((holds && operator == SyntaxKind.AmpersandAmpersand)
+                || (!holds && operator == SyntaxKind.PipePipe)) {
+            return addRetests(checker, core.left(), holds, path, local, retests)
+                && addRetests(checker, core.right(), holds, path, local, retests);
+        }
+    }
+    let tested = provingOperand(core, holds);
+    if (tested == null) {
+        return true;
+    }
+    let testedPath = buildNarrowingPath(checker, syntax.unwrapParentheses(tested));
+    if (testedPath == null) {
+        return true;
+    }
+    if (testedPath == path) {
+        retests.push(retest(core, tested, local));
+        return true;
+    }
+    return !narrow.startsWith(path, testedPath);
+}
+
+// The value written in 'test', a null check or a type test, which the test proves something of where
+// it is 'holds', or null where it proves nothing there.
+provingOperand(Expression test, bool holds) -> Expression? {
+    if (test is TypeTestExpressionNode) {
+        return holds ? test.value() : null;
+    }
+    if (!(test is BinaryExpressionNode)) {
+        return null;
+    }
+    SyntaxKind operator = test.operator().kind();
+    if ((operator == SyntaxKind.NotEquals) != holds || (operator != SyntaxKind.NotEquals
+            && operator != SyntaxKind.EqualsEquals)) {
+        return null;
+    }
+    bool nullLeft = wording.isNullLiteral(syntax.unwrapParentheses(test.left()));
+    bool nullRight = wording.isNullLiteral(syntax.unwrapParentheses(test.right()));
+    if (nullLeft == nullRight) {
+        return null;
+    }
+    return nullLeft ? test.right() : test.left();
+}
+
+// The change to 'test' that tests the local 'local' where it tests 'tested'.
+retest(Expression test, Expression tested, string local) -> string {
+    string whole = wording.oneLineSpelling(test);
+    string place = wording.oneLineSpelling(tested);
+    if (whole.startsWith(place)) {
+        return "the test '{whole}' to '{local}{whole.substring(place.length)}'";
+    }
+    if (whole.endsWith(place)) {
+        return "the test '{whole}' to '{whole.substring(0, whole.length - place.length)}{local}'";
+    }
+    return "the test '{whole}' so that it tests '{local}'";
+}
+
+// The whole place a lambda reads through 'operand' that proofs made where the lambda of 'frame' is
+// created cover: 'operand', or the member read of it that a proof covers too, and so on outward. A
+// copy of that place into a local before the lambda leaves nothing for the lambda to read from an
+// object.
+public copiedPlace(BodyChecker checker, Expression operand, LambdaFrame frame) -> Expression {
+    Expression place = syntax.unwrapParentheses(operand);
+    while (true) {
+        SyntaxNode? holder = place.parent();
+        while (holder is ParenthesizedExpressionNode) {
+            holder = holder.parent();
+        }
+        if (!(holder is MemberExpressionNode)
+                || syntax.unwrapParentheses(holder.object()).green() != place.green()) {
+            return place;
+        }
+        let path = buildNarrowingPath(checker, holder);
+        if (path == null || frame.uncarriedProof(path) == null) {
+            return place;
+        }
+        place = holder;
+    }
+}
+
+// The name of a local to copy 'place' into, named after the field it reads, which no name in scope
+// takes and which is not 'avoided'.
+public copyName(BodyChecker checker, Expression place, string avoided) -> string {
+    Expression read = syntax.unwrapParentheses(place);
+    string base = "value";
+    if (read is MemberExpressionNode) {
+        base = read.member().text();
+    }
+    return nullguidance.freeLocalName(checker, "", base, avoided);
+}
+
+// The type test that narrows 'value' to 'tested', written the way the code being checked can hold
+// it: an 'if' where a statement can go, and a '?:' anywhere else.
+public typeTestExample(BodyChecker checker, Expression value, Type tested) -> string {
+    string spelled = wording.oneLineSpelling(syntax.unwrapParentheses(value));
+    if (checker.frame().statementsAllowed()) {
+        return checker.names().quotedCode(["if ({spelled} is ", ")"], [tested]);
+    }
+    return checker.names().quotedCode(["{spelled} is ", " ? ... : ..."], [tested]);
+}
+
+// The sentences that follow the refusal of the member 'member' read through 'object' inside a lambda,
+// where a type test made where the lambda is created gives 'object' a type that has the member but
+// does not hold inside the lambda. Null anywhere else.
+public objectReadTestHint(BodyChecker checker, Expression object, string member) -> string? {
+    let path = buildNarrowingPath(checker, object);
+    if (path == null) {
+        return null;
+    }
+    let frame = lambdas.uncarriedFrame(checker, path);
+    if (frame == null) {
+        return null;
+    }
+    let proven = frame.uncarriedProof(path);
+    if (proven == null || memberaccess.lookupMember(checker, proven, member) is MissingMember) {
+        return null;
+    }
+    string read = objectReadSpelling(object, path);
+    string spelled = wording.oneLineSpelling(syntax.unwrapParentheses(object));
+    string reason = objectReadReason([read]);
+    if (frame.allowsStatementsBefore()) {
+        let place = copiedPlace(checker, object, frame);
+        string copied = wording.oneLineSpelling(place);
+        string name = copyName(checker, place, "");
+        let retests = copyRetests(checker, place, frame, name);
+        if (retests != null) {
+            string copy = "let {name} = {copied};";
+            return "{reason} {objectCopyAdvice([copied], [copy], copied == read, retests)}";
+        }
+    }
+    return "{reason} Test '{spelled}' inside the lambda, as in "
+        + "{typeTestExample(checker, object, convert.coreOf(proven))}.";
 }
 
 // Recognizes '(x as? T) != null' and '(x as? T) == null' over a narrowable 'x' and a class or
@@ -1145,6 +1424,49 @@ checkedCharCast(BodyChecker checker, CheckedCastExpressionNode node, Type source
     return checker.store().optionalOf(target);
 }
 
+// The refusal of the 'is' test 'test' of 'value' against 'target' inside a lambda, where a proof made
+// where the lambda is created makes the test always true and the declared type of 'value' does not,
+// or null anywhere else.
+carriedTestRefusal(BodyChecker checker, Expression test, Expression value, Type target) -> string? {
+    let path = buildNarrowingPath(checker, value);
+    let declared = declaredSlotType(checker, value);
+    if (path == null || declared == null) {
+        return null;
+    }
+    let carried = lambdas.carriedProof(checker, path);
+    if (carried == null || !hierarchy.isSubclassOrConforms(convert.coreOf(carried), target)
+            || hierarchy.isSubclassOrConforms(convert.coreOf(declared), target)) {
+        return null;
+    }
+    string place = wording.oneLineSpelling(syntax.unwrapParentheses(value));
+    string holds = checker.names().quotedCode(["{place} is ", ""], [target]);
+    string article = typenames.typeArticle(checker.names().of(target));
+    string tested = checker.names().quoted(target);
+    string refusal = "This test is always true: '{place}' is already {article} {tested} here, because "
+        + "{holds} holds where the lambda is created.";
+    let fix = alwaysTrueTestFix(test);
+    if (fix == null) {
+        return refusal;
+    }
+    return "{refusal} {fix}";
+}
+
+// The fix for an 'is' test that is always true where it is the whole condition of an 'if': removing
+// the test and keeping the body it guards, with its 'else' branch removed too. Null anywhere else.
+alwaysTrueTestFix(Expression test) -> string? {
+    SyntaxNode? holder = test.parent();
+    while (holder is ParenthesizedExpressionNode) {
+        holder = holder.parent();
+    }
+    if (!(holder is IfStatementNode)) {
+        return null;
+    }
+    if (holder.elseClause() != null) {
+        return "Remove this test and its 'else' branch, and keep its body.";
+    }
+    return "Remove this test and keep its body.";
+}
+
 // The 'is' and 'as?' rule set for 'test' on 'value': the target must be a plain class or interface,
 // and the pair must be able to succeed without always succeeding. Open-typed operands defer to each
 // instantiation.
@@ -1176,6 +1498,13 @@ checkClassTypeTest(BodyChecker checker, Expression test, Expression value, Type 
     if (convert.containsTypeParam(source) || convert.containsTypeParam(target)) {
         checker.recordObligation(new TypeTestObligation(source, target, isCast, span));
         return true;
+    }
+    if (!isCast) {
+        let carried = carriedTestRefusal(checker, test, value, target);
+        if (carried != null) {
+            checker.reporter().report(carried, span);
+            return false;
+        }
     }
     let issue = capabilities.typeTestIssue(source, target, isCast, checker.names(),
         nullguidance.oneLevelGuidance(checker, value, source));

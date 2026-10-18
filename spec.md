@@ -585,8 +585,11 @@ A parameter's type may also be written, as in `(int a, int b) -> a - b`, and the
 A lambda copies the values it reads from around it, and only those.
 Reading a local, a parameter, or `this` inside the body captures it: the closure keeps its own copy from the moment it is created, and a class reference it captured stays alive for as long as the closure does.
 A local a lambda captures must already be assigned where the lambda is created.
-A capture takes the local's declared type, not what the surrounding code narrowed it to.
-A narrowing made outside a lambda never reaches its body, so the body checks a place again on its own.
+A narrowing that holds where a lambda is created holds inside its body for what the lambda captures, because a capture is a copy that nothing can write.
+So `check(string? held) -> () -> bool { if (held == null) { return () -> false; } return () -> take(held); }` compiles, and `held` is a `string` inside the second lambda.
+The narrowing is the one where the lambda is created: assigning the local afterwards changes neither the copy nor its narrowing.
+The same holds for a narrowing of `this`, of a `const` field of a struct the lambda captures, and of a `lazy const` read through its type name, since nothing can write any of them.
+A `const` field of a class object is read from the object each time the lambda runs, and it can still change until the object's constructor ends, so a narrowing of it made outside the lambda does not reach the body; copy it into a local before the lambda, check the local, and read the local inside the lambda.
 A check inside the body narrows a captured local or parameter wherever the check holds, as it narrows the body's own locals.
 Assigning to a captured local inside the lambda, or passing it as `out`, is an error, because the write would land on the copy and leave the local outside it unchanged; return the value the lambda computes instead, or keep the value in an object the lambda can reach.
 A field of a captured struct is part of that copy, so writing `point.x = 1;` inside the lambda is the same error.

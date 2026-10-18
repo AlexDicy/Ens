@@ -162,8 +162,9 @@ test "a check narrows a local, a parameter, 'this' and a 'const' field reached t
 // assignment and '++'. In a chain it is the outermost unstable step, and the copy spells it in
 // full. A member only a subclass has gets the type test's version, and a member no subclass has gets none.
 // 'this' is a stable place that no write can change, so a type test on it narrows it wherever
-// one on a parameter would, and a lambda reads it as declared, as it reads a captured parameter.
-test "a type test narrows 'this' like a parameter, and a lambda reads it as declared" {
+// one on a parameter would, and inside a lambda created where the test holds, as a captured
+// parameter is narrowed there.
+test "a type test narrows 'this' like a parameter, and inside a lambda created where it holds" {
     let analysis = try sema_support.analyzeOne("class Base \{\n"
         + "    constructor();\n"
         + "    measure() -> int \{\n"
@@ -185,10 +186,7 @@ test "a type test narrows 'this' like a parameter, and a lambda reads it as decl
         + "main() -> int \{\n"
         + "    return 0;\n"
         + "\}\n");
-    let found = analysis.bodyDiagnostics();
-    try testing.assertEqual(found.length, 1L);
-    try sema_support.assertDiagnostic(found, 0, "/proj/src/main.ens",
-        "Type 'Base' has no field or method named 'width'.");
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
 }
 
 // '?.' tests the declared level of null and reads a member of the value, so where a type test holds
@@ -622,7 +620,8 @@ test "unsound reads stay rejected under narrowing" {
     try testing.assertEqual(reported.length, 4L);
 }
 
-test "a lazy const narrowing stays outside a lambda, and a mutable field under one never narrows" {
+// Nothing writes a lazy const, so a check of one holds inside a lambda created where it holds.
+test "a lazy const narrowing reaches a lambda, and a mutable field under one never narrows" {
     let analysis = try sema_support.analyzeOne("class Tally \{ protected int? count; protected string? note; "
         + "protected constructor(this.count = null, this.note = null); \}\n"
         + "class Settings \{\n"
@@ -663,21 +662,18 @@ test "a lazy const narrowing stays outside a lambda, and a mutable field under o
         "Cannot read a member of 'string?' because it may be null here. Check 'Settings.label' for "
         + "null first ('if (Settings.label != null)').");
     try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
-        "Cannot read a member of 'string?' because it may be null here. Supply a fallback for "
-        + "'Settings.label' with '??'.");
-    try sema_support.assertDiagnostic(reported, 2, "/proj/src/main.ens",
         "Cannot read a member of 'string?' because it may be null here. 'Settings.tally.note' is a field, "
         + "so it can change at any time. A later read of it can be null even after a null check. Copy it "
         + "into a local first ('let note = Settings.tally.note;') and check the local.");
-    try sema_support.assertDiagnostic(reported, 3, "/proj/src/main.ens",
+    try sema_support.assertDiagnostic(reported, 2, "/proj/src/main.ens",
         "'+=' needs numbers on both sides, but 'Settings.tally.count' has type 'int?'. "
         + "'Settings.tally.count' is a field, so it can change at any time. A later read of it can be "
         + "null even after a null check. Copy it into a local first ('let count = "
         + "Settings.tally.count;'), check the local, and write the result back to 'Settings.tally.count'.");
-    try sema_support.assertDiagnostic(reported, 4, "/proj/src/main.ens",
+    try sema_support.assertDiagnostic(reported, 3, "/proj/src/main.ens",
         "Cannot assign to 'Settings.label': a lazy const keeps the value its initializer gives "
         + "it. Change the initializer, or use an instance field.");
-    try testing.assertEqual(reported.length, 5L);
+    try testing.assertEqual(reported.length, 4L);
 }
 
 // Nothing can write a lambda's copy of what it captures, so a check inside the lambda narrows a
@@ -748,6 +744,434 @@ test "a check inside a lambda narrows what the lambda captures" {
         + "    return total as int + typed(new Shape())();\n"
         + "\}\n");
     try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+}
+
+// A lambda copies what it captures where it is created, and nothing writes the copy, so a narrowing
+// that holds there holds inside the body: of a parameter, a local and a value its initializer gives,
+// by a null check, a type test and at every level of null, on 'this', on a 'const' field of a struct
+// it copies, in a lambda nested in it, in a lambda made in a loop or on the right of '&&', in a field
+// default, and in a lambda passed to a generic call. Writing the local after the lambda is created
+// changes neither the copy nor its narrowing.
+test "a narrowing that holds where a lambda is created holds inside it for what it captures" {
+    let analysis = try sema_support.analyzeOne("class Shape \{ protected constructor(); \}\n"
+        + "class Circle extends Shape \{ protected int radius = 1; protected constructor(); \}\n"
+        + "struct Pair \{\n"
+        + "    const string? fixed;\n"
+        + "\}\n"
+        + "class Fields \{\n"
+        + "    protected string? name = pick();\n"
+        + "    protected () -> long measure = name != null ? () -> name.length : () -> 0;\n"
+        + "\n"
+        + "    protected constructor();\n"
+        + "\}\n"
+        + "pick() -> string? \{ return null; \}\n"
+        + "run(() -> long body) -> bool \{ return body() > 0; \}\n"
+        + "apply<T>(() -> T body) -> T \{ return body(); \}\n"
+        + "parameter(string? held) -> () -> long \{\n"
+        + "    if (held == null) \{ return () -> 0; \}\n"
+        + "    return () -> held.length;\n"
+        + "\}\n"
+        + "local() -> () -> long \{\n"
+        + "    string? found = pick();\n"
+        + "    if (found != null) \{\n"
+        + "        return () -> \{\n"
+        + "            return found.length;\n"
+        + "        \};\n"
+        + "    \}\n"
+        + "    return () -> 0;\n"
+        + "\}\n"
+        + "initialized() -> () -> int \{\n"
+        + "    int? count = 5;\n"
+        + "    return () -> count + 1;\n"
+        + "\}\n"
+        + "tested(Shape shape) -> () -> int \{\n"
+        + "    if (shape is Circle) \{ return () -> shape.radius; \}\n"
+        + "    return () -> 0;\n"
+        + "\}\n"
+        + "levels(string?? held) -> () -> long \{\n"
+        + "    if (held != null && held != null) \{ return () -> held.length; \}\n"
+        + "    return () -> 0;\n"
+        + "\}\n"
+        + "structField(Pair pair) -> () -> long \{\n"
+        + "    if (pair.fixed == null) \{ return () -> 0; \}\n"
+        + "    return () -> pair.fixed.length;\n"
+        + "\}\n"
+        + "nested(string? held) -> () -> () -> long \{\n"
+        + "    if (held == null) \{ return () -> () -> 0; \}\n"
+        + "    return () -> () -> held.length;\n"
+        + "\}\n"
+        + "looped(string?[] items) -> long \{\n"
+        + "    long total = 0;\n"
+        + "    for (let item in items) \{\n"
+        + "        if (item != null) \{\n"
+        + "            () -> long measure = () -> item.length;\n"
+        + "            total = total + measure();\n"
+        + "        \}\n"
+        + "    \}\n"
+        + "    return total;\n"
+        + "\}\n"
+        + "conjunction(string? held) -> bool \{\n"
+        + "    return held != null && run(() -> held.length);\n"
+        + "\}\n"
+        + "generic(string? held) -> long \{\n"
+        + "    if (held == null) \{ return 0; \}\n"
+        + "    return apply<long>(() -> held.length);\n"
+        + "\}\n"
+        + "reassigned() -> long \{\n"
+        + "    string? held = pick();\n"
+        + "    if (held == null) \{ return 0; \}\n"
+        + "    () -> long measure = () -> held.length;\n"
+        + "    held = null;\n"
+        + "    return measure();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+}
+
+// A 'const' field of a class object is read from the object when the lambda runs, and it can change
+// until the object's constructor ends, so a narrowing of one outside a lambda does not reach the body.
+// The refusal names the first field read from an object, and copying the whole value the lambda reads
+// into a local before the lambda, which the lambda then reads instead. Two such operands share one
+// sentence.
+test "a narrowing of a field of a class object does not reach a lambda" {
+    let analysis = try sema_support.analyzeOne("class Shape \{ protected constructor(); \}\n"
+        + "class Circle extends Shape \{ protected int radius = 1; protected constructor(); \}\n"
+        + "class Holder \{\n"
+        + "    protected const string? fixed;\n"
+        + "    protected const Shape? shape;\n"
+        + "    protected const int? low;\n"
+        + "    protected const int? high;\n"
+        + "\n"
+        + "    protected constructor(this.fixed = null, this.shape = null, this.low = null, "
+        + "this.high = null);\n"
+        + "\n"
+        + "    protected fixedLength() -> () -> long \{\n"
+        + "        if (this.fixed == null) \{ return () -> 0; \}\n"
+        + "        return () -> this.fixed.length;\n"
+        + "    \}\n"
+        + "\n"
+        + "    protected radius() -> () -> int \{\n"
+        + "        if (!(this.shape is Circle)) \{ return () -> 0; \}\n"
+        + "        return () -> \{\n"
+        + "            return this.shape.radius;\n"
+        + "        \};\n"
+        + "    \}\n"
+        + "\n"
+        + "    protected sum() -> () -> int \{\n"
+        + "        if (this.low == null || this.high == null) \{ return () -> 0; \}\n"
+        + "        return () -> \{\n"
+        + "            return this.low + this.high;\n"
+        + "        \};\n"
+        + "    \}\n"
+        + "\}\n"
+        + "struct Pair \{\n"
+        + "    const Holder holder;\n"
+        + "\}\n"
+        + "class Link \{\n"
+        + "    protected const Holder target;\n"
+        + "\n"
+        + "    protected constructor(this.target);\n"
+        + "\}\n"
+        + "captured(Holder holder) -> () -> long \{\n"
+        + "    if (holder.fixed == null) \{ return () -> 0; \}\n"
+        + "    return () -> \{\n"
+        + "        return holder.fixed.length;\n"
+        + "    \};\n"
+        + "\}\n"
+        + "chained(Link link) -> () -> long \{\n"
+        + "    if (link.target.fixed == null) \{ return () -> 0; \}\n"
+        + "    return () -> \{\n"
+        + "        return link.target.fixed.length;\n"
+        + "    \};\n"
+        + "\}\n"
+        + "throughStruct(Pair pair) -> () -> long \{\n"
+        + "    if (pair.holder.fixed == null) \{ return () -> 0; \}\n"
+        + "    return () -> \{\n"
+        + "        return pair.holder.fixed.length;\n"
+        + "    \};\n"
+        + "\}\n"
+        + "tested(Holder holder) -> () -> int \{\n"
+        + "    if (holder.shape is Circle) \{ return () -> holder.shape.radius; \}\n"
+        + "    return () -> 0;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string file = "/proj/src/main.ens";
+    string constructed = "and a 'const' field can still change until its object's constructor ends.";
+    string member = "Cannot read a member of 'string?' because it may be null here.";
+    string inside = "and read the local inside the lambda.";
+    try sema_support.assertDiagnostic(reported, 0, file, "{member} The lambda reads 'this.fixed' from "
+        + "the object when the lambda runs, {constructed} Copy it into a local before the lambda, as in "
+        + "'let fixed = this.fixed;', {inside}");
+    try sema_support.assertDiagnostic(reported, 1, file, "Cannot read a member of 'Shape?' because it "
+        + "may be null here. The lambda reads 'this.shape' from the object when the lambda runs, "
+        + "{constructed} Copy it into a local before the lambda, as in 'let shape = this.shape;', {inside}");
+    try sema_support.assertDiagnostic(reported, 2, file, "'+' needs numbers on both sides, but "
+        + "'this.low' and 'this.high' both have type 'int?'. The lambda reads 'this.low' and 'this.high' "
+        + "from their objects when the lambda runs, {constructed} Copy them into locals before the "
+        + "lambda, as in 'let low = this.low; let high = this.high;', and read the locals inside the "
+        + "lambda.");
+    try sema_support.assertDiagnostic(reported, 3, file, "{member} The lambda reads 'holder.fixed' from "
+        + "the object when the lambda runs, {constructed} Copy it into a local before the lambda, as in "
+        + "'let fixed = holder.fixed;', {inside}");
+    try sema_support.assertDiagnostic(reported, 4, file, "{member} The lambda reads 'link.target' from "
+        + "the object when the lambda runs, {constructed} Copy 'link.target.fixed' into a local before the "
+        + "lambda, as in 'let fixed = link.target.fixed;', {inside}");
+    try sema_support.assertDiagnostic(reported, 5, file, "{member} The lambda reads 'pair.holder.fixed' "
+        + "from the object when the lambda runs, {constructed} Copy it into a local before the lambda, as "
+        + "in 'let fixed = pair.holder.fixed;', {inside}");
+    try sema_support.assertDiagnostic(reported, 6, file, "Cannot read a member of 'Shape?' because it "
+        + "may be null here. The lambda reads 'holder.shape' from the object when the lambda runs, "
+        + "{constructed} Copy it into a local before the lambda, as in 'let shape = holder.shape;', "
+        + "{inside}");
+    try testing.assertEqual(reported.length, 7L);
+}
+
+// A copy made before the statement that creates the lambda holds no proof that a '?:', a '&&' or a '||'
+// in that statement makes, so the fix changes each such test to test the copy, and the fixed code is
+// accepted. Where a test proves a part of the place to copy, the copy would read that part before the
+// test holds, so no copy is offered.
+test "a copy for a lambda moves a test written in the same statement onto the copy" {
+    string classes = "class Shape \{ protected constructor(); \}\n"
+        + "class Circle extends Shape \{ protected int radius = 1; protected constructor(); \}\n"
+        + "class Box \{ protected const string? name = \"box\"; protected constructor(); \}\n"
+        + "run(() -> long body) -> long \{ return body(); \}\n";
+    let analysis = try sema_support.analyzeOne(classes
+        + "class Holder \{\n"
+        + "    protected const string? fixed = \"start\";\n"
+        + "    protected const Shape? shape = null;\n"
+        + "    protected const Box? box = null;\n"
+        + "\n"
+        + "    protected constructor();\n"
+        + "\n"
+        + "    protected ternary() -> () -> long \{\n"
+        + "        return this.fixed == null ? () -> 0 : () -> this.fixed.length;\n"
+        + "    \}\n"
+        + "\n"
+        + "    protected both() -> bool \{\n"
+        + "        return this.fixed != null && run(() -> this.fixed.length) > 0;\n"
+        + "    \}\n"
+        + "\n"
+        + "    protected tested() -> () -> long \{\n"
+        + "        return this.shape is Circle ? () -> this.shape.radius : () -> 0;\n"
+        + "    \}\n"
+        + "\n"
+        + "    protected part() -> () -> long \{\n"
+        + "        return this.box != null && this.box.name != null ? () -> this.box.name.length : () -> 0;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string file = "/proj/src/main.ens";
+    string constructed = "and a 'const' field can still change until its object's constructor ends.";
+    string member = "Cannot read a member of 'string?' because it may be null here.";
+    string read = "and read the local inside the lambda.";
+    try sema_support.assertDiagnostic(reported, 0, file, "{member} The lambda reads 'this.fixed' from "
+        + "the object when the lambda runs, {constructed} Copy it into a local before the lambda, as in "
+        + "'let fixed = this.fixed;'. Change the test 'this.fixed == null' to 'fixed == null', {read}");
+    try sema_support.assertDiagnostic(reported, 1, file, "{member} The lambda reads 'this.fixed' from "
+        + "the object when the lambda runs, {constructed} Copy it into a local before the lambda, as in "
+        + "'let fixed = this.fixed;'. Change the test 'this.fixed != null' to 'fixed != null', {read}");
+    try sema_support.assertDiagnostic(reported, 2, file, "Cannot read a member of 'Shape?' because it "
+        + "may be null here. The lambda reads 'this.shape' from the object when the lambda runs, "
+        + "{constructed} Copy it into a local before the lambda, as in 'let shape = this.shape;'. Change "
+        + "the test 'this.shape is Circle' to 'shape is Circle', {read}");
+    try sema_support.assertDiagnostic(reported, 3, file, "Cannot read a member of 'Box?' because it may "
+        + "be null here. The lambda reads 'this.box' from the object when the lambda runs, {constructed} "
+        + "Supply a fallback for 'this.box' with '??'.");
+    try testing.assertEqual(reported.length, 4L);
+
+    let fixed = try sema_support.analyzeOne(classes
+        + "class Holder \{\n"
+        + "    protected const string? fixed = \"start\";\n"
+        + "    protected const Shape? shape = null;\n"
+        + "\n"
+        + "    protected constructor();\n"
+        + "\n"
+        + "    protected ternary() -> () -> long \{\n"
+        + "        let fixed = this.fixed;\n"
+        + "        return fixed == null ? () -> 0 : () -> fixed.length;\n"
+        + "    \}\n"
+        + "\n"
+        + "    protected both() -> bool \{\n"
+        + "        let fixed = this.fixed;\n"
+        + "        return fixed != null && run(() -> fixed.length) > 0;\n"
+        + "    \}\n"
+        + "\n"
+        + "    protected tested() -> () -> long \{\n"
+        + "        let shape = this.shape;\n"
+        + "        return shape is Circle ? () -> shape.radius : () -> 0;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try testing.assertEqual(fixed.bodyDiagnostics().length, 0L);
+}
+
+// Where the lambda reads a chain of 'const' fields of objects that proofs made where it is created
+// cover, the copy takes the whole chain, so the lambda reads nothing from an object afterwards.
+test "a chain of fields of class objects is copied whole before a lambda" {
+    let analysis = try sema_support.analyzeOne("class Holder \{\n"
+        + "    protected const string? fixed;\n"
+        + "    protected const Holder? next;\n"
+        + "\n"
+        + "    protected constructor(this.fixed = null, this.next = null);\n"
+        + "\}\n"
+        + "chain(Holder holder) -> () -> long \{\n"
+        + "    if (holder.next == null || holder.next.fixed == null) \{ return () -> 0; \}\n"
+        + "    return () -> \{\n"
+        + "        return holder.next.fixed.length;\n"
+        + "    \};\n"
+        + "\}\n"
+        + "copied(Holder holder) -> () -> long \{\n"
+        + "    if (holder.next == null || holder.next.fixed == null) \{ return () -> 0; \}\n"
+        + "    let fixed = holder.next.fixed;\n"
+        + "    return () -> fixed.length;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens", "Cannot read a member of "
+        + "'Holder?' because it may be null here. The lambda reads 'holder.next' from the object when the "
+        + "lambda runs, and a 'const' field can still change until its object's constructor ends. Copy "
+        + "'holder.next.fixed' into a local before the lambda, as in 'let fixed = holder.next.fixed;', and "
+        + "read the local inside the lambda.");
+    try testing.assertEqual(reported.length, 1L);
+}
+
+// The copy each refusal above writes compiles, and the lambda reads the narrowed local in place of the
+// field of the object.
+test "a field of a class object copied into a local before a lambda narrows inside it" {
+    let analysis = try sema_support.analyzeOne("class Shape \{ protected constructor(); \}\n"
+        + "class Circle extends Shape \{ protected int radius = 1; protected constructor(); \}\n"
+        + "class Holder \{\n"
+        + "    protected const string? fixed;\n"
+        + "    protected const Shape? shape;\n"
+        + "\n"
+        + "    protected constructor(this.fixed = null, this.shape = null);\n"
+        + "\n"
+        + "    protected radius() -> () -> int \{\n"
+        + "        if (!(this.shape is Circle)) \{ return () -> 0; \}\n"
+        + "        let shape = this.shape;\n"
+        + "        return () -> shape.radius;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "class Link \{\n"
+        + "    protected const Holder target;\n"
+        + "\n"
+        + "    protected constructor(this.target);\n"
+        + "\}\n"
+        + "chained(Link link) -> () -> long \{\n"
+        + "    if (link.target.fixed == null) \{ return () -> 0; \}\n"
+        + "    let fixed = link.target.fixed;\n"
+        + "    return () -> fixed.length;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+}
+
+// A type test inside a lambda that a proof made where the lambda is created already settles is
+// refused with that reason. Where it is the whole condition of an 'if', the fix removes the test and
+// keeps the body, with the 'else' branch removed too, and anywhere else the refusal stops after the
+// reason. A value whose declared type settles the test, and one an earlier test settles outside any
+// lambda, keep the plain refusal.
+test "a type test settled where a lambda is created is refused with that reason" {
+    let analysis = try sema_support.analyzeOne("class Shape \{ protected constructor(); \}\n"
+        + "class Circle extends Shape \{ protected int radius = 1; protected constructor(); \}\n"
+        + "plain(Shape shape) -> int \{\n"
+        + "    if (shape is Circle) \{\n"
+        + "        if (shape is Circle) \{ return shape.radius; \}\n"
+        + "    \}\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "carried(Shape shape, bool flag) -> () -> int \{\n"
+        + "    if (!(shape is Circle)) \{ return () -> 0; \}\n"
+        + "    return () -> \{\n"
+        + "        if ((shape is Circle)) \{ return shape.radius; \}\n"
+        + "        if (shape is Circle) \{ return 1; \} else \{ return 2; \}\n"
+        + "    \};\n"
+        + "\}\n"
+        + "joined(Shape shape, bool flag) -> () -> bool \{\n"
+        + "    if (!(shape is Circle)) \{ return () -> false; \}\n"
+        + "    return () -> flag && shape is Circle;\n"
+        + "\}\n"
+        + "declared(Circle circle) -> () -> bool \{\n"
+        + "    return () -> circle is Circle;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string file = "/proj/src/main.ens";
+    string vacuous = "A value of type 'Circle' is always a 'Circle', so this 'is' test is always true.";
+    string carried = "This test is always true: 'shape' is already a 'Circle' here, because "
+        + "'shape is Circle' holds where the lambda is created.";
+    try sema_support.assertDiagnostic(reported, 0, file, vacuous);
+    try sema_support.assertDiagnostic(reported, 1, file, "{carried} Remove this test and keep its body.");
+    try sema_support.assertDiagnostic(reported, 2, file, "{carried} Remove this test and its 'else' "
+        + "branch, and keep its body.");
+    try sema_support.assertDiagnostic(reported, 3, file, carried);
+    try sema_support.assertDiagnostic(reported, 4, file, vacuous);
+    try testing.assertEqual(reported.length, 5L);
+}
+
+// A lambda copies a local where it is created, so a write in a later argument of the same call does
+// not narrow the copy, whether the call checks the lambda before that argument or after it, or the
+// lambda is a field of a '{...}' argument, and a write in an earlier argument does.
+test "a write in a later argument does not narrow what a lambda before it copies" {
+    let analysis = try sema_support.analyzeOne("pick() -> string? \{ return null; \}\n"
+        + "struct Holder \{ () -> long body; \}\n"
+        + "struct Other \{ () -> long body; long extra; \}\n"
+        + "run(Holder holder, string? value) -> long \{ return holder.body(); \}\n"
+        + "run(Other other, int value) -> long \{ return other.body(); \}\n"
+        + "single(Holder holder, string? value) -> long \{ return holder.body(); \}\n"
+        + "make(string? text) -> () -> long \{ return () -> 0; \}\n"
+        + "consume((() -> long)[] bodies) -> long \{ return 0; \}\n"
+        + "consume(long[] values) -> long \{ return 0; \}\n"
+        + "apply<T, U>(() -> T body, U value) -> T \{ return body(); \}\n"
+        + "overloaded() -> long \{\n"
+        + "    string? held = pick();\n"
+        + "    return consume([() -> held.length, make(held = \"abc\")]);\n"
+        + "\}\n"
+        + "explicit() -> long \{\n"
+        + "    string? other = pick();\n"
+        + "    return apply<long, string?>(() -> other.length, other = \"abc\");\n"
+        + "\}\n"
+        + "fieldOverloaded() -> long \{\n"
+        + "    string? third = pick();\n"
+        + "    return run(\{ body: () -> third.length \}, third = \"abc\");\n"
+        + "\}\n"
+        + "fieldSingle() -> long \{\n"
+        + "    string? fourth = pick();\n"
+        + "    return single(\{ body: () -> fourth.length \}, fourth = \"abc\");\n"
+        + "\}\n"
+        + "earlier() -> long \{\n"
+        + "    string? first = pick();\n"
+        + "    return consume([make(first = \"abc\"), () -> first.length]);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string file = "/proj/src/main.ens";
+    string member = "Cannot read a member of 'string?' because it may be null here.";
+    for (long i = 0; i < 4; i++) {
+        string name = ["held", "other", "third", "fourth"][i];
+        try sema_support.assertDiagnostic(reported, i, file, "{member} The lambda copies '{name}' when it is "
+            + "created. The assignment '{name} = \"abc\"' comes later in the same call. Assign '{name}' before "
+            + "the call, for example '{name} = \"abc\";'.");
+    }
+    try testing.assertEqual(reported.length, 4L);
 }
 
 // A narrowing of a capture is a narrowing of the name, so it ends where a local of the lambda takes

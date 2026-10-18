@@ -22,6 +22,8 @@ import LocalBinding from model.scopes;
 import BindingKind from model.scopes;
 import LambdaCapture from model.lambdas;
 import LambdaInfo from model.lambdas;
+import NarrowingPath from model.narrow;
+import NarrowingState from model.narrow;
 import model.convert;
 import model.flow;
 import ExitScope from model.flow;
@@ -31,6 +33,7 @@ import phases.bodies.thisuses;
 import ThisUse from result;
 import ThisUseKind from result;
 import phases.bodies.literalfixes;
+import phases.bodies.narrowing;
 import phases.bodies.nullguidance;
 import phases.bodies.wording;
 import phases.bodies.voidcalls;
@@ -44,35 +47,64 @@ import FunctionType from model.types;
 import OptionalType from model.types;
 import PrimitiveType from model.types;
 import List from @std.collections.list;
+import Map from @std.collections.map;
 import StringBuilder from @std.text.stringbuilder;
 import BodyChecker from phases.bodies;
 import AssignmentFlow from phases.bodies.definiteassignment;
 import support.syntax;
 
-// What holds where a lambda is created, which its body starts from where the call the lambda is passed
-// to checks it after the arguments written after it: the locals and the fields assigned there.
+// What holds where a lambda is created, which its body starts from: the locals and the fields assigned
+// there, the narrowings proven there, and the 'is' tests to write for comparisons of 'as?' casts with null.
 public final class LambdaStart {
     protected AssignmentFlow assigned;
+    protected Map<NarrowingPath, Type> proofs;
+    protected Map<NarrowingPath, string> castHints;
 
-    public constructor(this.assigned);
+    public constructor(this.assigned, this.proofs, this.castHints);
 }
 
-// One lambda whose body is being checked: the scope outside it, the receiver outside it, and
-// what its body has read from either so far. The captures accumulate in first-read order, which
-// is the order the closure copies them in.
+// One lambda whose body is being checked: the lambda, the scope and the receiver outside it, the
+// proofs made outside it that hold inside it and the ones that do not, whether a statement can go
+// right before it, and what its body has read from the scope or the receiver so far. The captures
+// accumulate in first-read order, which is the order the closure copies them in.
 public final class LambdaFrame {
+    protected LambdaExpressionNode lambdaNode;
     protected Scope? enclosingScope;
     protected Type? enclosingReceiver;
+    protected Map<NarrowingPath, Type> carriedNarrowings;
+    protected Map<NarrowingPath, Type> uncarriedNarrowings;
+    protected bool statementsBefore;
     protected List<LambdaCapture> captures;
     protected List<LocalBinding> capturedBindings;
     protected bool readsReceiver;
 
-    protected constructor(Scope? enclosingScope, Type? enclosingReceiver) {
+    protected constructor(LambdaExpressionNode lambdaNode, Scope? enclosingScope, Type? enclosingReceiver,
+                          Map<NarrowingPath, Type> carriedNarrowings,
+                          Map<NarrowingPath, Type> uncarriedNarrowings, bool statementsBefore) {
+        this.lambdaNode = lambdaNode;
         this.enclosingScope = enclosingScope;
         this.enclosingReceiver = enclosingReceiver;
+        this.carriedNarrowings = carriedNarrowings;
+        this.uncarriedNarrowings = uncarriedNarrowings;
+        this.statementsBefore = statementsBefore;
         this.captures = new List<LambdaCapture>();
         this.capturedBindings = new List<LocalBinding>();
         this.readsReceiver = false;
+    }
+
+    // The type a proof made where the lambda is created gives 'path', where the proof does not hold
+    // inside it, or null.
+    public uncarriedProof(NarrowingPath path) -> Type? {
+        return this.uncarriedNarrowings.get(path);
+    }
+
+    public lambda() -> LambdaExpressionNode {
+        return this.lambdaNode;
+    }
+
+    // Whether a statement can go right before the lambda, where a local can be declared for it.
+    public allowsStatementsBefore() -> bool {
+        return this.statementsBefore;
     }
 
     // The binding this name has outside the lambda, or null when the enclosing scope has none.
@@ -125,7 +157,8 @@ public final class LambdaFrame {
     // A frame for the same lambda that holds what this one has captured so far and records later
     // captures in its own lists.
     public copy() -> LambdaFrame {
-        let copied = new LambdaFrame(this.enclosingScope, this.enclosingReceiver);
+        let copied = new LambdaFrame(this.lambdaNode, this.enclosingScope, this.enclosingReceiver,
+            this.carriedNarrowings, this.uncarriedNarrowings, this.statementsBefore);
         copied.captures.pushAll(this.captures);
         copied.capturedBindings.pushAll(this.capturedBindings);
         copied.readsReceiver = this.readsReceiver;
@@ -265,31 +298,35 @@ checkLambdaShape(BodyChecker checker, LambdaExpressionNode node, FunctionType ta
     return matched;
 }
 
-// Walks the lambda's body under its own checker state and returns what it captured. A lambda its call
-// checks after the arguments written after it is checked against what holds where it is created.
+// Walks the lambda's body under its own checker state and returns what it captured. The body starts
+// from what holds where the lambda is created, which is what holds here unless the call the lambda is
+// passed to checks it after the arguments written after it.
 checkLambdaBody(BodyChecker checker, LambdaExpressionNode node, Signature signature) -> LambdaCapture[] {
-    let start = checker.takeLambdaStart(node);
-    if (start == null) {
-        return checkLambdaBodyHere(checker, node, signature);
+    let recorded = checker.takeLambdaStart(node);
+    if (recorded == null) {
+        return checkLambdaBodyFrom(checker, node, signature, checker.lambdaStartHere());
     }
     let here = checker.assignment().snapshot();
-    checker.assignment().restore(start.assigned);
-    let captures = checkLambdaBodyHere(checker, node, signature);
+    checker.assignment().restore(recorded.assigned);
+    let captures = checkLambdaBodyFrom(checker, node, signature, recorded);
     checker.assignment().restore(here);
     return captures;
 }
 
-// Walks the lambda's body against what holds here and returns what it captured.
-checkLambdaBodyHere(BodyChecker checker, LambdaExpressionNode node, Signature signature)
+// Walks the lambda's body from 'start', with the proofs made there that hold inside the body, and
+// returns what it captured.
+checkLambdaBodyFrom(BodyChecker checker, LambdaExpressionNode node, Signature signature, LambdaStart start)
         -> LambdaCapture[] {
-    let lambdaFrame = new LambdaFrame(checker.currentScope(), checker.frame().thisType());
+    let carried = narrowing.lambdaNarrowings(start.proofs, true);
     let outerFrame = checker.frame();
+    let lambdaFrame = new LambdaFrame(node, checker.currentScope(), outerFrame.thisType(), carried,
+        narrowing.lambdaNarrowings(start.proofs, false), outerFrame.statementsAllowed());
     let outerDeferred = checker.targets().deferredFixes();
     bool outerAwaiting = checker.targets().awaitingParameter();
 
     let innerFrame = outerFrame.forLambda(node, signature.returnType(),
         literalfixes.returnOriginThrough(checker, checker.targets().lambdaHolder(), signature.returnType()));
-    let outer = checker.enterLambda(lambdaFrame, innerFrame);
+    let outer = checker.enterLambda(lambdaFrame, innerFrame, new NarrowingState(carried), start.castHints);
     checker.targets().setLambdaHolder(null);
     checker.targets().setDeferredFixes(null);
     checker.targets().setAwaitingParameter(false);
@@ -423,6 +460,29 @@ assignmentAfter(SyntaxNode node, string name, long after) -> AssignmentExpressio
         }
     }
     return null;
+}
+
+// The innermost of the lambdas being checked where a proof of 'path' is made where it is created but
+// does not hold inside it, or null where no such proof is made.
+public uncarriedFrame(BodyChecker checker, NarrowingPath path) -> LambdaFrame? {
+    for (long i = checker.lambdaFrames().length() - 1; i >= 0; i--) {
+        let frame = checker.lambdaFrames().get(i);
+        let proven = frame.uncarriedNarrowings.get(path);
+        if (proven != null && !(proven is ErrorType)) {
+            return frame;
+        }
+    }
+    return null;
+}
+
+// The type a proof made where the innermost lambda being checked is created gives 'path' inside it,
+// or null where no such proof is made.
+public carriedProof(BodyChecker checker, NarrowingPath path) -> Type? {
+    long count = checker.lambdaFrames().length();
+    if (count == 0) {
+        return null;
+    }
+    return checker.lambdaFrames().get(count - 1).carriedNarrowings.get(path);
 }
 
 // A name the lambda being checked does not declare itself: the enclosing lambdas' scopes,
