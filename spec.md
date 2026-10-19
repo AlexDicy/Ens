@@ -159,6 +159,8 @@ Only when no overload takes that type is it fitted element by element, and then 
 An empty `[]` fits every array parameter.
 A struct literal fits only a parameter whose type is a struct or a nullable struct, and it fits every such parameter as a value of that struct would, whatever fields it names.
 Once an overload is chosen, each of these arguments is typed from the parameter it maps to, and an argument that parameter cannot type is an error.
+A call evaluates and checks its arguments in the order they are written, including the ones the chosen overload types.
+A lambda among them sees what holds where it is written: in `run(() -> held.length, held = "abc")` the lambda copies `held` before the assignment runs, so the narrowing the assignment makes does not reach it.
 A name is not a value, so a name that picks an overload is an error whose fix is a lambda that calls it, and a name that picks none is an error of its own.
 A lambda or an array literal that two overloads fit equally well, such as a lambda where both take a function type with the same number of parameters, leaves the call ambiguous.
 When two overloads match equally well, the call is a compile error that lists the candidates.
