@@ -1,0 +1,198 @@
+// Observable destruction, a read-only prepass of the optimization pipeline. Destroying a value is
+// observable when it runs a destructor the program declares or ends the life of an object a weak
+// field watches, directly or through anything the value owns. A value typed as a base class, an
+// interface or a function type is judged by the classes the program allocates and the closures it
+// makes.
+import EirFunction from eir.model;
+import EirClassNew from eir.model;
+import EirClosureNew from eir.model;
+import Type from @ens.sema.model.types;
+import @ens.sema.model.typemembers;
+import @ens.sema.model.types;
+import DescriptorPlans from layout.descriptors;
+import layout.vtables;
+import lower.classes;
+import support.primitives;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+import Set from @std.collections.set;
+
+// The class, interface and function types whose values are destroyed observably, decided once
+// per program. It is never written after it is made, so passes reading it stay pure.
+public final class DestructionFacts {
+    Set<Type> observable;
+
+    public constructor(this.observable);
+
+    // True when destroying a value of this type is observable.
+    public isObservable(Type type) -> bool {
+        for (let held in heldTypes(type)) {
+            if (this.observable.contains(held)) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+public analyze(List<EirFunction> functions, DescriptorPlans plans) -> DestructionFacts {
+    let graph = new HoldingGraph();
+    let allocated = new List<Type>();
+    let seenAllocations = new Set<Type>();
+    for (let function in functions) {
+        for (let block in function.blocks()) {
+            for (let instruction in block.instructions()) {
+                if (instruction is EirClassNew) {
+                    if (seenAllocations.add(instruction.type)) {
+                        allocated.push(instruction.type);
+                    }
+                } else if (instruction is EirClosureNew) {
+                    Type made = primitives.underOptionals(instruction.type);
+                    for (let capture in instruction.captureTypes) {
+                        graph.holdsEvery(made, capture);
+                    }
+                }
+            }
+        }
+    }
+    let watched = new Set<Type>();
+    for (let classType in allocated) {
+        graph.addClass(classType, plans, watched);
+    }
+    let observable = new List<Type>();
+    for (let classType in allocated) {
+        if (!classes.destructorChain(classType).isEmpty() || isWatched(classType, watched)) {
+            observable.push(classType);
+        }
+    }
+    return new DestructionFacts(graph.holdersOf(observable));
+}
+
+// Which types can hold a value of which: a class or an interface every allocated class at or below
+// it, an allocated class what its fields own, and a function type what the closures made over it
+// capture.
+final class HoldingGraph {
+    Map<Type, List<Type>> holders;
+
+    protected constructor() {
+        this.holders = new Map<Type, List<Type>>();
+    }
+
+    // Records an allocated class: what holds it and what it owns. A weak field owns nothing, and
+    // the class it is declared with is added to 'watched'.
+    protected addClass(Type classType, DescriptorPlans plans, Set<Type> watched) {
+        Type? ancestor = vtables.baseClassOf(classType);
+        while (ancestor != null) {
+            this.holds(ancestor, classType);
+            ancestor = vtables.baseClassOf(ancestor);
+        }
+        let plan = plans.planFor(classType);
+        if (plan != null) {
+            for (let conformance in plan.conformances()) {
+                this.holds(conformance.interfaceType(), classType);
+            }
+        }
+        let fields = typemembers.fieldsOf(classType);
+        if (fields == null) {
+            return;
+        }
+        for (let field in fields) {
+            if (field.isWeak()) {
+                watched.add(primitives.underOptionals(field.type()));
+            } else {
+                this.holdsEvery(classType, field.type());
+            }
+        }
+    }
+
+    // Records that 'holder' can own every class, interface and function type a value of 'type'
+    // holds.
+    protected holdsEvery(Type holder, Type type) {
+        for (let held in heldTypes(type)) {
+            this.holds(holder, held);
+        }
+    }
+
+    holds(Type holder, Type held) {
+        let known = this.holders.get(held);
+        if (known != null) {
+            known.push(holder);
+            return;
+        }
+        let made = new List<Type>();
+        made.push(holder);
+        this.holders.set(held, made);
+    }
+
+    // The given types and every type that can hold one of them, however indirectly.
+    protected holdersOf(List<Type> types) -> Set<Type> {
+        let found = new Set<Type>();
+        let pending = new List<Type>();
+        for (let type in types) {
+            if (found.add(type)) {
+                pending.push(type);
+            }
+        }
+        while (!pending.isEmpty()) {
+            let held = pending.pop();
+            for (let holder in this.holders.get(held) ?? new List<Type>()) {
+                if (found.add(holder)) {
+                    pending.push(holder);
+                }
+            }
+        }
+        return found;
+    }
+}
+
+// True when a weak field declared with this class or one of its bases can watch an object of it.
+isWatched(Type classType, Set<Type> watched) -> bool {
+    Type? current = classType;
+    while (current != null) {
+        if (watched.contains(current)) {
+            return true;
+        }
+        current = vtables.baseClassOf(current);
+    }
+    return false;
+}
+
+// The class, interface and function types a value of this type holds directly or through its
+// optionals, array elements and struct fields, each struct looked at once, since a struct may hold
+// an array of itself.
+heldTypes(Type type) -> List<Type> {
+    let found = new List<Type>();
+    let seen = new Set<Type>();
+    let pending = new List<Type>();
+    pending.push(type);
+    while (!pending.isEmpty()) {
+        Type value = primitives.underOptionals(pending.pop());
+        if (!seen.add(value)) {
+            continue;
+        }
+        let array = primitives.arrayOf(value);
+        if (types.classOf(value) != null || primitives.interfaceOf(value) != null
+                || primitives.functionOf(value) != null) {
+            found.push(value);
+        } else if (array != null) {
+            pending.push(array.element());
+        } else {
+            pushFields(pending, value);
+        }
+    }
+    return found;
+}
+
+pushFields(List<Type> pending, Type value) {
+    let structType = primitives.structOf(value);
+    if (structType == null) {
+        return;
+    }
+    let fields = typemembers.fieldsOf(structType);
+    if (fields == null) {
+        return;
+    }
+    for (let field in fields) {
+        pending.push(field.type());
+    }
+}

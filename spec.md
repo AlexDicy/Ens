@@ -374,6 +374,10 @@ Type arguments are never written on the method name: `List.withCapacity<int>(8)`
 A class may declare a `destructor`, introduced by the `destructor` keyword, to run cleanup when an instance is destroyed.
 A destructor takes no parameters, has no return type, and cannot be `throws`; a class declares at most one, and it cannot be called explicitly.
 When the last reference to an object is released its destructor runs, followed by each inherited destructor from the most derived class up to the base, and then the object's fields are released.
+A local releases its reference when the block it is declared in ends, or earlier when an assignment replaces its value, and the same holds at every optimization level.
+Returning a local hands its reference to the caller instead.
+Copying a local into another local, a field, an array element or an argument leaves the local holding its own reference, so the copy never ends the object's life before the local releases it.
+A value no local holds, such as an object made inside an argument, is released by the end of the statement it is made in.
 When an argument of a `new` expression throws, the constructor never runs, so no destructor runs for that object either, and its fields hold no values yet.
 An assignment stores the new value before it releases the old one, so a destructor that release runs finds the new value in the field or element, and a value that destructor writes there is the one kept.
 Destructors are a class-only feature; structs and interfaces cannot declare them.
