@@ -157,7 +157,7 @@ The name of a method or a function fits a parameter of function type only when s
 An array literal first fits by the type it has alone, an array of its first element's type.
 Only when no overload takes that type is it fitted element by element, and then it fits as well as its worst-fitting element.
 An empty `[]` fits every array parameter.
-A struct literal takes no part in choosing the overload.
+A struct literal fits only a parameter whose type is a struct or a nullable struct, and it fits every such parameter as a value of that struct would, whatever fields it names.
 Once an overload is chosen, each of these arguments is typed from the parameter it maps to, and an argument that parameter cannot type is an error.
 A name is not a value, so a name that picks an overload is an error whose fix is a lambda that calls it, and a name that picks none is an error of its own.
 A lambda or an array literal that two overloads fit equally well, such as a lambda where both take a function type with the same number of parameters, leaves the call ambiguous.
