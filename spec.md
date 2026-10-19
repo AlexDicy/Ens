@@ -99,7 +99,7 @@ struct Rectangle {
 A struct value is built with a context-typed aggregate literal or a constructor call.
 
 An aggregate literal `{field: value, field: value}` names each field it sets, and takes its type from the surrounding context: the declared type of a variable, a parameter, a return type, an assignment target, or an array element.
-That context reaches a literal written as a branch of `?:` or an arm of a switch (see the switch section).
+That context reaches a literal written as a branch of `?:` or an arm of a switch, and where there is none, such a literal takes the type of the other branches (see the switch section).
 Every field that has no declared default must be listed; a field that has a default may be omitted to accept that default.
 Naming a field the struct does not have, listing the same field twice, leaving out a required field, or giving a value that is not assignable to the field's type are each errors.
 A field's visibility is respected: a literal sets a field only where the field is visible, the same rule as a direct field assignment.
@@ -588,7 +588,7 @@ The body is either one expression, whose value the call returns, or a block writ
 
 A lambda takes its shape from the type it is written against, so it always needs one: a local or field with a declared function type, a parameter, a return type, an assignment target, an array element, or an aggregate literal's field.
 A lambda with nothing to take its shape from, such as `let f = (a) -> a;`, is an error, exactly as an aggregate literal with no context is.
-A lambda written as a branch of `?:` or an arm of a switch takes its shape from the type the whole `?:` or switch is written against (see the switch section).
+A lambda written as a branch of `?:` or an arm of a switch takes its shape from the type the whole `?:` or switch is written against, and where there is none, from the type of the other branches (see the switch section).
 The parameter types come from that type, and the number of parameters must match it.
 A parameter's type may also be written, as in `(int a, int b) -> a - b`, and then it must be exactly the type the target passes there; one lambda writes every parameter's type or none of them.
 
@@ -1628,10 +1628,14 @@ That context is the declared type of a variable, a parameter, a return type, an 
 So in `run(ready ? (x) -> x + 1 : (x) -> x * 2)` both lambdas take the type of `run`'s parameter, and among overloads the call picks the one such a `?:` fits, as it would for each of its lambdas written alone.
 A branch with a type of its own keeps it, so `((int) -> int)? step = ready ? (x) -> x + 1 : null;` gives the lambda the type `(int) -> int`.
 The `?:` or switch itself still has the type its values unify to, as above: that `?:` has the type `((int) -> int)?`, and in `Point? p = ready ? {x: 1, y: 2} : {x: 3, y: 4};` the `?:` has the type `Point`, so `p.x` needs no null check after it.
+With no context type, such a value takes the type the other branches unify to, as a number literal does, so in `let step = ready ? twice : (x) -> x + 1;` the lambda takes the type of `twice`.
+Where nothing gives those values a type, as in `let step = ready ? (x) -> x : (x) -> -x;`, it is an error, and so is a type they cannot take, such as `int` for a lambda, since the branches then have no common type.
 
 ```ens
 run(ready ? (x) -> x + 1 : (x) -> x * 2);            // both lambdas take the type of run's parameter
 Point corner = ready ? {x: 0, y: 0} : {x: 1, y: 1};  // both literals build a Point
+let step = ready ? twice : (x) -> x + 1;             // the lambda takes the type of twice
+let guess = ready ? (x) -> x : (x) -> -x;            // error: nothing gives the lambdas a type
 ```
 
 When the value is nullable, a `null ->` arm handles the null case and counts toward exhaustiveness alongside the other labels.
@@ -1763,7 +1767,7 @@ let g = [[1, 2], [3, 4]];          // nested literal -> int[][]
 let h = [[1], []];                 // empty inner adopts first inner's type
 ```
 
-An empty literal `[]` requires a target type, `let xs = []` is rejected because there is no element to infer from. Write `int[] xs = []` or pass `[]` as an argument where the declared parameter type pins it down.
+An empty literal `[]` requires a target type, or as a branch of `?:` or an arm of a switch, another branch with a type of its own; `let xs = []` is rejected because there is no element to infer from. Write `int[] xs = []` or pass `[]` as an argument where the declared parameter type pins it down.
 
 An array literal is one way to construct an array of a non-nullable reference type: `[new Box(1), new Box(2)]` initializes every slot at construction, and the resulting type is `Box[]`.
 

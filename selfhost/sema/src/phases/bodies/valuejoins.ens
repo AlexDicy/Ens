@@ -14,6 +14,7 @@ import TernaryExpressionNode from @ens.frontend.syntax.generated.nodes;
 import NullCoalesceExpressionNode from @ens.frontend.syntax.generated.nodes;
 import ParenthesizedExpressionNode from @ens.frontend.syntax.generated.nodes;
 import ArrayLiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
+import StructLiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
 import SyntaxKind from @ens.frontend.syntax.generated.kind;
 import GreenNode from @ens.frontend.syntax.green;
 import Span from @ens.frontend.support.source;
@@ -37,9 +38,13 @@ import phases.bodies.wording;
 import phases.bodies.voidcalls;
 import phases.bodies.narrowing;
 import ConditionSite from phases.bodies.narrowing;
+import model.types;
 import Type from model.types;
 import ErrorType from model.types;
+import NullType from model.types;
 import OptionalType from model.types;
+import FunctionType from model.types;
+import ArrayType from model.types;
 import PrimitiveType from model.types;
 import PrimitiveKind from model.types;
 import List from @std.collections.list;
@@ -364,9 +369,267 @@ public coverJoinLiterals(BodyChecker checker, JoinText fix, Expression reported)
 public analyzeTernary(BodyChecker checker, TernaryExpressionNode node, Type? target,
                       LiteralOrigin? origin = null) -> Type {
     let scope = checker.targets().beginJoin(node, false);
-    Type analyzed = analyzeTernaryValues(checker, node, target, origin);
+    Type? given = target ?? untypedJoinTarget(checker, node, node.span());
+    Type analyzed = analyzeTernaryValues(checker, node, given, origin);
     endJoin(checker, node, scope);
     return analyzed;
+}
+
+// Whether 'value', a value of a join with no context type, takes its type from the other values of the
+// join: it has no type of its own, and no value of the '?:' or the switch it is has one, other than
+// 'null'.
+public takesTypeFromJoin(Expression value) -> bool {
+    if (!syntax.needsTargetType(value)) {
+        return false;
+    }
+    for (let leaf in syntax.joinValues(value)) {
+        if (!syntax.needsTargetType(leaf) && !wording.isNullLiteral(leaf)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The type the '?:' or the switch 'join' with no context type is checked against: the error type where
+// every value takes its type from the others, so that the join is refused once at 'at', and null
+// otherwise.
+public untypedJoinTarget(BodyChecker checker, Expression join, Span at) -> Type? {
+    if (!takesTypeFromJoin(join)) {
+        return null;
+    }
+    let refusal = untypedJoinRefusal(join);
+    if (refusal == null) {
+        return null;
+    }
+    holdMismatch(checker, refusal, at);
+    return checker.store().errorType();
+}
+
+// Whether the values of the '?:' or the switch 'join', analyzed against no type, can share no type: the
+// ones with a type of their own share none, the one they share cannot be taken by a value with no type
+// of its own, or those values need types of different kinds.
+public lacksCommonType(BodyChecker checker, Expression join) -> bool {
+    Type? joined = null;
+    for (let leaf in syntax.joinValues(join)) {
+        if (syntax.needsTargetType(leaf) || checker.neverReturns(leaf)) {
+            continue;
+        }
+        Type type = checker.recordedType(leaf);
+        if (type is ErrorType || types.isVoidType(type)) {
+            return false;
+        }
+        if (!(type is NullType)) {
+            joined = joined == null ? type : convert.unifyValueTypes(joined, type, checker.store());
+            if (joined == null) {
+                return true;
+            }
+        }
+    }
+    let untyped = untypedValues(join);
+    for (let value in untyped) {
+        if ((joined != null && !canTake(value, joined)) || !isSameKind(untyped.get(0), value)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The type 'waiting', the values of the '?:' or the switch 'join' that take their type from the others,
+// are checked against once 'typed', its other values, are analyzed: the type those join to. The error
+// type where they share none, where it does not suit one of 'waiting' or where nothing gives one, each
+// refused once at 'at', or where one of 'typed' is refused. Null where they give 'void', which no value
+// takes, so each value is refused on its own.
+public waitingTarget(BodyChecker checker, Expression join, Span at, List<Expression> typed,
+                     List<Expression> waiting) -> Type? {
+    Type? joined = null;
+    Expression? source = null;
+    for (let value in typed) {
+        Type type = checker.recordedType(value);
+        if (checker.neverReturns(value) || type is NullType) {
+            continue;
+        }
+        if (type is ErrorType) {
+            return type;
+        }
+        if (types.isVoidType(type)) {
+            return null;
+        }
+        if (joined == null) {
+            joined = type;
+            source = value;
+            continue;
+        }
+        let unified = convert.unifyValueTypes(joined, type, checker.store());
+        if (unified == null) {
+            holdMismatch(checker, joinMismatch(join, checker.names().quoted(joined),
+                checker.names().quoted(type)), at);
+            return checker.store().errorType();
+        }
+        joined = unified;
+    }
+    if (joined == null || source == null) {
+        let refusal = untypedJoinRefusal(join);
+        if (refusal == null) {
+            return null;
+        }
+        holdMismatch(checker, refusal, at);
+        return checker.store().errorType();
+    }
+    for (let value in waiting) {
+        for (let leaf in syntax.joinValues(value)) {
+            if (syntax.needsTargetType(leaf) && !canTake(leaf, joined)) {
+                string given = checker.names().quoted(joined);
+                string refusal = joinMismatch(join, given, untypedText(leaf));
+                if (leaf.span().start < source.span().start) {
+                    refusal = joinMismatch(join, untypedText(leaf), given);
+                }
+                holdMismatch(checker, refusal, at);
+                return checker.store().errorType();
+            }
+        }
+    }
+    return joined;
+}
+
+// Whether 'value', which has no type of its own, can take the type 'type': a lambda a function type, a
+// '{...}' literal a struct and an array literal an array type.
+canTake(Expression value, Type type) -> bool {
+    Type core = convert.coreOf(type);
+    switch (syntax.unwrapParentheses(value)) {
+        is LambdaExpressionNode ignored -> {
+            return core is FunctionType;
+        },
+        is StructLiteralExpressionNode ignored -> {
+            return types.isStructLike(core);
+        },
+        is ArrayLiteralExpressionNode ignored -> {
+            return core is ArrayType;
+        },
+        default -> {
+            return true;
+        },
+    }
+}
+
+// What a refusal calls 'value', which has no type of its own.
+untypedText(Expression value) -> string {
+    Expression core = syntax.unwrapParentheses(value);
+    switch (core) {
+        is LambdaExpressionNode ignored -> {
+            return "a lambda";
+        },
+        is StructLiteralExpressionNode ignored -> {
+            return "a '\{...\}' literal";
+        },
+        is ArrayLiteralExpressionNode array -> {
+            return array.elementsCount() == 0 ? "an empty '[]'" : "an array literal";
+        },
+        default -> {
+            return "'{wording.oneLineSpelling(core)}'";
+        },
+    }
+}
+
+// Whether 'first' and 'second', which have no type of their own, need a type of the same kind: both
+// lambdas, both '{...}' literals or both array literals.
+isSameKind(Expression first, Expression second) -> bool {
+    Expression left = syntax.unwrapParentheses(first);
+    Expression right = syntax.unwrapParentheses(second);
+    return (left is LambdaExpressionNode && right is LambdaExpressionNode)
+        || (left is StructLiteralExpressionNode && right is StructLiteralExpressionNode)
+        || (left is ArrayLiteralExpressionNode && right is ArrayLiteralExpressionNode);
+}
+
+// The refusal of the '?:' or the switch 'join' with no context type, each value of which takes its type
+// from the others: where they are lambdas, '{...}' literals or empty '[]', that nothing gives them a
+// type, and where they are of different kinds, that they have no common type. Null where they are array
+// literals that are not all empty, which are refused one by one.
+untypedJoinRefusal(Expression join) -> string? {
+    let values = untypedValues(join);
+    let first = values.get(0);
+    for (let value in values) {
+        if (!isSameKind(first, value)) {
+            return joinMismatch(join, untypedText(first), untypedText(value));
+        }
+        if (value is ArrayLiteralExpressionNode && value.elementsCount() > 0) {
+            return null;
+        }
+    }
+    return untypedValuesRefusal(join);
+}
+
+// The refusal of the '?:' or the switch 'join' with no context type, whose values with no type of their
+// own get none from the others, for the kind of the first of them.
+untypedValuesRefusal(Expression join) -> string {
+    let values = untypedValues(join);
+    bool one = values.length() == 1;
+    string named = wording.joinName(join);
+    string parts = wording.joinPartsName(join);
+    string places = "such as a variable, a field, a parameter, an array element or a return value.";
+    switch (syntax.unwrapParentheses(values.get(0))) {
+        is LambdaExpressionNode ignored -> {
+            if (one) {
+                return "This {named} has no function type to give the lambda in one of its {parts}, so the "
+                    + "lambda's parameters and result have no types. Write the {named} where a function type "
+                    + "is declared, {places}";
+            }
+            return "This {named} has no function type to give the lambdas in its {parts}, so their "
+                + "parameters and results have no types. Write the {named} where a function type is "
+                + "declared, {places}";
+        },
+        is StructLiteralExpressionNode ignored -> {
+            string literal = one ? "the '\{...\}' literal in one of its {parts}"
+                : "the '\{...\}' literals in its {parts}";
+            return "This {named} has no declared struct type for {literal} to build. Write the {named} where "
+                + "a struct type is declared, {places}";
+        },
+        default -> {
+            string empty = one ? "the empty '[]' in one of its {parts}" : "each empty '[]' in its {parts}";
+            return "This {named} has no element type to give {empty}. Write the {named} where an array type "
+                + "is declared, as in '{emptyExample(join)}'.";
+        },
+    }
+}
+
+// The values of the '?:' or the switch 'join' that have no type of their own, in source order.
+untypedValues(Expression join) -> List<Expression> {
+    let values = new List<Expression>();
+    for (let leaf in syntax.joinValues(join)) {
+        if (syntax.needsTargetType(leaf)) {
+            values.push(leaf);
+        }
+    }
+    return values;
+}
+
+// A declaration of an array type that the '?:' or the switch 'join' initializes, or that '[]' does where
+// the join is too long to repeat. The type is nullable where a value of the join is 'null'.
+emptyExample(Expression join) -> string {
+    let spelled = wording.shortSpelling(join);
+    if (spelled == null) {
+        return "int[] values = [];";
+    }
+    for (let leaf in syntax.joinValues(join)) {
+        if (wording.isNullLiteral(leaf)) {
+            return "int[]? values = {spelled};";
+        }
+    }
+    return "int[] values = {spelled};";
+}
+
+// The refusal of the '?:' or the switch 'join' two of whose values, as 'first' and 'second' name them,
+// have no common type.
+public joinMismatch(Expression join, string first, string second) -> string {
+    if (syntax.unwrapParentheses(join) is TernaryExpressionNode) {
+        return branchesMismatch(first, second);
+    }
+    return switches.armsMismatch(first, second);
+}
+
+// The refusal of a '?:' whose two branches, as 'first' and 'second' name them, have no common type.
+branchesMismatch(string first, string second) -> string {
+    return "The two results of this '?:' are {first} and {second}, which have no common type. Give both "
+        + "branches the same type.";
 }
 
 // Keeps the refusal 'message' of a value of the current join until the join ends, when the
@@ -427,31 +690,34 @@ analyzeTernaryValues(BodyChecker checker, TernaryExpressionNode node, Type? targ
     if (elseJoins) {
         elseTarget = null;
     }
-    if (thenTarget == null) {
-        checker.targets().stash(thenValue, fixTarget, fixOrigin);
-    }
     let outerDeferred = checker.targets().deferredFixes();
     let thenDeferred = new List<DeferredLiteralFix>();
-    checker.targets().setDeferredFixes(thenDeferred);
-    noteJoinValue(checker, thenValue);
-    let site = new ConditionSite("", node, "");
-    Type thenType = narrowing.analyzeGuardedBranch(checker, node.condition(), thenValue, true, thenTarget,
-        origin, site);
-    checker.endPathIfNeverReturns(thenValue);
-    let branchFlows = new List<AssignmentFlow>();
-    branchFlows.push(checker.assignment().snapshot());
-    checker.assignment().restore(entry);
-    checker.targets().clearStash();
-    if (elseTarget == null) {
-        checker.targets().stash(elseValue, fixTarget, fixOrigin);
-    }
     let elseDeferred = new List<DeferredLiteralFix>();
-    checker.targets().setDeferredFixes(elseDeferred);
-    noteJoinValue(checker, elseValue);
-    Type elseType = narrowing.analyzeGuardedBranch(checker, node.condition(), elseValue, false, elseTarget,
-        origin, site);
-    checker.endPathIfNeverReturns(elseValue);
+    let branchFlows = new List<AssignmentFlow>();
+    // With no context type, a branch that takes its type from the other one is analyzed after it.
+    bool thenWaits = target == null && takesTypeFromJoin(thenValue) && !takesTypeFromJoin(elseValue);
+    bool elseWaits = target == null && takesTypeFromJoin(elseValue) && !takesTypeFromJoin(thenValue);
+    Type elseType = checker.store().errorType();
+    if (thenWaits) {
+        elseType = analyzeBranch(checker, node, false, elseTarget, origin, fixTarget, fixOrigin,
+            elseDeferred);
+        branchFlows.push(checker.assignment().snapshot());
+        checker.assignment().restore(entry);
+        thenTarget = waitingTarget(checker, node, node.span(), List.of([elseValue]), List.of([thenValue]));
+    }
+    Type thenType = analyzeBranch(checker, node, true, thenTarget, origin, fixTarget, fixOrigin,
+        thenDeferred);
     branchFlows.push(checker.assignment().snapshot());
+    if (!thenWaits) {
+        checker.assignment().restore(entry);
+        if (elseWaits) {
+            elseTarget = waitingTarget(checker, node, node.span(), List.of([thenValue]),
+                List.of([elseValue]));
+        }
+        elseType = analyzeBranch(checker, node, false, elseTarget, origin, fixTarget, fixOrigin,
+            elseDeferred);
+        branchFlows.push(checker.assignment().snapshot());
+    }
     checker.assignment().finishBranches(branchFlows, entry);
     checker.targets().clearStash();
     checker.targets().setDeferredFixes(outerDeferred);
@@ -508,10 +774,28 @@ analyzeTernaryValues(BodyChecker checker, TernaryExpressionNode node, Type? targ
     if (unified != null) {
         return unified;
     }
-    holdMismatch(checker, "The two results of this '?:' are {checker.names().quoted(thenType)} and "
-        + "{checker.names().quoted(elseType)}, which have no common type. Give both branches the "
-        + "same type.", node.span());
+    holdMismatch(checker, branchesMismatch(checker.names().quoted(thenType),
+        checker.names().quoted(elseType)), node.span());
     return checker.store().errorType();
+}
+
+// Analyzes the branch of the '?:' 'node' taken where its condition is 'holds' against 'target', or with
+// no target for a fix to name 'fixTarget' and 'fixOrigin', keeping the fixes of its literals that wait
+// for the other branch in 'deferred'.
+analyzeBranch(BodyChecker checker, TernaryExpressionNode node, bool holds, Type? target,
+              LiteralOrigin? origin, Type? fixTarget, LiteralOrigin? fixOrigin,
+              List<DeferredLiteralFix> deferred) -> Type {
+    Expression value = holds ? node.thenValue() : node.elseValue();
+    checker.targets().clearStash();
+    if (target == null) {
+        checker.targets().stash(value, fixTarget, fixOrigin);
+    }
+    checker.targets().setDeferredFixes(deferred);
+    noteJoinValue(checker, value);
+    Type analyzed = narrowing.analyzeGuardedBranch(checker, node.condition(), value, holds, target, origin,
+        new ConditionSite("", node, ""));
+    checker.endPathIfNeverReturns(value);
+    return analyzed;
 }
 
 // The type of 'value', of type 'analyzed', the one branch of a '?:' that can give a value because

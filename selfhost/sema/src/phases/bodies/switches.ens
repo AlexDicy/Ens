@@ -177,11 +177,12 @@ matchesEveryValue(Type inner, Type armType) -> bool {
 }
 
 // A switch used as a value. The target is the type its arms are checked against, and is null where the
-// surroundings offer none.
+// surroundings offer none. Without one, an arm with no type of its own takes the type of the others.
 public analyzeSwitchExpression(BodyChecker checker, SwitchExpressionNode node, Type? target,
                                LiteralOrigin? origin = null) -> Type {
     let scope = checker.targets().beginJoin(node, false);
-    Type analyzed = analyzeSwitchValues(checker, node, target, origin);
+    Type? given = target ?? valuejoins.untypedJoinTarget(checker, node, node.switchKeyword().span());
+    Type analyzed = analyzeSwitchValues(checker, node, given, origin);
     valuejoins.endJoin(checker, node, scope);
     return analyzed;
 }
@@ -196,16 +197,17 @@ analyzeSwitchValues(BodyChecker checker, SwitchExpressionNode node, Type? target
     }
     checker.targets().clearStash();
     return checkSwitchArms(checker, node.scrutinee(), armsOfExpression(node),
-        node.switchKeyword().span(), true, target, fixOrigin, fixTarget);
+        node.switchKeyword().span(), true, target, fixOrigin, fixTarget, node);
 }
 
 // Checks a switch in either form: the scrutinee kind, the labels or 'is' arm targets, arm
 // reachability, exhaustiveness, and the unified value type of the expression form.
 // Exhaustiveness reasons over the unwrapped scrutinee type; a scrutinee whose
-// narrowing-aware type is still nullable additionally needs a 'null' arm or a default.
+// narrowing-aware type is still nullable additionally needs a 'null' arm or a default. 'valued' is the
+// switch used as a value, where it is one.
 public checkSwitchArms(BodyChecker checker, Expression scrutinee, List<SwitchArm> arms, Span span,
                        bool requireValue, Type? armTargetType, LiteralOrigin? origin = null,
-                       Type? fixTarget = null) -> Type {
+                       Type? fixTarget = null, SwitchExpressionNode? valued = null) -> Type {
     Type scrutineeType = checker.analyzeExpression(scrutinee);
     narrowing.noteLoopTest(checker, scrutinee);
     thisuses.checkSwitchedThis(checker, scrutinee, arms);
@@ -257,6 +259,10 @@ public checkSwitchArms(BodyChecker checker, Expression scrutinee, List<SwitchArm
     let outerDeferred = checker.targets().deferredFixes();
     let armDeferred = new List<List<DeferredLiteralFix>>();
     let armValues = new List<Expression?>();
+    // With no context type, the arms that take their type from the others are walked after them.
+    bool deferWaiting = valued != null && armTargetType == null && hasWaitingArm(arms);
+    let waitingIndexes = new List<long>();
+    let waitingWalks = new List<(Type?) -> bool>();
     for (long a = 0; a < arms.length(); a++) {
         long sunk = valueExpressions.length();
         if (requireValue) {
@@ -267,6 +273,7 @@ public checkSwitchArms(BodyChecker checker, Expression scrutinee, List<SwitchArm
         checker.assignment().restore(switchEntry);
         checker.narrowing().restoreLayers(entryLayers);
         checker.assignment().setUnconditionalPosition(unconditional);
+        ((Type?) -> bool)? walk = null;
         switch (arms.get(a)) {
             is DefaultArmNode arm -> {
                 if (hasDefault) {
@@ -274,10 +281,8 @@ public checkSwitchArms(BodyChecker checker, Expression scrutinee, List<SwitchArm
                         + "'default' arm.", arm.span());
                 }
                 hasDefault = true;
-                if (walkArmBodyFlow(checker, arm.body(), requireValue, armTargetType,
-                        valueExpressions, armFlows, armNarrowings, deferLiterals, origin, fixTarget)) {
-                    sawValueBlock = true;
-                }
+                walk = (Type? target) -> walkArmBodyFlow(checker, arm.body(), requireValue, target,
+                    valueExpressions, armFlows, armNarrowings, deferLiterals, origin, fixTarget);
             },
             is TypeArmNode arm -> {
                 Type armType = checker.resolver().resolveType(arm.target());
@@ -313,29 +318,31 @@ public checkSwitchArms(BodyChecker checker, Expression scrutinee, List<SwitchArm
                     checkTypeArmReachable(checker, armTarget, armTargets, arm.target().span());
                     armTargets.push(armTarget);
                 }
-                checker.enterScope();
+                LocalBinding? binding = null;
                 let bindingToken = arm.binding();
                 if (bindingToken != null) {
                     Type bindingType = checker.store().errorType();
                     if (armTarget != null) {
                         bindingType = armTarget;
                     }
-                    let binding = new LocalBinding(bindingToken.text(), bindingType,
-                        BindingKind.Variable, true, bindingToken.span());
+                    binding = new LocalBinding(bindingToken.text(), bindingType, BindingKind.Variable, true,
+                        bindingToken.span());
                     checker.armBindings().push(binding);
-                    let current = checker.currentScope();
-                    if (current != null) {
-                        current.define(binding);
-                    }
                     checker.result().setBinding(arm.green(), binding);
-                } else if (armTarget != null) {
-                    narrowing.narrowArmValue(checker, scrutinee, armTarget);
                 }
-                if (walkArmBodyFlow(checker, arm.body(), requireValue, armTargetType,
-                        valueExpressions, armFlows, armNarrowings, deferLiterals, origin, fixTarget)) {
-                    sawValueBlock = true;
-                }
-                checker.leaveScope();
+                walk = (Type? target) -> {
+                    checker.enterScope();
+                    let current = checker.currentScope();
+                    if (binding != null && current != null) {
+                        current.define(binding);
+                    } else if (binding == null && armTarget != null) {
+                        narrowing.narrowArmValue(checker, scrutinee, armTarget);
+                    }
+                    bool sawBlock = walkArmBodyFlow(checker, arm.body(), requireValue, target,
+                        valueExpressions, armFlows, armNarrowings, deferLiterals, origin, fixTarget);
+                    checker.leaveScope();
+                    return sawBlock;
+                };
             },
             is ValueArmNode arm -> {
                 bool mixReported = false;
@@ -378,14 +385,18 @@ public checkSwitchArms(BodyChecker checker, Expression scrutinee, List<SwitchArm
                         checkStringLabel(checker, label, seenStringLabels);
                     }
                 }
-                if (walkArmBodyFlow(checker, arm.body(), requireValue, armTargetType,
-                        valueExpressions, armFlows, armNarrowings, deferLiterals, origin, fixTarget)) {
-                    sawValueBlock = true;
-                }
+                walk = (Type? target) -> walkArmBodyFlow(checker, arm.body(), requireValue, target,
+                    valueExpressions, armFlows, armNarrowings, deferLiterals, origin, fixTarget);
             },
             // Dropped before the walk begins; the case is here because the arm kinds are
             // checked for exhaustiveness.
             is ErrorSwitchArmNode ignored -> { },
+        }
+        if (walk != null && deferWaiting && takesTypeFromArms(arms.get(a))) {
+            waitingIndexes.push(a);
+            waitingWalks.push(walk);
+        } else if (walk != null && walk(armTargetType)) {
+            sawValueBlock = true;
         }
         Expression? armValue = null;
         if (valueExpressions.length() > sunk) {
@@ -393,6 +404,48 @@ public checkSwitchArms(BodyChecker checker, Expression scrutinee, List<SwitchArm
             armValue = valueExpressions.get(valueExpressions.length() - 1);
         }
         armValues.push(armValue);
+    }
+    bool refusedWaiting = false;
+    if (valued != null && !waitingWalks.isEmpty()) {
+        let typed = new List<Expression>();
+        for (let value in armValues) {
+            if (value != null) {
+                typed.push(value);
+            }
+        }
+        let waiting = new List<Expression>();
+        for (let index in waitingIndexes) {
+            let value = syntax.armValue(arms.get(index));
+            if (value != null) {
+                waiting.push(value);
+            }
+        }
+        Type? given = valuejoins.waitingTarget(checker, valued, span, typed, waiting);
+        refusedWaiting = given is ErrorType;
+        for (long w = 0; w < waitingWalks.length(); w++) {
+            long a = waitingIndexes.get(w);
+            checker.assignment().restore(switchEntry);
+            checker.narrowing().restoreLayers(entryLayers);
+            checker.assignment().setUnconditionalPosition(unconditional);
+            checker.targets().setDeferredFixes(armDeferred.get(a));
+            long sunk = valueExpressions.length();
+            let walk = waitingWalks.get(w);
+            if (walk(given)) {
+                sawValueBlock = true;
+            }
+            if (valueExpressions.length() > sunk) {
+                armValues.set(a, valueExpressions.get(valueExpressions.length() - 1));
+            }
+        }
+        valueExpressions.clear();
+        valueArms.clear();
+        for (long a = 0; a < arms.length(); a++) {
+            let value = armValues.get(a);
+            if (value != null) {
+                valueExpressions.push(value);
+                valueArms.push(arms.get(a));
+            }
+        }
     }
     checker.targets().setDeferredFixes(outerDeferred);
     for (long a = 0; a < armDeferred.length(); a++) {
@@ -459,6 +512,9 @@ public checkSwitchArms(BodyChecker checker, Expression scrutinee, List<SwitchArm
     if (givingValues.length() == 0) {
         return checker.store().primitive(PrimitiveKind.Void);
     }
+    if (refusedWaiting) {
+        return checker.store().errorType();
+    }
     literalfixes.noteSuffixedArms(checker, givingValues, givingArms, armTargetType ?? fixTarget, origin);
     if (deferLiterals && armTargetType != null
             && !adaptLiteralArms(checker, givingValues, givingArms, armTargetType, origin)) {
@@ -504,9 +560,8 @@ public checkSwitchArms(BodyChecker checker, Expression scrutinee, List<SwitchArm
         }
         let joined = convert.unifyValueTypes(unified, analyzed, checker.store());
         if (joined == null) {
-            valuejoins.holdMismatch(checker, "Switch arms produce {checker.names().quoted(unified)} and "
-                + "{checker.names().quoted(analyzed)}, which have no common type. Give every arm "
-                + "the same type.", span);
+            valuejoins.holdMismatch(checker, armsMismatch(checker.names().quoted(unified),
+                checker.names().quoted(analyzed)), span);
             return checker.store().errorType();
         }
         unified = joined;
@@ -516,6 +571,35 @@ public checkSwitchArms(BodyChecker checker, Expression scrutinee, List<SwitchArm
         literaltyping.adaptFloatLiteral(checker, value, unified);
     }
     return unified;
+}
+
+// The refusal of a switch used as a value two of whose arms, as 'first' and 'second' name them, have no
+// common type.
+public armsMismatch(string first, string second) -> string {
+    return "Switch arms produce {first} and {second}, which have no common type. Give every arm the same "
+        + "type.";
+}
+
+// Whether the value of 'arm', in a switch with no context type, takes its type from the other arms.
+takesTypeFromArms(SwitchArm arm) -> bool {
+    let value = syntax.armValue(arm);
+    return value != null && valuejoins.takesTypeFromJoin(value);
+}
+
+// Whether, with no context type, an arm of a switch of 'arms' takes its type from the others, and
+// another arm gives one.
+hasWaitingArm(List<SwitchArm> arms) -> bool {
+    bool waits = false;
+    bool gives = false;
+    for (let arm in arms) {
+        let value = syntax.armValue(arm);
+        if (value != null) {
+            bool taking = valuejoins.takesTypeFromJoin(value);
+            waits = waits || taking;
+            gives = gives || !taking;
+        }
+    }
+    return waits && gives;
 }
 
 // The refusal of a switch used as a value when the value of one of its 'arms' that can give one,
