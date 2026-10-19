@@ -20,6 +20,7 @@ import model.typenames;
 import TypeTestExpressionNode from @ens.frontend.syntax.generated.nodes;
 import AssignmentExpressionNode from @ens.frontend.syntax.generated.nodes;
 import ParenthesizedExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ListNode from @ens.frontend.syntax.generated.nodes;
 import WhileStatementNode from @ens.frontend.syntax.generated.nodes;
 import ForStatementNode from @ens.frontend.syntax.generated.nodes;
 import ForEachStatementNode from @ens.frontend.syntax.generated.nodes;
@@ -59,6 +60,7 @@ import TypeParamType from model.types;
 import TypeTestObligation from phases.obligations;
 import List from @std.collections.list;
 import Map from @std.collections.map;
+import PriorityQueue from @std.collections.priorityqueue;
 import BodyChecker from phases.bodies;
 import LiteralOrigin from phases.bodies.literaltargets;
 import support.syntax;
@@ -176,6 +178,7 @@ detectNullCheck(BodyChecker checker, Expression condition) -> NarrowingFact? {
     if (path == null) {
         return null;
     }
+    touchLoopRoot(checker, path.root(), null);
     // One check strips one level, off the sharpest type proven for the path so far: a
     // re-check of a value already proven present at every level proves nothing new.
     Type presence = checker.narrowing().provenType(path) ?? checkedType;
@@ -190,13 +193,14 @@ detectNullCheck(BodyChecker checker, Expression condition) -> NarrowingFact? {
 // the test flips the polarity in collectNarrowings. A test whose type was refused proves that the
 // operand's type is not known where the test holds, which readType and refinementRefused read.
 detectTypeTest(BodyChecker checker, TypeTestExpressionNode test) -> NarrowingFact? {
+    let path = buildNarrowingPath(checker, test.value());
+    if (path == null) {
+        return null;
+    }
+    touchLoopRoot(checker, path.root(), null);
     let refused = checker.result().typeOf(test.target().green());
     if (refused is ErrorType) {
-        let refusedPath = buildNarrowingPath(checker, test.value());
-        if (refusedPath == null) {
-            return null;
-        }
-        return new NarrowingFact(refusedPath, refused, true);
+        return new NarrowingFact(path, refused, true);
     }
     let testType = checker.result().typeOf(test.green());
     if (testType == null || !convert.isBoolType(testType)) {
@@ -204,10 +208,6 @@ detectTypeTest(BodyChecker checker, TypeTestExpressionNode test) -> NarrowingFac
     }
     let target = checker.result().typeOf(test.target().green());
     if (target == null || target is OptionalType || !types.isClassLike(target)) {
-        return null;
-    }
-    let path = buildNarrowingPath(checker, test.value());
-    if (path == null) {
         return null;
     }
     return new NarrowingFact(path, target, true);
@@ -965,14 +965,17 @@ public establishAssignmentNarrowing(BodyChecker checker, LocalBinding binding, T
 
 // The write at 'at' that stores a 'stored' into 'target': it drops the narrowings of the storage it
 // replaces and is recorded as what ended them, it narrows the place to what the stored value proves,
-// and the loops being settled see it.
-public recordWrite(BodyChecker checker, Expression target, Span at, Type stored) {
+// and the loops being settled see it. 'assignment' is the plain '=' that makes the write, if one does.
+public recordWrite(BodyChecker checker, Expression target, Span at, Type stored,
+                   AssignmentExpressionNode? assignment = null) {
     let end = new NarrowingEnd(NarrowingEndKind.Assigned, at, stored, "",
         wording.oneLineSpelling(syntax.unwrapParentheses(target)), null);
     invalidateForWrite(checker, target, end);
     establishWriteNarrowing(checker, target, stored);
     renewEndsForWrite(checker, target, end);
-    noteLoopWrite(checker, writtenRoot(checker, target), end);
+    let root = writtenRoot(checker, target);
+    noteLoopWrite(checker, root, end);
+    touchLoopRoot(checker, root, loopCopy(checker, target, assignment, stored, end));
 }
 
 // 'out' lets the function 'callee' write the caller's variable directly, so the argument at 'at'
@@ -982,6 +985,7 @@ public recordOutWrite(BodyChecker checker, LocalBinding binding, Span at, string
     checker.narrowing().clearForRoot(binding, end);
     checker.narrowing().renewForRoot(binding, end);
     noteLoopWrite(checker, binding, end);
+    touchLoopRoot(checker, binding, null);
 }
 
 // Narrows the place a write stored into, after invalidateForWrite has dropped what the place
@@ -1039,20 +1043,79 @@ renewEndsForWrite(BodyChecker checker, Expression target, NarrowingEnd end) {
     }
 }
 
-// The narrowings a pass over a loop watches on the locals and parameters it may write: the type each
-// still holds with after the writes seen so far, the ones a write left without a proof, the first write
-// that widened or broke each, and whether a write changed any.
+// The narrowings a pass over the loop 'loop' watches on the locals and parameters it may write: the type
+// each starts with and still holds with after the writes seen so far, the ones a write left without a
+// proof, the first write that widened or broke each, and whether a write changed any. The copies that
+// read a start are kept by the local they read, and 'lambdaDepth' counts the lambdas the loop is in.
 public final class LoopWatch {
+    protected GreenNode loop;
+    protected Map<NarrowingPath, Type> starts;
     protected Map<NarrowingPath, Type> held;
     protected Map<NarrowingPath, NarrowingEnd> widened;
     protected Map<NarrowingPath, NarrowingEnd> broken;
     protected bool changed;
+    protected Map<NarrowingPath, List<LoopCopy>> startReaders;
+    protected long lambdaDepth;
 
-    protected constructor(this.held) {
+    protected constructor(this.loop, Map<NarrowingPath, Type> starts, this.lambdaDepth) {
+        this.starts = starts;
+        this.held = new Map<NarrowingPath, Type>();
+        for (let path in starts.keys()) {
+            let start = starts.get(path);
+            if (start != null) {
+                this.held.set(path, start);
+            }
+        }
         this.widened = new Map<NarrowingPath, NarrowingEnd>();
         this.broken = new Map<NarrowingPath, NarrowingEnd>();
         this.changed = false;
+        this.startReaders = new Map<NarrowingPath, List<LoopCopy>>();
     }
+}
+
+// A plain '=' in a pass over the loops being settled that stores a local or a parameter into another
+// one, where what the source holds is what a loop starts it with or what an earlier such copy stored.
+// It is kept with the type it stores, the watches that still hold a narrowing of its target after it
+// and the copies that read what it stored, so the passes learn at once what a change to the source does
+// along the copies. 'statement' is the statement it makes up the whole of, directly in a block.
+final class LoopCopy {
+    protected NarrowingPath target;
+    protected Type declared;
+    protected Type stored;
+    protected NarrowingEnd end;
+    protected long order;
+    protected LoopWatch? startSource;
+    protected NarrowingPath source;
+    protected LoopCopy? copySource;
+    protected List<LoopWatch> watches;
+    protected List<LoopCopy> readers;
+    protected SyntaxNode? statement;
+
+    protected constructor(this.target, this.declared, this.stored, this.end, this.order, this.source) {
+        this.startSource = null;
+        this.copySource = null;
+        this.watches = new List<LoopWatch>();
+        this.readers = new List<LoopCopy>();
+        this.statement = null;
+    }
+}
+
+// What last changed the proofs of a local or a parameter in a pass over the loops being settled: the
+// start of the loop of 'started', the copy 'copied', or, where both are null, any other write or a test.
+final class LoopTouch {
+    protected LoopWatch? started;
+    protected LoopCopy? copied;
+    protected long lambdaDepth;
+
+    protected constructor(this.started, this.copied, this.lambdaDepth);
+}
+
+// A copy to bring up to date, as the pass 'pass' after the one made would store it.
+final class CopyUpdate {
+    protected long pass;
+    protected LoopCopy copy;
+
+    protected constructor(this.pass, this.copy);
 }
 
 // What the passes over one loop have learned about where it starts: the type each narrowing it watches
@@ -1112,16 +1175,21 @@ learnedFor<V>(Map<NarrowingPath, V> learned, NarrowingPath path) -> V? {
 }
 
 // What the passes over a loop and the loops inside it have learned about where each loop a pass reaches
-// starts, which is final once 'settled'.
+// starts, which is final once 'settled', and what the pass being made has seen: what last changed the
+// proofs of each local and parameter, and the copies, in the order it made them.
 public final class LoopSettlement {
     protected Map<GreenNode, LoopStart> starts;
     protected bool changed;
     protected bool settled;
+    protected Map<NarrowingPath, LoopTouch> touches;
+    protected List<LoopCopy> copies;
 
     protected constructor() {
         this.starts = new Map<GreenNode, LoopStart>();
         this.changed = false;
         this.settled = false;
+        this.touches = new Map<NarrowingPath, LoopTouch>();
+        this.copies = new List<LoopCopy>();
     }
 }
 
@@ -1176,6 +1244,8 @@ passLoops(BodyChecker checker, SyntaxNode loop, (BodyChecker) -> void walk) {
     }
     while (true) {
         settlement.changed = false;
+        settlement.touches = new Map<NarrowingPath, LoopTouch>();
+        settlement.copies = new List<LoopCopy>();
         let trial = checker.trial();
         trial.setLoopSettlement(settlement);
         passLoop(trial, settlement, loop, walk);
@@ -1183,6 +1253,7 @@ passLoops(BodyChecker checker, SyntaxNode loop, (BodyChecker) -> void walk) {
         if (!settlement.changed) {
             break;
         }
+        followCopies(checker, settlement);
     }
     settlement.settled = true;
     checker.setLoopSettlement(settlement);
@@ -1223,8 +1294,14 @@ passLoop(BodyChecker checker, LoopSettlement settlement, SyntaxNode loop, (BodyC
         walk(checker);
         return;
     }
-    let watch = new LoopWatch(held);
+    long lambdaDepth = checker.lambdaFrames().length();
+    let watch = new LoopWatch(loop.green(), held, lambdaDepth);
     checker.loopWatches().push(watch);
+    for (let path in held.keys()) {
+        if (path.fieldNames().length == 0) {
+            settlement.touches.set(path, new LoopTouch(watch, null, lambdaDepth));
+        }
+    }
     walk(checker);
     checker.loopWatches().pop();
     learnLoop(settlement, loop.green(), watch);
@@ -1336,6 +1413,209 @@ noteLoopWrite(BodyChecker checker, LocalBinding? root, NarrowingEnd end) {
             }
         }
     }
+}
+
+// Records in the pass being made over the loops being settled that 'copy', or with 'copy' null any other
+// write or a test, last changed the proofs of the local or parameter 'root', null for a place under neither.
+touchLoopRoot(BodyChecker checker, LocalBinding? root, LoopCopy? copy) {
+    let settlement = checker.loopSettlement();
+    if (root == null || settlement == null || checker.loopWatches().isEmpty()) {
+        return;
+    }
+    long lambdaDepth = checker.lambdaFrames().length();
+    settlement.touches.set(narrow.bindingPath(root), new LoopTouch(null, copy, lambdaDepth));
+}
+
+// Records that the pass being made over the loops being settled tests the place 'tested'.
+public noteLoopTest(BodyChecker checker, Expression tested) {
+    if (checker.loopWatches().isEmpty()) {
+        return;
+    }
+    let path = buildNarrowingPath(checker, tested);
+    if (path != null) {
+        touchLoopRoot(checker, path.root(), null);
+    }
+}
+
+// The copy the plain '=' 'assignment' makes, whose write is 'end' and stores a 'stored' into 'target',
+// where it stores a local or a parameter into another one and the source holds what a loop being settled
+// starts it with, or what an earlier copy stored that 'assignment' runs after on every path to it. Null
+// for any other write, and outside the passes over the loops being settled. Every value the source can
+// hold can be stored, so a later pass makes the same write.
+loopCopy(BodyChecker checker, Expression target, AssignmentExpressionNode? assignment, Type stored,
+         NarrowingEnd end) -> LoopCopy? {
+    let settlement = checker.loopSettlement();
+    if (assignment == null || settlement == null || checker.loopWatches().isEmpty()) {
+        return null;
+    }
+    Expression written = syntax.unwrapParentheses(target);
+    Expression value = syntax.unwrapParentheses(assignment.value());
+    if (!(written is IdentifierExpressionNode) || !(value is IdentifierExpressionNode)) {
+        return null;
+    }
+    let binding = checker.result().bindingOf(written.green());
+    let read = checker.result().bindingOf(value.green());
+    if (binding == null || read == null || binding == read
+            || !convert.isAssignableStrict(binding.type(), read.type())) {
+        return null;
+    }
+    let source = narrow.bindingPath(read);
+    let proven = checker.narrowing().provenType(source);
+    let touch = settlement.touches.get(source);
+    long lambdaDepth = checker.lambdaFrames().length();
+    if (proven == null || proven != stored || touch == null || touch.lambdaDepth != lambdaDepth) {
+        return null;
+    }
+    let copy = new LoopCopy(narrow.bindingPath(binding), binding.type(), stored, end,
+        settlement.copies.length(), source);
+    let started = touch.started;
+    let copied = touch.copied;
+    if (started != null && checker.loopWatches().contains(started) && started.starts.get(source) == proven) {
+        copy.startSource = started;
+        let readers = started.startReaders.get(source) ?? new List<LoopCopy>();
+        readers.push(copy);
+        started.startReaders.set(source, readers);
+    } else if (copied != null && runsAfter(assignment, copied) && copyRead(checker, copied) == proven) {
+        copy.copySource = copied;
+        copied.readers.push(copy);
+    } else {
+        return null;
+    }
+    let statement = assignment.parent();
+    let statements = statement?.parent();
+    if (statement is ExpressionStatementNode && statements is ListNode && statements.parent() is BlockNode) {
+        copy.statement = statement;
+    }
+    for (let watch in checker.loopWatches()) {
+        if (watch.held.get(copy.target) != null && watch.broken.get(copy.target) == null) {
+            copy.watches.push(watch);
+        }
+    }
+    settlement.copies.push(copy);
+    return copy;
+}
+
+// Whether 'assignment' runs after the copy 'copied' on every path to it in a pass: 'copied' makes up a
+// statement of a block, and 'assignment' is in a later statement of that block.
+runsAfter(AssignmentExpressionNode assignment, LoopCopy copied) -> bool {
+    let statement = copied.statement;
+    if (statement == null) {
+        return false;
+    }
+    let statements = statement.parent();
+    return statements != null && within(assignment.span(), statements.span())
+        && assignment.span().start >= statement.span().end();
+}
+
+// What a read of the target of 'copy' after it gets.
+copyRead(BodyChecker checker, LoopCopy copy) -> Type {
+    return heldAfterStore(checker, copy.declared, copy.stored);
+}
+
+// Learns at once what the next passes over the loops being settled would learn from the copies the pass
+// made. Where what a copy reads changes, it stores the new value, and each loop that watches its target
+// learns what that does. The copies that read what it stored follow on the same pass, and those that read
+// where such a loop starts follow on the next one, in the order a pass makes them.
+followCopies(BodyChecker checker, LoopSettlement settlement) {
+    let updates = new PriorityQueue<CopyUpdate>((first, second) -> updateOrder(first, second));
+    for (let copy in settlement.copies) {
+        if (copy.startSource != null) {
+            updates.push(new CopyUpdate(1, copy));
+        }
+    }
+    while (!updates.isEmpty()) {
+        let update = updates.pop();
+        let copy = update.copy;
+        Type read = sourceRead(checker, settlement, copy);
+        if (read == copy.stored) {
+            continue;
+        }
+        copy.stored = read;
+        let end = new NarrowingEnd(NarrowingEndKind.Assigned, copy.end.at(), read, "", copy.end.place(),
+            null);
+        for (let watch in copy.watches) {
+            if (!learnCopy(checker, settlement, watch, copy, end)) {
+                continue;
+            }
+            let readers = watch.startReaders.get(copy.target);
+            if (readers != null) {
+                for (let reader in readers) {
+                    updates.push(new CopyUpdate(update.pass + 1, reader));
+                }
+            }
+        }
+        for (let reader in copy.readers) {
+            updates.push(new CopyUpdate(update.pass, reader));
+        }
+    }
+}
+
+// Whether 'first' comes before 'second': by pass, then in the order a pass makes the copies.
+updateOrder(CopyUpdate first, CopyUpdate second) -> int {
+    if (first.pass != second.pass) {
+        return first.pass < second.pass ? -1 : 1;
+    }
+    if (first.copy.order != second.copy.order) {
+        return first.copy.order < second.copy.order ? -1 : 1;
+    }
+    return 0;
+}
+
+// What the copy 'copy' reads from its source on the pass the updates have reached.
+sourceRead(BodyChecker checker, LoopSettlement settlement, LoopCopy copy) -> Type {
+    let started = copy.startSource;
+    if (started != null) {
+        return startOf(checker, settlement, started, copy.source) ?? copy.source.rootType();
+    }
+    let copied = copy.copySource;
+    if (copied != null) {
+        return copyRead(checker, copied);
+    }
+    return copy.stored;
+}
+
+// The type the next pass starts the loop of 'watch' with for 'path', from what the passes have learned
+// so far and what this pass started it with, or null where it starts with no proof of 'path'.
+startOf(BodyChecker checker, LoopSettlement settlement, LoopWatch watch, NarrowingPath path) -> Type? {
+    let start = watch.starts.get(path);
+    let learned = settlement.starts.get(watch.loop);
+    if (start == null || learned == null) {
+        return start;
+    }
+    if (learned.dropOf(path) != null) {
+        return null;
+    }
+    let kept = learned.keptType(path);
+    if (kept == null) {
+        return start;
+    }
+    return unifyNarrowed(checker, start, kept);
+}
+
+// Learns for the loop of 'watch' what the copy 'copy', now the write 'end', does to the narrowing of its
+// target there, and returns whether the type the loop starts with for it changes.
+learnCopy(BodyChecker checker, LoopSettlement settlement, LoopWatch watch, LoopCopy copy,
+          NarrowingEnd end) -> bool {
+    let held = startOf(checker, settlement, watch, copy.target);
+    let learned = settlement.starts.get(watch.loop);
+    if (held == null || learned == null) {
+        return false;
+    }
+    let proven = provenByStore(checker, copy.declared, copy.stored);
+    Type? kept = null;
+    if (proven != null) {
+        kept = unifyNarrowed(checker, held, proven);
+    }
+    if (kept == null) {
+        learned.drop(copy.target, end);
+        return true;
+    }
+    if (kept == held) {
+        return false;
+    }
+    learned.keep(copy.target, kept);
+    learned.widen(copy.target, end);
+    return true;
 }
 
 // The local or parameter a write to 'target' stores into or under, or null where it has none.
