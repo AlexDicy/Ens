@@ -1044,24 +1044,40 @@ renewEndsForWrite(BodyChecker checker, Expression target, NarrowingEnd end) {
     }
 }
 
-// The narrowings a pass over the loop 'loop' watches on the locals and parameters it may write: the type
-// each starts with and still holds with after the writes seen so far, the ones a write left without a
-// proof, the first write that widened or broke each, and whether a write changed any. The paths are
-// also kept by the local or parameter they start at, the copies that read a start by the local they
-// read, and 'lambdaDepth' counts the lambdas the loop is in.
+// The narrowings a pass over the loop 'loop' watches on the locals and parameters it may write. 'trace'
+// follows each from the type the loop starts it with, and 'changed' is whether a write changed it.
+// 'entryTrace' follows each the loop starts weaker than the proof where it is entered from that proof,
+// which finds the first write of the pass that widens or breaks it. The copies that read a start are
+// kept by the local they read, and 'lambdaDepth' counts the lambdas the loop is in.
 public final class LoopWatch {
     protected GreenNode loop;
     protected Map<NarrowingPath, Type> starts;
-    protected Map<NarrowingPath, Type> held;
-    protected Map<LocalBinding, List<NarrowingPath>> rootPaths;
-    protected Map<NarrowingPath, NarrowingEnd> widened;
-    protected Map<NarrowingPath, NarrowingEnd> broken;
+    protected NarrowingTrace trace;
+    protected NarrowingTrace entryTrace;
     protected bool changed;
     protected Map<NarrowingPath, List<LoopCopy>> startReaders;
     protected long lambdaDepth;
 
-    protected constructor(this.loop, Map<NarrowingPath, Type> starts, this.lambdaDepth) {
+    protected constructor(this.loop, Map<NarrowingPath, Type> starts, Map<NarrowingPath, Type> weakened,
+                          this.lambdaDepth) {
         this.starts = starts;
+        this.trace = new NarrowingTrace(starts);
+        this.entryTrace = new NarrowingTrace(weakened);
+        this.changed = false;
+        this.startReaders = new Map<NarrowingPath, List<LoopCopy>>();
+    }
+}
+
+// Narrowings on locals and parameters followed through the writes of a pass: the type each holds after
+// the writes seen so far, the ones a write left without a proof, and the first write that widened or
+// broke each. The paths are also kept by the local or parameter they start at.
+final class NarrowingTrace {
+    protected Map<NarrowingPath, Type> held;
+    protected Map<LocalBinding, List<NarrowingPath>> rootPaths;
+    protected Map<NarrowingPath, NarrowingEnd> widened;
+    protected Map<NarrowingPath, NarrowingEnd> broken;
+
+    protected constructor(Map<NarrowingPath, Type> starts) {
         this.held = new Map<NarrowingPath, Type>();
         this.rootPaths = new Map<LocalBinding, List<NarrowingPath>>();
         for (let path in starts.keys()) {
@@ -1077,8 +1093,44 @@ public final class LoopWatch {
         }
         this.widened = new Map<NarrowingPath, NarrowingEnd>();
         this.broken = new Map<NarrowingPath, NarrowingEnd>();
-        this.changed = false;
-        this.startReaders = new Map<NarrowingPath, List<LoopCopy>>();
+    }
+
+    // Whether the narrowing of 'path' is followed and no write has broken it.
+    protected holds(NarrowingPath path) -> bool {
+        return this.held.get(path) != null && this.broken.get(path) == null;
+    }
+
+    // After the write 'end' to or under the local or parameter 'root', widens each narrowing under it to
+    // the type a proof now gives it where that type is wider, and marks it broken by the write where no
+    // proof of a related type holds any more. Returns whether any changed.
+    protected follow(BodyChecker checker, LocalBinding root, NarrowingEnd end) -> bool {
+        let paths = this.rootPaths.get(root);
+        if (paths == null) {
+            return false;
+        }
+        bool changed = false;
+        for (let path in paths) {
+            let held = this.held.get(path);
+            if (held == null || this.broken.get(path) != null) {
+                continue;
+            }
+            let proven = checker.narrowing().provenType(path);
+            Type? kept = null;
+            if (proven != null) {
+                kept = unifyNarrowed(checker, held, proven);
+            }
+            if (kept == null) {
+                this.broken.set(path, end);
+                changed = true;
+            } else if (kept != held) {
+                this.held.set(path, kept);
+                if (this.widened.get(path) == null) {
+                    this.widened.set(path, end);
+                }
+                changed = true;
+            }
+        }
+        return changed;
     }
 }
 
@@ -1175,6 +1227,22 @@ final class LoopStart {
         let learned = this.learning(path);
         this.kept.remove(learned);
         if (this.dropped.get(learned) == null) {
+            this.dropped.set(learned, end);
+        }
+    }
+
+    // Names 'end' as the write that widened the narrowing of 'path', where a widening is learned for it.
+    protected nameWidening(NarrowingPath path, NarrowingEnd end) {
+        let learned = this.learnedPath(path);
+        if (learned != null && this.widened.get(learned) != null) {
+            this.widened.set(learned, end);
+        }
+    }
+
+    // Names 'end' as the write that broke the narrowing of 'path', where it is learned to be dropped.
+    protected nameDrop(NarrowingPath path, NarrowingEnd end) {
+        let learned = this.learnedPath(path);
+        if (learned != null && this.dropped.get(learned) != null) {
             this.dropped.set(learned, end);
         }
     }
@@ -1277,7 +1345,7 @@ passLoops(BodyChecker checker, SyntaxNode loop, (BodyChecker) -> void walk) {
         return;
     }
     let settlement = new LoopSettlement();
-    if (startLoop(checker, settlement, loop).isEmpty()) {
+    if (startLoop(checker, settlement, loop).starts.isEmpty()) {
         walk(checker);
         return;
     }
@@ -1328,17 +1396,15 @@ public within(Span inner, Span outer) -> bool {
 // One pass over 'loop', which starts with what 'settlement' has learned for it. Until the passes are
 // settled, the writes in the loop are watched and what they do is learned.
 passLoop(BodyChecker checker, LoopSettlement settlement, SyntaxNode loop, (BodyChecker) -> void walk) {
-    let held = startLoop(checker, settlement, loop);
+    let watch = startLoop(checker, settlement, loop);
     if (settlement.settled) {
         walk(checker);
         return;
     }
-    long lambdaDepth = checker.lambdaFrames().length();
-    let watch = new LoopWatch(loop.green(), held, lambdaDepth);
     checker.loopWatches().push(watch);
-    for (let path in held.keys()) {
+    for (let path in watch.starts.keys()) {
         if (path.fieldNames().length == 0) {
-            settlement.touches.set(path, new LoopTouch(watch, null, lambdaDepth));
+            settlement.touches.set(path, new LoopTouch(watch, null, watch.lambdaDepth));
         }
     }
     walk(checker);
@@ -1347,14 +1413,15 @@ passLoop(BodyChecker checker, LoopSettlement settlement, SyntaxNode loop, (BodyC
 }
 
 // Starts 'loop' with what 'settlement' has learned for it, which widens or drops a narrowing it watches
-// with the write that did as what ended it, and returns the narrowings it watches with their types.
-startLoop(BodyChecker checker, LoopSettlement settlement, SyntaxNode loop) -> Map<NarrowingPath, Type> {
+// with the write that did as what ended it, and returns the watch for a pass over it.
+startLoop(BodyChecker checker, LoopSettlement settlement, SyntaxNode loop) -> LoopWatch {
     let written = new Set<LocalBinding>();
     for (let name in loopWriteNames(checker, loop)) {
         addWrittenName(checker, name, written);
     }
     let learned = settlement.starts.get(loop.green());
     let held = new Map<NarrowingPath, Type>();
+    let weakened = new Map<NarrowingPath, Type>();
     let entry = checker.narrowing().flatten();
     for (let path in entry.keys()) {
         let proven = entry.get(path);
@@ -1365,6 +1432,7 @@ startLoop(BodyChecker checker, LoopSettlement settlement, SyntaxNode loop) -> Ma
         let broken = learned?.dropOf(path);
         if (broken != null) {
             checker.narrowing().endProof(path, broken.inLoop(loop.span()).narrowedFrom(proven));
+            weakened.set(path, proven);
             continue;
         }
         Type? start = proven;
@@ -1379,6 +1447,7 @@ startLoop(BodyChecker checker, LoopSettlement settlement, SyntaxNode loop) -> Ma
             } else {
                 checker.narrowing().clearPath(path);
             }
+            weakened.set(path, proven);
             continue;
         }
         if (start != proven) {
@@ -1387,25 +1456,40 @@ startLoop(BodyChecker checker, LoopSettlement settlement, SyntaxNode loop) -> Ma
             if (widening != null) {
                 checker.narrowing().noteWidening(path, widening.inLoop(loop.span()).narrowedFrom(proven));
             }
+            weakened.set(path, proven);
         }
         held.set(path, start);
     }
-    return held;
+    return new LoopWatch(loop.green(), held, weakened, checker.lambdaFrames().length());
 }
 
 // Records in 'settlement' that a pass reached the loop 'loop', and what 'watch' saw on it: the type each
 // narrowing it watches keeps with the first write that widened it, and the ones it drops with the first
-// write that broke them.
+// write that broke them. A narrowing the pass started weaker than the proof where the loop is entered is
+// named as ended by the first write of the pass that widened or broke it, so the last pass, which starts
+// the loop as it is analyzed, names those writes.
 learnLoop(LoopSettlement settlement, GreenNode loop, LoopWatch watch) {
     let learned = settlement.starts.get(loop) ?? new LoopStart();
     settlement.starts.set(loop, learned);
+    for (let path in watch.entryTrace.widened.keys()) {
+        let end = watch.entryTrace.widened.get(path);
+        if (end != null) {
+            learned.nameWidening(path, end);
+        }
+    }
+    for (let path in watch.entryTrace.broken.keys()) {
+        let end = watch.entryTrace.broken.get(path);
+        if (end != null) {
+            learned.nameDrop(path, end);
+        }
+    }
     if (!watch.changed) {
         return;
     }
     settlement.changed = true;
-    for (let path in watch.held.keys()) {
-        let type = watch.held.get(path);
-        let widening = watch.widened.get(path);
+    for (let path in watch.trace.held.keys()) {
+        let type = watch.trace.held.get(path);
+        let widening = watch.trace.widened.get(path);
         if (type != null) {
             learned.keep(path, type);
         }
@@ -1413,48 +1497,25 @@ learnLoop(LoopSettlement settlement, GreenNode loop, LoopWatch watch) {
             learned.widen(path, widening);
         }
     }
-    for (let path in watch.broken.keys()) {
-        let end = watch.broken.get(path);
+    for (let path in watch.trace.broken.keys()) {
+        let end = watch.trace.broken.get(path);
         if (end != null) {
             learned.drop(path, end);
         }
     }
 }
 
-// After the write 'end' to or under the local or parameter 'root', null for a place under neither,
-// widens each narrowing under it that a loop being settled watches to the type a proof now gives it
-// where that type is wider, and marks it broken by the write where no proof of a related type holds
-// any more. The first write that widens a narrowing is recorded with it.
+// Follows each narrowing under the local or parameter 'root', null for a place under neither, that a
+// loop being settled watches through the write 'end' to or under it.
 noteLoopWrite(BodyChecker checker, LocalBinding? root, NarrowingEnd end) {
     if (root == null) {
         return;
     }
     for (let watch in checker.loopWatches()) {
-        let paths = watch.rootPaths.get(root);
-        if (paths == null) {
-            continue;
+        if (watch.trace.follow(checker, root, end)) {
+            watch.changed = true;
         }
-        for (let path in paths) {
-            let held = watch.held.get(path);
-            if (held == null || watch.broken.get(path) != null) {
-                continue;
-            }
-            let proven = checker.narrowing().provenType(path);
-            Type? kept = null;
-            if (proven != null) {
-                kept = unifyNarrowed(checker, held, proven);
-            }
-            if (kept == null) {
-                watch.broken.set(path, end);
-                watch.changed = true;
-            } else if (kept != held) {
-                watch.held.set(path, kept);
-                if (watch.widened.get(path) == null) {
-                    watch.widened.set(path, end);
-                }
-                watch.changed = true;
-            }
-        }
+        watch.entryTrace.follow(checker, root, end);
     }
 }
 
@@ -1530,7 +1591,7 @@ loopCopy(BodyChecker checker, Expression target, AssignmentExpressionNode? assig
         copy.statement = statement;
     }
     for (let watch in checker.loopWatches()) {
-        if (watch.held.get(copy.target) != null && watch.broken.get(copy.target) == null) {
+        if (watch.trace.holds(copy.target)) {
             copy.watches.push(watch);
         }
     }
