@@ -1319,8 +1319,17 @@ checkFromCStringCall(BodyChecker checker, ArgumentListNode arguments, Span callS
     return result;
 }
 
+// A call to a generic function, whose pending arguments are settled once whatever path the call takes.
 analyzeGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry entry, string name,
                    Type? expected) -> Type {
+    let pending = new PendingArguments(node.arguments());
+    Type result = checkGenericCall(checker, node, entry, name, expected, pending);
+    pending.settle(checker);
+    return result;
+}
+
+checkGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry entry, string name,
+                 Type? expected, PendingArguments pending) -> Type {
     let signature = entry.signature();
     let arguments = node.arguments();
     Parameter[] declared = signature.parameters();
@@ -1369,7 +1378,7 @@ analyzeGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry e
 
     bool typesWritten = explicitList != null;
     long reportedBefore = checker.reporter().reportedCount();
-    let offered = offeredTypes(checker, arguments, List.of([signature]), typesWritten);
+    let offered = offeredTypes(checker, arguments, List.of([signature]), typesWritten, pending);
     let argumentTypes = offered.types;
     bool refusedArgument = offered.refused;
     long waiting = offered.pendingFrom;
@@ -1389,7 +1398,6 @@ analyzeGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry e
     for (long i = 0; i < arity; i++) {
         let argument = typeArguments.get(i);
         if (argument == null && refusedArgument) {
-            analyzeRefusedArguments(checker, arguments, waiting, typesWritten, parameters, null);
             return checker.store().errorType();
         }
         // A call with the wrong number of arguments is refused for the count first: an argument it leaves out
@@ -1397,12 +1405,12 @@ analyzeGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry e
         if (argument == null && !calls.acceptsArgumentCount(signature, arguments.argumentsCount())) {
             checker.reporter().report(calls.arityRefusal("Function '{name}'", signature,
                 arguments.argumentsCount()), node.span());
-            analyzeRefusedArguments(checker, arguments, waiting, typesWritten, parameters, null);
             return checker.store().errorType();
         }
         if (argument == null) {
             bool untyped = voidtypearguments.inferFromLambdas(checker, arguments, parameters, inference);
-            analyzeRefusedArguments(checker, arguments, waiting, typesWritten, parameters, inference);
+            pending.checkLambdasWith(parameters, inference);
+            pending.settle(checker);
             bool refusedVoid = voidtypearguments.reportVoidTypeArgument(checker, arguments, parameters,
                 argumentTypes, inference, typeParameters, "'{name}'");
             if (refusedVoid) {
@@ -1489,11 +1497,7 @@ analyzeGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry e
             }
         }
     }
-    long extra = parameters.length;
-    if (extra < waiting) {
-        extra = waiting;
-    }
-    analyzeRefusedArguments(checker, arguments, extra, typesWritten, parameters, null);
+    pending.analyzedBefore(parameters.length);
 
     if (bounded) {
         checker.result().setCallTypeArguments(node.green(), resolvedArguments);
@@ -1696,7 +1700,7 @@ public final class OfferedTypes {
 // does, and returns the types they offer. With the type arguments 'written', the arguments from the
 // first that waits and is no lambda on are analyzed once those types are resolved.
 public offeredTypes(BodyChecker checker, ArgumentListNode arguments, List<Signature> signatures,
-                    bool written) -> OfferedTypes {
+                    bool written, PendingArguments pending) -> OfferedTypes {
     let types = new List<Type>();
     bool refused = false;
     long count = arguments.argumentsCount();
@@ -1710,6 +1714,7 @@ public offeredTypes(BodyChecker checker, ArgumentListNode arguments, List<Signat
             analyzer.noteLambdaStart(argument);
         } else if (argument is Expression && waitsForParameter(argument, written)) {
             if (written) {
+                pending.start(i, written);
                 return new OfferedTypes(paddedTypes(checker, types, count), refused, i);
             }
             let target = knownParameterType(signatures, i);
@@ -1728,7 +1733,9 @@ public offeredTypes(BodyChecker checker, ArgumentListNode arguments, List<Signat
         }
         types.push(offered);
     }
-    return new OfferedTypes(types, refused, order.finish(count));
+    long pendingFrom = order.finish(count);
+    pending.start(pendingFrom, written);
+    return new OfferedTypes(types, refused, pendingFrom);
 }
 
 // 'types' with the error type added for each argument up to 'count' it has no type for.
@@ -1767,19 +1774,66 @@ takesArgumentAt(List<Signature> signatures, long index) -> bool {
     return false;
 }
 
-// Analyzes the arguments of a refused generic call that no parameter types, so their problems are
-// reported with the refusal: from 'from' on, the ones not analyzed yet, and outside a trial, each lambda
-// whose parameter types 'inference' settles from 'parameters'.
-public analyzeRefusedArguments(BodyChecker checker, ArgumentListNode arguments, long from, bool written,
-                               Parameter[] parameters, TypeArgumentInference? inference) {
-    for (long i = 0; i < arguments.argumentsCount(); i++) {
-        let argument = arguments.arguments(i);
-        if (argument is LambdaExpressionNode) {
-            if (inference != null && i < parameters.length && !checker.inTrial()) {
-                voidtypearguments.checkRefusedLambda(checker, argument, parameters[i], inference);
+// The arguments of a generic call that the call has not analyzed yet, from the first that waits for
+// its parameter on. The call settles them once whatever path it takes: where it chose a candidate, the
+// ones beyond the parameters it analyzed them against, and where it is refused, each one against no
+// parameter, so their problems are reported with the refusal. A refusal that settles the type parameters
+// of a lambda's parameters has the lambda checked against them too.
+public final class PendingArguments {
+    protected ArgumentListNode arguments;
+    protected long from;
+    protected bool written = false;
+    protected Parameter[] parameters = [];
+    protected TypeArgumentInference? inference = null;
+    protected bool settled = false;
+
+    public constructor(this.arguments) {
+        this.from = arguments.argumentsCount();
+    }
+
+    // Starts with the arguments from 'from' on pending, where 'written' says whether the call writes its
+    // type arguments.
+    protected start(long from, bool written) {
+        this.from = from;
+        this.written = written;
+    }
+
+    // Has each lambda checked against the parameter types 'inference' settles from 'parameters'.
+    public checkLambdasWith(Parameter[] parameters, TypeArgumentInference inference) {
+        this.parameters = parameters;
+        this.inference = inference;
+    }
+
+    // Leaves to the call the arguments before 'count', which it analyzed against the parameters of the
+    // candidate it chose.
+    public analyzedBefore(long count) {
+        if (count > this.from) {
+            this.from = count;
+        }
+    }
+
+    // Leaves every argument to the call, which hands them to a resolution that analyzes them.
+    public handedOver() {
+        this.from = this.arguments.argumentsCount();
+    }
+
+    // Analyzes each argument still pending, once: outside a trial, each lambda against the parameter
+    // types the inference settles, and each other one from 'from' on that is not analyzed yet.
+    public settle(BodyChecker checker) {
+        if (this.settled) {
+            return;
+        }
+        this.settled = true;
+        for (long i = 0; i < this.arguments.argumentsCount(); i++) {
+            let argument = this.arguments.arguments(i);
+            let inference = this.inference;
+            if (argument is LambdaExpressionNode) {
+                if (inference != null && i < this.parameters.length && !checker.inTrial()) {
+                    voidtypearguments.checkRefusedLambda(checker, argument, this.parameters[i], inference);
+                }
+            } else if (argument is Expression && i >= this.from && !checker.takePlaced(argument)) {
+                let ignored = analyzeWithoutParameter(checker, argument, this.written);
             }
-        } else if (argument is Expression && i >= from && !checker.takePlaced(argument)) {
-            let ignored = analyzeWithoutParameter(checker, argument, written);
         }
     }
 }

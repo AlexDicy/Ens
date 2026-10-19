@@ -69,6 +69,7 @@ import TypeParameterName from phases.bodies;
 import FunctionName from phases.bodies;
 import TypeName from phases.bodies;
 import BuiltShape from phases.bodies.functioncalls;
+import PendingArguments from phases.bodies.functioncalls;
 import support.syntax;
 
 // What a member access's written head names when it is a type rather than a value: the
@@ -684,6 +685,14 @@ finishStaticCall(BodyChecker checker, CallExpressionNode node, MemberExpressionN
 // the type name.
 analyzeInferredStaticCall(BodyChecker checker, CallExpressionNode node, MemberExpressionNode member,
                           DeclaredType template, string name, Type? expected) -> Type {
+    let pending = new PendingArguments(node.arguments());
+    Type result = checkInferredStatic(checker, node, member, template, name, expected, pending);
+    pending.settle(checker);
+    return result;
+}
+
+checkInferredStatic(BodyChecker checker, CallExpressionNode node, MemberExpressionNode member,
+                    DeclaredType template, string name, Type? expected, PendingArguments pending) -> Type {
     let arguments = node.arguments();
     let templateStatics = typemembers.staticMethodsOf(template);
     if (templateStatics == null) {
@@ -727,11 +736,10 @@ analyzeInferredStaticCall(BodyChecker checker, CallExpressionNode node, MemberEx
     for (let index in indexes) {
         signatures.push(templateStatics.get(index).signature());
     }
-    let offered = functioncalls.offeredTypes(checker, arguments, signatures, false);
+    let offered = functioncalls.offeredTypes(checker, arguments, signatures, false, pending);
     let argumentTypes = offered.argumentTypes();
     bool refusedArgument = offered.anyRefused();
     long waiting = offered.pending();
-    Parameter[] noParameters = [];
     let owner = template.declaration();
     TypeParamType[] typeParameters = template.typeParameterTypes();
     long arity = typeParameters.length;
@@ -759,14 +767,12 @@ analyzeInferredStaticCall(BodyChecker checker, CallExpressionNode node, MemberEx
         }
     }
     if (completedIndexes.length() == 0 && refusedArgument) {
-        functioncalls.analyzeRefusedArguments(checker, arguments, waiting, false, noParameters, null);
         return checker.store().errorType();
     }
     if (completedIndexes.length() == 0) {
         let refusal = countRefusal(checker, templateStatics, indexes, name, node, argumentTypes);
         if (refusal != null) {
             checker.reporter().report(refusal, node.span());
-            functioncalls.analyzeRefusedArguments(checker, arguments, waiting, false, noParameters, null);
             return checker.store().errorType();
         }
     }
@@ -777,9 +783,10 @@ analyzeInferredStaticCall(BodyChecker checker, CallExpressionNode node, MemberEx
         let inference = openInferences.get(0);
         sole = inference;
         untyped = voidtypearguments.inferFromLambdas(checker, arguments, parameters, inference);
-        functioncalls.analyzeRefusedArguments(checker, arguments, waiting, false, parameters, inference);
-    } else if (completedIndexes.length() == 0) {
-        functioncalls.analyzeRefusedArguments(checker, arguments, waiting, false, noParameters, null);
+        pending.checkLambdasWith(parameters, inference);
+    }
+    if (completedIndexes.length() == 0) {
+        pending.settle(checker);
     }
     if (completedIndexes.length() == 0) {
         for (long c = 0; c < indexes.length(); c++) {
@@ -844,16 +851,15 @@ analyzeInferredStaticCall(BodyChecker checker, CallExpressionNode node, MemberEx
                     vector, failed), node.span());
             }
         }
-        functioncalls.analyzeRefusedArguments(checker, arguments, waiting, false, noParameters, null);
         return checker.store().errorType();
     }
     if (boundedIndexes.length() == 1) {
         return checkInferredStaticCall(checker, node, member, template,
             boundedIndexes.get(0), boundedArguments.get(0), argumentTypes, waiting,
-            templateStatics.get(boundedIndexes.get(0)), boundedInferences.get(0));
+            templateStatics.get(boundedIndexes.get(0)), boundedInferences.get(0), pending);
     }
     return selectInferredStaticCall(checker, node, member, template, name, boundedIndexes,
-        boundedArguments, argumentTypes, waiting);
+        boundedArguments, argumentTypes, waiting, pending);
 }
 
 // The first constraint a conditional static fails at this inferred type-argument vector, or
@@ -889,18 +895,15 @@ inferTypeArguments(BodyChecker checker, Method candidate, GreenNode owner, long 
 checkInferredStaticCall(BodyChecker checker, CallExpressionNode node, MemberExpressionNode member,
                         DeclaredType template, long staticIndex, Type[] typeArguments,
                         List<Type> argumentTypes, long waiting, Method templateCandidate,
-                        TypeArgumentInference inference) -> Type {
+                        TypeArgumentInference inference, PendingArguments pending) -> Type {
     let arguments = node.arguments();
-    Parameter[] noParameters = [];
     if (!checker.resolver().acceptsKeyType(template, typeArguments, node.span())) {
-        functioncalls.analyzeRefusedArguments(checker, arguments, waiting, false, noParameters, null);
         return checker.store().errorType();
     }
     let instantiation = checker.store().instantiationOf(template, typeArguments);
     checker.resolver().recordInstantiationMention(instantiation, node.span());
     let resolved = staticAtIndex(checker, instantiation, staticIndex);
     if (resolved == null) {
-        functioncalls.analyzeRefusedArguments(checker, arguments, waiting, false, noParameters, null);
         return checker.store().errorType();
     }
     checker.result().setType(member.object().green(), instantiation);
@@ -957,11 +960,7 @@ checkInferredStaticCall(BodyChecker checker, CallExpressionNode node, MemberExpr
             }
         }
     }
-    long extra = parameters.length;
-    if (extra < waiting) {
-        extra = waiting;
-    }
-    functioncalls.analyzeRefusedArguments(checker, arguments, extra, false, noParameters, null);
+    pending.analyzedBefore(parameters.length);
     return signature.returnType();
 }
 
@@ -971,11 +970,11 @@ checkInferredStaticCall(BodyChecker checker, CallExpressionNode node, MemberExpr
 // once a candidate is chosen.
 selectInferredStaticCall(BodyChecker checker, CallExpressionNode node, MemberExpressionNode member,
                          DeclaredType template, string name, List<long> staticIndexes,
-                         List<Type[]> vectors, List<Type> argumentTypes, long waiting) -> Type {
+                         List<Type[]> vectors, List<Type> argumentTypes, long waiting,
+                         PendingArguments pending) -> Type {
     let arguments = node.arguments();
     let shape = new CallShape();
     let values = new List<Expression?>();
-    Parameter[] noParameters = [];
     for (long i = 0; i < arguments.argumentsCount(); i++) {
         switch (arguments.arguments(i)) {
             is Expression value -> {
@@ -1006,7 +1005,6 @@ selectInferredStaticCall(BodyChecker checker, CallExpressionNode node, MemberExp
     let resolvedOwners = new List<Type>();
     for (long c = 0; c < staticIndexes.length(); c++) {
         if (!checker.resolver().acceptsKeyType(template, vectors.get(c), node.span())) {
-            functioncalls.analyzeRefusedArguments(checker, arguments, waiting, false, noParameters, null);
             return checker.store().errorType();
         }
         let instantiation = checker.store().instantiationOf(template, vectors.get(c));
@@ -1021,9 +1019,9 @@ selectInferredStaticCall(BodyChecker checker, CallExpressionNode node, MemberExp
             memberaccess.isAccessAllowed(checker, resolved.visibility(), resolved.definingType())));
     }
     if (callCandidates.length() == 0) {
-        functioncalls.analyzeRefusedArguments(checker, arguments, waiting, false, noParameters, null);
         return checker.store().errorType();
     }
+    pending.handedOver();
     let resolution = functioncalls.resolveBuiltCall(checker, callCandidates, built,
         node.span(), name, "Method");
     if (resolution.failed()) {
