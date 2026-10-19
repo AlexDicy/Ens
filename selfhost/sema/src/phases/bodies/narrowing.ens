@@ -702,8 +702,8 @@ emptyNarrowings() -> BranchNarrowings {
         new Map<NarrowingPath, NarrowingEnd>());
 }
 
-// What holds where a branch of an 'if' statement ends, for the places 'places' the branch changed since
-// the branches started, which hold what they held there in a branch that did not change them.
+// What holds where a branch of an 'if' statement or a '?:' ends, for the places 'places' the branch changed
+// since the branches started, which hold what they held there in a branch that did not change them.
 public final class BranchChanges {
     protected Set<NarrowingPath> places;
     protected BranchNarrowings held;
@@ -976,11 +976,53 @@ joinedWrite(List<BranchNarrowings> survivors, NarrowingPath path, Type joined, T
     return widening ?? first;
 }
 
+// The branches of a '?:' analyzed so far, each from what holds where they start: their values, and what
+// holds at the end of each.
+public final class TernaryBranches {
+    protected List<Expression> values;
+    protected List<BranchChanges> ends;
+
+    protected constructor() {
+        this.values = new List<Expression>();
+        this.ends = new List<BranchChanges>();
+    }
+}
+
+// Starts the branches of the '?:' 'ternary', whose condition has been analyzed, or returns null where it
+// writes no local or parameter, so that each branch starts from what holds before it and leaves it as
+// it is.
+public enterBranches(BodyChecker checker, TernaryExpressionNode ternary) -> TernaryBranches? {
+    if (ternaryWriteNames(checker, ternary).isEmpty()) {
+        return null;
+    }
+    checker.narrowing().startBranches();
+    return new TernaryBranches();
+}
+
+// Installs what holds after the '?:' whose branches are 'branches': where the branches that give a value
+// meet, a narrowing holds where it holds at the end of both. Null 'branches' leave what holds as it is.
+public joinBranches(BodyChecker checker, TernaryBranches? branches) {
+    if (branches == null) {
+        return;
+    }
+    let survivors = new List<BranchChanges>();
+    for (long i = 0; i < branches.values.length(); i++) {
+        if (!checker.neverReturns(branches.values.get(i))) {
+            survivors.push(branches.ends.get(i));
+        }
+    }
+    joinBranchChanges(checker, survivors, "'?:'", "in one branch of the '?:'");
+}
+
 // Analyzes a '?:' branch or the right side of '&&' or '||' under the facts the condition proves
-// there. 'target' is the type the branch is checked against, set at 'origin', or null.
+// there. 'target' is the type the branch is checked against, set at 'origin', or null. A branch of
+// 'branches' starts from what holds where they start, and what holds at its end is kept there.
 public analyzeGuardedBranch(BodyChecker checker, Expression condition, Expression branch, bool conditionHolds,
-                            Type? target, LiteralOrigin? origin = null, ConditionSite? site = null)
-                            -> Type {
+                            Type? target, LiteralOrigin? origin = null, ConditionSite? site = null,
+                            TernaryBranches? branches = null) -> Type {
+    if (branches != null && !branches.values.isEmpty()) {
+        checker.narrowing().restartBranches();
+    }
     let facts = new List<NarrowingFact>();
     collectNarrowings(checker, condition, conditionHolds, facts, site);
     checker.narrowing().push();
@@ -990,6 +1032,10 @@ public analyzeGuardedBranch(BodyChecker checker, Expression condition, Expressio
         analyzed = checker.analyzeExpressionAdapt(branch, target, origin);
     } else {
         analyzed = checker.analyzeExpression(branch);
+    }
+    if (branches != null) {
+        branches.values.push(branch);
+        branches.ends.push(branchChanges(checker));
     }
     checker.narrowing().pop();
     return analyzed;
@@ -2146,19 +2192,19 @@ public writtenRoot(BodyChecker checker, Expression target) -> LocalBinding? {
 // The names of the locals and the parameters 'loop' may write, which one walk over the parts each pass
 // through it runs records for it and for each loop inside it.
 loopWriteNames(BodyChecker checker, SyntaxNode loop) -> Set<string> {
-    return checker.loopWrites().get(loop.green()) ?? collectLoopNames(loop, checker.loopWrites());
+    return checker.writeNames().get(loop.green()) ?? collectLoopNames(loop, checker.writeNames());
 }
 
 // The names of the locals and the parameters the loop condition 'condition' may write, which one walk over
-// it records for it and for each loop inside it.
+// it records for it and for each loop and each '?:' inside it.
 conditionWriteNames(BodyChecker checker, Expression condition) -> Set<string> {
-    let recorded = checker.loopWrites().get(condition.green());
+    let recorded = checker.writeNames().get(condition.green());
     if (recorded != null) {
         return recorded;
     }
     let names = new Set<string>();
-    collectWrittenNames(condition, checker.loopWrites(), names);
-    checker.loopWrites().set(condition.green(), names);
+    collectWrittenNames(condition, checker.writeNames(), names);
+    checker.writeNames().set(condition.green(), names);
     return names;
 }
 
@@ -2199,6 +2245,10 @@ collectWrittenNames(SyntaxNode node, Map<GreenNode, Set<string>> recorded, Set<s
             addNames(names, collectLoopNames(node, recorded));
             return;
         },
+        is TernaryExpressionNode ignored -> {
+            addNames(names, recorded.get(node.green()) ?? collectTernaryNames(node, recorded));
+            return;
+        },
         is AssignmentExpressionNode assignment -> {
             addTargetName(assignment.target(), names);
         },
@@ -2222,6 +2272,23 @@ collectWrittenNames(SyntaxNode node, Map<GreenNode, Set<string>> recorded, Set<s
     for (let child in node.childNodes()) {
         collectWrittenNames(child, recorded, names);
     }
+}
+
+// The names of the locals and the parameters the '?:' 'ternary' may write, which one walk over it records
+// for it and for each loop and each '?:' inside it.
+ternaryWriteNames(BodyChecker checker, TernaryExpressionNode ternary) -> Set<string> {
+    return checker.writeNames().get(ternary.green()) ?? collectTernaryNames(ternary, checker.writeNames());
+}
+
+// Records in 'recorded', for the '?:' 'ternary' and for each loop and each '?:' inside it, the names of the
+// locals and the parameters it may write, and returns the names 'ternary' may write.
+collectTernaryNames(SyntaxNode ternary, Map<GreenNode, Set<string>> recorded) -> Set<string> {
+    let names = new Set<string>();
+    for (let child in ternary.childNodes()) {
+        collectWrittenNames(child, recorded, names);
+    }
+    recorded.set(ternary.green(), names);
+    return names;
 }
 
 // Only a local or a parameter can be written in a loop and hold a narrowing, since a 'const'

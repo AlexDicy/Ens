@@ -1198,7 +1198,8 @@ draw(Outer? outer) {
 }
 ```
 
-A narrowing holds after an `if`/`else` (or a `switch`) when it holds at the end of every branch that can fall through: the branches are intersected at the merge.
+A narrowing holds after an `if`/`else` (or a `switch` or a `?:`) when it holds at the end of every branch that can fall through: the branches are intersected at the merge.
+Each branch starts from what holds before it, so a write in one branch does not reach a read in the other.
 Where the branches narrow a value to different types, it keeps the wider type where one holds the other, and otherwise the nearest class both extend, or else its declared class or interface.
 It can be null after the merge only where some branch leaves it nullable: after `if (round) { shape = new Circle(); } else { shape = new Square(); }`, a `Shape?` named `shape` is a `Shape` that is not null.
 A branch that always exits, by `return`, `throw`, or `panic`, and, inside a loop, also by `break` or `continue`, reaches nothing below the merge, so it places no constraint on the result.
