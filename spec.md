@@ -1138,14 +1138,25 @@ The same narrowing applies to the `else` branch of `if (x == null) { ... } else 
 Reassigning `x` inside the block replaces the narrowing with what the new value proves, as the next paragraph describes.
 
 A binding also narrows without an explicit check.
-Assigning a value whose type is non-nullable to a plain local variable or parameter of nullable declared type narrows it to the non-nullable form from that point on, and a declaration initializer behaves the same way.
+Assigning a value to a local variable or a parameter narrows it to the type of that value from that point on: it drops each level of null the value cannot be, and it takes the value's class or interface where that is narrower than the declared one.
+A declaration initializer drops the levels of null the same way, while the local keeps the class or interface it is declared with.
+A write to a `const` field through `this` in a constructor also drops only the levels of null.
 
 ```ens
 string? s;
-s = compute();   // compute() returns a non-null 'string'
-s.length;        // s is treated as non-nullable 'string' here
+s = compute();         // compute() returns a non-null 'string'
+s.length;              // s is treated as non-nullable 'string' here
 
-string? t = "x"; // starts narrowed from its initializer
+Shape shape;
+shape = new Circle();
+shape.radius;          // shape is treated as a 'Circle' here
+
+Shape? found;
+found = findCircle();  // findCircle() returns 'Circle?'
+found?.radius;         // found is treated as a 'Circle?' here
+
+string? t = "x";       // starts narrowed from its initializer
+Shape other = new Circle(); // a 'Shape', as declared
 ```
 
 Narrowing, by a check and by a write alike, applies to stable places only.
@@ -1188,6 +1199,8 @@ draw(Outer? outer) {
 ```
 
 A narrowing holds after an `if`/`else` (or a `switch`) when it holds at the end of every branch that can fall through: the branches are intersected at the merge.
+Where the branches narrow a value to different types, it keeps the wider type where one holds the other, and otherwise the nearest class both extend, or else its declared class or interface.
+It can be null after the merge only where some branch leaves it nullable: after `if (round) { shape = new Circle(); } else { shape = new Square(); }`, a `Shape?` named `shape` is a `Shape` that is not null.
 A branch that always exits, by `return`, `throw`, or `panic`, and, inside a loop, also by `break` or `continue`, reaches nothing below the merge, so it places no constraint on the result.
 This makes the `else` above optional, and it lets a value narrow when the branches prove the fact in different ways: after `if (x == null) { x = fallback(); }` the value is non-null below, because the then-branch reassigned it to a non-null value while the else-path failed the `== null` check, so both paths reaching the merge prove it.
 A loop guard clause therefore narrows the checked value for the rest of the iteration:
@@ -1239,7 +1252,7 @@ A call drops nothing that a stable place proved, whether the place is the call's
 A callee cannot reassign the caller's binding, the binding's own reference keeps the narrowed object alive, and no callee can write a `const` field.
 
 Inside a loop a narrowing must hold on every iteration.
-A narrowing established before the loop holds inside it when every write in the loop that could change its path, in the condition, the body or a `for` update, proves it again, as `name = "b";` proves that a `string?` local holds a `string`.
+A narrowing established before the loop holds inside it when every write in the loop that could change its path, in the condition, the body or a `for` update, proves it again, as `name = "b";` proves that a `string?` local holds a `string` and `shape = new Circle();` proves that a `Shape` local holds a `Circle`.
 A write that proves only part of it keeps that part: storing a `Square` into a `Shape?` local narrowed to `Circle` leaves the local a `Shape` that is not null where the loop starts.
 Any other write, such as `name = pick();` where `pick` returns `string?`, or passing the local as `out`, drops the narrowing at the loop's entry: an earlier read in the loop would otherwise use, on the next pass, the value that write stored.
 A narrowing the loop condition or an in-body guard clause re-establishes on each iteration is unaffected, so `while (x != null)` loops and guard-narrowed loops keep working.

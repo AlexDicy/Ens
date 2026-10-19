@@ -541,7 +541,7 @@ public widenedReadHint(BodyChecker checker, Expression object, string member) ->
     if (path == null) {
         return null;
     }
-    let widening = checker.narrowing().wideningOf(path) ?? checker.narrowing().endOf(path);
+    let widening = checker.narrowing().writeOf(path) ?? checker.narrowing().endOf(path);
     if (widening == null) {
         return null;
     }
@@ -686,18 +686,20 @@ public walkBranch(BodyChecker checker, BlockNode block, List<NarrowingFact> fact
     checker.leaveScope();
 }
 
-// What holds where a branch ends: the narrowings proven there, and the writes there that ended the
-// narrowings made before it.
+// What holds where a branch ends: the narrowings proven there, the writes that left those a write left,
+// and the writes there that ended the narrowings made before it.
 public final class BranchNarrowings {
     protected Map<NarrowingPath, Type> proofs;
+    protected Map<NarrowingPath, NarrowingEnd> writes;
     protected Map<NarrowingPath, NarrowingEnd> ends;
 
-    public constructor(this.proofs, this.ends);
+    public constructor(this.proofs, this.writes, this.ends);
 }
 
 // What holds where the branch being checked ends.
 public branchNarrowings(BodyChecker checker) -> BranchNarrowings {
-    return new BranchNarrowings(checker.narrowing().flatten(), checker.narrowing().ends());
+    return new BranchNarrowings(checker.narrowing().flatten(), checker.narrowing().writes(),
+        checker.narrowing().ends());
 }
 
 // Walks a branch under the facts its condition proves and returns what holds at its end,
@@ -722,19 +724,56 @@ public captureConditionBranch(BodyChecker checker, List<NarrowingFact> facts) ->
     return captured;
 }
 
-// The proven type common to two branch end-states for one path: identity, or the wider of
-// two types related by assignability, or null when neither contains the other.
-unifyNarrowed(BodyChecker checker, Type left, Type right) -> Type? {
-    if (left == right) {
-        return left;
-    }
-    if (convert.isAssignableStrict(left, right)) {
+// The narrowest type that holds both 'left' and 'right', two proofs for 'path': the wider of the two
+// where one holds the other, and otherwise the nearest class both extend, or else the declared type of
+// the path, at the levels of null either may have. Null where that is the declared type itself.
+joinedProof(BodyChecker checker, NarrowingPath path, Type left, Type right) -> Type? {
+    if (left == right || convert.isAssignableStrict(left, right)) {
         return left;
     }
     if (convert.isAssignableStrict(right, left)) {
         return right;
     }
-    return null;
+    let declared = declaredPathType(path);
+    if (declared == null) {
+        return null;
+    }
+    Type present = declared;
+    while (present is OptionalType && convert.isAssignableStrict(present.inner(), left)
+            && convert.isAssignableStrict(present.inner(), right)) {
+        present = present.inner();
+    }
+    let shared = convert.nearestCommonBase(convert.coreOf(left), convert.coreOf(right));
+    if (shared != null) {
+        Type candidate = withLevels(checker, shared, wording.optionalLevels(present));
+        if (convert.isAssignableStrict(present, candidate) && convert.isAssignableStrict(candidate, left)
+                && convert.isAssignableStrict(candidate, right)) {
+            return candidate;
+        }
+    }
+    return present == declared ? null : present;
+}
+
+// The declared type of the place 'path' names, or null where a hop along it reads no field.
+declaredPathType(NarrowingPath path) -> Type? {
+    Type held = path.rootType();
+    for (let name in path.fieldNames()) {
+        let read = typemembers.inheritedOrOwnField(convert.coreOf(held), name);
+        if (read == null) {
+            return null;
+        }
+        held = read.type();
+    }
+    return held;
+}
+
+// 'core' inside 'levels' levels of null.
+withLevels(BodyChecker checker, Type core, long levels) -> Type {
+    Type wrapped = core;
+    for (long level = 0; level < levels; level++) {
+        wrapped = checker.store().optionalOf(wrapped);
+    }
+    return wrapped;
 }
 
 // The intersection of the surviving branch end-states: a path keeps a proof only where every
@@ -755,7 +794,7 @@ intersectNarrowings(BodyChecker checker, List<BranchNarrowings> survivors) -> Ma
             let mine = result.get(key);
             let theirs = other.get(key);
             if (mine != null && theirs != null) {
-                let unified = unifyNarrowed(checker, mine, theirs);
+                let unified = joinedProof(checker, key, mine, theirs);
                 if (unified != null) {
                     merged.set(key, unified);
                 }
@@ -819,7 +858,25 @@ public applyNarrowingJoin(BodyChecker checker, Map<NarrowingPath, Type> entryFac
         }
         checker.narrowing().clearPath(key);
         checker.narrowing().narrow(key, joinedType);
+        let write = joinedWrite(survivors, key, joinedType);
+        if (write != null) {
+            checker.narrowing().noteWrite(key, write.throughJoin(statement, branch));
+        }
     }
+}
+
+// The write that left the proof 'joined' of 'path' where branches meet: the first branch's write that left
+// that proof itself, or else the first that left a proof of it at all. Null where no write left one.
+joinedWrite(List<BranchNarrowings> survivors, NarrowingPath path, Type joined) -> NarrowingEnd? {
+    NarrowingEnd? first = null;
+    for (let survivor in survivors) {
+        let write = survivor.writes.get(path);
+        if (write != null && survivor.proofs.get(path) == joined) {
+            return write;
+        }
+        first = first ?? write;
+    }
+    return first;
 }
 
 // Analyzes a '?:' branch or the right side of '&&' or '||' under the facts the condition proves
@@ -928,36 +985,51 @@ retypeOperand(BodyChecker checker, Expression operand, Type type) {
     }
 }
 
-// The deepest level a stored value proves present in storage of optional declared type. A
-// bare value proves every wrapped level, and a 'T?' stored into a 'T??' proves the outer one.
-// Null when the store proves nothing, so the storage keeps its declared type.
-provenByStore(BodyChecker checker, Type declared, Type stored) -> Type? {
-    if (!(declared is OptionalType)) {
-        return null;
-    }
-    if (stored is ErrorType || stored is NullType) {
-        return null;
-    }
+// What a write that stores a 'stored' into storage of type 'declared' proves for that storage, or null
+// where it proves nothing narrower than 'declared'. With 'typed', as for a local or a parameter an
+// assignment writes, the storage holds the type of the stored value, and otherwise only the levels of
+// null that value proves present.
+provenByStore(BodyChecker checker, Type declared, Type stored, bool typed) -> Type? {
     Type proven = declared;
-    while (proven is OptionalType && convert.isAssignableStrict(proven.inner(), stored)) {
-        proven = proven.inner();
+    if (typed) {
+        proven = heldAfterStore(checker, declared, stored);
+    } else if (!(stored is ErrorType) && !(stored is NullType)) {
+        proven = presentLevels(declared, stored);
     }
-    if (proven == declared) {
-        return null;
-    }
-    return proven;
+    return proven == declared ? null : proven;
 }
 
-// The type storage of type 'declared' holds after a write stores a 'stored' into it: 'declared', without
-// the levels of null the stored value proves present.
+// The type storage of type 'declared' holds after a write stores a 'stored' into it: 'declared' without the
+// levels of null the stored value proves present, holding the class or interface of the stored value where
+// that is narrower. A bare value proves every level, and a 'T?' stored into a 'T??' proves the outer one.
 public heldAfterStore(BodyChecker checker, Type declared, Type stored) -> Type {
-    return provenByStore(checker, declared, stored) ?? declared;
+    if (stored is ErrorType || stored is NullType) {
+        return declared;
+    }
+    Type held = presentLevels(declared, stored);
+    Type storedCore = convert.coreOf(stored);
+    Type heldCore = convert.coreOf(held);
+    if (storedCore == heldCore || !types.isClassLike(storedCore) || !types.isClassLike(heldCore)
+            || !hierarchy.isSubclassOrConforms(storedCore, heldCore)) {
+        return held;
+    }
+    return withLevels(checker, storedCore, wording.optionalLevels(held));
 }
 
-// Narrows a binding to what its initializer proves, for a declaration, whose name is bound
-// here rather than written as an expression.
+// 'declared' without the levels of null that a stored 'stored' proves present.
+presentLevels(Type declared, Type stored) -> Type {
+    Type held = declared;
+    while (held is OptionalType && convert.isAssignableStrict(held.inner(), stored)) {
+        held = held.inner();
+    }
+    return held;
+}
+
+// Narrows a binding to what its initializer proves, for a declaration, whose name is bound here rather
+// than written as an expression. The binding keeps the type it is declared with, and drops the levels of
+// null the initializer proves present.
 public establishAssignmentNarrowing(BodyChecker checker, LocalBinding binding, Type value) {
-    let proven = provenByStore(checker, binding.type(), value);
+    let proven = provenByStore(checker, binding.type(), value, false);
     if (proven == null) {
         return;
     }
@@ -972,7 +1044,7 @@ public recordWrite(BodyChecker checker, Expression target, Span at, Type stored,
     let end = new NarrowingEnd(NarrowingEndKind.Assigned, at, stored, "",
         wording.oneLineSpelling(syntax.unwrapParentheses(target)), null);
     invalidateForWrite(checker, target, end);
-    establishWriteNarrowing(checker, target, stored);
+    establishWriteNarrowing(checker, target, stored, end);
     renewEndsForWrite(checker, target, end);
     let root = writtenRoot(checker, target);
     noteLoopWrite(checker, root, end);
@@ -989,22 +1061,21 @@ public recordOutWrite(BodyChecker checker, LocalBinding binding, Span at, string
     touchLoopRoot(checker, binding, null);
 }
 
-// Narrows the place a write stored into, after invalidateForWrite has dropped what the place
-// held before. Only a stable place has a path, so a write to any other place narrows nothing.
-establishWriteNarrowing(BodyChecker checker, Expression target, Type stored) {
+// Narrows the place a write stored into, after invalidateForWrite has dropped what the place held before,
+// with the write 'end' as what left the proof. Only a stable place has a path, so a write to any other
+// place narrows nothing.
+establishWriteNarrowing(BodyChecker checker, Expression target, Type stored, NarrowingEnd end) {
     let declared = declaredSlotType(checker, target);
-    if (declared == null) {
+    let path = buildNarrowingPath(checker, target);
+    if (declared == null || path == null) {
         return;
     }
-    let proven = provenByStore(checker, declared, stored);
+    let proven = provenByStore(checker, declared, stored, path.fieldNames().length == 0);
     if (proven == null) {
         return;
     }
-    let path = buildNarrowingPath(checker, target);
-    if (path == null) {
-        return;
-    }
     checker.narrowing().narrow(path, proven);
+    checker.narrowing().noteWrite(path, end);
 }
 
 // A write drops the narrowings of the storage it replaces, and 'end' is recorded as what ended them.
@@ -1117,7 +1188,7 @@ final class NarrowingTrace {
             let proven = checker.narrowing().provenType(path);
             Type? kept = null;
             if (proven != null) {
-                kept = unifyNarrowed(checker, held, proven);
+                kept = joinedProof(checker, path, held, proven);
             }
             if (kept == null) {
                 this.broken.set(path, end);
@@ -1438,7 +1509,7 @@ startLoop(BodyChecker checker, LoopSettlement settlement, SyntaxNode loop) -> Lo
         Type? start = proven;
         let kept = learned?.keptType(path);
         if (kept != null) {
-            start = unifyNarrowed(checker, proven, kept);
+            start = joinedProof(checker, path, proven, kept);
         }
         let widening = learned?.wideningOf(path);
         if (start == null) {
@@ -1454,7 +1525,7 @@ startLoop(BodyChecker checker, LoopSettlement settlement, SyntaxNode loop) -> Lo
             checker.narrowing().clearPath(path);
             checker.narrowing().narrow(path, start);
             if (widening != null) {
-                checker.narrowing().noteWidening(path, widening.inLoop(loop.span()).narrowedFrom(proven));
+                checker.narrowing().noteWrite(path, widening.inLoop(loop.span()).narrowedFrom(proven));
             }
             weakened.set(path, proven);
         }
@@ -1693,7 +1764,7 @@ startOf(BodyChecker checker, LoopSettlement settlement, LoopWatch watch, Narrowi
     if (kept == null) {
         return start;
     }
-    return unifyNarrowed(checker, start, kept);
+    return joinedProof(checker, path, start, kept);
 }
 
 // Learns for the loop of 'watch' what the copy 'copy', now the write 'end', does to the narrowing of its
@@ -1705,10 +1776,10 @@ learnCopy(BodyChecker checker, LoopSettlement settlement, LoopWatch watch, LoopC
     if (held == null || learned == null) {
         return false;
     }
-    let proven = provenByStore(checker, copy.declared, copy.stored);
+    let proven = provenByStore(checker, copy.declared, copy.stored, true);
     Type? kept = null;
     if (proven != null) {
-        kept = unifyNarrowed(checker, held, proven);
+        kept = joinedProof(checker, copy.target, held, proven);
     }
     if (kept == null) {
         learned.drop(copy.target, end);
