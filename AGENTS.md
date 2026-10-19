@@ -20,7 +20,7 @@ It compiles itself to a byte-identical fixpoint, which the `bootstrap` job gates
 It is the `ens` command a user runs, and it is the only compiler this repository has.
 
 The C++ compiler Ens was first written in has been deleted.
-Nothing in the tree answers for its behavior any more, and building, testing and bootstrapping Ens go through no C++ but the `ens-lld` linker bridge.
+Nothing in the tree answers for its behavior any more, and building, testing and bootstrapping Ens go through no C++ but the `ens-llvm` library that carries the linker bridge.
 The language server is C++ as well, but it is a separate tool with a front end of its own; see the repository map.
 
 `spec.md` is the single source of truth for user-facing language and tool behavior.
@@ -29,7 +29,8 @@ If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surf
 ## Repository map
 
 - `libs/std/` - the standard library, written in Ens, imported as the built-in `@std` package; its own `AGENTS.md` holds the conventions its API follows.
-- `runtime/lld/` - `ens_lld.cpp`, one C entry point over lld's C++ link drivers, built as the `ens-lld` shared library. It carries no link policy; that all lives in `selfhost/link/`.
+- `runtime/lld/` - `ens_lld.cpp`, one C entry point over lld's C++ link drivers, built into `ens-llvm`: one static library holding the bridge, LLVM, lld, their support libraries and the C++ runtime, so `ens` links one library and needs nothing beside it. It carries no link policy; that all lives in `selfhost/link/`.
+  Until the pin names a seed linked that way, the bridge is also built as the `ens-lld` shared library the seed loads.
 - `selfhost/` - the `ens` compiler and build tool, written in Ens, as one workspace of packages:
   - `syntax.grammar` + `syntaxgen/` - the declarative grammar and the generator that emits the syntax-tree sources.
   - `frontend/` - lexer, event parser, red-green syntax tree.
@@ -39,7 +40,7 @@ If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surf
   - `codegen/` - lowering to EIR (the ownership-explicit intermediate form), its verifiers, the optimization passes, and LLVM emission.
   - `host/` - what a run reads from the machine once: the environment snapshot, the user's `.ens` folder, path text, and a scratch folder that removes itself.
   - `cli/` - the command-line library: the immutable declaration model, the pure argv walk, generated help, nearest-match suggestions.
-  - `link/` - the `ens-lld` binding plus all link policy: flavor from triple, per-flavor argument vector, C runtime, unwinder and SDK discovery.
+  - `link/` - the linker bridge binding plus all link policy: flavor from triple, per-flavor argument vector, C runtime, unwinder and SDK discovery.
   - `packages/` - dependency resolution: `ens.overrides`, `ens.lock`, the content store, sha256, git fetching, prebuilt artifacts, version selection.
   - `build/` - target resolution, the toolchain decision, build and check orchestration, test discovery and runner synthesis, reporting.
   - `driver/` - the `ens` executable itself: command declarations, dispatch, exit codes.
@@ -58,13 +59,13 @@ If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surf
 
 ## Building and testing
 
-- One native target carries what the tests need: `xmake build ens-lld`, the linker bridge every Ens program links through, without which a fresh clone cannot reach an executable.
+- One native target carries what the tests need: `xmake build ens-llvm`, the linker bridge every Ens program links through together with LLVM, without which a fresh clone cannot reach an executable.
 - The language server is built on its own: `xmake build ens-lsp` (see `tools/vscode/README.md`).
   `xmake test` includes an `ens_lsp` job that builds it; when the binary is held open by a running editor the job reports a skip instead of failing, so a green suite has not necessarily checked it.
   Any change that touches `lsp/`, and any repository-wide rename or move that its sources could be reading, is gated by closing a running `ens-lsp.exe` and running `xmake build ens-lsp` by hand.
 - Run everything: `xmake test` (subset: `xmake test <name>...`).
   The full suite must be green before every commit, with no exceptions.
-  `xmake test` builds `ens-lld` itself before any job starts, so it is the one command that always works from a clean checkout, and an edit to the bridge is gated by the run that follows it rather than by the run after that.
+  `xmake test` builds `ens-llvm` itself before any job starts, so it is the one command that always works from a clean checkout, and an edit to the bridge is gated by the run that follows it rather than by the run after that.
   On Windows it builds the bridge with the LLVM package's `bin` folder on PATH whatever the calling shell has, so the bridge's own linker resolves the same way in a suite run as it does by hand.
 - `xmake test` starts by building the compiler it then tests: the **seed** for this host compiles `selfhost/driver` into `build/host/ens`, and every job that compiles Ens drives that.
   Everything Ens-related is therefore built by the Ens compiler as this tree defines it, so nothing frozen into the seed can shape what the suite measures.
@@ -75,7 +76,7 @@ If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surf
   Placing the seed is the one thing in a run that does, and it happens before any job starts.
 - `xmake test` uses the binary of the currently configured mode.
   Never run `xmake f -m release` to "fix" staleness; rebuild instead.
-  If linking fails with unresolved LLVM symbols, put the LLVM package's `bin` folder (containing `clang++.exe`) on PATH, run `xmake f -c -m <current mode> -p windows -a x64`, then `xmake build ens-lld`.
+  If linking fails with unresolved LLVM symbols, put the LLVM package's `bin` folder (containing `clang++.exe`) on PATH, run `xmake f -c -m <current mode> -p windows -a x64`, then `xmake build ens-llvm`.
   Pass the platform and architecture explicitly: with `clang++` on PATH and no `-p`/`-a`, xmake detects `mingw/x86_64` and then refuses the packages.
   Building without that `bin` folder on PATH re-resolves the linker to MSVC `link.exe`, which silently ignores `-lLLVMCGData` and leaves unresolved LLVM CGData symbols.
   That choice is written into the config, so later builds keep failing even once PATH is fixed until the reconfigure above is rerun.
@@ -125,7 +126,7 @@ The download happens once per pin; later runs use the cached copy, and the hash 
 
 A host the pin does not name fails the run by name instead of falling back to another compiler, because a fallback would leave the seed itself untested.
 A pin whose asset is gone, or whose bytes no longer hash to what is pinned, is equally a hard failure: nothing runs until the two agree.
-Nothing has to be compiled from C++ before Ens can be, beyond the `ens-lld` linker bridge and the LLVM package every build links against.
+Nothing has to be compiled from C++ before Ens can be, beyond the `ens-llvm` library, which holds the linker bridge and the LLVM every build links against.
 
 **What the seed is for, and what it is not.**
 Its one job is to build `build/host/ens` out of the tree, and no test drives the seed itself.

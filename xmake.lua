@@ -2,7 +2,10 @@ add_rules("mode.debug", "mode.release")
 add_rules("plugin.vsxmake.autoupdate")
 
 add_requires("llvm 21.1.0")
-add_requires("libllvm 21.1.0", { configs = { lld = true } })
+add_requires("libllvm 21.1.0", { configs = { lld = true, clang = false, target_x86 = true, target_aarch64 = true } })
+-- LLVM finds zlib wherever the machine keeps it, so ens-llvm links a copy built here instead, and
+-- `ens` does not load whichever one a machine happens to have.
+add_requires("zlib v1.3.2", { system = false, configs = { shared = false, runtimes = "MT" } })
 add_requires("libxml2 v2.14.3", { configs = { runtimes = "MT" } })
 add_requires("lsp-framework 1.3.1", { configs = { runtimes = "MT" } })
 
@@ -79,8 +82,111 @@ target("lsp-frontend")
     add_includedirs("lsp/frontend", { public = true })
 
 
--- The linker bridge `ens` links every Ens program through: one C entry point over lld's C++
--- drivers, shipped as a shared library beside LLVM-C. All link policy lives in selfhost/link.
+-- Everything native that `ens` links, as one static archive: the linker bridge, the LLVM and lld
+-- libraries it and the ens.llvm binding call, the libraries those depend on, and on Linux and
+-- macOS the C++ runtime. `ens` is then one executable that needs nothing beside it, and it holds
+-- one copy of LLVM. All link policy lives in selfhost/link.
+target("ens-llvm")
+    set_kind("static")
+    set_languages("cxx17")
+    set_toolchains("@llvm")
+    add_files("runtime/lld/ens_lld.cpp")
+    add_packages("libllvm", "libxml2", "zlib")
+    after_link(function (target)
+        local archives = {}
+        local seen = {}
+        local function add(file)
+            if not seen[file] then
+                seen[file] = true
+                table.insert(archives, file)
+            end
+        end
+        local function staticArchive(dirs, link)
+            for _, dir in ipairs(dirs) do
+                for _, name in ipairs({"lib" .. link .. ".a", link .. ".lib"}) do
+                    local file = path.join(dir, name)
+                    if os.isfile(file) then
+                        return file
+                    end
+                end
+            end
+        end
+        local function addPackage(package)
+            local dirs = table.wrap(package:get("linkdirs"))
+            for _, link in ipairs(table.wrap(package:get("links"))) do
+                -- the Windows LLVM package also carries LLVM-C, the import library of its DLL.
+                if link ~= "LLVM-C" then
+                    local file = staticArchive(dirs, link)
+                    if file then
+                        add(file)
+                    end
+                end
+            end
+            -- the LLVM package's list of links leaves some of its own components out, such as
+            -- LLVMCGData, so every component archive in its folders is taken.
+            if package:name() == "libllvm" then
+                for _, dir in ipairs(dirs) do
+                    for _, pattern in ipairs({"libLLVM*.a", "liblld*.a", "LLVM*.lib", "lld*.lib"}) do
+                        for _, file in ipairs(os.files(path.join(dir, pattern))) do
+                            if path.basename(file) ~= "LLVM-C" then
+                                add(file)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        for _, package in ipairs(target:orderpkgs()) do
+            addPackage(package)
+        end
+        if target:is_plat("macosx") then
+            local llvm = target:toolchain("llvm")
+            local folder = llvm and llvm:sdkdir() and path.join(llvm:sdkdir(), "lib")
+            for _, name in ipairs({"libc++.a", "libc++abi.a"}) do
+                local file = folder and path.join(folder, name)
+                if not file or not os.isfile(file) then
+                    raise("the LLVM toolchain has no '%s' to link `ens` with", name)
+                end
+                add(file)
+            end
+        elseif target:is_plat("linux") then
+            local compiler = target:tool("cxx")
+            local printed = os.iorunv(compiler, {"-print-file-name=libstdc++.a"}):trim()
+            if not os.isfile(printed) then
+                raise("'%s' has no 'libstdc++.a' to link `ens` with", compiler)
+            end
+            add(printed)
+        end
+        -- llvm-ar reads an MRI script on every platform, so one merge serves every archive format.
+        -- The archive is made again from the bridge's objects each time, never from the archive a
+        -- previous merge left behind, so nothing is added twice.
+        local llvm = target:toolchain("llvm")
+        local suffix = is_host("windows") and ".exe" or ""
+        local archiver = llvm and path.join(llvm:bindir(), "llvm-ar" .. suffix)
+        if not archiver or not os.isfile(archiver) then
+            raise("the LLVM toolchain has no llvm-ar to merge ens-llvm with")
+        end
+        local merged = target:targetfile() .. ".merging"
+        local script = target:targetfile() .. ".mri"
+        local lines = {"create " .. merged}
+        for _, object in ipairs(target:objectfiles()) do
+            table.insert(lines, "addmod " .. object)
+        end
+        for _, archive in ipairs(archives) do
+            table.insert(lines, "addlib " .. archive)
+        end
+        table.insert(lines, "save")
+        table.insert(lines, "end")
+        io.writefile(script, table.concat(lines, "\n") .. "\n")
+        os.tryrm(merged)
+        os.vrunv(archiver, {"-M"}, {stdin = script})
+        os.mv(merged, target:targetfile())
+        os.rm(script)
+    end)
+
+
+-- The linker bridge as a shared library beside LLVM-C, which is what the pinned seed loads when it
+-- runs. It goes once the pin names a seed linked with ens-llvm.
 target("ens-lld")
     set_kind("shared")
     set_languages("cxx17")

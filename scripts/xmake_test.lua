@@ -79,8 +79,12 @@ task("test")
                 stem .. exe_suffix))
             return found[1] or path.join(workspace, ".ens", "<target>", "O2", stem .. exe_suffix)
         end
-        -- the linker bridge every Ens program links through. It is a separate target from the
-        -- compiler, so a fresh clone needs it built before anything can reach an executable.
+        -- the native archive every Ens program that links LLVM or the linker bridge links: the
+        -- bridge, LLVM and lld in one library. It is a separate target from the compiler, so a
+        -- fresh clone needs it built before anything can reach an executable.
+        local native_archive = path.join(build_dir, is_host("windows") and "ens-llvm.lib"
+            or "libens-llvm.a")
+        -- the linker bridge as the shared library the pinned seed loads when it runs.
         local lld_library = path.join(build_dir, is_host("windows") and "ens-lld.dll"
             or (is_host("macosx") and "libens-lld.dylib" or "libens-lld.so"))
 
@@ -299,8 +303,8 @@ task("test")
         end
 
         -- the ens.llvm binding's own unit tests: build small LLVM modules through the binding and
-        -- assert the LLVM verifier accepts them. They link the native LLVM-C library, so the job
-        -- points the linker and loader at the local LLVM package the same way codegencheck does.
+        -- assert the LLVM verifier accepts them. They link the native ens-llvm library, so the job
+        -- points the linker at it the same way codegencheck does.
         if want("selfhost_llvm") then
             table.insert(jobs, {
                 name = "selfhost_llvm",
@@ -322,7 +326,7 @@ task("test")
 
         -- the linking library's unit tests: the link line of each flavor pinned argument by
         -- argument, the flavor a triple picks, and the paths a failing link reports through. It
-        -- binds the ens-lld native library, so the job carries the same native plumbing.
+        -- binds the native ens-llvm library, so the job carries the same native plumbing.
         if want("selfhost_link") then
             table.insert(jobs, {
                 name = "selfhost_link",
@@ -351,6 +355,15 @@ task("test")
                 name = "selfhost_driver",
                 source = path.join(os.projectdir(), "selfhost", "driver"),
                 ens_test_args = {},
+            })
+        end
+
+        -- `ens` as one file: the compiler loads only libraries every machine of its platform has,
+        -- and it runs from a folder of its own with none of this build's library paths set.
+        if want("standalone") then
+            table.insert(jobs, {
+                name = "standalone",
+                standalone = true,
             })
         end
 
@@ -498,9 +511,9 @@ task("test")
             return false
         end
 
-        -- find the native libraries an Ens build links against - the local LLVM the compiler was
-        -- built against, and the ens-lld linker bridge from this build - and build the environment a
-        -- process linking or loading them needs: on Windows lld-link reads LIB (and finds nothing
+        -- find the native libraries an Ens build links or the seed loads - the ens-llvm archive and
+        -- the ens-lld linker bridge from this build, and the local LLVM package - and build the
+        -- environment a process linking or loading them needs: on Windows lld-link reads LIB (and finds nothing
         -- else once LIB is set, so the MSVC and SDK folders must be added too) and the loader
         -- searches PATH; on Linux/macOS the ens linker turns LIBRARY_PATH into -L and -rpath, and
         -- the loader honors LD_LIBRARY_PATH / DYLD_FALLBACK_LIBRARY_PATH. A machine without the
@@ -722,15 +735,19 @@ task("test")
             placeNativeLibraries(native_libraries, seed_dir)
         end
 
-        -- the linker bridge, built every run. The build is incremental. A run whose bridge sources
-        -- are unchanged pays nothing for it. A run that skipped it would link every fixture through
-        -- whatever bridge an earlier build left behind. The build carries the environment a link
-        -- carries. On Windows that puts the LLVM package's bin folder on PATH, where the bridge
-        -- resolves its own linker.
-        local function buildLinkerBridge()
+        -- the native archive, and the shared bridge the seed loads, built every run. The build is
+        -- incremental. A run whose bridge sources are unchanged pays nothing for it. A run that
+        -- skipped it would link every fixture through whatever archive an earlier build left
+        -- behind. The build carries the environment a link carries. On Windows that puts the LLVM
+        -- package's bin folder on PATH, where the bridge resolves its own linker.
+        local function buildNativeLibraries()
             local env, _, env_error = llvmEnvironment()
             if not env then
-                os.raise("could not build the linker bridge: %s", env_error)
+                os.raise("could not build the native libraries: %s", env_error)
+            end
+            os.execv("xmake", {"build", "ens-llvm"}, {envs = env})
+            if not os.isfile(native_archive) then
+                os.raise("Could not locate the native archive at " .. native_archive)
             end
             os.execv("xmake", {"build", "ens-lld"}, {envs = env})
             if not os.isfile(lld_library) then
@@ -1129,6 +1146,112 @@ task("test")
                 .. "%.1f MB; executables %s", seconds[1] or 0, seconds[2] or 0,
                 #names2, total_bytes / (1024 * 1024), executables)
             return {name = name, ok = true, note = note}
+        end
+
+        -- the libraries a program loads when it starts, as the LLVM package's llvm-readobj lists
+        -- them, or nil and why not.
+        local function loadedLibraries(program, log)
+            local readobj = os.files(path.join(global.directory(), "packages", "l", "llvm", "*",
+                "*", "bin", "llvm-readobj" .. exe_suffix))[1]
+            if not readobj then
+                return nil, "no llvm-readobj in the LLVM package"
+            end
+            local option = is_host("windows") and "--coff-imports" or "--needed-libs"
+            local rc = execMerged(readobj, {option, program}, log)
+            if rc ~= 0 then
+                return nil, "llvm-readobj could not read " .. program
+            end
+            local libraries = {}
+            local listing = false
+            for line in (io.readfile(log) or ""):gmatch("[^\r\n]+") do
+                local trimmed = line:match("^%s*(.-)%s*$")
+                if is_host("windows") then
+                    local imported = trimmed:match("^Name:%s*(.+)$")
+                    if imported then
+                        table.insert(libraries, imported)
+                    end
+                elseif trimmed == "NeededLibraries [" then
+                    listing = true
+                elseif trimmed == "]" then
+                    listing = false
+                elseif listing and #trimmed > 0 then
+                    table.insert(libraries, trimmed)
+                end
+            end
+            return libraries
+        end
+
+        -- whether a library is one every machine of this platform has. Windows names a system DLL
+        -- in any letter case.
+        local function isSystemLibrary(library)
+            if is_host("macosx") then
+                return library == "/usr/lib/libSystem.B.dylib"
+            end
+            if is_host("windows") then
+                local name = library:lower()
+                if name:startswith("api-ms-win-") then
+                    return true
+                end
+                for _, system in ipairs({"kernel32.dll", "ntdll.dll", "advapi32.dll",
+                        "shell32.dll", "ole32.dll", "oleaut32.dll", "user32.dll", "psapi.dll",
+                        "version.dll", "ws2_32.dll", "bcrypt.dll", "crypt32.dll", "dbghelp.dll",
+                        "shlwapi.dll"}) do
+                    if name == system then
+                        return true
+                    end
+                end
+                return false
+            end
+            for _, system in ipairs({"libc.so.6", "libm.so.6", "libpthread.so.0", "libdl.so.2",
+                    "librt.so.1", "libgcc_s.so.1"}) do
+                if library == system then
+                    return true
+                end
+            end
+            return library:match("^ld%-linux.*%.so%.%d+$") ~= nil
+        end
+
+        local function run_standalone(job)
+            local name = job.name
+            local log = path.join(out_dir, name .. ".log")
+            local libraries, why = loadedLibraries(host_exe, log)
+            if not libraries then
+                return {name = name, ok = false, short = why,
+                    full = string.format("%s: %s\n%s", name, why, captured(log))}
+            end
+            local foreign = {}
+            for _, library in ipairs(libraries) do
+                if not isSystemLibrary(library) then
+                    table.insert(foreign, library)
+                end
+            end
+            if #foreign > 0 then
+                return {name = name, ok = false, short = "loads " .. table.concat(foreign, ", "),
+                    full = string.format("%s: '%s' loads libraries a machine without this build "
+                        .. "does not have: %s", name, host_exe, table.concat(foreign, ", "))}
+            end
+            local alone_dir = path.join(os.projectdir(), "build", "standalone")
+            os.tryrm(alone_dir)
+            os.mkdir(alone_dir)
+            local alone_exe = path.join(alone_dir, "ens" .. exe_suffix)
+            os.cp(host_exe, alone_exe)
+            local envs = {LIBRARY_PATH = "", LD_LIBRARY_PATH = "", DYLD_LIBRARY_PATH = "",
+                DYLD_FALLBACK_LIBRARY_PATH = "", LIB = ""}
+            if is_host("windows") then
+                local root = os.getenv("SystemRoot") or "C:\\Windows"
+                envs.PATH = path.join(root, "System32")
+            else
+                envs.PATH = "/usr/bin:/bin"
+            end
+            local rc = execMerged(alone_exe, {"version"}, log, {envs = envs, curdir = alone_dir})
+            local printed = captured(log)
+            if rc ~= 0 or not printed:startswith("ens ") then
+                return {name = name, ok = false, short = "does not run on its own",
+                    full = string.format("%s: '%s version' run from '%s' with no library paths "
+                        .. "set exited %s:\n%s", name, alone_exe, alone_dir, tostring(rc),
+                        printed)}
+            end
+            return {name = name, ok = true}
         end
 
         -- the command's own behavior, driven end to end against scratch fixtures: every assertion
@@ -3286,6 +3409,7 @@ task("test")
             if job.lsp_build then return run_lsp_build(job) end
             if job.corpus then return run_corpus(job) end
             if job.semacheck then return run_semacheck(job) end
+            if job.standalone then return run_standalone(job) end
             if job.cli_build then return run_cli_build(job) end
             if job.cli_runtest then return run_cli_runtest(job) end
             if job.cli_toolchain then return run_cli_toolchain(job) end
@@ -3447,7 +3571,7 @@ task("test")
             -- `ens test` on a folder, asserting its two streams: the unit tests of every selfhost
             -- package and of the standard library, and the @ens-test fixtures. The command under
             -- test runs them, so its sema and code generator see every one of those tests. Its
-            -- builds link through ens-lld and some of the suites bind native libraries, so the job
+            -- builds link through ens-llvm and some of the suites bind native libraries, so the job
             -- carries the same linker and loader environment the codegen harness does.
             if ens_test_args ~= nil then
                 os.tryrm(stdout_file)
@@ -3569,8 +3693,8 @@ task("test")
         -- the compiler has to exist before any job that compiles Ens starts, and the jobs run in
         -- parallel, so the seed is placed and the compiler built here rather than on demand inside
         -- one of them. The bridge is first. The compiler is the first program linked through it.
-        print("Building the ens-lld linker bridge...")
-        buildLinkerBridge()
+        print("Building the ens-llvm native archive...")
+        buildNativeLibraries()
         locateSeed()
         print(string.format("Building the compiler with the pinned %s seed...", seed_host))
         local host_started = os.mclock()
