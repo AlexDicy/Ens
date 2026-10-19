@@ -987,7 +987,7 @@ analyzeCallOf(BodyChecker checker, CallExpressionNode node, Type? expected) -> T
             return methodcalls.analyzeSuperCall(checker, node, chained);
         },
         is IdentifierExpressionNode identifier -> {
-            return analyzeFunctionCall(checker, node, identifier);
+            return analyzeFunctionCall(checker, node, identifier, expected);
         },
         default -> {
             Type calleeType = checker.analyzeExpression(node.callee());
@@ -1085,8 +1085,8 @@ public analyzeFunctionValueCall(BodyChecker checker, CallExpressionNode node, Ty
     return calleeType.returnType();
 }
 
-analyzeFunctionCall(BodyChecker checker, CallExpressionNode node, IdentifierExpressionNode identifier)
-                    -> Type {
+analyzeFunctionCall(BodyChecker checker, CallExpressionNode node, IdentifierExpressionNode identifier,
+                    Type? expected) -> Type {
     string name = identifier.name().text();
     let primitive = types.primitiveNamed(checker.store(), name);
     if (primitive != null) {
@@ -1145,7 +1145,7 @@ analyzeFunctionCall(BodyChecker checker, CallExpressionNode node, IdentifierExpr
                 }
             }
             checker.result().setCallableFile(identifier.green(), declaringFile);
-            return dispatchFunctionCall(checker, node, identifier, name, functions.entries());
+            return dispatchFunctionCall(checker, node, identifier, name, functions.entries(), expected);
         },
         is TypeName named -> {
             if (types.isStructLike(named.target())) {
@@ -1183,7 +1183,7 @@ analyzeFunctionCall(BodyChecker checker, CallExpressionNode node, IdentifierExpr
 }
 
 dispatchFunctionCall(BodyChecker checker, CallExpressionNode node, IdentifierExpressionNode identifier,
-                     string name, List<FunctionEntry> entries) -> Type {
+                     string name, List<FunctionEntry> entries, Type? expected) -> Type {
     let first = entries.get(0);
     if (first.isExternal()) {
         checker.result().setCallable(identifier.green(), first.signature());
@@ -1191,7 +1191,7 @@ dispatchFunctionCall(BodyChecker checker, CallExpressionNode node, IdentifierExp
     }
     if (first.signature().isGeneric()) {
         checker.result().setCallable(identifier.green(), first.signature());
-        return analyzeGenericCall(checker, node, first, name);
+        return analyzeGenericCall(checker, node, first, name, expected);
     }
     if (entries.length() > 1 || usesNamedArguments(node.arguments())) {
         let candidates = new List<CallCandidate>();
@@ -1217,7 +1217,7 @@ dispatchFunctionCall(BodyChecker checker, CallExpressionNode node, IdentifierExp
 // A namespace-qualified free-function call, or null when the member is not a function of
 // the target module (the member then resolves as a type reference).
 public analyzeNamespaceFunctionCall(BodyChecker checker, CallExpressionNode node, MemberExpressionNode member,
-                                    string targetPath, string memberName) -> Type? {
+                                    string targetPath, string memberName, Type? expected) -> Type? {
     let target = checker.contextsByPath().get(targetPath);
     if (target == null) {
         return null;
@@ -1279,7 +1279,7 @@ public analyzeNamespaceFunctionCall(BodyChecker checker, CallExpressionNode node
         return checkFromCStringCall(checker, node.arguments(), node.span());
     }
     if (entry.signature().isGeneric()) {
-        return analyzeGenericCall(checker, node, entry, memberName);
+        return analyzeGenericCall(checker, node, entry, memberName, expected);
     }
     return checkDirectArguments(checker, "Function", memberName, entry.signature(),
         node.arguments(), node.span(), null);
@@ -1319,7 +1319,8 @@ checkFromCStringCall(BodyChecker checker, ArgumentListNode arguments, Span callS
     return result;
 }
 
-analyzeGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry entry, string name) -> Type {
+analyzeGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry entry, string name,
+                   Type? expected) -> Type {
     let signature = entry.signature();
     let arguments = node.arguments();
     Parameter[] declared = signature.parameters();
@@ -1413,7 +1414,13 @@ analyzeGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry e
                 checker.reporter().report(unshown, node.span());
                 return checker.store().errorType();
             }
-            string listed = staticmembers.writtenTypeArguments(checker, inference, arity, node.arguments());
+            let listed = staticmembers.writtenTypeArguments(checker, inference,
+                contextInference(checker, owner, arity, signature.returnType(), expected), arity,
+                node.arguments(), parameters);
+            if (listed == null) {
+                checker.reporter().report(unshown, node.span());
+                return checker.store().errorType();
+            }
             string write = "Write it";
             if (arity > 1) {
                 write = "Write its type arguments";
@@ -1793,9 +1800,31 @@ public waitsForParameter(Expression value, bool written) -> bool {
     return needsTargetType(value) || (written && value is ArrayLiteralExpressionNode);
 }
 
+// The type arguments that 'expected', the type the call's value is given to, gives through 'returned',
+// the type the call returns, or null where there is no such type.
+contextInference(BodyChecker checker, GreenNode owner, long arity, Type returned, Type? expected)
+        -> TypeArgumentInference? {
+    if (expected == null) {
+        return null;
+    }
+    let context = new TypeArgumentInference(checker.store(), owner, arity);
+    context.unifyArgument(0, returned, expected);
+    return context;
+}
+
+// Whether 'value' has no type of its own, so the parameter it fills gives it one: a lambda, a '{...}'
+// literal, an empty array literal, and an array literal holding one of them.
 needsTargetType(Expression value) -> bool {
     if (value is ArrayLiteralExpressionNode) {
-        return value.elementsCount() == 0;
+        if (value.elementsCount() == 0) {
+            return true;
+        }
+        for (long i = 0; i < value.elementsCount(); i++) {
+            if (needsTargetType(syntax.unwrapParentheses(value.elements(i)))) {
+                return true;
+            }
+        }
+        return false;
     }
     return value is StructLiteralExpressionNode || value is LambdaExpressionNode;
 }
