@@ -17,6 +17,8 @@ import QuotedCode from model.typenames;
 import model.types;
 import Type from model.types;
 import ErrorType from model.types;
+import NullType from model.types;
+import OptionalType from model.types;
 import ArrayType from model.types;
 import FunctionType from model.types;
 import PrimitiveType from model.types;
@@ -62,6 +64,7 @@ public class ArgumentValue {
     bool withoutCommonType;
     string? writtenSpelling;
     bool withoutEffects;
+    string writtenPlace;
 
     public constructor(string name, Type type, bool isIntegerLiteral, bool isNegative,
                 ulong magnitude, bool isCharacterLiteral, Span span) {
@@ -83,6 +86,7 @@ public class ArgumentValue {
         this.withoutCommonType = false;
         this.writtenSpelling = null;
         this.withoutEffects = false;
+        this.writtenPlace = "";
     }
 
     // True for an argument typed once a candidate is chosen: one that names no type of its own, and
@@ -180,6 +184,16 @@ public class ArgumentValue {
 
     public setSpelling(string? spelled) {
         this.writtenSpelling = spelled;
+    }
+
+    // Where this value of a '?:' or a switch is written in it, as in "in the '1 ->' arm", or empty for
+    // any other value.
+    public place() -> string {
+        return this.writtenPlace;
+    }
+
+    public setPlace(string place) {
+        this.writtenPlace = place;
     }
 
     // Whether evaluating the argument does nothing but produce its value. Only marked on the
@@ -1112,62 +1126,180 @@ soleCountRefusal(List<CallCandidate> candidates, CallShape shape, string display
             callee = "the constructor of '{displayName}'";
             noun = "constructor of '{displayName}'";
         }
-        string passed = "has type {argumentText(argument, names)}";
-        if (argument.shape() == ArgumentShape.Join) {
-            passed = "is {joinText(argument, names, wanted)}";
-        } else if (argument.shape() != ArgumentShape.Typed && argument.aloneType() == null) {
-            passed = "is {argumentText(argument, names)}";
-        }
         string taken = "{typenames.typeArticle(names.of(wanted))} {names.quoted(wanted)}";
         string signature = quotedSignature(sole.signature(), names);
-        return "Argument {label} of {callee} {passed}, but {signature}, the only "
-            + "{noun} that takes {takenCount(count, count, "argument")}, takes {taken} there"
-            + "{shapeMismatch(argument, wanted)}.";
+        string misfit = elementMisfit(argument, wanted, names);
+        string why = "";
+        let reason = shapeReason(argument, wanted);
+        Type core = convert.coreOf(wanted);
+        if (reason != null) {
+            why = ", which {reason}";
+        } else if (misfit.length > 0 && core is ArrayType) {
+            why = ", whose elements have type {names.quoted(core.element())}";
+        }
+        return "Argument {label} of {callee} {passedText(argument, wanted, names)}, but {signature}, "
+            + "the only {noun} that takes {takenCount(count, count, "argument")}, takes {taken} there"
+            + "{why}.{nullHint(argument, wanted, names)}{misfit}";
     }
     return null;
 }
 
-// Why a lambda, an array literal or a '{...}' literal does not fit the parameter type 'wanted', opening
-// with a comma, or empty for any other argument. For a '?:' or a switch, it is why its values that do not
-// fit do not, where that is the same for each of them.
-shapeMismatch(ArgumentValue argument, Type wanted) -> string {
+// What 'argument', which does not fit 'wanted', is, as a refusal says it after the argument's position:
+// "has type 'string'", or "is a lambda with two parameters" where it names no type of its own.
+passedText(ArgumentValue argument, Type wanted, TypeNames names) -> string {
+    if (argument.shape() == ArgumentShape.Join) {
+        return "is {joinText(argument, names, wanted)}";
+    }
+    if (argument.shape() != ArgumentShape.Typed && argument.aloneType() == null) {
+        return "is {argumentText(argument, names)}";
+    }
+    return "has type {argumentText(argument, names)}";
+}
+
+// Why 'argument' does not fit 'wanted' where it is 'null' and 'wanted' allows no null, opening with a
+// space, or empty otherwise.
+nullHint(ArgumentValue argument, Type wanted, TypeNames names) -> string {
+    if (argument.shape() != ArgumentShape.Typed || !(argument.type() is NullType)
+            || wanted is OptionalType || wanted is ErrorType) {
+        return "";
+    }
+    return neverNullHint(names.quoted(wanted), "Write the type as {names.quotedNullable(wanted)}");
+}
+
+// Why 'null' does not fit the type 'quoted', which allows no null, followed by 'fix', the words that
+// write that type so it does, opening with a space.
+public neverNullHint(string quoted, string fix) -> string {
+    return " {quoted} can never be null. {fix} if it should allow null.";
+}
+
+// The sentence naming the first element that does not fit in an array literal 'argument' passes where
+// 'wanted' is taken, opening with a space, or empty where 'argument' passes no such array literal.
+elementMisfit(ArgumentValue argument, Type wanted, TypeNames names) -> string {
+    let literal = firstMisfitArrayLiteral(argument, wanted);
+    if (literal == null) {
+        return "";
+    }
+    string owner = "the array literal";
+    if (literal.place().length > 0) {
+        owner = "{owner} {literal.place()}";
+    }
+    let misfit = elementMisfitText(literal, wanted, owner, false, names);
+    if (misfit == null) {
+        return "";
+    }
+    return " {typenames.capitalizedAscii(misfit)}";
+}
+
+// The first array literal with no type of its own that 'argument' is or gives and that does not fit the
+// array type 'wanted', or null where there is none.
+firstMisfitArrayLiteral(ArgumentValue argument, Type wanted) -> ArgumentValue? {
+    if (conversionRank(argument, wanted, true) > 0) {
+        return null;
+    }
+    switch (argument.shape()) {
+        Join -> {
+            for (let value in argument.elements()) {
+                let found = firstMisfitArrayLiteral(value, wanted);
+                if (found != null) {
+                    return found;
+                }
+            }
+            return null;
+        },
+        ArrayLiteral -> {
+            if (argument.aloneType() == null && convert.coreOf(wanted) is ArrayType) {
+                return argument;
+            }
+            return null;
+        },
+        default -> {
+            return null;
+        },
+    }
+}
+
+// "element 2 of 'owner' has type 'string'." and why, for the first element of the array literal
+// 'literal' that does not fit the elements of the array type 'wanted', following a nested array literal
+// down to the element inside it that does not fit. 'nested' marks a literal that is itself an element,
+// whose element type no earlier sentence names. Null where every element fits.
+elementMisfitText(ArgumentValue literal, Type wanted, string owner, bool nested,
+                  TypeNames names) -> string? {
+    Type core = convert.coreOf(wanted);
+    if (!(core is ArrayType)) {
+        return null;
+    }
+    Type elementType = core.element();
+    ArgumentValue[] elements = literal.elements();
+    for (long i = 0; i < elements.length; i++) {
+        let element = elements[i];
+        if (conversionRank(element, elementType, true) > 0) {
+            continue;
+        }
+        string position = "element {i + 1} of {owner}";
+        if (element.shape() == ArgumentShape.ArrayLiteral && element.aloneType() == null) {
+            let inner = elementMisfitText(element, elementType, position, true, names);
+            if (inner != null) {
+                return inner;
+            }
+        }
+        string hint = nullHint(element, elementType, names);
+        string why = "";
+        let reason = shapeReason(element, elementType);
+        if (reason != null) {
+            why = ", but {names.quoted(elementType)} {reason}";
+        } else if (nested && hint.length == 0) {
+            why = ", but it has to be {typenames.typeArticle(names.of(elementType))} "
+                + names.quoted(elementType);
+        }
+        return "{position} {passedText(element, elementType, names)}{why}.{hint}";
+    }
+    return null;
+}
+
+// Why a lambda, an array literal or a '{...}' literal does not fit the type 'wanted', as the words that
+// follow that type: "takes one parameter", "is not a function type", "is not an array type" or "is not
+// a struct type". For a '?:' or a switch, it is why its values that do not fit do not, where that is
+// the same for each of them. Null where the types alone tell why.
+shapeReason(ArgumentValue argument, Type wanted) -> string? {
     Type core = convert.coreOf(wanted);
     switch (argument.shape()) {
         Join -> {
             string? reason = null;
+            bool seen = false;
             for (let value in argument.elements()) {
                 if (conversionRank(value, wanted, true) > 0) {
                     continue;
                 }
-                string mismatch = shapeMismatch(value, wanted);
-                if (reason != null && reason != mismatch) {
-                    return "";
+                let own = shapeReason(value, wanted);
+                if (seen && own != reason) {
+                    return null;
                 }
-                reason = mismatch;
+                reason = own;
+                seen = true;
             }
-            return reason ?? "";
+            return reason;
         },
         Lambda -> {
             if (core is FunctionType) {
                 long taken = core.parameterTypes().length;
-                return ", which takes {takenCount(taken, taken, "parameter")}";
+                return "takes {takenCount(taken, taken, "parameter")}";
             }
-            return ", which is not a function type";
+            return "is not a function type";
         },
         ArrayLiteral -> {
             if (!(core is ArrayType)) {
-                return ", which is not an array type";
+                return "is not an array type";
             }
-            return "";
+            return null;
         },
         StructLiteral -> {
             if (!types.isStructLike(core)) {
-                return ", which is not a struct type";
+                return "is not a struct type";
             }
-            return "";
+            return null;
         },
         default -> {
-            return "";
+            return null;
         },
     }
 }
