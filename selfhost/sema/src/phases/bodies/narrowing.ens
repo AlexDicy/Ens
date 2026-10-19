@@ -35,6 +35,7 @@ import Span from @ens.frontend.support.source;
 import LocalBinding from model.scopes;
 import model.capabilities;
 import model.convert;
+import model.flow;
 import phases.bodies.nullguidance;
 import phases.bodies.lambdas;
 import LambdaFrame from phases.bodies.lambdas;
@@ -679,13 +680,6 @@ public narrowArmValue(BodyChecker checker, Expression scrutinee, Type armType) {
     }
 }
 
-public walkBranch(BodyChecker checker, BlockNode block, List<NarrowingFact> facts) {
-    checker.enterScope();
-    applyFacts(checker, facts);
-    checker.walkBlock(block);
-    checker.leaveScope();
-}
-
 // What holds where a branch ends: the narrowings proven there, the writes that left those a write left,
 // and the writes there that ended the narrowings made before it.
 public final class BranchNarrowings {
@@ -821,23 +815,30 @@ pathRootInScope(BodyChecker checker, NarrowingPath path) -> bool {
 
 // Installs the intersection of the surviving branches as the narrowing after a merge: a path
 // stays narrowed only where every falling-through branch proves it, an entry proof a branch
-// dropped is dropped, with the write in the first such branch recorded as what ended it where the
-// branches of 'statement', as in "'if' statement", meet, from 'branch', as in "one branch of the 'if'
-// statement", and a proof a branch newly established is added.
+// dropped is dropped, with the write that dropped it recorded as what ended it where the branches of
+// 'statement', as in "'if' statement", meet, from 'branch', as in "one branch of the 'if' statement",
+// and a proof a branch newly established is added. 'entryFacts' is what holds where the branches start,
+// which is what holds here.
 public applyNarrowingJoin(BodyChecker checker, Map<NarrowingPath, Type> entryFacts,
                           List<BranchNarrowings> survivors, string statement, string branch) {
+    joinNarrowings(checker, entryFacts, entryFacts, survivors, statement, branch);
+}
+
+// Installs the intersection of the surviving branches as applyNarrowingJoin does, where 'proven' holds each
+// proof a branch can drop, with the type it held, and 'held' holds here. For the branches of a statement
+// those are the proofs that held where they start, and for the ways out of a loop also those made since.
+joinNarrowings(BodyChecker checker, Map<NarrowingPath, Type> proven, Map<NarrowingPath, Type> held,
+               List<BranchNarrowings> survivors, string statement, string branch) {
     if (survivors.length() == 0) {
         return;
     }
     let joined = intersectNarrowings(checker, survivors);
-    for (let key in entryFacts.keys()) {
-        if (joined.get(key) != null) {
+    for (let key in proven.keys()) {
+        let provenType = proven.get(key);
+        if (provenType == null || joined.get(key) != null || !pathRootInScope(checker, key)) {
             continue;
         }
-        NarrowingEnd? ended = null;
-        for (let survivor in survivors) {
-            ended = ended ?? survivor.ends.get(key);
-        }
+        let ended = droppedEnd(survivors, key, provenType);
         if (ended != null) {
             checker.narrowing().endProof(key, ended.throughJoin(statement, branch));
         } else {
@@ -846,11 +847,7 @@ public applyNarrowingJoin(BodyChecker checker, Map<NarrowingPath, Type> entryFac
     }
     for (let key in joined.keys()) {
         let joinedType = joined.get(key);
-        if (joinedType == null) {
-            continue;
-        }
-        let entryType = entryFacts.get(key);
-        if (entryType != null && entryType == joinedType) {
+        if (joinedType == null || held.get(key) == joinedType) {
             continue;
         }
         if (!pathRootInScope(checker, key)) {
@@ -858,25 +855,55 @@ public applyNarrowingJoin(BodyChecker checker, Map<NarrowingPath, Type> entryFac
         }
         checker.narrowing().clearPath(key);
         checker.narrowing().narrow(key, joinedType);
-        let write = joinedWrite(survivors, key, joinedType);
+        let write = joinedWrite(survivors, key, joinedType, proven.get(key));
         if (write != null) {
             checker.narrowing().noteWrite(key, write.throughJoin(statement, branch));
         }
     }
 }
 
-// The write that left the proof 'joined' of 'path' where branches meet: the first branch's write that left
-// that proof itself, or else the first that left a proof of it at all. Null where no write left one.
-joinedWrite(List<BranchNarrowings> survivors, NarrowingPath path, Type joined) -> NarrowingEnd? {
+// The write that dropped the proof 'dropped' of 'path', which held before the branches end and holds where
+// they meet no more: the write that ended it in the first branch that holds no proof of it, or else the
+// write in the first branch that left a proof of a type 'dropped' does not hold. Null where no write did.
+droppedEnd(List<BranchNarrowings> survivors, NarrowingPath path, Type dropped) -> NarrowingEnd? {
+    for (let survivor in survivors) {
+        let ended = survivor.ends.get(path);
+        if (ended != null && survivor.proofs.get(path) == null) {
+            return ended;
+        }
+    }
+    for (let survivor in survivors) {
+        let proven = survivor.proofs.get(path);
+        let write = survivor.writes.get(path);
+        if (proven != null && write != null && !convert.isAssignableStrict(dropped, proven)) {
+            return write;
+        }
+    }
+    return null;
+}
+
+// The write that left the proof 'joined' of 'path' where branches meet, after the proof 'before' held: the
+// first branch's write that left that proof itself, or else the first that left a proof wider than
+// 'before' or not related to it, or else the first that left a proof at all. Null where no write left one.
+joinedWrite(List<BranchNarrowings> survivors, NarrowingPath path, Type joined, Type? before)
+            -> NarrowingEnd? {
+    NarrowingEnd? widening = null;
     NarrowingEnd? first = null;
     for (let survivor in survivors) {
         let write = survivor.writes.get(path);
-        if (write != null && survivor.proofs.get(path) == joined) {
+        let proven = survivor.proofs.get(path);
+        if (write == null || proven == null) {
+            continue;
+        }
+        if (proven == joined) {
             return write;
+        }
+        if (before == null || !convert.isAssignableStrict(before, proven)) {
+            widening = widening ?? write;
         }
         first = first ?? write;
     }
-    return first;
+    return widening ?? first;
 }
 
 // Analyzes a '?:' branch or the right side of '&&' or '||' under the facts the condition proves
@@ -1038,7 +1065,8 @@ public establishAssignmentNarrowing(BodyChecker checker, LocalBinding binding, T
 
 // The write at 'at' that stores a 'stored' into 'target': it drops the narrowings of the storage it
 // replaces and is recorded as what ended them, it narrows the place to what the stored value proves,
-// and the loops being settled see it. 'assignment' is the plain '=' that makes the write, if one does.
+// and a copy it makes among the loops being settled is kept. 'assignment' is the plain '=' that makes the
+// write, if one does.
 public recordWrite(BodyChecker checker, Expression target, Span at, Type stored,
                    AssignmentExpressionNode? assignment = null) {
     let end = new NarrowingEnd(NarrowingEndKind.Assigned, at, stored, "",
@@ -1047,17 +1075,15 @@ public recordWrite(BodyChecker checker, Expression target, Span at, Type stored,
     establishWriteNarrowing(checker, target, stored, end);
     renewEndsForWrite(checker, target, end);
     let root = writtenRoot(checker, target);
-    noteLoopWrite(checker, root, end);
     touchLoopRoot(checker, root, loopCopy(checker, target, assignment, stored, end));
 }
 
 // 'out' lets the function 'callee' write the caller's variable directly, so the argument at 'at'
-// drops even the binding's own narrowing, and the loops being settled see it.
+// drops even the binding's own narrowing.
 public recordOutWrite(BodyChecker checker, LocalBinding binding, Span at, string callee) {
     let end = new NarrowingEnd(NarrowingEndKind.PassedOut, at, null, callee, binding.name(), null);
     checker.narrowing().clearForRoot(binding, end);
     checker.narrowing().renewForRoot(binding, end);
-    noteLoopWrite(checker, binding, end);
     touchLoopRoot(checker, binding, null);
 }
 
@@ -1115,13 +1141,15 @@ renewEndsForWrite(BodyChecker checker, Expression target, NarrowingEnd end) {
     }
 }
 
-// The narrowings a pass over the loop 'loop' watches on the locals and parameters it may write. 'trace'
-// follows each from the type the loop starts it with, and 'changed' is whether a write changed it.
-// 'entryTrace' follows each the loop starts weaker than the proof where it is entered from that proof,
-// which finds the first write of the pass that widens or breaks it. The copies that read a start are
-// kept by the local they read, and 'lambdaDepth' counts the lambdas the loop is in.
+// The narrowings a pass over the loop 'loop', written at 'span', watches on the locals and parameters it
+// may write. 'trace' follows each from the type the loop starts it with to the proofs that reach the back
+// edges of the pass, and 'changed' is whether one changed it. 'entryTrace' follows the same way each
+// narrowing the loop starts weaker than the proof where it is entered, from that proof, which finds the
+// back edge and the write of the pass that widen or break it. The copies that read a start are kept by
+// the local they read, and 'lambdaDepth' counts the lambdas the loop is in.
 public final class LoopWatch {
     protected GreenNode loop;
+    protected Span span;
     protected Map<NarrowingPath, Type> starts;
     protected NarrowingTrace trace;
     protected NarrowingTrace entryTrace;
@@ -1129,8 +1157,8 @@ public final class LoopWatch {
     protected Map<NarrowingPath, List<LoopCopy>> startReaders;
     protected long lambdaDepth;
 
-    protected constructor(this.loop, Map<NarrowingPath, Type> starts, Map<NarrowingPath, Type> weakened,
-                          this.lambdaDepth) {
+    protected constructor(this.loop, this.span, Map<NarrowingPath, Type> starts,
+                          Map<NarrowingPath, Type> weakened, this.lambdaDepth) {
         this.starts = starts;
         this.trace = new NarrowingTrace(starts);
         this.entryTrace = new NarrowingTrace(weakened);
@@ -1139,79 +1167,93 @@ public final class LoopWatch {
     }
 }
 
-// Narrowings on locals and parameters followed through the writes of a pass: the type each holds after
-// the writes seen so far, the ones a write left without a proof, and the first write that widened or
-// broke each. The paths are also kept by the local or parameter they start at.
+// Narrowings on locals and parameters followed to the back edges of a pass: the type each holds over the
+// back edges seen so far, the ones a back edge reaches without a proof, the write that first broke each,
+// and the write that widened each to the type it holds, which a read that type has no member for can name.
 final class NarrowingTrace {
     protected Map<NarrowingPath, Type> held;
-    protected Map<LocalBinding, List<NarrowingPath>> rootPaths;
     protected Map<NarrowingPath, NarrowingEnd> widened;
     protected Map<NarrowingPath, NarrowingEnd> broken;
 
     protected constructor(Map<NarrowingPath, Type> starts) {
         this.held = new Map<NarrowingPath, Type>();
-        this.rootPaths = new Map<LocalBinding, List<NarrowingPath>>();
         for (let path in starts.keys()) {
             let start = starts.get(path);
-            let root = path.root();
-            if (start == null || root == null) {
-                continue;
+            if (start != null && path.root() != null) {
+                this.held.set(path, start);
             }
-            this.held.set(path, start);
-            let paths = this.rootPaths.get(root) ?? new List<NarrowingPath>();
-            paths.push(path);
-            this.rootPaths.set(root, paths);
         }
         this.widened = new Map<NarrowingPath, NarrowingEnd>();
         this.broken = new Map<NarrowingPath, NarrowingEnd>();
     }
 
-    // Whether the narrowing of 'path' is followed and no write has broken it.
+    // Whether the narrowing of 'path' is followed and no back edge has broken it.
     protected holds(NarrowingPath path) -> bool {
         return this.held.get(path) != null && this.broken.get(path) == null;
     }
 
-    // After the write 'end' to or under the local or parameter 'root', widens each narrowing under it to
-    // the type a proof now gives it where that type is wider, and marks it broken by the write where no
-    // proof of a related type holds any more. Returns whether any changed.
-    protected follow(BodyChecker checker, LocalBinding root, NarrowingEnd end) -> bool {
-        let paths = this.rootPaths.get(root);
-        if (paths == null) {
-            return false;
-        }
+    // Widens each narrowing it follows to the proof 'reached' holds for it at a back edge where that proof
+    // is wider, and marks it broken where 'reached' holds no proof of a related type, each with the write
+    // that left that proof or ended it. A write the start of the loop written at 'loop' names is not one of
+    // the pass, so what it explains changes nothing. Returns whether any changed.
+    protected follow(BodyChecker checker, BranchNarrowings reached, Span loop) -> bool {
         bool changed = false;
-        for (let path in paths) {
+        for (let path in this.held.keys()) {
             let held = this.held.get(path);
             if (held == null || this.broken.get(path) != null) {
                 continue;
             }
-            let proven = checker.narrowing().provenType(path);
+            let proven = reached.proofs.get(path);
             Type? kept = null;
             if (proven != null) {
                 kept = joinedProof(checker, path, held, proven);
             }
+            if (kept == held) {
+                continue;
+            }
+            let write = proven == null ? reached.ends.get(path) : reached.writes.get(path);
+            if (write != null && write.loop() == loop) {
+                continue;
+            }
+            changed = true;
             if (kept == null) {
-                this.broken.set(path, end);
-                changed = true;
-            } else if (kept != held) {
-                this.held.set(path, kept);
-                if (this.widened.get(path) == null) {
-                    this.widened.set(path, end);
-                }
-                changed = true;
+                this.broken.set(path, write ?? new NarrowingEnd(NarrowingEndKind.Assigned, loop, null, "",
+                    rootName(path), null));
+                continue;
+            }
+            this.held.set(path, kept);
+            if (write != null) {
+                this.widened.set(path, write);
+            } else {
+                this.widened.remove(path);
             }
         }
         return changed;
     }
 }
 
-// What reaches the ends of one pass through the loop being walked: what holds at each 'continue'. A 'for'
-// loop's update runs from what holds at the end of the body and at each 'continue'.
+// What reaches the ends of one pass through the loop being walked: the names of the locals and parameters
+// its condition writes, and where 'joins' says what holds after the loop can differ from where it starts,
+// what holds where it starts, where its condition is tested false, null where it never is, at each back
+// edge to its start and at each 'break'. A 'for' loop's update runs from what holds at the end of the body
+// and at each 'continue', and 'updateReached' says a pass reaches it.
 public final class LoopFlow {
+    protected Set<string> conditionWrites;
+    protected bool joins;
+    protected Map<NarrowingPath, Type> entry;
+    protected BranchNarrowings? exit;
+    protected List<BranchNarrowings> backEdges;
     protected List<BranchNarrowings> continues;
+    protected List<BranchNarrowings> breaks;
+    protected bool updateReached;
 
-    protected constructor() {
+    protected constructor(this.conditionWrites, this.joins) {
+        this.entry = new Map<NarrowingPath, Type>();
+        this.exit = null;
+        this.backEdges = new List<BranchNarrowings>();
         this.continues = new List<BranchNarrowings>();
+        this.breaks = new List<BranchNarrowings>();
+        this.updateReached = false;
     }
 }
 
@@ -1225,12 +1267,51 @@ currentFlow(BodyChecker checker) -> LoopFlow? {
     return flows.get(flows.length() - 1);
 }
 
-// Records what holds at a 'continue' in the loop whose pass it ends. A path that has already ended
-// reaches none.
-public noteContinue(BodyChecker checker) {
+// Records what holds where the condition of the loop being walked is tested false, which leaves the loop,
+// unless 'alwaysHolds' says it never is. A for-in loop has no condition, and it leaves where a pass starts.
+public noteLoopCondition(BodyChecker checker, bool alwaysHolds) {
+    let flows = checker.loopFlows();
+    if (flows.isEmpty()) {
+        return;
+    }
+    let flow = flows.get(flows.length() - 1);
+    if (flow.joins && !alwaysHolds) {
+        flow.exit = branchNarrowings(checker);
+    }
+}
+
+// Records what holds at a 'continue', or with 'leaves' at a 'break', in the loop whose pass it ends. A
+// path that has already ended reaches neither.
+public noteLoopExit(BodyChecker checker, bool leaves) {
     let flow = currentFlow(checker);
-    if (flow != null && !checker.assignment().terminated()) {
+    if (flow == null || checker.assignment().terminated()) {
+        return;
+    }
+    if (leaves) {
+        if (flow.joins) {
+            flow.breaks.push(branchNarrowings(checker));
+        }
+    } else {
         flow.continues.push(branchNarrowings(checker));
+    }
+}
+
+// Walks the body of a 'while' or a for-in loop under the facts its condition proves, and records what
+// holds where the pass ends as its back edges.
+public walkLoopBody(BodyChecker checker, BlockNode body, List<NarrowingFact> facts) {
+    checker.enterScope();
+    applyFacts(checker, facts);
+    checker.walkBlock(body);
+    endPass(checker);
+    checker.leaveScope();
+}
+
+// Records what holds at the end of the body of the loop being walked and at each 'continue' as the back
+// edges of the pass.
+public endPass(BodyChecker checker) {
+    let flow = currentFlow(checker);
+    if (flow != null && flow.joins) {
+        flow.backEdges = passEnds(checker, flow);
     }
 }
 
@@ -1241,8 +1322,19 @@ public joinPassEnds(BodyChecker checker) {
     if (flow == null) {
         return;
     }
-    applyNarrowingJoin(checker, checker.narrowing().flatten(), passEnds(checker, flow), "'continue'",
+    let ends = passEnds(checker, flow);
+    flow.updateReached = !ends.isEmpty();
+    applyNarrowingJoin(checker, checker.narrowing().flatten(), ends, "'continue'",
         "a pass that ends with 'continue'");
+}
+
+// Records what holds after the update of the 'for' loop being walked as the back edge of the pass, where
+// a pass reaches the update and, as 'neverReturns' says, the update returns.
+public endUpdate(BodyChecker checker, bool neverReturns) {
+    let flow = currentFlow(checker);
+    if (flow != null && flow.joins && flow.updateReached && !neverReturns) {
+        flow.backEdges.push(branchNarrowings(checker));
+    }
 }
 
 // What holds at the end of the body of the loop of 'flow', where a pass reaches it, and at each 'continue'.
@@ -1255,19 +1347,87 @@ passEnds(BodyChecker checker, LoopFlow flow) -> List<BranchNarrowings> {
     return ends;
 }
 
-// Walks one pass through a loop with 'walk', with a flow of its own for what reaches its ends.
-walkPass(BodyChecker checker, (BodyChecker) -> void walk) {
-    let flow = new LoopFlow();
+// Walks one pass through 'loop' with 'walk' and returns what reached its ends, where 'watched' says the
+// pass watches a narrowing the loop can write. Where it watches none and the condition writes nothing and
+// can be false, what holds after the loop is what holds where it starts, so nothing is kept for a join.
+walkPass(BodyChecker checker, SyntaxNode loop, (BodyChecker) -> void walk, bool watched) -> LoopFlow {
+    let condition = loopCondition(loop);
+    let conditionWrites = condition == null ? new Set<string>() : conditionWriteNames(checker, condition);
+    let flow = new LoopFlow(conditionWrites,
+        watched || !conditionWrites.isEmpty() || !leavesAtCondition(loop, condition));
+    if (flow.joins) {
+        flow.entry = checker.narrowing().flatten();
+    }
     checker.loopFlows().push(flow);
     walk(checker);
     checker.loopFlows().pop();
+    return flow;
+}
+
+// The condition of the 'while' or 'for' loop 'loop', or null where it has none.
+loopCondition(SyntaxNode loop) -> Expression? {
+    switch (loop) {
+        is WhileStatementNode node -> {
+            return node.condition();
+        },
+        is ForStatementNode node -> {
+            return node.condition();
+        },
+        default -> {
+            return null;
+        },
+    }
+}
+
+// Whether a pass through 'loop', whose condition is 'condition', can leave it where the condition is tested
+// false, or for a for-in loop where the pass starts.
+leavesAtCondition(SyntaxNode loop, Expression? condition) -> bool {
+    return loop is ForEachStatementNode || !flow.loopConditionAlwaysHolds(condition);
+}
+
+// What holds where the condition of a loop is tested false after the back edge 'reached': what 'reached'
+// holds, but for the places under the locals and parameters 'written' names, which the condition writes,
+// what 'exit', where the condition was tested false on the pass, holds.
+conditionRun(BranchNarrowings reached, BranchNarrowings exit, Set<string> written) -> BranchNarrowings {
+    if (written.isEmpty()) {
+        return reached;
+    }
+    let run = new BranchNarrowings(new Map<NarrowingPath, Type>(), new Map<NarrowingPath, NarrowingEnd>(),
+        new Map<NarrowingPath, NarrowingEnd>());
+    copyPlaces(reached, written, false, run);
+    copyPlaces(exit, written, true, run);
+    return run;
+}
+
+// Copies into 'into' what 'from' holds for the places under the locals and parameters 'written' names, or
+// with 'under' false for every other place.
+copyPlaces(BranchNarrowings from, Set<string> written, bool under, BranchNarrowings into) {
+    for (let path in from.proofs.keys()) {
+        let proven = from.proofs.get(path);
+        if (proven != null && written.contains(rootName(path)) == under) {
+            into.proofs.set(path, proven);
+        }
+    }
+    for (let path in from.writes.keys()) {
+        let write = from.writes.get(path);
+        if (write != null && written.contains(rootName(path)) == under) {
+            into.writes.set(path, write);
+        }
+    }
+    for (let path in from.ends.keys()) {
+        let end = from.ends.get(path);
+        if (end != null && written.contains(rootName(path)) == under) {
+            into.ends.set(path, end);
+        }
+    }
 }
 
 // A plain '=' in a pass over the loops being settled that stores a local or a parameter into another
 // one, where what the source holds is what a loop starts it with or what an earlier such copy stored.
-// It is kept with the type it stores, the watches that still hold a narrowing of its target after it
-// and the copies that read what it stored, so the passes learn at once what a change to the source does
-// along the copies. 'statement' is the statement it makes up the whole of, directly in a block.
+// It is kept with the type it stores, the watches of the loops whose back edges the value it stores
+// reaches with a narrowing of its target, and the copies that read what it stored, so the passes learn at
+// once what a change to the source does along the copies. 'statement' is the statement it makes up the
+// whole of, directly in a block.
 final class LoopCopy {
     protected NarrowingPath target;
     protected Type declared;
@@ -1309,7 +1469,7 @@ final class CopyUpdate {
 }
 
 // What the passes over one loop have learned about where it starts: the type each narrowing it watches
-// keeps there and the ones it drops, with the first write that widens or breaks each. Each pass over an
+// keeps there and the ones it drops, with the write that first widens or breaks each. Each pass over an
 // enclosing loop declares the locals inside that loop again, so a narrowing is found by where its path
 // is declared, and what is learned is kept under the first path learned for that declaration.
 final class LoopStart {
@@ -1412,13 +1572,15 @@ rootName(NarrowingPath path) -> string {
 
 // What the passes over a loop and the loops inside it have learned about where each loop a pass reaches
 // starts, which is final once 'settled', and what the pass being made has seen: what last changed the
-// proofs of each local and parameter, and the copies, in the order it made them.
+// proofs of each local and parameter, and the copies, in the order it made them and by where each is
+// written.
 public final class LoopSettlement {
     protected Map<GreenNode, LoopStart> starts;
     protected bool changed;
     protected bool settled;
     protected Map<NarrowingPath, LoopTouch> touches;
     protected List<LoopCopy> copies;
+    protected Map<long, LoopCopy> copiesAt;
 
     protected constructor() {
         this.starts = new Map<GreenNode, LoopStart>();
@@ -1426,6 +1588,7 @@ public final class LoopSettlement {
         this.settled = false;
         this.touches = new Map<NarrowingPath, LoopTouch>();
         this.copies = new List<LoopCopy>();
+        this.copiesAt = new Map<long, LoopCopy>();
     }
 }
 
@@ -1457,31 +1620,25 @@ public loopParts(SyntaxNode loop) -> List<SyntaxNode> {
     return parts;
 }
 
-// Analyzes 'loop' with 'walk', starting it with the narrowings every write in it proves again, which
-// trial passes find by watching the writes until a pass changes nothing. The loops inside it are
-// settled by the same passes, so a pass analyzes each of them once. A loop those passes never reach,
-// such as one in a lambda that a trial does not check, is settled on its own. A write in the loop that
-// ended a proof is recorded as one in the loop, for a read after it.
-public settleLoop(BodyChecker checker, SyntaxNode loop, (BodyChecker) -> void walk) {
-    passLoops(checker, loop, walk);
-    markLoopEnds(checker, loop);
-}
-
-passLoops(BodyChecker checker, SyntaxNode loop, (BodyChecker) -> void walk) {
+// Analyzes 'loop' with 'walk', starting it with the narrowings that every back edge to its start proves
+// again, which trial passes find by following what reaches the back edges until a pass changes nothing.
+// The loops inside it are settled by the same passes, so a pass analyzes each of them once. A loop those
+// passes never reach, such as one in a lambda that a trial does not check, is settled on its own. Returns
+// what reached the ends of the pass that analyzed it, which leaveLoop installs after the loop.
+public settleLoop(BodyChecker checker, SyntaxNode loop, (BodyChecker) -> void walk) -> LoopFlow {
     let enclosing = checker.loopSettlement();
     if (enclosing != null && (!enclosing.settled || enclosing.starts.get(loop.green()) != null)) {
-        passLoop(checker, enclosing, loop, walk);
-        return;
+        return passLoop(checker, enclosing, loop, walk);
     }
     let settlement = new LoopSettlement();
     if (startLoop(checker, settlement, loop).starts.isEmpty()) {
-        walkPass(checker, walk);
-        return;
+        return walkPass(checker, loop, walk, false);
     }
     while (true) {
         settlement.changed = false;
         settlement.touches = new Map<NarrowingPath, LoopTouch>();
         settlement.copies = new List<LoopCopy>();
+        settlement.copiesAt = new Map<long, LoopCopy>();
         let trial = checker.trial();
         trial.setLoopSettlement(settlement);
         passLoop(trial, settlement, loop, walk);
@@ -1493,14 +1650,52 @@ passLoops(BodyChecker checker, SyntaxNode loop, (BodyChecker) -> void walk) {
     }
     settlement.settled = true;
     checker.setLoopSettlement(settlement);
-    passLoop(checker, settlement, loop, walk);
+    let flow = passLoop(checker, settlement, loop, walk);
     checker.setLoopSettlement(enclosing);
+    return flow;
+}
+
+// Installs what holds after 'loop', from 'flow', what reached the ends of the pass that analyzed it: what
+// holds where its condition is tested false, at each 'break', and where each back edge leads, since the
+// next pass can leave there, with a place the condition writes holding what the condition stores. A proof
+// that held where the loop starts or that its condition made is dropped where a way out does not keep
+// it. A write in the loop that ended a proof is then recorded as one in the loop, for a read after it.
+public leaveLoop(BodyChecker checker, SyntaxNode loop, LoopFlow flow) {
+    string statement = loopStatement(loop);
+    if (flow.joins) {
+        let leaving = new List<BranchNarrowings>();
+        let held = checker.narrowing().flatten();
+        let proven = new Map<NarrowingPath, Type>();
+        let exit = flow.exit;
+        if (exit != null) {
+            leaving.push(exit);
+            for (let reached in flow.backEdges) {
+                leaving.push(conditionRun(reached, exit, flow.conditionWrites));
+            }
+            addProofs(proven, exit.proofs);
+        }
+        leaving.pushAll(flow.breaks);
+        addProofs(proven, held);
+        addProofs(proven, flow.entry);
+        joinNarrowings(checker, proven, held, leaving, statement, "the {statement}");
+    }
+    markLoopEnds(checker, loop);
+}
+
+// Adds to 'into' each proof 'added' holds, replacing the one 'into' holds for the same place.
+addProofs(Map<NarrowingPath, Type> into, Map<NarrowingPath, Type> added) {
+    for (let path in added.keys()) {
+        let proof = added.get(path);
+        if (proof != null) {
+            into.set(path, proof);
+        }
+    }
 }
 
 // Records each write in the parts of 'loop' each pass runs that is what ended a proof where the loop
 // ends as a write in the loop, which a read after the loop can be reached without.
 markLoopEnds(BodyChecker checker, SyntaxNode loop) {
-    string statement = loop is WhileStatementNode ? "'while' loop" : "'for' loop";
+    string statement = loopStatement(loop);
     let parts = loopParts(loop);
     let ends = checker.narrowing().ends();
     for (let path in ends.keys()) {
@@ -1517,18 +1712,23 @@ markLoopEnds(BodyChecker checker, SyntaxNode loop) {
     }
 }
 
+// The kind of statement 'loop' is, as in "'while' loop".
+loopStatement(SyntaxNode loop) -> string {
+    return loop is WhileStatementNode ? "'while' loop" : "'for' loop";
+}
+
 // Whether 'inner' lies within 'outer'.
 public within(Span inner, Span outer) -> bool {
     return inner.start >= outer.start && inner.end() <= outer.end();
 }
 
-// One pass over 'loop', which starts with what 'settlement' has learned for it. Until the passes are
-// settled, the writes in the loop are watched and what they do is learned.
-passLoop(BodyChecker checker, LoopSettlement settlement, SyntaxNode loop, (BodyChecker) -> void walk) {
+// One pass over 'loop', which starts with what 'settlement' has learned for it, and returns what reached its
+// ends. Until the passes are settled, what reaches the back edges of the pass is learned.
+passLoop(BodyChecker checker, LoopSettlement settlement, SyntaxNode loop, (BodyChecker) -> void walk)
+         -> LoopFlow {
     let watch = startLoop(checker, settlement, loop);
     if (settlement.settled) {
-        walkPass(checker, walk);
-        return;
+        return walkPass(checker, loop, walk, !watch.starts.isEmpty());
     }
     checker.loopWatches().push(watch);
     for (let path in watch.starts.keys()) {
@@ -1536,13 +1736,38 @@ passLoop(BodyChecker checker, LoopSettlement settlement, SyntaxNode loop, (BodyC
             settlement.touches.set(path, new LoopTouch(watch, null, watch.lambdaDepth));
         }
     }
-    walkPass(checker, walk);
+    let flow = walkPass(checker, loop, walk, !watch.starts.isEmpty());
     checker.loopWatches().pop();
+    for (let reached in flow.backEdges) {
+        noteCopiesReached(settlement, watch, reached);
+        if (watch.trace.follow(checker, reached, watch.span)) {
+            watch.changed = true;
+        }
+        watch.entryTrace.follow(checker, reached, watch.span);
+    }
     learnLoop(settlement, loop.green(), watch);
+    return flow;
+}
+
+// Records for each copy whose write left a proof that the back edge 'reached' of the loop of 'watch'
+// holds for a narrowing the watch still holds that the copy reaches that back edge, so a change to what
+// the copy stores changes where the loop starts.
+noteCopiesReached(LoopSettlement settlement, LoopWatch watch, BranchNarrowings reached) {
+    for (let path in watch.starts.keys()) {
+        let write = reached.writes.get(path);
+        if (write == null || !watch.trace.holds(path)) {
+            continue;
+        }
+        let copy = settlement.copiesAt.get(write.at().start);
+        if (copy != null && copy.target == path && !copy.watches.contains(watch)) {
+            copy.watches.push(watch);
+        }
+    }
 }
 
 // Starts 'loop' with what 'settlement' has learned for it, which widens or drops a narrowing it watches
-// with the write that did as what ended it, and returns the watch for a pass over it.
+// with the write that did as what ended it, recorded as a write in the loop for a read after the loop,
+// and returns the watch for a pass over it.
 startLoop(BodyChecker checker, LoopSettlement settlement, SyntaxNode loop) -> LoopWatch {
     let written = new Set<LocalBinding>();
     for (let name in loopWriteNames(checker, loop)) {
@@ -1583,20 +1808,22 @@ startLoop(BodyChecker checker, LoopSettlement settlement, SyntaxNode loop) -> Lo
             checker.narrowing().clearPath(path);
             checker.narrowing().narrow(path, start);
             if (widening != null) {
-                checker.narrowing().noteWrite(path, widening.inLoop(loop.span()).narrowedFrom(proven));
+                string statement = loopStatement(loop);
+                checker.narrowing().noteWrite(path, widening.inLoop(loop.span()).narrowedFrom(proven)
+                    .throughJoin(statement, "the {statement}"));
             }
             weakened.set(path, proven);
         }
         held.set(path, start);
     }
-    return new LoopWatch(loop.green(), held, weakened, checker.lambdaFrames().length());
+    return new LoopWatch(loop.green(), loop.span(), held, weakened, checker.lambdaFrames().length());
 }
 
-// Records in 'settlement' that a pass reached the loop 'loop', and what 'watch' saw on it: the type each
-// narrowing it watches keeps with the first write that widened it, and the ones it drops with the first
-// write that broke them. A narrowing the pass started weaker than the proof where the loop is entered is
-// named as ended by the first write of the pass that widened or broke it, so the last pass, which starts
-// the loop as it is analyzed, names those writes.
+// Records in 'settlement' that a pass reached the loop 'loop', and what 'watch' saw at its back edges: the
+// type each narrowing it watches keeps with the write that first widened it, and the ones it drops with the
+// write that first broke them. A narrowing the pass started weaker than the proof where the loop is entered
+// is named as ended by the write of the pass that widened or broke it at a back edge, so the last pass, which
+// starts the loop as it is analyzed, names those writes.
 learnLoop(LoopSettlement settlement, GreenNode loop, LoopWatch watch) {
     let learned = settlement.starts.get(loop) ?? new LoopStart();
     settlement.starts.set(loop, learned);
@@ -1631,20 +1858,6 @@ learnLoop(LoopSettlement settlement, GreenNode loop, LoopWatch watch) {
         if (end != null) {
             learned.drop(path, end);
         }
-    }
-}
-
-// Follows each narrowing under the local or parameter 'root', null for a place under neither, that a
-// loop being settled watches through the write 'end' to or under it.
-noteLoopWrite(BodyChecker checker, LocalBinding? root, NarrowingEnd end) {
-    if (root == null) {
-        return;
-    }
-    for (let watch in checker.loopWatches()) {
-        if (watch.trace.follow(checker, root, end)) {
-            watch.changed = true;
-        }
-        watch.entryTrace.follow(checker, root, end);
     }
 }
 
@@ -1719,12 +1932,8 @@ loopCopy(BodyChecker checker, Expression target, AssignmentExpressionNode? assig
     if (statement is ExpressionStatementNode && statements is ListNode && statements.parent() is BlockNode) {
         copy.statement = statement;
     }
-    for (let watch in checker.loopWatches()) {
-        if (watch.trace.holds(copy.target)) {
-            copy.watches.push(watch);
-        }
-    }
     settlement.copies.push(copy);
+    settlement.copiesAt.set(end.at().start, copy);
     return copy;
 }
 
@@ -1869,6 +2078,19 @@ public writtenRoot(BodyChecker checker, Expression target) -> LocalBinding? {
 // through it runs records for it and for each loop inside it.
 loopWriteNames(BodyChecker checker, SyntaxNode loop) -> Set<string> {
     return checker.loopWrites().get(loop.green()) ?? collectLoopNames(loop, checker.loopWrites());
+}
+
+// The names of the locals and the parameters the loop condition 'condition' may write, which one walk over
+// it records for it and for each loop inside it.
+conditionWriteNames(BodyChecker checker, Expression condition) -> Set<string> {
+    let recorded = checker.loopWrites().get(condition.green());
+    if (recorded != null) {
+        return recorded;
+    }
+    let names = new Set<string>();
+    collectWrittenNames(condition, checker.loopWrites(), names);
+    checker.loopWrites().set(condition.green(), names);
+    return names;
 }
 
 // Records in 'recorded', for 'loop' and for each loop inside it, the names of the locals and the

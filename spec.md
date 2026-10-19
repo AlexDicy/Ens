@@ -1252,9 +1252,11 @@ A call drops nothing that a stable place proved, whether the place is the call's
 A callee cannot reassign the caller's binding, the binding's own reference keeps the narrowed object alive, and no callee can write a `const` field.
 
 Inside a loop a narrowing must hold on every iteration.
-A narrowing established before the loop holds inside it when every write in the loop that could change its path, in the condition, the body or a `for` update, proves it again, as `name = "b";` proves that a `string?` local holds a `string` and `shape = new Circle();` proves that a `Shape` local holds a `Circle`.
+A narrowing established before the loop holds inside it when what each pass leaves for the next one proves it again, at the end of the body, at each `continue` and after a `for` update, as `name = "b";` proves that a `string?` local holds a `string` and `shape = new Circle();` proves that a `Shape` local holds a `Circle`.
 A write that proves only part of it keeps that part: storing a `Square` into a `Shape?` local narrowed to `Circle` leaves the local a `Shape` that is not null where the loop starts.
 Any other write, such as `name = pick();` where `pick` returns `string?`, or passing the local as `out`, drops the narrowing at the loop's entry: an earlier read in the loop would otherwise use, on the next pass, the value that write stored.
+A write after which the pass leaves the loop, by `break`, `return` or `throw`, leaves nothing for the next pass, so it does not drop the narrowing inside the loop.
+After the loop, a narrowing holds when it holds everywhere a pass can leave the loop: where the condition is false, which is after any write the condition makes, at the start of each pass of a for-in loop, and at each `break`, so `while (go) { name = "b"; }` leaves a `string?` named `name` a `string` after the loop when it was one before.
 A narrowing the loop condition or an in-body guard clause re-establishes on each iteration is unaffected, so `while (x != null)` loops and guard-narrowed loops keep working.
 
 A write to a narrowed local is checked against its declared type, not the narrowed one, so nulling out a just-checked local (`x = null`) or storing a base value over an `is`-narrowed one is allowed, and the local keeps only what the write proves.
