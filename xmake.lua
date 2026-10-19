@@ -124,6 +124,8 @@ target("ens-llvm")
                 end
             end
         end
+        local provided = {}
+        local missing = {}
         local function addPackage(package)
             local dirs = table.wrap(package:get("linkdirs"))
             for _, link in ipairs(table.wrap(package:get("links"))) do
@@ -132,6 +134,9 @@ target("ens-llvm")
                     local file = staticArchive(dirs, link)
                     if file then
                         add(file)
+                        provided[link] = true
+                    else
+                        table.insert(missing, {package = package:name(), link = link, dirs = dirs})
                     end
                 end
             end
@@ -151,6 +156,18 @@ target("ens-llvm")
         end
         for _, package in ipairs(target:orderpkgs()) do
             addPackage(package)
+        end
+        -- what `ens` links by name, through the native llvm declaration or by default.
+        local systemLibraries = {m = true, pthread = true, dl = true, rt = true, c = true}
+        for _, entry in ipairs(missing) do
+            if not provided[entry.link] and not systemLibraries[entry.link] then
+                local searched = #entry.dirs == 0
+                    and "it names no folder to find it in, as a library found on the system does"
+                    or "no static archive of it is in " .. table.concat(entry.dirs, ", ")
+                raise("package '%s' links '%s', but %s, so ens-llvm cannot hold it. Require it " ..
+                    "with 'system = false' and 'shared = false', as zlib is", entry.package,
+                    entry.link, searched)
+            end
         end
         if target:is_plat("macosx") then
             local llvm = target:toolchain("llvm")
