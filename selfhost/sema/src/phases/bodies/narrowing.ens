@@ -1440,7 +1440,7 @@ public joinPassEnds(BodyChecker checker) {
     }
     let ends = passEnds(checker, flow);
     flow.updateReached = !ends.isEmpty();
-    applyNarrowingJoin(checker, checker.narrowing().flatten(), ends, "'continue'",
+    applyNarrowingJoin(checker, checker.narrowing().flatten(), ends, "'for' loop's body",
         "before 'continue', and the update runs after each 'continue'");
 }
 
@@ -2497,6 +2497,50 @@ carriedTestRefusal(BodyChecker checker, Expression test, Expression value, Type 
     return "{refusal} {fix}";
 }
 
+// The refusal of the 'is' test 'test' of 'value' against 'target', where the class a write proved for
+// 'value' makes the test always true or always false and the declared type of 'value' does not, with that
+// write as a note, or null anywhere else. The class is the one the write stored, or where branches met
+// after writes of different classes, the class every way through them leaves.
+writtenTestRefusal(BodyChecker checker, Expression test, Expression value, Type target) -> string? {
+    let path = buildNarrowingPath(checker, value);
+    let declared = declaredSlotType(checker, value);
+    if (path == null || declared == null) {
+        return null;
+    }
+    let write = checker.narrowing().writeOf(path);
+    let proven = checker.narrowing().provenType(path);
+    if (write == null || write.loop() != null || proven == null || proven is OptionalType) {
+        return null;
+    }
+    Type core = convert.coreOf(proven);
+    Type declaredCore = convert.coreOf(declared);
+    let stored = write.stored();
+    bool storedProof = stored != null && convert.coreOf(stored) == core;
+    if (!types.isClassLike(core) || !types.isClassLike(declaredCore)
+            || hierarchy.isSubclassOrConforms(declaredCore, target) || (!storedProof && !write.inJoin())) {
+        return null;
+    }
+    string place = wording.oneLineSpelling(syntax.unwrapParentheses(value));
+    string held = "{typenames.typeArticle(checker.names().of(core))} {checker.names().quoted(core)}";
+    string reason = "the value assigned to '{place}' is {held}";
+    if (!storedProof) {
+        reason = "'{place}' is {held} after the {write.joinedStatement()}, whichever way it runs";
+    }
+    string tested = "{typenames.typeArticle(checker.names().of(target))} {checker.names().quoted(target)}";
+    string note = diagnostics.carriedNote(write.at(), "'{place}' is assigned here");
+    if (hierarchy.isSubclassOrConforms(core, target)) {
+        string refusal = "This test is always true: {reason}, so '{place}' is always {tested} here.{note}";
+        let fix = alwaysTrueTestFix(test);
+        return fix == null ? refusal : "{refusal} {fix}";
+    }
+    if (types.isInterfaceLike(core) || types.isInterfaceLike(target) || hierarchy.isSubclassOf(target, core)
+            || !hierarchy.isSubclassOf(target, declaredCore)) {
+        return null;
+    }
+    return "This test is always false: {reason}, and {checker.names().quoted(target)} does not extend "
+        + "{checker.names().quoted(core)}, so '{place}' is never {tested} here.{note}";
+}
+
 // The fix for an 'is' test that is always true where it is the whole condition of an 'if': removing
 // the test and keeping the body it guards, with its 'else' branch removed too. Null anywhere else.
 alwaysTrueTestFix(Expression test) -> string? {
@@ -2546,7 +2590,8 @@ checkClassTypeTest(BodyChecker checker, Expression test, Expression value, Type 
         return true;
     }
     if (!isCast) {
-        let carried = carriedTestRefusal(checker, test, value, target);
+        let carried = carriedTestRefusal(checker, test, value, target)
+            ?? writtenTestRefusal(checker, test, value, target);
         if (carried != null) {
             checker.reporter().report(carried, span);
             return false;
