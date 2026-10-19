@@ -83,15 +83,20 @@ target("lsp-frontend")
 
 
 -- Everything native that `ens` links, as one static archive: the linker bridge, the LLVM and lld
--- libraries it and the ens.llvm binding call, the libraries those depend on, and on Linux and
--- macOS the C++ runtime. `ens` is then one executable that needs nothing beside it, and it holds
--- one copy of LLVM. All link policy lives in selfhost/link.
+-- libraries it and the ens.llvm binding call, the libraries those depend on, the C++ runtime on
+-- Linux and macOS, and clang's builtins on Windows. `ens` is then one executable that needs
+-- nothing beside it, and it holds one copy of LLVM. All link policy lives in selfhost/link.
 target("ens-llvm")
     set_kind("static")
     set_languages("cxx17")
     set_toolchains("@llvm")
     add_files("runtime/lld/ens_lld.cpp")
     add_packages("libllvm", "libxml2", "zlib")
+    -- clang on Windows names its builtins library in every object it compiles, a file `ens` does not
+    -- link through, so the name is left out and the library is merged in below instead.
+    if is_plat("windows") then
+        add_cxxflags("-fno-rtlib-defaultlib", { force = true })
+    end
     after_link(function (target)
         local archives = {}
         local seen = {}
@@ -149,6 +154,16 @@ target("ens-llvm")
                 end
                 add(file)
             end
+        elseif target:is_plat("windows") then
+            local llvm = target:toolchain("llvm")
+            local architecture = target:is_arch("arm64") and "aarch64" or "x86_64"
+            local name = "clang_rt.builtins-" .. architecture .. ".lib"
+            local file = llvm and llvm:sdkdir() and os.files(path.join(llvm:sdkdir(), "lib",
+                "clang", "*", "lib", "windows", name))[1]
+            if not file then
+                raise("the LLVM toolchain has no '%s' to link `ens` with", name)
+            end
+            add(file)
         elseif target:is_plat("linux") then
             local compiler = target:tool("cxx")
             local printed = os.iorunv(compiler, {"-print-file-name=libstdc++.a"}):trim()
