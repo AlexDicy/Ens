@@ -84,8 +84,9 @@ target("lsp-frontend")
 
 -- Everything native that `ens` links, as one static archive: the linker bridge, the LLVM and lld
 -- libraries it and the ens.llvm binding call, the libraries those depend on, the C++ runtime on
--- Linux and macOS, and clang's builtins on Windows. `ens` is then one executable that needs
--- nothing beside it, and it holds one copy of LLVM. All link policy lives in selfhost/link.
+-- Linux and macOS, GCC's runtime library on Linux, and clang's builtins on Windows. `ens` is then
+-- one executable that needs nothing beside it, and it holds one copy of LLVM. All link policy
+-- lives in selfhost/link.
 target("ens-llvm")
     set_kind("static")
     set_languages("cxx17")
@@ -176,6 +177,11 @@ target("ens-llvm")
                 raise("'%s' has no 'libstdc++.a' to link `ens` with", compiler)
             end
             add(printed)
+            local libgcc = os.iorunv(compiler, {"-print-libgcc-file-name"}):trim()
+            if not os.isfile(libgcc) then
+                raise("'%s' has no '%s' to link `ens` with", compiler, path.filename(libgcc))
+            end
+            add(libgcc)
         end
         -- llvm-ar reads an MRI script on every platform, so one merge serves every archive format.
         -- The archive is made again from the bridge's objects each time, never from the archive a
