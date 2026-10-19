@@ -840,7 +840,7 @@ Within one platform the base names must be in the same order, because they are l
 
 The toolchain is one command, `ens`, with a subcommand for each thing it does.
 `ens help` and `ens --help` list the commands, and `ens help <command>` describes one of them along with every option it takes.
-`ens --version` prints the toolchain version, the same as `ens version`.
+`ens --version` prints the same as `ens version`.
 
 - `ens build [path]` compiles a program and writes an executable.
 - `ens check [path]` does everything a build does up to code generation and nothing after it: it reports every problem a build finds before code generation, and produces no artifact.
@@ -850,7 +850,7 @@ The toolchain is one command, `ens`, with a subcommand for each thing it does.
   Everything written after `--` is passed to the program exactly as written, and `ens run` exits with the program's exit code.
 - `ens test [path]` builds a target's tests together with its sources and runs them, as described in the section on tests.
 - `ens override add <package> <folder>`, `ens override remove <package>` and `ens override list` maintain the `ens.overrides` file beside the build root's manifest.
-- `ens version` prints the toolchain version.
+- `ens version` prints which release of Ens it is and the language version it implements, which is the version a package's `ens` declaration names, as in `ens 0.10.0-beta (language 0.1)`.
 
 The path is an `.ens` file, a folder of sources, a package folder, or a workspace root.
 With no path, the command works on the nearest package in or above the folder it was run in, found the way `git` finds a repository from a subfolder.

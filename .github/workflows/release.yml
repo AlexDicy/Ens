@@ -5,6 +5,10 @@
 # The tag is the version with a leading v, whether or not the input already wrote it. Seeds are
 # cached by tag.
 #
+# The version is written into the tree here, not by a person: every job applies the same edit to
+# the dispatched commit, and the draft job commits it as `Release vX` and tags that commit, so the
+# tag rebuilds the binaries from source alone. Each build checks its tree is the one the tag holds.
+#
 # The release is created as a draft first and each host uploads straight into it, instead of passing
 # through the artifact store.
 #
@@ -48,14 +52,34 @@ concurrency:
 jobs:
   draft:
     runs-on: ubuntu-latest
+    outputs:
+      tree: ${{ steps.release-commit.outputs.tree }}
     steps:
       - uses: actions/checkout@v4
-      - name: Open a draft release
+      - uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: '3.1.1'
+
+      - name: Write the version
+        run: xmake l scripts/set_version.lua "${TAG#v}"
+
+      # authored by whoever dispatched the release, so the history shows who cut it.
+      - name: Commit the release
+        id: release-commit
+        run: |
+          git -c user.name="${{ github.actor }}" \
+            -c user.email="${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com" \
+            commit --allow-empty -am "Release ${{ env.TAG }}"
+          echo "tree=$(git rev-parse 'HEAD^{tree}')" >> "$GITHUB_OUTPUT"
+
+      - name: Tag the release and open a draft
         if: ${{ !inputs.dry_run }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          flags=(--draft --target "$GITHUB_SHA" --title "${{ env.TAG }}" --generate-notes)
+          git tag "${{ env.TAG }}"
+          git push origin "refs/tags/${{ env.TAG }}"
+          flags=(--draft --verify-tag --title "${{ env.TAG }}" --generate-notes)
           if [ "${{ inputs.prerelease }}" = "true" ]; then
             flags+=(--prerelease)
           fi
@@ -65,6 +89,7 @@ jobs:
   # builds on linux-x64 and linked on that host. The build stops before the link, since nothing here
   # can link for another system.
   first-seed-objects:
+    needs: draft
     if: ${{ inputs.first_seed_host != '' }}
     runs-on: ubuntu-22.04
     env:
@@ -76,6 +101,15 @@ jobs:
           xmake-version: ${{ env.XMAKE_VERSION }}
           actions-cache-folder: .xmake-install
           actions-cache-key: linux-x64-${{ env.XMAKE_VERSION }}
+
+      # the edit the draft job committed, so this host builds the tree the tag holds.
+      - name: Write the version
+        shell: bash
+        run: |
+          xmake l scripts/set_version.lua "${TAG#v}"
+          git add selfhost/build/src/version.ens
+          test "$(git write-tree)" = "${{ needs.draft.outputs.tree }}" || {
+            echo "this tree is not the one the release commit holds"; exit 1; }
 
       - name: Resolve the cache key and the package folder
         id: packages
@@ -172,6 +206,15 @@ jobs:
           xmake-version: ${{ env.XMAKE_VERSION }}
           actions-cache-folder: .xmake-install
           actions-cache-key: ${{ matrix.host }}-${{ env.XMAKE_VERSION }}
+
+      # the edit the draft job committed, so this host builds the tree the tag holds.
+      - name: Write the version
+        shell: bash
+        run: |
+          xmake l scripts/set_version.lua "${TAG#v}"
+          git add selfhost/build/src/version.ens
+          test "$(git write-tree)" = "${{ needs.draft.outputs.tree }}" || {
+            echo "this tree is not the one the release commit holds"; exit 1; }
 
       # The key covers the add_requires lines only to prevent rebuilding LLVM from source for unrelated changes.
       - name: Resolve the cache key and the package folder
@@ -342,7 +385,10 @@ jobs:
     if: ${{ !cancelled() && needs.build.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
+      # the release commit, which the pull request below carries along with the new pin.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.dry_run && github.sha || env.TAG }}
       - uses: actions/download-artifact@v4
         with:
           path: ${{ runner.temp }}/digests
@@ -387,15 +433,18 @@ jobs:
         if: ${{ !inputs.dry_run }}
         with:
           token: ${{ secrets.SEED_PR_TOKEN || github.token }}
+          base: ${{ github.ref_name }}
           add-paths: seed/seed.json
           branch: seed/${{ env.TAG }}
           title: Update the bootstrap binaries to ${{ env.TAG }}
           commit-message: Update the bootstrap binaries to ${{ env.TAG }}
           body: |
-            Points `seed/seed.json` at the `${{ env.TAG }}` release, built from
-            ${{ github.sha }} on every supported host.
+            Carries the `Release ${{ env.TAG }}` commit, which writes the version into the tree,
+            and points `seed/seed.json` at the `${{ env.TAG }}` release built from it on every
+            supported host.
 
-  # Cleanup in case of failure, only a draft is deleted
+  # Cleanup in case of failure: only a draft is deleted, together with the tag it was opened on,
+  # which no pin can name yet.
   cleanup:
     needs: [draft, first-seed-objects, build, publish]
     if: ${{ (failure() || cancelled()) && !inputs.dry_run }}
@@ -409,8 +458,10 @@ jobs:
           draft="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft \
             --jq .isDraft 2>/dev/null || echo absent)"
           case "$draft" in
-            true)  echo "removing the draft $tag"
-                   gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes ;;
+            true)  echo "removing the draft $tag and its tag"
+                   gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag ;;
             false) echo "$tag is already published, leaving it" ;;
-            *)     echo "there is no $tag release to remove" ;;
+            *)     echo "there is no $tag release to remove"
+                   gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$tag" 2>/dev/null \
+                     && echo "removed the tag $tag, which no release was opened on" || true ;;
           esac
