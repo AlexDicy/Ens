@@ -61,6 +61,7 @@ import TypeTestObligation from phases.obligations;
 import List from @std.collections.list;
 import Map from @std.collections.map;
 import PriorityQueue from @std.collections.priorityqueue;
+import Set from @std.collections.set;
 import BodyChecker from phases.bodies;
 import LiteralOrigin from phases.bodies.literaltargets;
 import support.syntax;
@@ -1045,12 +1046,14 @@ renewEndsForWrite(BodyChecker checker, Expression target, NarrowingEnd end) {
 
 // The narrowings a pass over the loop 'loop' watches on the locals and parameters it may write: the type
 // each starts with and still holds with after the writes seen so far, the ones a write left without a
-// proof, the first write that widened or broke each, and whether a write changed any. The copies that
-// read a start are kept by the local they read, and 'lambdaDepth' counts the lambdas the loop is in.
+// proof, the first write that widened or broke each, and whether a write changed any. The paths are
+// also kept by the local or parameter they start at, the copies that read a start by the local they
+// read, and 'lambdaDepth' counts the lambdas the loop is in.
 public final class LoopWatch {
     protected GreenNode loop;
     protected Map<NarrowingPath, Type> starts;
     protected Map<NarrowingPath, Type> held;
+    protected Map<LocalBinding, List<NarrowingPath>> rootPaths;
     protected Map<NarrowingPath, NarrowingEnd> widened;
     protected Map<NarrowingPath, NarrowingEnd> broken;
     protected bool changed;
@@ -1060,11 +1063,17 @@ public final class LoopWatch {
     protected constructor(this.loop, Map<NarrowingPath, Type> starts, this.lambdaDepth) {
         this.starts = starts;
         this.held = new Map<NarrowingPath, Type>();
+        this.rootPaths = new Map<LocalBinding, List<NarrowingPath>>();
         for (let path in starts.keys()) {
             let start = starts.get(path);
-            if (start != null) {
-                this.held.set(path, start);
+            let root = path.root();
+            if (start == null || root == null) {
+                continue;
             }
+            this.held.set(path, start);
+            let paths = this.rootPaths.get(root) ?? new List<NarrowingPath>();
+            paths.push(path);
+            this.rootPaths.set(root, paths);
         }
         this.widened = new Map<NarrowingPath, NarrowingEnd>();
         this.broken = new Map<NarrowingPath, NarrowingEnd>();
@@ -1121,57 +1130,87 @@ final class CopyUpdate {
 // What the passes over one loop have learned about where it starts: the type each narrowing it watches
 // keeps there and the ones it drops, with the first write that widens or breaks each. Each pass over an
 // enclosing loop declares the locals inside that loop again, so a narrowing is found by where its path
-// is declared.
+// is declared, and what is learned is kept under the first path learned for that declaration.
 final class LoopStart {
     protected Map<NarrowingPath, Type> kept;
     protected Map<NarrowingPath, NarrowingEnd> widened;
     protected Map<NarrowingPath, NarrowingEnd> dropped;
+    // The first path learned for each declaration, by the name of the local or parameter it starts at.
+    Map<string, List<NarrowingPath>> learnedPaths;
 
     protected constructor() {
         this.kept = new Map<NarrowingPath, Type>();
         this.widened = new Map<NarrowingPath, NarrowingEnd>();
         this.dropped = new Map<NarrowingPath, NarrowingEnd>();
+        this.learnedPaths = new Map<string, List<NarrowingPath>>();
     }
 
     protected keptType(NarrowingPath path) -> Type? {
-        return learnedFor(this.kept, path);
+        let learned = this.learnedPath(path);
+        return learned == null ? null : this.kept.get(learned);
     }
 
     protected wideningOf(NarrowingPath path) -> NarrowingEnd? {
-        return learnedFor(this.widened, path);
+        let learned = this.learnedPath(path);
+        return learned == null ? null : this.widened.get(learned);
     }
 
     protected dropOf(NarrowingPath path) -> NarrowingEnd? {
-        return learnedFor(this.dropped, path);
+        let learned = this.learnedPath(path);
+        return learned == null ? null : this.dropped.get(learned);
     }
 
     protected keep(NarrowingPath path, Type type) {
-        this.kept.removeWhere((key, kept) -> key.sameDeclaration(path));
-        this.kept.set(path, type);
+        this.kept.set(this.learning(path), type);
     }
 
     protected widen(NarrowingPath path, NarrowingEnd end) {
-        if (this.wideningOf(path) == null) {
-            this.widened.set(path, end);
+        let learned = this.learning(path);
+        if (this.widened.get(learned) == null) {
+            this.widened.set(learned, end);
         }
     }
 
     protected drop(NarrowingPath path, NarrowingEnd end) {
-        this.kept.removeWhere((key, kept) -> key.sameDeclaration(path));
-        if (this.dropOf(path) == null) {
-            this.dropped.set(path, end);
+        let learned = this.learning(path);
+        this.kept.remove(learned);
+        if (this.dropped.get(learned) == null) {
+            this.dropped.set(learned, end);
         }
+    }
+
+    // The path learned first for the declaration of 'path', or null where none is.
+    learnedPath(NarrowingPath path) -> NarrowingPath? {
+        let paths = this.learnedPaths.get(rootName(path));
+        if (paths == null) {
+            return null;
+        }
+        for (let learned in paths) {
+            if (learned.sameDeclaration(path)) {
+                return learned;
+            }
+        }
+        return null;
+    }
+
+    // The path to learn something for the declaration of 'path' under: the one learned first, or 'path'.
+    learning(NarrowingPath path) -> NarrowingPath {
+        let learned = this.learnedPath(path);
+        if (learned != null) {
+            return learned;
+        }
+        string name = rootName(path);
+        let paths = this.learnedPaths.get(name) ?? new List<NarrowingPath>();
+        paths.push(path);
+        this.learnedPaths.set(name, paths);
+        return path;
     }
 }
 
-// What 'learned' holds for the path declared where 'path' is, or null where it holds nothing for it.
-learnedFor<V>(Map<NarrowingPath, V> learned, NarrowingPath path) -> V? {
-    for (let key in learned.keys()) {
-        if (key.sameDeclaration(path)) {
-            return learned.get(key);
-        }
-    }
-    return null;
+// The name of the local or parameter 'path' starts at, or empty where it starts at a field.
+rootName(NarrowingPath path) -> string {
+    let root = path.root();
+    return root == null ? "" : root.name();
 }
 
 // What the passes over a loop and the loops inside it have learned about where each loop a pass reaches
@@ -1310,7 +1349,7 @@ passLoop(BodyChecker checker, LoopSettlement settlement, SyntaxNode loop, (BodyC
 // Starts 'loop' with what 'settlement' has learned for it, which widens or drops a narrowing it watches
 // with the write that did as what ended it, and returns the narrowings it watches with their types.
 startLoop(BodyChecker checker, LoopSettlement settlement, SyntaxNode loop) -> Map<NarrowingPath, Type> {
-    let written = new List<LocalBinding>();
+    let written = new Set<LocalBinding>();
     for (let name in loopWriteNames(checker, loop)) {
         addWrittenName(checker, name, written);
     }
@@ -1391,9 +1430,13 @@ noteLoopWrite(BodyChecker checker, LocalBinding? root, NarrowingEnd end) {
         return;
     }
     for (let watch in checker.loopWatches()) {
-        for (let path in watch.held.keys()) {
+        let paths = watch.rootPaths.get(root);
+        if (paths == null) {
+            continue;
+        }
+        for (let path in paths) {
             let held = watch.held.get(path);
-            if (path.root() != root || held == null || watch.broken.get(path) != null) {
+            if (held == null || watch.broken.get(path) != null) {
                 continue;
             }
             let proven = checker.narrowing().provenType(path);
@@ -1634,14 +1677,14 @@ public writtenRoot(BodyChecker checker, Expression target) -> LocalBinding? {
 
 // The names of the locals and the parameters 'loop' may write, which one walk over the parts each pass
 // through it runs records for it and for each loop inside it.
-loopWriteNames(BodyChecker checker, SyntaxNode loop) -> List<string> {
+loopWriteNames(BodyChecker checker, SyntaxNode loop) -> Set<string> {
     return checker.loopWrites().get(loop.green()) ?? collectLoopNames(loop, checker.loopWrites());
 }
 
 // Records in 'recorded', for 'loop' and for each loop inside it, the names of the locals and the
 // parameters it may write, and returns the names 'loop' may write.
-collectLoopNames(SyntaxNode loop, Map<GreenNode, List<string>> recorded) -> List<string> {
-    let names = new List<string>();
+collectLoopNames(SyntaxNode loop, Map<GreenNode, Set<string>> recorded) -> Set<string> {
+    let names = new Set<string>();
     for (let part in loopParts(loop)) {
         collectWrittenNames(part, recorded, names);
     }
@@ -1651,7 +1694,7 @@ collectLoopNames(SyntaxNode loop, Map<GreenNode, List<string>> recorded) -> List
 
 // Adds to 'names' each local and parameter 'node' may write by an assignment, '++', '--' or 'out'. A loop
 // inside records its own names, and its initializer or iterable is written once, outside it.
-collectWrittenNames(SyntaxNode node, Map<GreenNode, List<string>> recorded, List<string> names) {
+collectWrittenNames(SyntaxNode node, Map<GreenNode, Set<string>> recorded, Set<string> names) {
     switch (node) {
         is WhileStatementNode ignored -> {
             addNames(names, collectLoopNames(node, recorded));
@@ -1691,7 +1734,7 @@ collectWrittenNames(SyntaxNode node, Map<GreenNode, List<string>> recorded, List
             }
         },
         is OutArgumentNode outArgument -> {
-            addName(names, outArgument.name().text());
+            names.add(outArgument.name().text());
         },
         default -> { },
     }
@@ -1702,22 +1745,16 @@ collectWrittenNames(SyntaxNode node, Map<GreenNode, List<string>> recorded, List
 
 // Only a local or a parameter can be written in a loop and hold a narrowing, since a 'const'
 // field takes no write there and nothing else narrows. Parentheses name the place they hold.
-addTargetName(Expression target, List<string> names) {
+addTargetName(Expression target, Set<string> names) {
     Expression place = syntax.unwrapParentheses(target);
     if (place is IdentifierExpressionNode) {
-        addName(names, place.name().text());
+        names.add(place.name().text());
     }
 }
 
-addNames(List<string> names, List<string> added) {
+addNames(Set<string> names, Set<string> added) {
     for (let name in added) {
-        addName(names, name);
-    }
-}
-
-addName(List<string> names, string name) {
-    if (!names.contains(name)) {
-        names.push(name);
+        names.add(name);
     }
 }
 
@@ -1725,14 +1762,14 @@ addName(List<string> names, string name) {
 // scope, since the loop is not analyzed yet, and resolving one is not a read, so no lambda captures
 // it. A 'const' local never changes, and neither does a name the scopes of the lambda being checked do
 // not declare, since that is a capture.
-addWrittenName(BodyChecker checker, string name, List<LocalBinding> written) {
+addWrittenName(BodyChecker checker, string name, Set<LocalBinding> written) {
     let current = checker.currentScope();
     if (current == null) {
         return;
     }
     let binding = current.lookup(name);
-    if (binding != null && !binding.isConst() && !written.contains(binding)) {
-        written.push(binding);
+    if (binding != null && !binding.isConst()) {
+        written.add(binding);
     }
 }
 
