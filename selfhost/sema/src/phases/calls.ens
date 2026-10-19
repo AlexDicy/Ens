@@ -24,8 +24,9 @@ import PrimitiveKind from model.types;
 import List from @std.collections.list;
 
 // What an argument fits a parameter by: its type, or for an argument that names no type of its own,
-// what is written. A struct literal fits every parameter until a candidate is chosen, and a value
-// that never returns fits every parameter, since nothing ever reads it.
+// what is written. A '{...}' literal fits only a struct parameter, a value that never returns fits
+// every parameter, since nothing ever reads it, and a '?:' or a switch holding a value with no type of
+// its own fits as well as its least fitting value.
 public enum ArgumentShape {
     Typed,
     Lambda,
@@ -33,6 +34,7 @@ public enum ArgumentShape {
     ArrayLiteral,
     StructLiteral,
     NeverReturning,
+    Join,
 }
 
 // One analyzed call argument. The literal facts carry what conversionRank reads about
@@ -51,11 +53,12 @@ public class ArgumentValue {
     double floatLiteralMagnitude;
 
     ArgumentShape argumentShape;
-    // The parameter counts a lambda or a name fits, and the elements of an array literal with the type
-    // the literal has when it is written alone.
+    // The parameter counts a lambda or a name fits, the elements of an array literal with the type the
+    // literal has when it is written alone, and the values of a '?:' or a switch with what it is called.
     long[] parameterCounts;
     ArgumentValue[] elementValues;
     Type? typeAlone;
+    string joinWord;
     string? writtenSpelling;
     bool withoutEffects;
 
@@ -75,6 +78,7 @@ public class ArgumentValue {
         this.parameterCounts = [];
         this.elementValues = [];
         this.typeAlone = null;
+        this.joinWord = "";
         this.writtenSpelling = null;
         this.withoutEffects = false;
     }
@@ -117,6 +121,14 @@ public class ArgumentValue {
         this.markShape(ArgumentShape.StructLiteral);
     }
 
+    // A '?:' or a switch, as 'word' calls it, whose values are 'values', one of which has no type of its
+    // own.
+    public markJoin(ArgumentValue[] values, string word) {
+        this.markShape(ArgumentShape.Join);
+        this.elementValues = values;
+        this.joinWord = word;
+    }
+
     public markNeverReturning() {
         this.argumentShape = ArgumentShape.NeverReturning;
     }
@@ -132,6 +144,11 @@ public class ArgumentValue {
 
     public aloneType() -> Type? {
         return this.typeAlone;
+    }
+
+    // What a '?:' or a switch argument is called in a refusal: "'?:'" or "switch".
+    protected joinName() -> string {
+        return this.joinWord;
     }
 
     protected takesParameterCount(long count) -> bool {
@@ -669,6 +686,16 @@ public conversionRank(ArgumentValue argument, Type parameterType, bool byElement
         StructLiteral -> {
             return structLiteralRank(parameterType);
         },
+        Join -> {
+            long fit = 3;
+            for (let value in argument.elements()) {
+                long rank = conversionRank(value, parameterType, byElements);
+                if (rank < fit) {
+                    fit = rank;
+                }
+            }
+            return fit;
+        },
         default -> { },
     }
     Type argumentType = argument.type();
@@ -967,7 +994,9 @@ public noMatchMessage(List<CallCandidate> candidates, CallShape shape, string di
     }
     let typed = new List<string>();
     let described = new List<string>();
+    let placed = new List<string>();
     bool untyped = false;
+    bool joined = false;
     for (long i = 0; i < count; i++) {
         let argument = shape.argumentAt(i);
         string text = argumentText(argument, names);
@@ -977,10 +1006,17 @@ public noMatchMessage(List<CallCandidate> candidates, CallShape shape, string di
         } else {
             untyped = true;
         }
+        joined = joined || argument.shape() == ArgumentShape.Join;
         described.push(text);
+        placed.push("{argumentPosition(argument, i)} is {text}");
     }
     if (count == 1) {
         return "{declared} takes {described.get(0)}. {listing} Change the argument to match one of them.";
+    }
+    if (joined) {
+        string last = placed.pop();
+        return "{declared} takes these arguments: {string.joined(placed.toArray(), ", ")}, and {last}. "
+            + "{listing} Change the arguments to match one of them.";
     }
     if (untyped) {
         return "{declared} takes {diagnostics.andJoined(described.toArray())}. {listing} Change the "
@@ -1056,7 +1092,9 @@ soleCountRefusal(List<CallCandidate> candidates, CallShape shape, string display
             noun = "constructor of '{displayName}'";
         }
         string passed = "has type {argumentText(argument, names)}";
-        if (argument.shape() != ArgumentShape.Typed && argument.aloneType() == null) {
+        if (argument.shape() == ArgumentShape.Join) {
+            passed = "is {joinText(argument, names, wanted)}";
+        } else if (argument.shape() != ArgumentShape.Typed && argument.aloneType() == null) {
             passed = "is {argumentText(argument, names)}";
         }
         string taken = "{typenames.typeArticle(names.of(wanted))} {names.quoted(wanted)}";
@@ -1069,10 +1107,25 @@ soleCountRefusal(List<CallCandidate> candidates, CallShape shape, string display
 }
 
 // Why a lambda, an array literal or a '{...}' literal does not fit the parameter type 'wanted', opening
-// with a comma, or empty for any other argument.
+// with a comma, or empty for any other argument. For a '?:' or a switch, it is why its values that do not
+// fit do not, where that is the same for each of them.
 shapeMismatch(ArgumentValue argument, Type wanted) -> string {
     Type core = convert.coreOf(wanted);
     switch (argument.shape()) {
+        Join -> {
+            string? reason = null;
+            for (let value in argument.elements()) {
+                if (conversionRank(value, wanted, true) > 0) {
+                    continue;
+                }
+                string mismatch = shapeMismatch(value, wanted);
+                if (reason != null && reason != mismatch) {
+                    return "";
+                }
+                reason = mismatch;
+            }
+            return reason ?? "";
+        },
         Lambda -> {
             if (core is FunctionType) {
                 long taken = core.parameterTypes().length;
@@ -1125,10 +1178,32 @@ argumentText(ArgumentValue argument, TypeNames names) -> string {
         NeverReturning -> {
             return "a value that never returns";
         },
+        Join -> {
+            return joinText(argument, names, null);
+        },
         Typed -> {
             return names.quoted(argument.type());
         },
     }
+}
+
+// The '?:' or switch 'argument' as a refusal names it, with the values it gives: every one of them, or
+// with 'wanted' only those that do not fit that type.
+joinText(ArgumentValue argument, TypeNames names, Type? wanted) -> string {
+    let described = new List<string>();
+    for (let value in argument.elements()) {
+        if (wanted != null && conversionRank(value, wanted, true) > 0) {
+            continue;
+        }
+        string text = argumentText(value, names);
+        if (value.shape() == ArgumentShape.Typed) {
+            text = "a value of type {text}";
+        }
+        if (!described.contains(text)) {
+            described.push(text);
+        }
+    }
+    return "a {argument.joinName()} that gives {diagnostics.andJoined(described.toArray(), "or")}";
 }
 
 // The refusal of a call that several declarations accept equally well. The fix converts every
@@ -1292,6 +1367,7 @@ localsFix(List<long> differing, ViableCandidate first, CallShape shape, TypeName
         Lambda -> "the lambda",
         ArrayLiteral -> "the array",
         StructLiteral -> "the struct",
+        Join -> "the {argument.joinName()}",
         default -> "argument {index + 1}",
     };
     string? spelled = argument.spelling();
