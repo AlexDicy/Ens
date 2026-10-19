@@ -92,10 +92,15 @@ target("ens-llvm")
     set_toolchains("@llvm")
     add_files("runtime/lld/ens_lld.cpp")
     add_packages("libllvm", "libxml2", "zlib")
-    -- clang on Windows names its builtins library in every object it compiles, a file `ens` does not
-    -- link through, so the name is left out and the library is merged in below instead.
+    -- For a target that names a C runtime, xmake has clang on Windows write a reference to clang's
+    -- builtins library into every object, by a path relative to clang's own folders, which `ens`
+    -- does not link through. So this target names no runtime and gives clang the static one
+    -- itself, and the builtins library is merged in below.
     if is_plat("windows") then
-        add_cxxflags("-fno-rtlib-defaultlib", { force = true })
+        add_cxxflags("-fms-runtime-lib=static", { force = true })
+        on_load(function (target)
+            target:set("runtimes", nil)
+        end)
     end
     after_link(function (target)
         local archives = {}
