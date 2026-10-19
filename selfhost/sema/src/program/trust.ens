@@ -17,6 +17,8 @@ import Map from @std.collections.map;
 // What a program's parse leaves worth analyzing.
 export final class ProgramTrust {
     bool programAnalyzable;
+    // The declarations whose diagnostics are dropped, by file, in the order they start and none inside
+    // another.
     Map<string, Span[]> quietPerFile;
 
     protected constructor(bool analyzable, Map<string, Span[]> quiet) {
@@ -39,12 +41,19 @@ export final class ProgramTrust {
         if (declarations == null) {
             return false;
         }
-        for (let declaration in declarations) {
-            if (span.start >= declaration.start && span.start < declaration.end()) {
-                return true;
+        long low = 0;
+        long high = declarations.length - 1;
+        long found = -1;
+        while (low <= high) {
+            long middle = (low + high) / 2;
+            if (declarations[middle].start <= span.start) {
+                found = middle;
+                low = middle + 1;
+            } else {
+                high = middle - 1;
             }
         }
-        return false;
+        return found >= 0 && span.start < declarations[found].end();
     }
 }
 
@@ -68,9 +77,32 @@ export assess(GraphResult graphResult) -> ProgramTrust {
         if (!verdict.confined) {
             analyzable = false;
         }
-        quiet.set(module.filePath(), verdict.quiet.toArray());
+        quiet.set(module.filePath(), outermost(verdict.quiet));
     }
     return new ProgramTrust(analyzable, quiet);
+}
+
+// The spans of 'spans' that no other one holds, in the order they start.
+outermost(List<Span> spans) -> Span[] {
+    let ordered = spans.sorted((first, second) -> spanOrder(first, second));
+    let kept = new List<Span>();
+    for (let span in ordered) {
+        if (kept.isEmpty() || span.end() > kept.last().end()) {
+            kept.push(span);
+        }
+    }
+    return kept.toArray();
+}
+
+// Whether 'first' comes before 'second': by where they start, then the wider first.
+spanOrder(Span first, Span second) -> int {
+    if (first.start != second.start) {
+        return first.start < second.start ? -1 : 1;
+    }
+    if (first.length != second.length) {
+        return first.length > second.length ? -1 : 1;
+    }
+    return 0;
 }
 
 // One file's verdict: whether every guess in it stayed inside a body, and the declarations owning
@@ -87,7 +119,7 @@ class FileVerdict {
 
 assessFile(ParseResult parsed) -> FileVerdict {
     let walk = new BodyWalk();
-    walk.visit(parsed.root(), 0, null, null);
+    walk.visit(parsed.root(), 0, null, -1);
     bool confined = walk.errorNodesConfined;
     for (let recovery in parsed.recoveries()) {
         if (recovery.scope() == RecoveryScope.File) {
@@ -104,17 +136,19 @@ assessFile(ParseResult parsed) -> FileVerdict {
     return new FileVerdict(confined, walk.quiet);
 }
 
-// The interior of one block whose '{' the source wrote, and the declaration owning it.
+// The interior of one block whose '{' the source wrote, the declaration owning it, and the index of the
+// body around it, or -1 where none is.
 class BodyRegion {
     protected Span interior;
     protected Span owner;
+    protected long enclosing;
 
-    protected constructor(this.interior, this.owner);
+    protected constructor(this.interior, this.owner, this.enclosing);
 }
 
-// One pass over the green tree: the bodies a guess can hide in, and whether every error node is
-// in one. An error node is a region the parser skipped rather than a token it invented, so the tree
-// carries it instead of the recovery list.
+// One pass over the green tree: the bodies a guess can hide in, in the order their blocks start, and
+// whether every error node is in one. An error node is a region the parser skipped rather than a token
+// it invented, so the tree carries it instead of the recovery list.
 class BodyWalk {
     List<BodyRegion> bodies;
     protected List<Span> quiet;
@@ -126,15 +160,16 @@ class BodyWalk {
         this.errorNodesConfined = true;
     }
 
-    protected visit(GreenElement element, long fullStart, Span? declaration, Span? bodyOwner) {
+    // Visits 'element', inside the body at the index 'body' of the bodies, or -1 for none.
+    protected visit(GreenElement element, long fullStart, Span? declaration, long body) {
         if (!(element is GreenNode)) {
             return;
         }
         if (kind.isErrorKind(element.kind())) {
-            if (bodyOwner == null) {
+            if (body < 0) {
                 this.errorNodesConfined = false;
             } else {
-                this.quiet.push(bodyOwner);
+                this.quiet.push(this.bodies.get(body).owner);
             }
             return;
         }
@@ -142,12 +177,12 @@ class BodyWalk {
         if (ownsBodies(element.kind())) {
             owning = source.makeSpan(fullStart, element.fullLength());
         }
-        Span? inside = bodyOwner;
+        long inside = body;
         if (element.kind() == SyntaxKind.Block && owning != null) {
             let interior = soundInterior(element, fullStart);
             if (interior != null) {
-                this.bodies.push(new BodyRegion(interior, owning));
-                inside = owning;
+                inside = this.bodies.length();
+                this.bodies.push(new BodyRegion(interior, owning, body));
             }
         }
         long offset = fullStart;
@@ -160,22 +195,29 @@ class BodyWalk {
         }
     }
 
-    // The declaration owning the narrowest body holding this offset, or null when no body does.
+    // The declaration owning the narrowest body holding this offset, or null when no body does. That
+    // body is the last one to start at or before the offset, or a body around it.
     protected ownerAt(long offset) -> Span? {
-        Span? owner = null;
-        long narrowest = -1;
-        for (long i = 0; i < this.bodies.length(); i++) {
-            let body = this.bodies.get(i);
-            if (offset < body.interior.start || offset > body.interior.end()) {
-                continue;
-            }
-            long width = body.interior.end() - body.interior.start;
-            if (narrowest < 0 || width < narrowest) {
-                narrowest = width;
-                owner = body.owner;
+        long low = 0;
+        long high = this.bodies.length() - 1;
+        long found = -1;
+        while (low <= high) {
+            long middle = (low + high) / 2;
+            if (this.bodies.get(middle).interior.start <= offset) {
+                found = middle;
+                low = middle + 1;
+            } else {
+                high = middle - 1;
             }
         }
-        return owner;
+        while (found >= 0) {
+            let body = this.bodies.get(found);
+            if (offset <= body.interior.end()) {
+                return body.owner;
+            }
+            found = body.enclosing;
+        }
+        return null;
     }
 }
 
