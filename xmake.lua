@@ -3,9 +3,10 @@ add_rules("plugin.vsxmake.autoupdate")
 
 add_requires("llvm 21.1.0")
 add_requires("libllvm 21.1.0", { configs = { lld = true, clang = false, target_x86 = true, target_aarch64 = true } })
--- LLVM finds zlib wherever the machine keeps it, so ens-llvm links a copy built here instead, and
--- `ens` does not load whichever one a machine happens to have.
+-- LLVM finds zlib and zstd wherever the machine keeps them, so ens-llvm links copies built here
+-- instead, and `ens` does not load whichever ones a machine happens to have.
 add_requires("zlib v1.3.2", { system = false, configs = { shared = false, runtimes = "MT" } })
+add_requires("zstd v1.5.7", { system = false, configs = { shared = false, runtimes = "MT" } })
 add_requires("libxml2 v2.14.3", { configs = { runtimes = "MT" } })
 add_requires("lsp-framework 1.3.1", { configs = { runtimes = "MT" } })
 
@@ -92,7 +93,7 @@ target("ens-llvm")
     set_languages("cxx17")
     set_toolchains("@llvm")
     add_files("runtime/lld/ens_lld.cpp")
-    add_packages("libllvm", "libxml2", "zlib")
+    add_packages("libllvm", "libxml2", "zlib", "zstd")
     -- For a target that names a C runtime, xmake has clang on Windows write a reference to clang's
     -- builtins library into every object, by a path relative to clang's own folders, which `ens`
     -- does not link through. xmake's rules give a target that names none the dynamic runtime while
