@@ -95,11 +95,12 @@ target("ens-llvm")
     add_packages("libllvm", "libxml2", "zlib")
     -- For a target that names a C runtime, xmake has clang on Windows write a reference to clang's
     -- builtins library into every object, by a path relative to clang's own folders, which `ens`
-    -- does not link through. So this target names no runtime and gives clang the static one
-    -- itself, and the builtins library is merged in below.
+    -- does not link through. xmake's rules give a target that names none the dynamic runtime while
+    -- it is configured, so the runtime is cleared after them, clang is given the static one itself,
+    -- and the builtins library is merged in below.
     if is_plat("windows") then
         add_cxxflags("-fms-runtime-lib=static", { force = true })
-        on_load(function (target)
+        on_config(function (target)
             target:set("runtimes", nil)
         end)
     end
