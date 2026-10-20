@@ -262,8 +262,10 @@ public final class NarrowingLayer {
     protected Map<NarrowingPath, Type> proofs;
     protected Map<NarrowingPath, NarrowingEnd> ends;
     protected Map<NarrowingPath, NarrowingEnd> writes;
+    // Where the layer is in its state, counted from the outermost one.
+    protected long index;
 
-    protected constructor() {
+    protected constructor(this.index) {
         this.proofs = new Map<NarrowingPath, Type>();
         this.ends = new Map<NarrowingPath, NarrowingEnd>();
         this.writes = new Map<NarrowingPath, NarrowingEnd>();
@@ -275,7 +277,7 @@ public final class NarrowingLayer {
     }
 
     protected copy() -> NarrowingLayer {
-        let copied = new NarrowingLayer();
+        let copied = new NarrowingLayer(this.index);
         for (let key in this.proofs.keys()) {
             let proven = this.proofs.get(key);
             if (proven != null) {
@@ -301,19 +303,22 @@ public final class NarrowingLayer {
 // The proven types, one layer per branch of control flow. Establishment writes the top layer;
 // lookup prefers the innermost layer; invalidation erases from every layer, since a write inside a
 // branch may have happened by any later read, and records the write that ended each proof in the top
-// layer.
+// layer. Only the layers that have held a proof, an end or a write are read.
 public class NarrowingState {
     List<NarrowingLayer> layers;
+    // The layers that have held a proof, an end or a write since they were pushed, outermost first.
+    List<NarrowingLayer> filled;
 
     public constructor() {
         this.layers = new List<NarrowingLayer>();
-        this.layers.push(new NarrowingLayer());
+        this.layers.push(new NarrowingLayer(0));
+        this.filled = new List<NarrowingLayer>();
     }
 
     // A state whose one layer holds the proofs in 'proven'.
     public constructor(Map<NarrowingPath, Type> proven) {
         this.layers = new List<NarrowingLayer>();
-        let layer = new NarrowingLayer();
+        let layer = new NarrowingLayer(0);
         for (let key in proven.keys()) {
             let type = proven.get(key);
             if (type != null) {
@@ -321,26 +326,52 @@ public class NarrowingState {
             }
         }
         this.layers.push(layer);
+        this.filled = new List<NarrowingLayer>();
+        this.fill(0);
     }
 
     // A state with the same proofs and ends in copies of the same layers.
     public copy() -> NarrowingState {
         let copied = new NarrowingState();
         copied.layers = copyLayers(this.layers);
+        for (let layer in this.filled) {
+            copied.filled.push(copied.layers.get(layer.index));
+        }
         return copied;
     }
 
     public push() {
-        this.layers.push(new NarrowingLayer());
+        this.layers.push(new NarrowingLayer(this.layers.length()));
     }
 
     public pop() {
         if (this.layers.length() > 1) {
-            this.layers.pop();
+            this.popLayer();
         }
     }
 
+    popLayer() {
+        long top = this.layers.length() - 1;
+        if (!this.filled.isEmpty() && this.filled.last().index == top) {
+            this.filled.pop();
+        }
+        this.layers.pop();
+    }
+
+    // Records that the layer at 'index' holds a proof, an end or a write.
+    fill(long index) {
+        long at = this.filled.length();
+        while (at > 0 && this.filled.get(at - 1).index >= index) {
+            if (this.filled.get(at - 1).index == index) {
+                return;
+            }
+            at--;
+        }
+        this.filled.insert(at, this.layers.get(index));
+    }
+
     public narrow(NarrowingPath path, Type proven) {
+        this.fill(this.layers.length() - 1);
         let top = this.layers.get(this.layers.length() - 1);
         top.proofs.set(path, proven);
         top.ends.remove(path);
@@ -349,13 +380,14 @@ public class NarrowingState {
 
     // Records 'write' as the write that left the proof of 'path' made here last.
     public noteWrite(NarrowingPath path, NarrowingEnd write) {
+        this.fill(this.layers.length() - 1);
         this.layers.get(this.layers.length() - 1).writes.set(path, write);
     }
 
     // The write that left the proof of 'path' that holds here, or null where a test made it or none holds.
     public writeOf(NarrowingPath path) -> NarrowingEnd? {
-        for (long i = this.layers.length() - 1; i >= 0; i--) {
-            let layer = this.layers.get(i);
+        for (long i = this.filled.length() - 1; i >= 0; i--) {
+            let layer = this.filled.get(i);
             let write = layer.writes.get(path);
             if (write != null) {
                 return write;
@@ -371,7 +403,7 @@ public class NarrowingState {
     // finds it.
     public writes() -> Map<NarrowingPath, NarrowingEnd> {
         let found = new Map<NarrowingPath, NarrowingEnd>();
-        for (let layer in this.layers) {
+        for (let layer in this.filled) {
             if (layer.isEmpty()) {
                 continue;
             }
@@ -389,8 +421,8 @@ public class NarrowingState {
     }
 
     public provenType(NarrowingPath path) -> Type? {
-        for (long i = this.layers.length() - 1; i >= 0; i--) {
-            let found = this.layers.get(i).proofs.get(path);
+        for (long i = this.filled.length() - 1; i >= 0; i--) {
+            let found = this.filled.get(i).proofs.get(path);
             if (found != null) {
                 return found;
             }
@@ -400,8 +432,8 @@ public class NarrowingState {
 
     // The write that ended the last proof of 'path', or null where a proof holds or none was ended.
     public endOf(NarrowingPath path) -> NarrowingEnd? {
-        for (long i = this.layers.length() - 1; i >= 0; i--) {
-            let layer = this.layers.get(i);
+        for (long i = this.filled.length() - 1; i >= 0; i--) {
+            let layer = this.filled.get(i);
             if (layer.proofs.get(path) != null) {
                 return null;
             }
@@ -417,7 +449,7 @@ public class NarrowingState {
     // as endOf finds it.
     public ends() -> Map<NarrowingPath, NarrowingEnd> {
         let found = new Map<NarrowingPath, NarrowingEnd>();
-        for (let layer in this.layers) {
+        for (let layer in this.filled) {
             if (layer.isEmpty()) {
                 continue;
             }
@@ -467,8 +499,7 @@ public class NarrowingState {
     // Erases every narrowing 'cleared' accepts, and records 'end' as what ended it in the layer that held
     // it, which can outlast the branch the write is in.
     clearWhere((NarrowingPath) -> bool cleared, NarrowingEnd end) {
-        for (long i = 0; i < this.layers.length(); i++) {
-            let layer = this.layers.get(i);
+        for (let layer in this.filled) {
             if (layer.proofs.isEmpty()) {
                 continue;
             }
@@ -485,7 +516,7 @@ public class NarrowingState {
     // Replaces with 'end' the earlier write each layer records as what ended a path 'renewed' accepts
     // that holds no proof.
     renewWhere((NarrowingPath) -> bool renewed, NarrowingEnd end) {
-        for (let layer in this.layers) {
+        for (let layer in this.filled) {
             if (layer.ends.isEmpty()) {
                 continue;
             }
@@ -505,19 +536,25 @@ public class NarrowingState {
 
     public restoreLayers(List<NarrowingLayer> snapshot) {
         this.layers = copyLayers(snapshot);
+        this.filled = new List<NarrowingLayer>();
+        for (let layer in this.layers) {
+            if (!layer.isEmpty()) {
+                this.filled.push(layer);
+            }
+        }
     }
 
     // Every proven type visible here, merged outermost to innermost so the innermost proof of
     // a path wins, matching provenType.
     public flatten() -> Map<NarrowingPath, Type> {
         let merged = new Map<NarrowingPath, Type>();
-        for (long i = 0; i < this.layers.length(); i++) {
-            let layer = this.layers.get(i).proofs;
-            if (layer.isEmpty()) {
+        for (let layer in this.filled) {
+            let proofs = layer.proofs;
+            if (proofs.isEmpty()) {
                 continue;
             }
-            for (let key in layer.keys()) {
-                let value = layer.get(key);
+            for (let key in proofs.keys()) {
+                let value = proofs.get(key);
                 if (value != null) {
                     merged.set(key, value);
                 }
@@ -527,9 +564,9 @@ public class NarrowingState {
     }
 
     public clearPath(NarrowingPath path) {
-        for (long i = 0; i < this.layers.length(); i++) {
-            this.layers.get(i).proofs.remove(path);
-            this.layers.get(i).writes.remove(path);
+        for (let layer in this.filled) {
+            layer.proofs.remove(path);
+            layer.writes.remove(path);
         }
     }
 }
