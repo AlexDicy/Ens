@@ -577,10 +577,10 @@ public captureConditionBranch(BodyChecker checker, List<NarrowingFact> facts) ->
     return captured;
 }
 
-// Ends the branches of the innermost statement being analyzed and installs what holds after it, as
-// applyNarrowingJoin does, where 'survivors' are the ends of those of its branches that fall through. A
-// place a branch did not change holds at its end what it held where the branches started.
-public joinBranchChanges(BodyChecker checker, List<BranchChanges> survivors, string statement,
+// Ends the branches of the innermost statement being analyzed, written at 'at', and installs what holds
+// after it, as applyNarrowingJoin does, where 'survivors' are the ends of those of its branches that fall
+// through. A place a branch did not change holds at its end what it held where the branches started.
+public joinBranchChanges(BodyChecker checker, List<BranchChanges> survivors, Span at, string statement,
                          string branch) {
     checker.narrowing().endBranches();
     let places = new Set<NarrowingPath>();
@@ -602,7 +602,32 @@ public joinBranchChanges(BodyChecker checker, List<BranchChanges> survivors, str
     for (let survivor in survivors) {
         held.push(survivor.held);
     }
-    applyNarrowingJoin(checker, entry.proofs, held, statement, branch);
+    applyNarrowingJoin(checker, entry, held, at, statement, branch);
+}
+
+// Adds to 'proofs' the type that the start of a loop around 'at' ended for each place 'reached' holds.
+addFirstPassProofs(Map<NarrowingPath, Type> proofs, BranchNarrowings reached, Span at) {
+    for (let path in reached.writes.keys()) {
+        let first = firstPassProof(reached.writes.get(path), at);
+        if (first != null) {
+            proofs.set(path, first);
+        }
+    }
+    for (let path in reached.ends.keys()) {
+        let first = firstPassProof(reached.ends.get(path), at);
+        if (first != null && reached.proofs.get(path) == null) {
+            proofs.set(path, first);
+        }
+    }
+}
+
+// The type 'end' ended where the start of a loop around 'at' recorded it, or null where no such start did.
+firstPassProof(NarrowingEnd? end, Span at) -> Type? {
+    let loop = end?.loop();
+    if (end == null || loop == null || !within(at, loop)) {
+        return null;
+    }
+    return end.narrower();
 }
 
 // The narrowest type that holds both 'left' and 'right', two proofs for 'path': the wider of the two
@@ -700,22 +725,23 @@ pathRootInScope(BodyChecker checker, NarrowingPath path) -> bool {
     return checker.visibleBinding(root.name()) == root;
 }
 
-// Installs the intersection of the surviving branches as the narrowing after a merge: a path
-// stays narrowed only where every falling-through branch proves it, an entry proof a branch
-// dropped is dropped, with the write that dropped it recorded as what ended it where the branches of
-// 'statement', as in "'if' statement", meet, with 'branch' saying where in it the write is, as in "in
-// one branch of the 'if' statement", and a proof a branch newly established is added. 'entryFacts' is
-// what holds where the branches start, which is what holds here.
-public applyNarrowingJoin(BodyChecker checker, Map<NarrowingPath, Type> entryFacts,
-                          List<BranchNarrowings> survivors, string statement, string branch) {
-    joinNarrowings(checker, entryFacts, entryFacts, survivors, statement, branch);
+// Installs what holds where 'survivors', the branches that fall through of the statement written at 'at',
+// meet, after they start from 'entry'. 'statement' and 'branch' name where a write that drops a proof is,
+// as in "'if' statement" and "in one branch of the 'if' statement".
+public applyNarrowingJoin(BodyChecker checker, BranchNarrowings entry, List<BranchNarrowings> survivors,
+                          Span at, string statement, string branch) {
+    let proven = new Map<NarrowingPath, Type>();
+    addProofs(proven, entry.proofs);
+    addFirstPassProofs(proven, entry, at);
+    joinNarrowings(checker, proven, entry.proofs, survivors, at, statement, branch);
 }
 
 // Installs the intersection of the surviving branches as applyNarrowingJoin does, where 'proven' holds each
 // proof a branch can drop, with the type it held, and 'held' holds here. For the branches of a statement
 // those are the proofs that held where they start, and for the ways out of a loop also those made since.
+// The branches meet after 'at'.
 joinNarrowings(BodyChecker checker, Map<NarrowingPath, Type> proven, Map<NarrowingPath, Type> held,
-               List<BranchNarrowings> survivors, string statement, string branch) {
+               List<BranchNarrowings> survivors, Span at, string statement, string branch) {
     if (survivors.length() == 0) {
         return;
     }
@@ -725,7 +751,7 @@ joinNarrowings(BodyChecker checker, Map<NarrowingPath, Type> proven, Map<Narrowi
         if (provenType == null || joined.get(key) != null || !pathRootInScope(checker, key)) {
             continue;
         }
-        let ended = droppedEnd(survivors, key, provenType);
+        let ended = droppedEnd(survivors, key, provenType, at);
         if (ended != null) {
             checker.narrowing().endProof(key, ended.throughJoin(statement, branch).narrowedFrom(provenType));
         } else {
@@ -734,16 +760,17 @@ joinNarrowings(BodyChecker checker, Map<NarrowingPath, Type> proven, Map<Narrowi
     }
     for (let key in joined.keys()) {
         let joinedType = joined.get(key);
-        if (joinedType == null || held.get(key) == joinedType) {
-            continue;
-        }
-        if (!pathRootInScope(checker, key)) {
-            continue;
-        }
-        checker.narrowing().clearPath(key);
-        checker.narrowing().narrow(key, joinedType);
         let before = proven.get(key);
-        let write = joinedWrite(survivors, key, joinedType, before);
+        bool kept = held.get(key) == joinedType;
+        if (joinedType == null || (kept && (before == null || before == joinedType))
+                || !pathRootInScope(checker, key)) {
+            continue;
+        }
+        if (!kept) {
+            checker.narrowing().clearPath(key);
+            checker.narrowing().narrow(key, joinedType);
+        }
+        let write = joinedWrite(survivors, key, joinedType, before, at);
         if (write == null) {
             continue;
         }
@@ -757,14 +784,23 @@ joinNarrowings(BodyChecker checker, Map<NarrowingPath, Type> proven, Map<Narrowi
 }
 
 // The write that dropped the proof 'dropped' of 'path', which held before the branches end and holds where
-// they meet no more: the write that ended it in the first branch that holds no proof of it, or else the
-// write in the first branch that left a proof of a type 'dropped' does not hold. Null where no write did.
-droppedEnd(List<BranchNarrowings> survivors, NarrowingPath path, Type dropped) -> NarrowingEnd? {
+// they meet no more: the write that ended it in the first branch that holds no proof of it, before one that
+// the start of a loop around 'at' recorded, or else the write in the first branch that left a proof of a type
+// 'dropped' does not hold. Null where no write did.
+droppedEnd(List<BranchNarrowings> survivors, NarrowingPath path, Type dropped, Span at) -> NarrowingEnd? {
+    NarrowingEnd? started = null;
     for (let survivor in survivors) {
         let ended = survivor.ends.get(path);
-        if (ended != null && survivor.proofs.get(path) == null) {
+        if (ended == null || survivor.proofs.get(path) != null) {
+            continue;
+        }
+        if (firstPassProof(ended, at) == null) {
             return ended;
         }
+        started = started ?? ended;
+    }
+    if (started != null) {
+        return started;
     }
     for (let survivor in survivors) {
         let proven = survivor.proofs.get(path);
@@ -778,15 +814,21 @@ droppedEnd(List<BranchNarrowings> survivors, NarrowingPath path, Type dropped) -
 
 // The write that left the proof 'joined' of 'path' where branches meet, after the proof 'before' held: the
 // first branch's write that left that proof itself, or else the first that left a proof wider than
-// 'before' or not related to it, or else the first that left a proof at all. Null where no write left one.
-joinedWrite(List<BranchNarrowings> survivors, NarrowingPath path, Type joined, Type? before)
+// 'before' or not related to it, or else the first that left a proof at all, each before one that the start
+// of a loop around 'at' recorded. Null where no write left one.
+joinedWrite(List<BranchNarrowings> survivors, NarrowingPath path, Type joined, Type? before, Span at)
             -> NarrowingEnd? {
     NarrowingEnd? widening = null;
     NarrowingEnd? first = null;
+    NarrowingEnd? started = null;
     for (let survivor in survivors) {
         let write = survivor.writes.get(path);
         let proven = survivor.proofs.get(path);
         if (write == null || proven == null) {
+            continue;
+        }
+        if (firstPassProof(write, at) != null) {
+            started = started ?? write;
             continue;
         }
         if (proven == joined) {
@@ -797,16 +839,17 @@ joinedWrite(List<BranchNarrowings> survivors, NarrowingPath path, Type joined, T
         }
         first = first ?? write;
     }
-    return widening ?? first;
+    return widening ?? first ?? started;
 }
 
 // The branches of a '?:' analyzed so far, each from what holds where they start: their values, and what
 // holds at the end of each.
 public final class TernaryBranches {
+    protected Span at;
     protected List<Expression> values;
     protected List<BranchChanges> ends;
 
-    protected constructor() {
+    protected constructor(this.at) {
         this.values = new List<Expression>();
         this.ends = new List<BranchChanges>();
     }
@@ -820,7 +863,7 @@ public enterBranches(BodyChecker checker, TernaryExpressionNode ternary) -> Tern
         return null;
     }
     checker.narrowing().startBranches();
-    return new TernaryBranches();
+    return new TernaryBranches(ternary.span());
 }
 
 // Installs what holds after the '?:' whose branches are 'branches': where the branches that give a value
@@ -835,7 +878,7 @@ public joinBranches(BodyChecker checker, TernaryBranches? branches) {
             survivors.push(branches.ends.get(i));
         }
     }
-    joinBranchChanges(checker, survivors, "'?:'", "in one branch of the '?:'");
+    joinBranchChanges(checker, survivors, branches.at, "'?:'", "in one branch of the '?:'");
 }
 
 // Analyzes a '?:' branch or the right side of '&&' or '||' under the facts the condition proves
@@ -1096,6 +1139,8 @@ public final class LoopWatch {
     protected Map<NarrowingPath, List<LoopCopy>> startReaders;
     // The lambdas the loop is in.
     protected long lambdaDepth;
+    // Whether a loop around this one starts a place it may write weaker than its first pass does.
+    protected bool outerWeakened;
 
     protected constructor(this.loop, this.span, this.entry, Map<NarrowingPath, Type> starts,
                           Map<NarrowingPath, Type> weakened, this.lambdaDepth) {
@@ -1104,11 +1149,13 @@ public final class LoopWatch {
         this.entryTrace = new NarrowingTrace(weakened);
         this.changed = false;
         this.startReaders = new Map<NarrowingPath, List<LoopCopy>>();
+        this.outerWeakened = false;
     }
 
-    // Whether the loop can write a narrowing that holds where it is entered.
+    // Whether the loop can write a narrowing that holds where it is entered, or on the first pass of a loop
+    // around it.
     protected watchesAny() -> bool {
-        return !this.trace.held.isEmpty() || !this.entryTrace.held.isEmpty();
+        return !this.trace.held.isEmpty() || !this.entryTrace.held.isEmpty() || this.outerWeakened;
     }
 }
 
@@ -1274,8 +1321,9 @@ public endPass(BodyChecker checker) {
 }
 
 // Joins what holds at the end of the body of the 'for' loop being walked and at each 'continue', which is
-// where its update runs from. Without a 'continue', what holds at the end of the body holds there.
-public joinPassEnds(BodyChecker checker) {
+// where its update, written at 'update', runs from. Without a 'continue', what holds at the end of the body
+// holds there.
+public joinPassEnds(BodyChecker checker, Span update) {
     let flow = currentFlow(checker);
     if (flow == null) {
         return;
@@ -1286,7 +1334,13 @@ public joinPassEnds(BodyChecker checker) {
     }
     let ends = passEnds(checker, flow);
     flow.updateReached = !ends.isEmpty();
-    applyNarrowingJoin(checker, checker.narrowing().flatten(), ends, "'for' loop's body",
+    let held = checker.narrowing().flatten();
+    let proven = new Map<NarrowingPath, Type>();
+    addProofs(proven, held);
+    for (let reached in ends) {
+        addFirstPassProofs(proven, reached, update);
+    }
+    joinNarrowings(checker, proven, held, ends, update, "'for' loop's body",
         "before 'continue', and the update runs after each 'continue'");
 }
 
@@ -1647,7 +1701,10 @@ public leaveLoop(BodyChecker checker, SyntaxNode loop, LoopFlow flow) {
         leaving.pushAll(exits.breaks);
         addProofs(proven, held);
         addProofs(proven, exits.watch.entry);
-        joinNarrowings(checker, proven, held, leaving, statement, "in the {statement}");
+        for (let reached in leaving) {
+            addFirstPassProofs(proven, reached, loop.span());
+        }
+        joinNarrowings(checker, proven, held, leaving, loop.span(), statement, "in the {statement}");
     }
     markLoopEnds(checker, loop);
 }
@@ -1789,7 +1846,17 @@ startLoop(BodyChecker checker, LoopSettlement settlement, SyntaxNode loop) -> Lo
         }
         held.set(path, start);
     }
-    return new LoopWatch(loop.green(), loop.span(), entry, held, weakened, checker.lambdaFrames().length());
+    let watch = new LoopWatch(loop.green(), loop.span(), entry, held, weakened,
+        checker.lambdaFrames().length());
+    for (let root in written) {
+        let path = narrow.bindingPath(root);
+        if (entry.get(path) == null
+                && firstPassProof(checker.narrowing().endOf(path), loop.span()) != null) {
+            watch.outerWeakened = true;
+            break;
+        }
+    }
+    return watch;
 }
 
 // Records in 'settlement' that a pass reached the loop 'loop', and what 'watch' saw at its back edges: the
