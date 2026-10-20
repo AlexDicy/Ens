@@ -1207,6 +1207,7 @@ A `?.` there reads the members of the type the value was narrowed to, so `shape?
 A binding whose declared type is not nullable still rejects these operators.
 
 Narrowing also follows the short-circuit operators and conditions: `x != null && x.ready()` narrows `x` on the right of `&&`, `x == null || x.ready()` narrows on the right of `||`, a conjunction of checks narrows the whole `if` branch or ternary branch, and a loop condition narrows the loop body.
+A check or a type test of a plain assignment tests the value it stores, so `(x = e) != null` and `(x = e) is T` narrow `x` the way `x != null` and `x is T` do.
 
 ```ens
 if (a != null && a.b != null) {
