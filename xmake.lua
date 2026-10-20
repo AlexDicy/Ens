@@ -126,11 +126,14 @@ target("ens-llvm")
         end
         local provided = {}
         local missing = {}
+        -- the Windows LLVM package also carries LLVM-C, the import library of its DLL, and every
+        -- LLVM names LTO and Remarks, which it builds only as shared libraries: C interfaces over
+        -- component archives merged here, and ones `ens` binds none of.
+        local sharedOnly = {["LLVM-C"] = true, LTO = true, Remarks = true}
         local function addPackage(package)
             local dirs = table.wrap(package:get("linkdirs"))
             for _, link in ipairs(table.wrap(package:get("links"))) do
-                -- the Windows LLVM package also carries LLVM-C, the import library of its DLL.
-                if link ~= "LLVM-C" then
+                if package:name() ~= "libllvm" or not sharedOnly[link] then
                     local file = staticArchive(dirs, link)
                     if file then
                         add(file)
