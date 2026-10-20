@@ -264,8 +264,13 @@ local function readobjProgram()
     if found then
         return found
     end
+    local newest = -1
     for _, candidate in ipairs(os.files("/usr/lib/llvm-*/bin/llvm-readobj")) do
-        found = candidate
+        local version = tonumber(candidate:match("llvm%-(%d+)")) or 0
+        if version > newest then
+            found = candidate
+            newest = version
+        end
     end
     if found then
         return found
@@ -278,6 +283,18 @@ local function readobjProgram()
         .. "first, which installs it with the LLVM package, or install LLVM")
 end
 
+-- A field of llvm-readobj's JSON as text: one release writes the name alone, another an object
+-- holding the name beside its number.
+local function named(field)
+    if type(field) == "table" then
+        field = field.Name
+    end
+    if type(field) ~= "string" then
+        raise("llvm-readobj wrote a symbol field this script cannot read: %s", tostring(field))
+    end
+    return field
+end
+
 -- The entries one library contributes to a list, after its 'library' line.
 local function libraryEntries(readobj, file, soname)
     local dump = json.decode(os.iorunv(readobj, {"--elf-output-style=JSON", "--dyn-syms", file}))
@@ -287,14 +304,14 @@ local function libraryEntries(readobj, file, soname)
     end
     local versions = {}
     local hasDefault = {}
-    for _, entry in ipairs(dump[1].DynamicSymbols) do
+    for _, entry in ipairs(dump[1].DynamicSymbols or {}) do
         local symbol = entry.Symbol
-        local full = symbol.Name.Name
+        local full = named(symbol.Name)
         local name, marker, node = full:match("^(.-)(@@?)(.+)$")
-        local defined = symbol.Section.Name ~= "Undefined"
+        local defined = named(symbol.Section) ~= "Undefined"
         local kind = ({Function = "symbol", GNU_IFunc = "symbol", Object = "object",
-            TLS = "tls"})[symbol.Type.Name]
-        if name and name ~= node and defined and kind and symbol.Binding.Name ~= "Local" then
+            TLS = "tls"})[named(symbol.Type)]
+        if name and name ~= node and defined and kind and named(symbol.Binding) ~= "Local" then
             local numbered = withinBaseline(node)
             if marker == "@@" then
                 hasDefault[name] = true
@@ -333,6 +350,7 @@ local function linuxList(host, root)
         raise("'%s' is not a Linux host a list is kept for. Name 'linux-x64' or 'linux-arm64'", host)
     end
     local readobj = readobjProgram()
+    print("reading the libraries under '%s' with '%s'", root, readobj)
     local lines = {
         "# What glibc and libgcc_s export to a " .. described.machine .. " Linux program, at the "
             .. "baselines scripts/refresh_system_symbols.lua names.",
