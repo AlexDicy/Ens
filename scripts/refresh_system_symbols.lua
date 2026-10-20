@@ -30,6 +30,19 @@ import("lib.detect.find_tool")
 
 local lists = path.join(os.scriptdir(), "..", "selfhost", "bundled", "symbols")
 
+-- Whether `a` sorts before `b` by their bytes. Lua compares text the way the machine's locale
+-- orders it, so every list is sorted with this instead, and reads the same whichever machine
+-- wrote it.
+local function byteOrder(a, b)
+    for i = 1, math.min(#a, #b) do
+        local x, y = a:byte(i), b:byte(i)
+        if x ~= y then
+            return x < y
+        end
+    end
+    return #a < #b
+end
+
 -- The quoted or plain names of a tbd list, written between '[' and ']' and possibly across lines.
 local function names(text)
     local found = {}
@@ -184,7 +197,7 @@ local function macosList()
     for entry in pairs(entries) do
         table.insert(lines, entry)
     end
-    table.sort(lines)
+    table.sort(lines, byteOrder)
     if #lines < 1000 then
         raise("'%s' gave only %d symbols for arm64, which is not the whole of libSystem", tbd,
             #lines)
@@ -336,7 +349,7 @@ local function libraryEntries(readobj, file, soname)
             end
         end
     end
-    table.sort(lines)
+    table.sort(lines, byteOrder)
     if #lines == 0 then
         raise("'%s' gave no symbols at or below the baseline", file)
     end
@@ -380,13 +393,13 @@ local function linuxList(host, root)
 end
 
 -- The import libraries a Windows program links against, in the order a symbol more than one of
--- them names is taken from: the system's own kernel32 and C runtime first, ntdll last, for what
--- only it exports to a program without the Visual C++ runtime, such as memcpy.
+-- them names is taken from: kernel32, the C runtime Windows ships with the system, and shell32,
+-- for reading the command line. What else a C program takes from the Visual C++ runtime, such as
+-- memcpy, ens defines itself.
 local windowsLibraries = {
     {folder = "um", file = "kernel32.lib"},
     {folder = "ucrt", file = "ucrt.lib"},
     {folder = "um", file = "shell32.lib"},
-    {folder = "um", file = "ntdll.lib"},
 }
 
 -- The library folder of the Windows SDK xmake's MSVC toolchain finds, which holds a folder for
@@ -442,6 +455,7 @@ end
 -- What the Windows SDK under `root` lets a program for `processor` import, and the SDK's version.
 local function windowsList(processor, root)
     local readobj = readobjProgram()
+    print("reading the import libraries under '%s' with '%s'", root, readobj)
     local taken = {}
     local byDll = {}
     for _, library in ipairs(windowsLibraries) do
@@ -464,8 +478,8 @@ local function windowsList(processor, root)
     for dll in pairs(byDll) do
         table.insert(dlls, dll)
     end
-    table.sort(dlls)
-    local version = path.filename(root)
+    table.sort(dlls, byteOrder)
+    local version = root:match("([^/\\]+)[/\\]*$") or ""
     local lines = {
         "# What a Windows program on " .. processor .. " imports from the system, read from the "
             .. "import libraries of Windows SDK " .. version .. ".",
@@ -475,7 +489,7 @@ local function windowsList(processor, root)
     }
     for _, dll in ipairs(dlls) do
         table.insert(lines, "library " .. dll)
-        table.sort(byDll[dll])
+        table.sort(byDll[dll], byteOrder)
         for _, line in ipairs(byDll[dll]) do
             table.insert(lines, line)
         end
@@ -505,8 +519,8 @@ local function report(name, before, after)
     for line in pairs(before) do
         if not after[line] then table.insert(removed, line) end
     end
-    table.sort(added)
-    table.sort(removed)
+    table.sort(added, byteOrder)
+    table.sort(removed, byteOrder)
     print("%s: %d added, %d removed", name, #added, #removed)
     for _, line in ipairs(added) do print("  + " .. line) end
     for _, line in ipairs(removed) do print("  - " .. line) end
