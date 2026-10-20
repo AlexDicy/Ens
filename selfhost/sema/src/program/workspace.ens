@@ -21,11 +21,13 @@ import DependencyDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import MemberDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import OverrideDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import NativeDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import EmbedDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import StandardLibrary from program.implicit;
 import NativeLibraryBindingNode from @ens.frontend.syntax.generated.nodes;
 import NativeArtifactBindingNode from @ens.frontend.syntax.generated.nodes;
 import PackagePathNode from @ens.frontend.syntax.generated.nodes;
 import support.paths;
+import model.literalvalues;
 import Path from @std.fs;
 import List from @std.collections.list;
 import Map from @std.collections.map;
@@ -46,6 +48,7 @@ public class Workspace {
     protected Path manifestFile;
     protected string declaredPackageName;
     protected NativeInfo[] declaredNatives;
+    protected Path[] declaredEmbedFolders;
 
     protected constructor(Path root, Path sourceRoot, Path testsRoot, string packagePrefix) {
         this.rootFolder = root;
@@ -60,6 +63,7 @@ public class Workspace {
         this.manifestFile = Path("");
         this.declaredPackageName = "";
         this.declaredNatives = [];
+        this.declaredEmbedFolders = [];
     }
 
     public root() -> Path {
@@ -100,6 +104,11 @@ public class Workspace {
 
     public natives() -> NativeInfo[] {
         return this.declaredNatives;
+    }
+
+    // The folders outside the package that its manifest lets its sources embed files from.
+    public embedFolders() -> Path[] {
+        return this.declaredEmbedFolders;
     }
 
     public nativeNames() -> string[] {
@@ -367,6 +376,14 @@ class MemberInfo {
     protected constructor(this.folder, this.span);
 }
 
+class EmbedFolderInfo {
+    protected string written;
+    protected Path folder;
+    protected Span span;
+
+    protected constructor(this.written, this.folder, this.span);
+}
+
 class OverrideInfo {
     protected string name;
     protected string folder;
@@ -384,6 +401,7 @@ class ManifestData {
     protected List<NativeInfo> natives;
     protected List<MemberInfo> members;
     protected List<OverrideInfo> overrides;
+    protected List<EmbedFolderInfo> embeds;
 
     protected constructor() {
         this.form = ManifestForm.Absent;
@@ -394,6 +412,7 @@ class ManifestData {
         this.natives = new List<NativeInfo>();
         this.members = new List<MemberInfo>();
         this.overrides = new List<OverrideInfo>();
+        this.embeds = new List<EmbedFolderInfo>();
     }
 }
 
@@ -921,9 +940,35 @@ public class WorkspaceLoader {
         workspace.packageForm = true;
         workspace.declaredPackageName = manifest.packageName;
         workspace.declaredNatives = manifest.natives.toArray();
+        workspace.declaredEmbedFolders = this.embedFoldersOf(workspace, manifest);
         for (long i = 0; i < manifest.dependencies.length(); i++) {
             this.resolveDependency(workspace, manifest.dependencies.get(i));
         }
+    }
+
+    // The folders the manifest lists for embedding. Only a package whose sources the user can edit
+    // may list one: the files of a fetched package or of the standard library are the ones it was
+    // published with, and a folder outside it is whatever the machine building it has there.
+    embedFoldersOf(Workspace workspace, ManifestData manifest) -> Path[] {
+        let folders = new List<Path>();
+        for (long i = 0; i < manifest.embeds.length(); i++) {
+            let embed = manifest.embeds.get(i);
+            if (workspace.isEditable()) {
+                folders.push(embed.folder);
+            } else if (this.loader.folderKey(workspace.root())
+                    == this.loader.folderKey(this.standardLibrary)) {
+                this.report(workspace.manifestFile, embed.span, "The standard library may embed "
+                    + "only files inside its own folder, so this 'embed' line is refused. Remove "
+                    + "it.");
+            } else {
+                this.report(workspace.manifestFile, embed.span, "Package "
+                    + "'{workspace.declaredPackageName}' was fetched, and a fetched package may "
+                    + "embed only files inside its own folder, so this 'embed' line is refused. "
+                    + "Build the package from a copy of your own with 'ens override add "
+                    + "{workspace.declaredPackageName} <folder>' to embed from '{embed.written}'.");
+            }
+        }
+        return folders.toArray();
     }
 
     resolveDependency(Workspace workspace, DependencyInfo dependency) {
@@ -1210,6 +1255,9 @@ public class WorkspaceLoader {
                         is NativeDeclarationNode native -> {
                             this.readNative(file, native, data);
                         },
+                        is EmbedDeclarationNode embed -> {
+                            this.readEmbed(file, embed, data);
+                        },
                         default -> {
                         },
                     }
@@ -1399,6 +1447,54 @@ public class WorkspaceLoader {
             return;
         }
         data.members.push(new MemberInfo(folder, node.span()));
+    }
+
+    readEmbed(Path file, EmbedDeclarationNode node, ManifestData data) {
+        string raw = node.folder().text();
+        if (raw.length == 0) {
+            return;
+        }
+        string written = literalvalues.decodeString(raw);
+        let span = node.folder().span();
+        if (written.length == 0) {
+            this.report(file, span, "This 'embed' line names an empty folder. Write the folder "
+                + "the package embeds files from between the quotes, as in 'embed \"../assets\";', "
+                + "or remove the line.");
+            return;
+        }
+        if (written.contains("\\")) {
+            string separated = written.replace("\\", "/");
+            this.report(file, span, "Folders in an 'embed' line are separated with '/' on every "
+                + "system. Write '{separated}'.");
+            return;
+        }
+        if (Path(written).isAbsolute()) {
+            this.report(file, span, "'{written}' is an absolute path, so the package would build "
+                + "only where that folder is. Write the folder relative to the folder this "
+                + "'ens.package' is in.");
+            return;
+        }
+        Path folder = resolveTarget(file.parent() ?? Path("."), written);
+        if (!this.loader.exists(folder)) {
+            this.report(file, span, "Folder '{written}' is not there: nothing is at '{folder}'. "
+                + "Check the spelling, or create the folder.");
+            return;
+        }
+        if (this.loader.isFile(folder)) {
+            string holder = (Path(written).parent() ?? Path(".")).toString();
+            this.report(file, span, "'{written}' is a file, and an 'embed' line names a folder. "
+                + "Write 'embed \"{holder}\";' to embed from the folder that holds it.");
+            return;
+        }
+        string key = this.loader.folderKey(folder);
+        for (long i = 0; i < data.embeds.length(); i++) {
+            if (this.loader.folderKey(data.embeds.get(i).folder) == key) {
+                this.report(file, node.span(), "Folder '{written}' is already listed for "
+                    + "embedding. Remove this second 'embed' line.");
+                return;
+            }
+        }
+        data.embeds.push(new EmbedFolderInfo(written, folder, node.span()));
     }
 
     readOverride(Path file, OverrideDeclarationNode node, ManifestData data) {

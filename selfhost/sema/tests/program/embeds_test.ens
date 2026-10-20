@@ -1,0 +1,105 @@
+// What a module's 'embed' expressions read while the graph is built: a file's bytes, a folder's
+// files in path order, and the folders a package may embed from.
+import Path from @std.fs;
+import @std.testing;
+import program.graph;
+import GraphResult from program.graph;
+import PackageSources from program.workspace;
+import FakeFileLoader from sema_support;
+import sema_support;
+
+// The graph of a program whose entry module is '/proj/src/main.ens'.
+built(FakeFileLoader loader, string main) -> GraphResult {
+    loader.add("/proj/src/main.ens", main);
+    return graph.buildGraph(loader, Path("/proj/src"), Path(""), Path("/stdlib"), ["main.ens"]);
+}
+
+test "a file is read next to the module that embeds it" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/data.dat", "abc");
+    string main = "main() -> int \{\n    byte[] read = embed \"data.dat\";\n    return 0;\n\}\n";
+    let result = built(loader, main);
+    try sema_support.assertNoDiagnostics(result.diagnostics());
+    let content = (try sema_support.moduleWithPath(result, "main")).embedded(main.indexOf("embed"));
+    if (content == null) {
+        try testing.fail("the embed should have read its file");
+        return;
+    }
+    try testing.assertTrue(!content.folderForm, "a file embed reads one file");
+    try testing.assertEqual(try string.fromBytes(content.contents), "abc");
+}
+
+test "a folder is read in path order, leaving out names that start with a dot" {
+    let loader = new FakeFileLoader();
+    loader.add("/stdlib/std/src/embed.ens", "export struct EmbeddedFile \{\n"
+        + "    export const string path;\n"
+        + "    export const byte[] contents;\n"
+        + "\}\n");
+    loader.addFolder("/proj/src/assets");
+    loader.add("/proj/src/assets/b.dat", "bb");
+    loader.add("/proj/src/assets/a.dat", "a");
+    loader.add("/proj/src/assets/sub/c.dat", "ccc");
+    loader.add("/proj/src/assets/.hidden/x.dat", "x");
+    loader.add("/proj/src/assets/.ignored", "y");
+    string main = "main() -> int \{\n    let files = embed folder \"assets\";\n    return 0;\n\}\n";
+    let result = built(loader, main);
+    try sema_support.assertNoDiagnostics(result.diagnostics());
+    let content = (try sema_support.moduleWithPath(result, "main")).embedded(main.indexOf("embed"));
+    if (content == null) {
+        try testing.fail("the embed should have read its folder");
+        return;
+    }
+    try testing.assertTrue(content.folderForm, "a folder embed reads every file in it");
+    try testing.assertEqual(content.entries.length, 3L);
+    try testing.assertEqual(content.entries[0].path, "a.dat");
+    try testing.assertEqual(content.entries[1].path, "b.dat");
+    try testing.assertEqual(content.entries[2].path, "sub/c.dat");
+    try testing.assertEqual(try string.fromBytes(content.entries[2].contents), "ccc");
+    let embedModule = try sema_support.moduleWithPath(result, "std.embed");
+}
+
+test "a folder embed names the module the standard library lacks" {
+    let loader = new FakeFileLoader();
+    loader.addFolder("/proj/src/assets");
+    let result = built(loader, "main() -> int \{\n    let files = embed folder \"assets\";\n"
+        + "    return 0;\n\}\n");
+    try sema_support.assertDiagnostic(result.diagnostics(), 0, "/proj/src/main.ens",
+        "'embed folder' gives each file as an 'EmbeddedFile', which the standard library "
+            + "declares in module 'std.embed', and there is no file '/stdlib/std/src/embed.ens'. "
+            + "Pass the folder that holds the whole standard library with '--stdlib'.");
+}
+
+test "a package embeds outside its folder only from a folder its manifest lists" {
+    let loader = new FakeFileLoader();
+    loader.addFolder("/shared");
+    loader.add("/shared/x.dat", "x");
+    loader.add("/other/y.dat", "y");
+    loader.add("/proj/ens.package",
+        "package demo.app \{\n    ens \"0.1\";\n    embed \"../shared\";\n\}\n");
+    let result = built(loader, "main() -> int \{\n"
+        + "    byte[] listed = embed \"../../shared/x.dat\";\n"
+        + "    byte[] unlisted = embed \"../../other/y.dat\";\n"
+        + "    return 0;\n\}\n");
+    let diagnostics = result.diagnostics();
+    try testing.assertEqual(diagnostics.length, 1L);
+    try sema_support.assertDiagnostic(diagnostics, 0, "/proj/src/main.ens",
+        "'../../other/y.dat' names '/other/y.dat', which is outside package 'demo.app'. A "
+            + "package embeds files from its own folder, or from a folder its 'ens.package' lists. "
+            + "Add 'embed \"../other\";' to '/proj/ens.package', or move the file into the "
+            + "package.");
+}
+
+test "a fetched package may not list a folder to embed from" {
+    let loader = new FakeFileLoader();
+    let fetched = sema_support.fetchedAcme(loader, "export struct Part \{ \}\n");
+    loader.addFolder("/store/shared");
+    loader.add("/store/acme/ens.package",
+        "package acme \{\n    ens \"0.1\";\n    embed \"../shared\";\n\}\n");
+    loader.add("/proj/src/main.ens", "import Part from @acme.parts;\n");
+    let result = graph.buildGraph(loader, Path("/proj/src"), Path(""), Path("/stdlib"),
+        ["main.ens"], null, new PackageSources(fetched));
+    try sema_support.assertDiagnostic(result.diagnostics(), 0, "/store/acme/ens.package",
+        "Package 'acme' was fetched, and a fetched package may embed only files inside its own "
+            + "folder, so this 'embed' line is refused. Build the package from a copy of your own "
+            + "with 'ens override add acme <folder>' to embed from '../shared'.");
+}

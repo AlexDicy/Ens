@@ -836,6 +836,10 @@ When two packages in one build declare the same native library, the declarations
 Two declarations of a native library are identical when they have the same form (bare, `system`, or a binding block) and, for a block, name the same platforms with the same bindings in any platform order.
 Within one platform the base names must be in the same order, because they are linked in that order.
 
+`embed "../shared";` lists a folder outside the package that its sources may embed files from, written relative to the folder of `ens.package` with `/` between folders.
+Only a package whose sources are the user's own may list one: the program, a workspace member or an overridden package.
+A fetched package or the standard library embeds only files inside its own folder, because those are the files it was published with.
+
 ---
 
 The toolchain is one command, `ens`, with a subcommand for each thing it does.
@@ -1828,6 +1832,32 @@ A `char` hole renders as its character rather than its numeric code point, so `"
 Inside a generic body a hole may hold a value of a type-parameter type; the requirement is then checked against the concrete type of each instantiation.
 An explicit `.toString()` on a type-parameter value is checked the same way, against the concrete type of each instantiation.
 A hole or `.toString()` call whose type has no text form for any type argument, such as a struct with a class field or a function value, is refused in the generic body itself, and no instantiation reports it again.
+
+---
+
+`embed "path"` is an expression of type `byte[]` holding the contents of the file at `path`, read when the program is compiled.
+`embed folder "path"` is an expression of type `EmbeddedFile[]` with one element for every file under the folder, at any depth.
+`EmbeddedFile` is a struct from `@std.embed` with the file's `path` inside the folder, written with `/` between folders, and its `contents`.
+The elements are sorted by `path`, and a file or folder whose name starts with `.`, such as `.git`, is left out.
+The path is a string literal relative to the folder of the source file that writes it, with `/` between folders on every system.
+An empty path, an absolute one, or one written with `\` is an error, and so is a path that names nothing, or a folder where `embed` expects a file, or a file where `embed folder` expects a folder.
+The bytes are part of the program, and each evaluation copies them into a new array, because an array can be written to.
+A `lazy const` keeps one copy for the whole program, as in `lazy const byte[] logo = embed "logo.png";`.
+An `embed` is not a compile-time constant, so a `static const` cannot be initialized with one.
+
+```ens
+import EmbeddedFile from @std.embed;
+
+final class Assets {
+    lazy const byte[] logo = embed "logo.png";
+    lazy const EmbeddedFile[] icons = embed folder "icons";
+}
+```
+
+A package embeds the files inside its own folder.
+A file outside it can be embedded only from a folder its `ens.package` lists with an `embed` line, described with the other manifest lines.
+A program that no `ens.package` declares embeds the files inside the folder it is built from, which is the folder of the workspace around it when there is one.
+`embed` and `folder` are ordinary names everywhere except where `embed` is followed by a path or by `folder`.
 
 ---
 

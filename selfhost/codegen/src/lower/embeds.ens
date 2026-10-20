@@ -1,0 +1,85 @@
+// 'embed' lowered. The bytes the graph read are a private constant of the program, and every
+// evaluation copies them into a fresh array, because whoever holds an array may write to it.
+import EmbedExpressionNode from @ens.frontend.syntax.generated.nodes;
+import @ens.sema.model.typemembers;
+import @ens.sema.model.typenames;
+import Type from @ens.sema.model.types;
+import ArrayType from @ens.sema.model.types;
+import PrimitiveKind from @ens.sema.model.types;
+import EirAccess from eir.model;
+import EirArrayNew from eir.model;
+import EirConstInt from eir.model;
+import EirConstString from eir.model;
+import EirStringToBytes from eir.model;
+import LoweringContext from lower.context;
+import lower.arrays;
+import lower.stores;
+import lower.structs;
+
+public lowerEmbed(LoweringContext lowering, EmbedExpressionNode node) -> long {
+    let type = lowering.typeOf(node);
+    if (type == null) {
+        return -1;
+    }
+    let content = lowering.embedded(node);
+    if (content == null) {
+        lowering.internalError("an embed reached code generation with nothing read",
+            node.span());
+        return -1;
+    }
+    if (!content.folderForm) {
+        return copiedBytes(lowering, content.contents, type);
+    }
+    if (!(type is ArrayType)) {
+        lowering.internalError("an embedded folder has type '{typenames.display(type)}'",
+            node.span());
+        return -1;
+    }
+    let fileType = type.element();
+    long pathIndex = typemembers.inheritedOrOwnFieldIndex(fileType, "path");
+    long contentsIndex = typemembers.inheritedOrOwnFieldIndex(fileType, "contents");
+    if (pathIndex < 0 || contentsIndex < 0) {
+        lowering.internalError("'{typenames.display(fileType)}' has no 'path' and 'contents' "
+            + "fields", node.span());
+        return -1;
+    }
+    let store = lowering.store();
+    let stringType = store.stringType();
+    let bytesType = store.arrayOf(store.primitive(PrimitiveKind.Byte));
+    let longType = store.primitive(PrimitiveKind.Long);
+    let builder = lowering.builder();
+    long count = builder.newTemp(longType);
+    builder.append(new EirConstInt(count, longType, content.entries.length));
+    long array = builder.newTemp(type);
+    builder.append(new EirArrayNew(array, type, count));
+    lowering.protectValue(array);
+    for (long i = 0; i < content.entries.length; i++) {
+        let entry = content.entries[i];
+        long index = builder.newTemp(longType);
+        builder.append(new EirConstInt(index, longType, i));
+        long element = arrays.elementAddress(lowering, array, index, fileType, EirAccess.Write);
+        long path = builder.newTemp(stringType);
+        builder.append(new EirConstString(path, stringType, entry.path.toBytes()));
+        long pathAddress = structs.fieldAddressAt(lowering, element, stringType, pathIndex);
+        stores.initializeThroughAddress(lowering, pathAddress, stringType,
+            stores.operandFor(lowering, path, false, stringType));
+        long bytes = copiedBytes(lowering, entry.contents, bytesType);
+        long contentsAddress = structs.fieldAddressAt(lowering, element, bytesType,
+            contentsIndex);
+        stores.initializeThroughAddress(lowering, contentsAddress, bytesType,
+            stores.operandFor(lowering, bytes, true, bytesType));
+    }
+    lowering.unprotectValue(array);
+    return array;
+}
+
+// A fresh array holding the bytes, copied from a constant only the copy reads.
+copiedBytes(LoweringContext lowering, byte[] bytes, Type arrayType) -> long {
+    let builder = lowering.builder();
+    let stringType = lowering.store().stringType();
+    long constant = builder.newTemp(stringType);
+    builder.append(new EirConstString(constant, stringType, bytes));
+    long copy = builder.newTemp(arrayType);
+    builder.append(new EirStringToBytes(copy, arrayType, constant));
+    return copy;
+}
