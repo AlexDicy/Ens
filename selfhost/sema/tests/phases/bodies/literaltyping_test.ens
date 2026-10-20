@@ -1,6 +1,7 @@
 import @std.testing;
 import sema_support;
 import FakeFileLoader from sema_support;
+import Stage from sema_support;
 
 test "an unsuffixed floating-point literal adapts to the surrounding float" {
     let analysis = try sema_support.analyzeBody(["float declared = 1.0;", "declared = 2.5;",
@@ -542,6 +543,124 @@ test "struct literal errors are reported" {
         "Struct 'Pair' has no constructor to call. Build it with a literal, for example "
         + "'Pair<int, string> value = \{key: ..., value: ...\};', or add a 'constructor(...)'.");
     try testing.assertEqual(reported.length, 3L);
+}
+
+// A 'const' field with a default value already has its value, so a literal listing it is refused
+// with a note at the default, in the file that declares the struct, and is offered no default to
+// remove where this code could not set the field or the struct cannot be edited. A literal leaving
+// out a 'const' field without a default is not told to give it one, which would refuse every
+// constructor and literal that sets it, and neither is one that cannot set such a field.
+test "a struct literal sets only the 'const' fields without a default value" {
+    let loader = new FakeFileLoader();
+    loader.add("/proj/src/shapes.ens",
+        "public struct Tick \{\n"
+        + "    public const int count = 0;\n"
+        + "    public const int step;\n"
+        + "\}\n"
+        + "public struct Point \{\n"
+        + "    public const int x = 0;\n"
+        + "    public int y;\n"
+        + "    public constructor(this.y);\n"
+        + "\}\n"
+        + "public struct Guarded \{\n"
+        + "    const int hidden = 0;\n"
+        + "    public int step;\n"
+        + "\}\n");
+    loader.add("/proj/src/main.ens",
+        "import Tick from shapes;\n"
+        + "import Point from shapes;\n"
+        + "import Guarded from shapes;\n"
+        + "main() -> int \{\n"
+        + "    Tick tick = \{count: 2, step: 1\};\n"
+        + "    Tick partial = \{\};\n"
+        + "    Point point = \{x: 3, y: 1\};\n"
+        + "    Guarded guarded = \{hidden: 1, step: 2\};\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let analysis = sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramCleanExcept(analysis, [Stage.Bodies]);
+    let found = analysis.bodyDiagnostics();
+    try sema_support.assertDiagnostic(found, 0, "/proj/src/main.ens",
+        "Field 'count' of 'Tick' cannot be set in a literal, because it is 'const' and already has its "
+        + "default value. Remove 'count: 2' from the literal, or remove the default '= 0' and set "
+        + "'count' in every literal of 'Tick'.");
+    let count = try sema_support.relatedOf(found[0]);
+    try testing.assertEqual(count.file(), "/proj/src/shapes.ens");
+    try testing.assertEqual(count.note(), "'count' gets its default value here");
+    try sema_support.assertDiagnostic(found, 1, "/proj/src/main.ens",
+        "Struct literal for 'Tick' does not set the field 'step'. Add 'step: ...'.");
+    try sema_support.assertDiagnostic(found, 2, "/proj/src/main.ens",
+        "Field 'x' of 'Point' cannot be set in a literal, because it is 'const' and already has its "
+        + "default value. Remove 'x: 3' from the literal, or remove the default '= 0' and assign 'x' in "
+        + "every constructor of 'Point' and set it in every literal.");
+    try sema_support.assertDiagnostic(found, 3, "/proj/src/main.ens",
+        "Field 'hidden' of 'Guarded' cannot be set in a literal, because it is 'const' and already has "
+        + "its default value. Remove 'hidden: 1' from the literal.");
+    try testing.assertEqual(found.length, 4L);
+
+    let unbuildable = new FakeFileLoader();
+    unbuildable.add("/proj/src/shapes.ens",
+        "public struct Shape \{\n"
+        + "    const int sides;\n"
+        + "    public int width;\n"
+        + "    constructor(int sides) \{\n"
+        + "        this.sides = sides;\n"
+        + "        this.width = 1;\n"
+        + "    \}\n"
+        + "\}\n");
+    unbuildable.add("/proj/src/main.ens",
+        "import Shape from shapes;\n"
+        + "main() -> int \{\n"
+        + "    Shape shape = \{width: 2\};\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let refused = sema_support.analyzeAll(unbuildable, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramCleanExcept(refused, [Stage.Bodies]);
+    try sema_support.assertDiagnostic(refused.bodyDiagnostics(), 0, "/proj/src/main.ens",
+        "Struct 'Shape' cannot be built with a literal here. Its field 'sides' has no default value, "
+        + "and only code inside 'Shape' can set it. Mark 'sides' as 'public', or add a 'public' "
+        + "constructor to 'Shape'.");
+    try testing.assertEqual(refused.bodyDiagnostics().length, 1L);
+
+    let both = new FakeFileLoader();
+    both.add("/proj/src/boxes.ens",
+        "public struct Box \{\n"
+        + "    const int depth;\n"
+        + "    const int height;\n"
+        + "    constructor(this.depth, this.height);\n"
+        + "\}\n");
+    both.add("/proj/src/main.ens",
+        "import Box from boxes;\n"
+        + "main() -> int \{\n"
+        + "    Box box = \{\};\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let refusedBoth = sema_support.analyzeAll(both, "/proj/src", ["main.ens"]);
+    try sema_support.assertProgramCleanExcept(refusedBoth, [Stage.Bodies]);
+    try sema_support.assertDiagnostic(refusedBoth.bodyDiagnostics(), 0, "/proj/src/main.ens",
+        "Struct 'Box' cannot be built with a literal here. Its fields 'depth' and 'height' have no "
+        + "default value, and only code inside 'Box' can set them. Mark 'depth' and 'height' as "
+        + "'public', or add a 'public' constructor to 'Box'.");
+    try testing.assertEqual(refusedBoth.bodyDiagnostics().length, 1L);
+
+    let fetchedLoader = new FakeFileLoader();
+    let fetched = sema_support.fetchedAcme(fetchedLoader,
+        "export struct Knob \{\n"
+        + "    export const int level = 1;\n"
+        + "    export int turns;\n"
+        + "\}\n");
+    fetchedLoader.add("/proj/src/main.ens",
+        "import Knob from @acme.parts;\n"
+        + "main() -> int \{\n"
+        + "    Knob knob = \{level: 2, turns: 1\};\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let fixed = sema_support.analyzeWithFetched(fetchedLoader, "/proj/src", ["main.ens"], fetched);
+    try sema_support.assertProgramCleanExcept(fixed, [Stage.Bodies]);
+    try sema_support.assertDiagnostic(fixed.bodyDiagnostics(), 0, "/proj/src/main.ens",
+        "Field 'level' of 'Knob' cannot be set in a literal, because it is 'const' and already has "
+        + "its default value. Remove 'level: 2' from the literal.");
+    try testing.assertEqual(fixed.bodyDiagnostics().length, 1L);
 }
 
 // A literal written outside the struct's module counts only the fields it can set: the fields it

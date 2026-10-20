@@ -16,6 +16,7 @@ import phases.bodies.narrowing;
 import phases.bodies.functionvalues;
 import phases.bodies.thisuses;
 import phases.bodies.definiteassignment;
+import phases.bodies.assignments;
 import NamePosition from phases.bodies.memberaccess;
 import MissingMember from phases.bodies.memberaccess;
 import FieldMember from phases.bodies.memberaccess;
@@ -654,17 +655,22 @@ objectlessMemberRefusal(BodyChecker checker, string name, string kind, DeclaredT
     let field = typemembers.inheritedOrOwnField(owner, name);
     let declaring = field == null ? null : types.authorityOf(field.definingType());
     if (defaulted != null && declaring != null && declaring != owner) {
+        string fix = defaultFix(checker, owner, quotedOwner, defaulted, "read '{name}'",
+            "without reading the fields of {quotedBaseOf(checker, owner)}", written);
         return "'{name}' is a field {quotedOwner} inherits from {checker.names().quotedName(declaring)}, "
             + "and the default of field '{defaulted}' can read only the fields declared before it in "
-            + "{quotedOwner}. {defaultFix(owner, quotedOwner, defaulted, "read '{name}'", written)}";
+            + "{quotedOwner}. {fix}";
     }
     if (defaulted != null) {
         string avoided = "read '{name}'";
+        string computation = "without reading '{name}'";
         if (kind != "field") {
             avoided = "call '{name}'";
+            computation = "without calling '{name}'";
         }
+        string fix = defaultFix(checker, owner, quotedOwner, defaulted, avoided, computation, written);
         return "{opening}, and the default of field '{defaulted}' runs before the object's constructor "
-            + "body. {defaultFix(owner, quotedOwner, defaulted, avoided, written)}";
+            + "body. {fix}";
     }
     string? parameter = checker.frame().parameterDefaultName();
     if (parameter != null) {
@@ -685,18 +691,22 @@ objectlessMemberRefusal(BodyChecker checker, string name, string kind, DeclaredT
 }
 
 // The fix for the default of field 'defaulted' of 'owner' that would 'avoided', a member that needs
-// the object: the field is set by a constructor once every field has a value, written 'written'
-// there, which a field that needs a value can be only when it keeps a default that does not.
-defaultFix(DeclaredType owner, string quotedOwner, string defaulted, string avoided,
-        string written) -> string {
+// the object. A field that can change is set by a constructor once every field has a value, written
+// 'written' there, which a field that needs a value can be only when it keeps a default that does
+// not. A 'const' field is assigned once instead, its value computed as 'computation' says.
+defaultFix(BodyChecker checker, DeclaredType owner, string quotedOwner, string defaulted,
+           string avoided, string computation, string written) -> string {
+    let field = typemembers.inheritedOrOwnField(owner, defaulted);
+    if (field != null && field.isConst()) {
+        return constantDefaultFix(checker, field, "", "computing its value {computation}");
+    }
     string set = "set '{defaulted}' in a constructor of {quotedOwner} after 'super(...)', "
         + "writing '{written}' there";
     if (hierarchy.baseOf(owner) == null) {
         set = "set '{defaulted}' in a constructor of {quotedOwner} once its other fields have values, "
             + "writing '{written}' there";
     }
-    let field = typemembers.inheritedOrOwnField(owner, defaulted);
-    if (field != null && !field.isConst() && convert.isDefaultable(field.type())) {
+    if (field != null && convert.isDefaultable(field.type())) {
         return "Remove the default of '{defaulted}', and {set}.";
     }
     let placeholder = field == null ? null : wording.placeholderLiteral(field.type());
@@ -705,6 +715,55 @@ defaultFix(DeclaredType owner, string quotedOwner, string defaulted, string avoi
     }
     return "Change the default of '{defaulted}' to one that does not {avoided}, such as "
         + "'{placeholder}', and {set}.";
+}
+
+// The fix for the default of the 'const' field 'field': each constructor or literal sets it
+// instead, before 'super(...)' in a subclass. 'after' names what has a value by then, and
+// 'guidance' says how to write the value, as in "computing its value without calling 'count'".
+// Either is left out where it is empty.
+constantDefaultFix(BodyChecker checker, Field field, string after, string guidance) -> string {
+    string name = field.name();
+    Type owner = field.definingType();
+    string ownerName = assignments.quotedConstFieldOwner(checker, field);
+    bool constructed = typemembers.constructorsOf(owner).length() > 0;
+    bool literal = types.isStructLike(owner);
+    string timing = after;
+    if (hierarchy.baseOf(owner) != null && after.length > 0) {
+        timing = "{after} and before 'super(...)'";
+    } else if (hierarchy.baseOf(owner) != null) {
+        timing = "before 'super(...)'";
+    }
+    string subject = constructed && literal ? "it" : "'{name}'";
+    string place = "assign {subject} in every constructor of {ownerName}";
+    if (!constructed && literal) {
+        place = "set '{name}' in every literal of {ownerName}";
+    } else if (!constructed) {
+        place = "add a constructor to {ownerName} that assigns '{name}'";
+    }
+    if (timing.length > 0) {
+        place = "{place} {timing}";
+    }
+    if (guidance.length > 0) {
+        place = "{place}, {guidance}";
+    }
+    if (constructed && literal) {
+        return "Remove the default of '{name}', set '{name}' in every literal of {ownerName}, and "
+            + "{place}.";
+    }
+    return "Remove the default of '{name}', and {place}.";
+}
+
+// The base class of 'owner' quoted, as in "'Base'".
+quotedBaseOf(BodyChecker checker, Type owner) -> string {
+    let base = hierarchy.baseOf(owner);
+    if (base == null) {
+        return "the base class";
+    }
+    let authority = types.authorityOf(base);
+    if (authority != null) {
+        return checker.names().quotedName(authority);
+    }
+    return checker.names().quoted(base);
 }
 
 // The refusal of the static 'name' of 'declaring', the enclosing type or one of its bases, written
@@ -845,6 +904,9 @@ thisInDefaultRefusal(BodyChecker checker, string defaulted, string? member) -> s
     if (!firstAssigned) {
         return why;
     }
+    if (current != null && current.isConst()) {
+        return "{why} {constantThisFix(checker, owner, current, member, read)}";
+    }
     string after = "after the fields it reads have values";
     if (read != null && definiteassignment.needsAssignment(read)) {
         after = "after '{read.name()}' has a value";
@@ -857,6 +919,27 @@ thisInDefaultRefusal(BodyChecker checker, string defaulted, string? member) -> s
         quotedOwner = checker.names().quotedName(authority);
     }
     return why + " Set '{defaulted}' in a constructor of {quotedOwner} instead, {after}.";
+}
+
+// The fix for the default of the 'const' field 'field' of 'owner' that writes 'this.member', where
+// 'read' is the field 'member' names, or uses 'this' alone where 'member' is null.
+constantThisFix(BodyChecker checker, Type owner, Field field, string? member, Field? read) -> string {
+    if (member == null) {
+        return constantDefaultFix(checker, field, "", "computing its value without using 'this'");
+    }
+    if (read == null) {
+        return constantDefaultFix(checker, field, "",
+            "computing its value without calling '{member}'");
+    }
+    if (typemembers.isInheritedField(owner, read)) {
+        return constantDefaultFix(checker, field, "",
+            "computing its value without reading the fields of {quotedBaseOf(checker, owner)}");
+    }
+    string after = "";
+    if (definiteassignment.needsAssignment(read)) {
+        after = "after '{read.name()}' has a value";
+    }
+    return constantDefaultFix(checker, field, after, "writing 'this.{read.name()}' there");
 }
 
 public analyzeSuper(BodyChecker checker, SuperExpressionNode node) -> Type {

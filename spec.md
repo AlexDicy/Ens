@@ -257,7 +257,8 @@ Like a `toString` on a struct, one written `override` follows its class's visibi
 Inside a method, a constructor, or a destructor, a struct's or a class's own fields and methods are reached through `this`, as in `this.width` and `this.area()`, because a bare name there is a local, a parameter, or a top-level declaration and never a member.
 A field's default value is the one place a member is named on its own: a default may read the fields declared before it in the same class, as `string name = "{width}x{height}";` does.
 A default reads those fields and assigns none of them, so `int b = (a = 5);` is an error where `a` is a sibling field.
-A class computes the defaults of its own fields in declaration order when its constructor starts, after the arguments of `new` or `super(...)` are evaluated and before the body runs, so the constructor's assignments overwrite them.
+A class computes the defaults of its own fields in declaration order when its constructor starts, after the arguments of `new` or `super(...)` are evaluated and before the body runs.
+An assignment in the constructor body then replaces a field's default, except that a `const` field with a default can never be assigned.
 A struct that declares a constructor computes them before that constructor runs.
 In either a default may read an earlier field only when that field has a default of its own, or when its type has a default value, such as a number or a nullable type, and it is not `const`.
 A struct literal assigns the fields it lists before it computes the defaults of the others, so in a struct that declares no constructor a default may read any earlier field.
@@ -322,14 +323,29 @@ Such a clause may not reach its end or a `return`: every path through it ends by
 
 A field may also be `const`, in a struct as in a class: a const field is given its value when the object is constructed and never changes afterwards.
 It is assigned by a constructor of the type that declares it, through a `this.field = ...` statement or a `this.field` shorthand parameter, and a struct's const field is equally set by an aggregate literal naming it.
-Construction assigns it at most once: a second assignment on any path through a constructor is an error, and so is an assignment inside a loop, which could run more than once.
+Construction gives it exactly one value: either its default value or one assignment, never both.
+A second assignment on any path through a constructor is an error, and so is an assignment inside a loop, which could run more than once.
 A const field without a default value must be assigned on every path through every constructor, whatever its type, a class that declares one but no constructor is rejected, and every aggregate literal must name it.
-A const field with a default value keeps the default when construction does not assign it, so a constructor path may assign it once or not at all, and an aggregate literal may leave it out.
+A nullable const field is no exception: it does not start as null, so `const string? label;` needs a value like any other const field.
+A const field with a default value has that default as its one value, so no constructor may assign it, no `this.field` parameter may name it, and no aggregate literal may list it.
+Until every field that needs a value has one, `this` cannot leave the constructor, so no code outside it can see a const field before it has its value, and none ever sees it change.
 Everything else is an error: assigning from a method, a destructor, or a free function, assigning through any reference other than `this`, assigning an inherited const field from a subclass constructor, and `++`, `--`, or a compound assignment anywhere.
 Writing a field of a const field of a struct type is an error too, because a struct's fields are part of its value.
 That holds at any depth, for `=`, a compound assignment, `++`, and `--`, and in a constructor as anywhere else, so a constructor gives such a field its whole value in its one assignment.
 Calling a `mutating` method on such a field, or on a struct field of it, is an error for the same reason.
 A const field may be nullable, and it cannot also be `weak`, because a weak field resets to null when its target is destroyed while a const field never changes.
+
+```ens
+public class Download {
+    const int retries = 3;      // the default is the one value of 'retries'
+    const string? mirror;       // no default, so every constructor assigns it, even to null
+
+    public constructor(string? mirror) {
+        this.mirror = mirror;
+        // this.retries = 5;    // error: 'retries' already has its default value
+    }
+}
+```
 
 A field carries visibility modifiers, `const`, `static` (which requires `const`), `lazy` (which requires `const` too), and in a class also `weak`; no other modifier applies to one.
 A method carries visibility, the overriding markers (`abstract`, `override`, `final`), `noreturn`, and `static`, and a struct or interface method also `mutating`, while a constructor carries visibility alone, and a function declared at the top level carries visibility and `noreturn` alone, because nothing inherits it.

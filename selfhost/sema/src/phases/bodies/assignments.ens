@@ -11,6 +11,8 @@ import SubscriptExpressionNode from @ens.frontend.syntax.generated.nodes;
 import SafeSubscriptExpressionNode from @ens.frontend.syntax.generated.nodes;
 import AssignmentExpressionNode from @ens.frontend.syntax.generated.nodes;
 import ParenthesizedExpressionNode from @ens.frontend.syntax.generated.nodes;
+import FieldDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import @ens.frontend.syntax.generated.factory;
 import SyntaxKind from @ens.frontend.syntax.generated.kind;
 import Span from @ens.frontend.support.source;
 import LocalBinding from model.scopes;
@@ -21,6 +23,7 @@ import phases.bodies.nullguidance;
 import OperandForm from phases.bodies.nullguidance;
 import AccessStep from phases.bodies.nullguidance;
 import phases.bodies.definiteassignment;
+import FieldWrite from phases.bodies.definiteassignment;
 import phases.bodies.wording;
 import phases.bodies.thisuses;
 import phases.bodies.voidcalls;
@@ -42,6 +45,7 @@ import BodyChecker from phases.bodies;
 import LocalName from phases.bodies;
 import MemberPosition from phases.bodies.memberaccess;
 import support.syntax;
+import RelatedLocation from support.diagnostics;
 import ThisUse from result;
 import ThisUseKind from result;
 
@@ -115,9 +119,9 @@ public reportUnchangeable(BodyChecker checker, Expression changed, Type changedT
     let field = nullguidance.accessedField(checker, changed);
     if (field != null && field.isConst()) {
         checker.reporter().report("The '{operator}' operator cannot change field "
-            + "'{field.name()}': a 'const' field is assigned once when the object "
-            + "is constructed and never again. Remove 'const' from the field if it "
-            + "needs to change.", span);
+            + "'{field.name()}': a 'const' field gets its value when the object is "
+            + "constructed and never changes. Remove 'const' from the field if it needs "
+            + "to change.", span);
         return WriteRefusal.Unwritable;
     }
     if (!safe) {
@@ -597,7 +601,8 @@ public analyzeAssignment(BodyChecker checker, AssignmentExpressionNode node) -> 
 
 // Enforces the write-once contract of a 'const' field at an assignment naming it, and returns
 // true when it refuses the write. The one legal write is a plain '=' through 'this' inside a
-// constructor of the field's own type, outside any loop, on a path that cannot have assigned it.
+// constructor of the field's own type, to a field without a default, outside any loop, on a path
+// that cannot have assigned it.
 checkConstFieldWrite(BodyChecker checker, AssignmentExpressionNode node, Field field, bool throughThis,
                      bool simpleAssign) -> bool {
     string name = field.name();
@@ -605,21 +610,37 @@ checkConstFieldWrite(BodyChecker checker, AssignmentExpressionNode node, Field f
     if (!simpleAssign) {
         string operatorText = node.operator().text();
         checker.reporter().report("Cannot use '{operatorText}' on field '{name}': a 'const' "
-            + "field is assigned once when the object is constructed and never again. "
+            + "field gets its value when the object is constructed and never changes. "
             + "Remove 'const' from the field if it needs to change.", node.span());
         return true;
     }
     if (!checker.frame().inConstructor() || !throughThis) {
-        string sites = "inside a constructor of {ownerName} as 'this.{name} = ...'";
-        if (types.authorityOf(field.definingType()) is StructType) {
-            sites = sites + " or by a struct literal like '\{{name}: ...\}'";
+        string why = "it is 'const', so it is assigned exactly once, inside a constructor of "
+            + "{ownerName} as 'this.{name} = ...'";
+        if (field.hasDefault()) {
+            why = "it is 'const' and already has its default value";
+        } else if (types.authorityOf(field.definingType()) is StructType) {
+            why = why + " or by a struct literal like '\{{name}: ...\}'";
         }
-        checker.reporter().report("Cannot assign a new value to field '{name}': it is 'const', "
-            + "so it is assigned exactly once, " + sites + ". Remove 'const' from the "
-            + "field if it needs to change.", node.span());
+        checker.reporter().report("Cannot assign a new value to field '{name}': {why}. Remove "
+            + "'const' from the field if it needs to change.", node.span());
         return true;
     }
-    if (field.definingType() != checker.assignment().constructorFieldOwner()) {
+    bool inherited = field.definingType() != checker.assignment().constructorFieldOwner();
+    if (field.hasDefault()) {
+        string reason = "Field '{name}' cannot be assigned here, because it is 'const' and already "
+            + "has its default value.";
+        string fix = " Remove this assignment, or {defaultRemoval(field)} and "
+            + "{assignedEverywhere(checker, field)}.";
+        if (inherited) {
+            reason = "Field '{name}' cannot be assigned here, because it is 'const' in base class "
+                + "{ownerName} and already has its default value.";
+            fix = " Remove this assignment.";
+        }
+        checker.reporter().report(reason + fix, node.span(), defaultNotes(field));
+        return true;
+    }
+    if (inherited) {
         checker.reporter().report("Field '{name}' is 'const' and declared in base class "
             + "{ownerName}, so only a constructor of {ownerName} can assign it. Pass "
             + "the value to 'super(...)' instead.", node.span());
@@ -634,12 +655,72 @@ checkConstFieldWrite(BodyChecker checker, AssignmentExpressionNode node, Field f
     }
     let earlier = checker.assignment().possibleWriteOf(field);
     if (earlier != null) {
-        checker.reporter().report("Field '{name}' is 'const' and may already be assigned when "
-            + "this line runs. Remove one of the assignments.", node.span(), earlier.span(),
-            "'{name}' is assigned here");
+        checker.reporter().report(repeatedConstWriteRefusal(checker, field, earlier), node.span(),
+            earlier.span(), "'{name}' is assigned here");
         return true;
     }
     return false;
+}
+
+// The refusal of an assignment to the 'const' field 'field' that 'earlier' may already have
+// assigned on a path reaching it.
+repeatedConstWriteRefusal(BodyChecker checker, Field field, FieldWrite earlier) -> string {
+    string name = field.name();
+    string opening = "Field '{name}' cannot be assigned here, because it is 'const' and";
+    if (checker.assignment().assignedBeforeThrowing(earlier)) {
+        return "Field '{name}' cannot be assigned here, because it is 'const', and the constructor "
+            + "body may have assigned it before a call there threw. In the body, move the "
+            + "assignment to '{name}' after the last call that can throw, or remove this assignment.";
+    }
+    if (checker.assignment().hasValue(field)) {
+        return "{opening} is already assigned when this line runs. Remove this assignment.";
+    }
+    return "{opening} on some paths it is already assigned when this line runs. Assign '{name}' "
+        + "only on the paths where it has no value yet.";
+}
+
+// The fix that removes the default value of 'field': "remove the default '= 3'".
+public defaultRemoval(Field field) -> string {
+    let declaration = field.declaration();
+    if (declaration != null) {
+        let root = factory.createRoot(declaration);
+        if (root is FieldDeclarationNode) {
+            let initial = root.defaultValue();
+            if (initial != null) {
+                let spelled = wording.shortSpelling(initial.value());
+                if (spelled != null) {
+                    return "remove the default '= {spelled}'";
+                }
+            }
+        }
+    }
+    return "remove the default of '{field.name()}'";
+}
+
+// Where 'field' then gets its value, as the fix that removes its default says: "assign 'code' in
+// every constructor of 'Message'".
+public assignedEverywhere(BodyChecker checker, Field field) -> string {
+    string name = field.name();
+    string ownerName = quotedConstFieldOwner(checker, field);
+    Type owner = field.definingType();
+    if (!types.isStructLike(owner)) {
+        return "assign '{name}' in every constructor of {ownerName}";
+    }
+    if (typemembers.constructorsOf(owner).length() == 0) {
+        return "set '{name}' in every literal of {ownerName}";
+    }
+    return "assign '{name}' in every constructor of {ownerName} and set it in every literal";
+}
+
+// The note at the default value of 'field', in the file that declares it.
+public defaultNotes(Field field) -> RelatedLocation[] {
+    let at = field.defaultSpan();
+    let owner = types.authorityOf(field.definingType());
+    if (at == null || owner == null) {
+        return [];
+    }
+    string note = "'{field.name()}' gets its default value here";
+    return [new RelatedLocation(owner.filePath(), at, note)];
 }
 
 // The field's declaring type in quotes, as a diagnostic about the field names it.
