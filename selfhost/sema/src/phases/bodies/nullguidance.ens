@@ -115,19 +115,6 @@ public final class NullableOperand {
     protected bool checkedEarlier = false;
     // Whether a fallback written after the value needs it in parentheses.
     protected bool fallbackParenthesized = false;
-    // Where a proof made where the lambda being checked is created covers the value but does not hold
-    // inside the lambda: the part of the value the lambda reads from an object, the whole place to copy
-    // into a local before the lambda, and the name of the local with the name to take where another
-    // operand takes it, each with the changes to the tests that then have to test the local.
-    // Where no statement can go before the lambda, the type test to write inside it where the proof is
-    // a type test. Empty anywhere else.
-    protected string objectRead = "";
-    protected string copyPlace = "";
-    protected string copyName = "";
-    protected string otherCopyName = "";
-    protected string[] copyRetests = [];
-    protected string[] otherCopyRetests = [];
-    protected string objectTest = "";
     // The assignment to the local the value is that comes later in the call the lambda being checked is
     // passed to, after the lambda copies the local, or empty where there is none.
     protected string laterAssignment = "";
@@ -765,14 +752,10 @@ public classifyOperand(BodyChecker checker, Expression operand, long levels, str
     if (form == OperandForm.Stored) {
         classified.checkedEarlier = checkedBefore(checker, syntax.unwrapParentheses(operand));
     }
-    if (!writesBack && levels > 0 && (form == OperandForm.Stable || form == OperandForm.NoFix)) {
-        noteObjectRead(checker, operand, levels, classified);
-    }
     if (!writesBack && levels > 0) {
         noteLaterAssignment(checker, operand, classified);
     }
-    if (!writesBack && levels > 0 && (form == OperandForm.Stable || form == OperandForm.NoFix)
-            && classified.objectRead.length == 0) {
+    if (!writesBack && levels > 0 && (form == OperandForm.Stable || form == OperandForm.NoFix)) {
         noteEndedNarrowing(checker, operand, classified);
     }
     return classified;
@@ -939,45 +922,6 @@ loopConditionCheck(Expression operand, string place) -> string {
         + "'while ({place} != null && {spelled})'.";
 }
 
-
-// Records on 'classified' the part of 'operand' that the lambda being checked reads from an object,
-// where a proof made where the lambda is created takes off the 'levels' of null the use needs but
-// does not hold inside the lambda.
-noteObjectRead(BodyChecker checker, Expression operand, long levels, NullableOperand classified) {
-    let path = narrowing.buildNarrowingPath(checker, operand);
-    if (path == null) {
-        return;
-    }
-    let frame = lambdas.uncarriedFrame(checker, path);
-    if (frame == null) {
-        return;
-    }
-    let proven = frame.uncarriedProof(path);
-    let declared = narrowing.declaredSlotType(checker, operand);
-    long read = wording.optionalLevels(checker.recordedType(operand));
-    if (proven == null || declared == null || wording.optionalLevels(proven) + levels > read) {
-        return;
-    }
-    classified.objectRead = narrowing.objectReadSpelling(operand, path);
-    if (frame.allowsStatementsBefore()) {
-        let place = narrowing.copiedPlace(checker, operand, frame);
-        string name = narrowing.copyName(checker, place, "");
-        string other = narrowing.copyName(checker, place, name);
-        let retests = narrowing.copyRetests(checker, place, frame, name);
-        let otherRetests = narrowing.copyRetests(checker, place, frame, other);
-        if (retests != null && otherRetests != null) {
-            classified.copyPlace = wording.oneLineSpelling(place);
-            classified.copyName = name;
-            classified.otherCopyName = other;
-            classified.copyRetests = retests;
-            classified.otherCopyRetests = otherRetests;
-            return;
-        }
-    }
-    if (convert.coreOf(proven) != convert.coreOf(declared)) {
-        classified.objectTest = narrowing.typeTestExample(checker, operand, convert.coreOf(proven));
-    }
-}
 
 // A write through '?.' or '?[' as the step that the same write without its '?' lands in.
 // Null when a null check cannot narrow the value in front of the '?'.
@@ -1295,9 +1239,6 @@ valueConversion(BodyChecker checker, Type target, Type source, Expression? value
 operandsAdvice(NullableOperand[] operands, string operatorText = "") -> string? {
     if (operands.length == 2 && operands[0].form() == operands[1].form()
             && operands[0].levels == operands[1].levels && !samePlace(operands[0], operands[1])
-            && (operands[0].objectRead.length == 0) == (operands[1].objectRead.length == 0)
-            && (operands[0].copyName.length == 0) == (operands[1].copyName.length == 0)
-            && operands[0].objectTest.length == 0 && operands[1].objectTest.length == 0
             && operands[0].laterAssignment.length == 0 && operands[1].laterAssignment.length == 0
             && operands[0].endedReason.length == 0 && operands[1].endedReason.length == 0) {
         let paired = formAdvice(operands, operatorText);
@@ -1331,9 +1272,6 @@ formAdvice(NullableOperand[] operands, string operatorText) -> string? {
         string assignment = first.laterAssignment;
         return "The lambda copies '{name}' when it is created. The assignment '{assignment}' comes later in "
             + "the same call. Assign '{name}' before the call, for example '{assignment};'.";
-    }
-    if (first.objectRead.length > 0) {
-        return "{narrowing.objectReadReason(objectReads(operands))} {objectReadAdvice(operands)}";
     }
     if (first.endedReason.length > 0) {
         return endedAdvice(first);
@@ -1381,68 +1319,6 @@ endedAdvice(NullableOperand operand) -> string {
         return "{operand.endedReason} {check} ('if ({condition})').";
     }
     return "{operand.endedReason} {check}{repeatedCheck(condition, operand.levels, operand.everyLevel)}.";
-}
-
-// The parts of the operands that the lambda being checked reads from objects, each once.
-objectReads(NullableOperand[] operands) -> string[] {
-    let reads = new List<string>();
-    for (let operand in operands) {
-        if (!reads.contains(operand.objectRead)) {
-            reads.push(operand.objectRead);
-        }
-    }
-    return reads.toArray();
-}
-
-// The copy to make before the lambda being checked, or the check or the type test to write inside it
-// where no statement can go before it, for one operand, or for two of the same form, where a proof
-// made outside the lambda covers them.
-objectReadAdvice(NullableOperand[] operands) -> string {
-    let first = operands[0];
-    if (first.copyName.length > 0) {
-        return objectCopyAdvice(operands);
-    }
-    if (first.objectTest.length > 0) {
-        return "Test '{first.spelling}' inside the lambda, as in {first.objectTest}.";
-    }
-    if (first.form() == OperandForm.NoFix) {
-        return fallbackAdvice(operands, false) ?? "";
-    }
-    string names = joinedValues(operands, false, "'", "'", " and ");
-    string condition = joinedValues(operands, false, "", " != null", " && ");
-    if (first.levels == 1) {
-        return "Check {names} for null inside the lambda ('if ({condition})').";
-    }
-    return "Check {names} for null inside the lambda"
-        + "{repeatedCheck(condition, first.levels, first.everyLevel)}.";
-}
-
-// The copy of each operand into a local before the lambda being checked, which the lambda then reads.
-// Where two operands would copy into locals of one name, the second takes another.
-objectCopyAdvice(NullableOperand[] operands) -> string {
-    bool clash = operands.length == 2 && operands[0].copyName == operands[1].copyName;
-    let places = new List<string>();
-    let copies = new List<string>();
-    let retests = new List<string>();
-    bool named = true;
-    for (long i = 0; i < operands.length; i++) {
-        let operand = operands[i];
-        string name = operand.copyName;
-        string[] changes = operand.copyRetests;
-        if (clash && i == 1) {
-            name = operand.otherCopyName;
-            changes = operand.otherCopyRetests;
-        }
-        places.push(operand.copyPlace);
-        copies.push("let {name} = {operand.copyPlace};");
-        for (let change in changes) {
-            if (!retests.contains(change)) {
-                retests.push(change);
-            }
-        }
-        named = named && operand.copyPlace == operand.objectRead;
-    }
-    return narrowing.objectCopyAdvice(places.toArray(), copies.toArray(), named, retests.toArray());
 }
 
 // The advice for the values read where no statement can go, which only a '??' fallback can give a
