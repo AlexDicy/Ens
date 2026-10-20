@@ -186,7 +186,15 @@ A call evaluates and checks its arguments in the order they are written, includi
 A lambda among them sees what holds where it is written: in `run(() -> held.length, held = "abc")` the lambda copies `held` before the assignment runs, so the narrowing the assignment makes does not reach it.
 A name is not a value, so a name that picks an overload is an error whose fix is a lambda that calls it, and a name that picks none is an error of its own.
 A lambda or an array literal that two overloads fit equally well, such as a lambda where both take a function type with the same number of parameters, leaves the call ambiguous.
-When two overloads match equally well, the call is a compile error that lists the candidates.
+When two overloads match equally well, the call goes to the more specific one.
+A parameter type is more specific than another when every value it accepts is accepted by the other, and it differs by a subclass, by a `?` the other has, or both.
+So `Circle` is more specific than `Shape`, `Circle?` and `Shape?`.
+An overload is more specific than another when the type of each parameter an argument fills is the same or more specific, and at least one is more specific.
+A `Square` that extends `Circle` therefore calls `describe(Circle c)` rather than `describe(Shape s)`.
+How well the arguments fit is decided first, so for that `Square`, `fit(square, 1)` calls `fit(Shape s, int n)` rather than `fit(Circle c, long n)`, because the literal `1` fits `int` better than `long`.
+Implementing an interface or widening a number does not make a type more specific, so if `Circle` implements `Speaker`, `talk(Circle c)` and `talk(Speaker s)` stay ambiguous for that `Square`.
+Where a generic type's type argument gives two overloads the same parameter types, the one written without the type parameter is more specific: `Box<Shape>` calls `put(Shape value)` rather than `put(T value)`.
+When neither overload is more specific, the call is a compile error that lists the candidates.
 Overloads that are not visible from the call site lose to visible ones; visibility is only an error when no visible overload matches.
 Named arguments participate in selection: an overload is only considered when every named argument names one of its parameters.
 A subclass may add a new overload of an inherited method name; `override` still requires the exact signature of the method it replaces.

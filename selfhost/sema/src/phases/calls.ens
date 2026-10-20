@@ -17,10 +17,12 @@ import QuotedCode from model.typenames;
 import model.types;
 import Type from model.types;
 import ErrorType from model.types;
+import TypeParamType from model.types;
 import NullType from model.types;
 import OptionalType from model.types;
 import ArrayType from model.types;
 import FunctionType from model.types;
+import InstantiationType from model.types;
 import PrimitiveType from model.types;
 import PrimitiveKind from model.types;
 import TypeStore from model.types;
@@ -872,9 +874,10 @@ class ViableCandidate {
     protected constructor(this.candidate, this.mapping, this.ranks, this.defaulted);
 }
 
-// Picks the best candidate: filter by argument shape and viability, rank argument matches
-// (exact beats conversion beats literal fitting), prefer accessible candidates, keep the
-// Pareto-undominated set with fewer defaulted parameters as the tiebreak, and report the
+// Picks the best candidate: filter by argument shape and viability, prefer accessible candidates,
+// then keep the candidates no other one beats by how well the arguments fit (exact beats
+// conversion beats literal fitting), then by more specific parameter types, then by parameter types
+// written without the owner's type parameters, then by fewer defaulted parameters. Reports the
 // no-match and ambiguity diagnostics here. A call passing the name of a method or function reports
 // neither, because that name is refused on its own.
 public resolveCall(List<CallCandidate> candidates, CallShape shape, Reporter reporter,
@@ -920,22 +923,10 @@ public resolveCall(List<CallCandidate> candidates, CallShape shape, Reporter rep
         }
     }
 
-    let best = new List<ViableCandidate>();
-    for (long i = 0; i < pool.length(); i++) {
-        bool dominated = false;
-        for (long j = 0; j < pool.length(); j++) {
-            if (j != i && betterThan(pool.get(j), pool.get(i))) {
-                dominated = true;
-                break;
-            }
-        }
-        if (!dominated) {
-            best.push(pool.get(i));
-        }
-    }
-    if (best.length() == 0) {
-        best.push(pool.get(0));
-    }
+    let fitting = unbeaten(pool, (left, right) -> fitsBetter(left, right));
+    let specific = unbeaten(fitting, (left, right) -> isMoreSpecific(left, right));
+    let concrete = unbeaten(specific, (left, right) -> isWrittenMoreConcretely(left, right));
+    let best = unbeaten(concrete, (left, right) -> defaultsFewer(left, right));
     if (best.length() > 1 && !shape.hasErrorArgument()) {
         if (!shape.holdsName()) {
             reporter.report(ambiguityMessage(best, shape, displayName, kindWord, names), span);
@@ -975,24 +966,28 @@ viableCandidates(List<CallCandidate> candidates, CallShape shape, string kindWor
     return viable;
 }
 
-betterThan(ViableCandidate left, ViableCandidate right) -> bool {
-    bool atLeastAsGood = true;
-    bool strictlyBetter = false;
-    for (long i = 0; i < left.ranks.length; i++) {
-        if (left.ranks[i] < right.ranks[i]) {
-            atLeastAsGood = false;
+// The candidates of 'pool' that no other candidate of it beats.
+unbeaten(List<ViableCandidate> pool, (ViableCandidate, ViableCandidate) -> bool beats)
+        -> List<ViableCandidate> {
+    let kept = new List<ViableCandidate>();
+    for (let candidate in pool) {
+        bool beaten = false;
+        for (let other in pool) {
+            if (other != candidate && beats(other, candidate)) {
+                beaten = true;
+                break;
+            }
         }
-        if (left.ranks[i] > right.ranks[i]) {
-            strictlyBetter = true;
+        if (!beaten) {
+            kept.push(candidate);
         }
     }
-    if (!atLeastAsGood) {
-        return false;
-    }
-    if (strictlyBetter) {
-        return true;
-    }
-    return left.defaulted < right.defaulted;
+    return kept;
+}
+
+// Whether every argument fits 'left' at least as well as 'right', and one fits it better.
+fitsBetter(ViableCandidate left, ViableCandidate right) -> bool {
+    return ranksDominate(left.ranks, right.ranks);
 }
 
 // Whether every rank of 'left' is at least the one of 'right' at its index, and one is higher.
@@ -1005,6 +1000,103 @@ ranksDominate(long[] left, long[] right) -> bool {
         higher = higher || left[i] > right[i];
     }
     return higher;
+}
+
+// Whether 'left' takes every argument as the type 'right' takes it or a more specific one, and one
+// as a more specific one.
+isMoreSpecific(ViableCandidate left, ViableCandidate right) -> bool {
+    bool narrower = false;
+    for (long i = 0; i < left.ranks.length; i++) {
+        Type leftType = parameterTypeOf(left, i);
+        Type rightType = parameterTypeOf(right, i);
+        if (leftType != rightType) {
+            if (!isMoreSpecificType(leftType, rightType)) {
+                return false;
+            }
+            narrower = true;
+        }
+    }
+    return narrower;
+}
+
+// Whether every value of 'narrower' fits 'wider' and not the other way round, because it is a
+// subclass of it or the same type with fewer '?': 'Circle' is more specific than 'Shape', 'Circle?'
+// and 'Shape?'. A number type that widens to another, or a type implementing an interface, is not
+// more specific than it.
+public isMoreSpecificType(Type narrower, Type wider) -> bool {
+    if (!convert.isAssignableStrict(wider, narrower)
+            || convert.isAssignableStrict(narrower, wider)) {
+        return false;
+    }
+    Type narrowerCore = convert.coreOf(narrower);
+    Type widerCore = convert.coreOf(wider);
+    if (narrowerCore == widerCore) {
+        return true;
+    }
+    return types.classOf(narrowerCore) != null && types.classOf(widerCore) != null
+        && hierarchy.isSubclassOf(narrowerCore, widerCore);
+}
+
+// Whether 'left' and 'right' take every argument as the same type, 'left' never writes a type
+// parameter of its generic owner where 'right' does not, and once writes a type without one where
+// 'right' writes one: on 'Box<Shape>', 'put(Shape value)' beats 'put(T value)'.
+isWrittenMoreConcretely(ViableCandidate left, ViableCandidate right) -> bool {
+    Parameter[] leftWritten = writtenParameters(left.candidate);
+    Parameter[] rightWritten = writtenParameters(right.candidate);
+    bool concrete = false;
+    for (long i = 0; i < left.ranks.length; i++) {
+        if (parameterTypeOf(left, i) != parameterTypeOf(right, i)) {
+            return false;
+        }
+        bool leftOpen = convert.containsTypeParam(leftWritten[left.mapping[i]].type());
+        bool rightOpen = convert.containsTypeParam(rightWritten[right.mapping[i]].type());
+        if (leftOpen && !rightOpen) {
+            return false;
+        }
+        concrete = concrete || (rightOpen && !leftOpen);
+    }
+    return concrete;
+}
+
+// The parameters of 'candidate' as its declaration writes them, before a generic owner's type
+// arguments replace its type parameters.
+writtenParameters(CallCandidate candidate) -> Parameter[] {
+    let method = candidate.method();
+    if (method == null) {
+        return candidate.signature().parameters();
+    }
+    Type owner = method.definingType();
+    let declaration = method.signature().declaration();
+    if (!(owner is InstantiationType) || declaration == null) {
+        return candidate.signature().parameters();
+    }
+    let template = owner.template();
+    let written = typemembers.methodsOf(template) ?? new List<Method>();
+    if (method.isStatic()) {
+        written = typemembers.staticMethodsOf(template) ?? new List<Method>();
+    }
+    for (let declared in written) {
+        if (declared.signature().declaration() == declaration) {
+            return declared.signature().parameters();
+        }
+    }
+    return candidate.signature().parameters();
+}
+
+// Whether every argument fits 'left' exactly as well as 'right', and 'left' leaves fewer
+// parameters to their defaults.
+defaultsFewer(ViableCandidate left, ViableCandidate right) -> bool {
+    return fitsAlike(left, right) && left.defaulted < right.defaulted;
+}
+
+// Whether every argument fits 'left' exactly as well as 'right'.
+fitsAlike(ViableCandidate left, ViableCandidate right) -> bool {
+    for (long i = 0; i < left.ranks.length; i++) {
+        if (left.ranks[i] != right.ranks[i]) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // The type of the parameter the argument at 'index' fills in 'viable'.
@@ -1448,7 +1540,7 @@ joinText(ArgumentValue argument, TypeNames names, Type? wanted) -> string {
 
 // The refusal of a call that several declarations accept equally well. The fix converts the
 // arguments whose parameter types differ among them so that one of them matches best, with 'as'
-// where every converted argument is a number and with locals otherwise, and stops after the problem
+// where every converted argument is a number and with locals otherwise, and stops after the why
 // where no such conversion makes one of them match best. When the parameter types the arguments
 // fill agree, the fix passes the first defaulted argument whose type differs among them.
 ambiguityMessage(List<ViableCandidate> best, CallShape shape, string displayName, string kindWord,
@@ -1462,6 +1554,10 @@ ambiguityMessage(List<ViableCandidate> best, CallShape shape, string displayName
     let ending = endingAmbiguity(best, shape, displayName, kindWord, names);
     if (ending != null) {
         return "{problem} {ending}";
+    }
+    let reason = unspecificReason(best, shape, names);
+    if (reason != null) {
+        problem = "{problem} {reason}";
     }
     if (!differInArguments(best)) {
         return "{problem} {defaultedArgumentFix(best, shape, displayName, kindWord, names)}";
@@ -1575,6 +1671,122 @@ conversionFix(List<Conversion> conversions, ViableCandidate target, CallShape sh
     }
     return "Convert the arguments with 'as', as in {diagnostics.andJoined(written.toArray())}, so "
         + "the call matches one of them exactly.";
+}
+
+// Why neither of the two candidates 'best' is more specific than the other: each takes a more
+// specific type for a different argument, or they take an argument of a type of its own as two
+// types neither of which is more specific. Null where there are more than two candidates or
+// neither holds.
+unspecificReason(List<ViableCandidate> best, CallShape shape, TypeNames names) -> string? {
+    if (best.length() != 2) {
+        return null;
+    }
+    let first = best.get(0);
+    let second = best.get(1);
+    long firstNarrower = -1;
+    long secondNarrower = -1;
+    long unrelated = -1;
+    for (long i = 0; i < first.ranks.length; i++) {
+        Type firstType = parameterTypeOf(first, i);
+        Type secondType = parameterTypeOf(second, i);
+        if (firstType == secondType) {
+            continue;
+        }
+        if (isMoreSpecificType(firstType, secondType)) {
+            if (firstNarrower < 0) {
+                firstNarrower = i;
+            }
+        } else if (isMoreSpecificType(secondType, firstType)) {
+            if (secondNarrower < 0) {
+                secondNarrower = i;
+            }
+        } else if (unrelated < 0 && shape.argumentAt(i).shape() == ArgumentShape.Typed) {
+            unrelated = i;
+        }
+    }
+    if (firstNarrower >= 0 && secondNarrower >= 0) {
+        return "{narrowerText(first, firstNarrower, shape, names)}, and "
+            + "{narrowerText(second, secondNarrower, shape, names)}, so neither is more specific "
+            + "overall.";
+    }
+    if (unrelated < 0 || !fitsAlike(first, second)) {
+        return null;
+    }
+    return unrelatedText(shape, unrelated, parameterTypeOf(first, unrelated),
+        parameterTypeOf(second, unrelated), names);
+}
+
+// "'cross(Circle, Shape)' takes the more specific 'Circle' for argument 1".
+narrowerText(ViableCandidate viable, long index, CallShape shape, TypeNames names) -> string {
+    return "{quotedSignature(viable.candidate.signature(), names)} takes the more specific "
+        + "{names.quoted(parameterTypeOf(viable, index))} for "
+        + "{argumentPosition(shape.argumentAt(index), index)}";
+}
+
+// Why neither of 'left' and 'right', which two candidates take the argument at 'index' as, is
+// more specific than the other, or null where one of them is a type parameter or has two '?'.
+unrelatedText(CallShape shape, long index, Type left, Type right, TypeNames names) -> string? {
+    let argument = shape.argumentAt(index);
+    Type leftCore = convert.coreOf(left);
+    Type rightCore = convert.coreOf(right);
+    if (convert.isNumericType(leftCore) && convert.isNumericType(rightCore)) {
+        string subject = "Argument {index + 1}";
+        if (argument.name().length > 0) {
+            subject = "The argument '{argument.name()}'";
+        }
+        string described = "has type {names.quoted(argument.type())}";
+        string? literal = literalText(argument);
+        if (argument.type() is NullType) {
+            described = "is 'null'";
+        } else if (literal != null) {
+            described = "is '{literal}'";
+        }
+        return "{subject} {described}, which fits {names.quoted(left)} and {names.quoted(right)} "
+            + "alike.";
+    }
+    if (leftCore is TypeParamType || rightCore is TypeParamType
+            || convert.bareOf(left) is OptionalType || convert.bareOf(right) is OptionalType) {
+        return null;
+    }
+    string opening = "";
+    string neither = "Neither";
+    if (shape.argumentCount() > 1) {
+        opening = "For {argumentPosition(argument, index)}, ";
+        neither = "neither";
+    }
+    if (isMoreSpecificType(leftCore, rightCore)) {
+        return opening + nullableText(left, right, names);
+    }
+    if (isMoreSpecificType(rightCore, leftCore)) {
+        return opening + nullableText(right, left, names);
+    }
+    if (types.isInterfaceLike(rightCore) && convert.isAssignableStrict(rightCore, leftCore)) {
+        return opening + conformanceText(leftCore, rightCore, names);
+    }
+    if (types.isInterfaceLike(leftCore) && convert.isAssignableStrict(leftCore, rightCore)) {
+        return opening + conformanceText(rightCore, leftCore, names);
+    }
+    return "{opening}{neither} {names.quoted(leftCore)} nor {names.quoted(rightCore)} is a subclass "
+        + "of the other, so neither is more specific.";
+}
+
+// Why the nullable 'nullable', whose type without '?' is a subclass of 'wider', is not more
+// specific than 'wider'.
+nullableText(Type nullable, Type wider, TypeNames names) -> string {
+    return "{names.quoted(nullable)} accepts 'null', which {names.quoted(wider)} does not, and "
+        + "{names.quoted(wider)} accepts values of type {names.quoted(convert.coreOf(wider))} that "
+        + "are not of type {names.quoted(convert.coreOf(nullable))}, so neither is more specific.";
+}
+
+// Why 'source', which converts to the interface 'target' because it implements or extends it, is
+// not more specific than it.
+conformanceText(Type source, Type target, TypeNames names) -> string {
+    if (types.isInterfaceLike(source)) {
+        return "{names.quoted(source)} extends {names.quoted(target)}, but extending an interface "
+            + "does not make a parameter more specific.";
+    }
+    return "{names.quoted(source)} implements {names.quoted(target)}, but implementing an "
+        + "interface does not make a parameter more specific.";
 }
 
 // Why the choice among the candidates 'best' still matters when an argument never returns, so
