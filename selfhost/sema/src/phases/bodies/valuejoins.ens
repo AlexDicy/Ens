@@ -544,47 +544,82 @@ isSameKind(Expression first, Expression second) -> bool {
 }
 
 // The refusal of the '?:' or the switch 'join' with no context type, each value of which takes its type
-// from the others: where they are lambdas, '{...}' literals or empty '[]', that nothing gives them a
-// type, and where they are of different kinds, that they have no common type. Null where they are array
-// literals that are not all empty, which are refused one by one.
+// from the others: where they are lambdas, '{...}' literals or empty '[]', or array literals that hold
+// only lambdas or only '{...}' literals, that nothing gives them a type, and where they are of different
+// kinds, that they have no common type. Null where they are other array literals that are not all
+// empty, which are refused one by one.
 untypedJoinRefusal(Expression join) -> string? {
     let values = untypedValues(join);
     let first = values.get(0);
+    bool filled = false;
     for (let value in values) {
         if (!isSameKind(first, value)) {
             return joinMismatch(join, untypedText(first), untypedText(value));
         }
         if (value is ArrayLiteralExpressionNode && value.elementsCount() > 0) {
+            filled = true;
+        }
+    }
+    if (!filled) {
+        return untypedValuesRefusal(join, values, false);
+    }
+    let held = new List<Expression>();
+    for (let value in values) {
+        if (!collectHeldValues(value, held)) {
             return null;
         }
     }
-    return untypedValuesRefusal(join);
+    for (let value in held) {
+        if (!isSameKind(held.get(0), value) || value is ArrayLiteralExpressionNode) {
+            return null;
+        }
+    }
+    return untypedValuesRefusal(join, held, true);
 }
 
-// The refusal of the '?:' or the switch 'join' with no context type, whose values with no type of their
-// own get none from the others, for the kind of the first of them.
-untypedValuesRefusal(Expression join) -> string {
-    let values = untypedValues(join);
+// Collects the values with no type of their own that the array literal 'value' holds, through the
+// array literals it holds, into 'held'. False where one of them has a type of its own.
+collectHeldValues(Expression value, List<Expression> held) -> bool {
+    Expression core = syntax.unwrapParentheses(value);
+    if (!(core is ArrayLiteralExpressionNode) || core.elementsCount() == 0) {
+        held.push(core);
+        return true;
+    }
+    for (long i = 0; i < core.elementsCount(); i++) {
+        let element = core.elements(i);
+        if (!syntax.needsTargetType(element) || !collectHeldValues(element, held)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The refusal of the '?:' or the switch 'join' with no context type, whose 'values' with no type of
+// their own get none from the others, for the kind of the first of them. Where 'inArrays', the values
+// are held by array literals the join's values are, and an array type is the type to declare.
+untypedValuesRefusal(Expression join, List<Expression> values, bool inArrays) -> string {
     bool one = values.length() == 1;
     string named = wording.joinName(join);
     string parts = wording.joinPartsName(join);
     string places = "such as a variable, a field, a parameter, an array element or a return value.";
     switch (syntax.unwrapParentheses(values.get(0))) {
         is LambdaExpressionNode ignored -> {
+            string declared = inArrays ? "an array type" : "a function type";
             if (one) {
                 return "This {named} has no function type to give the lambda in one of its {parts}, so the "
-                    + "lambda's parameters and result have no types. Write the {named} where a function type "
-                    + "is declared, {places}";
+                    + "lambda's parameters and result have no types. Write the {named} where {declared} is "
+                    + "declared, {places}";
             }
             return "This {named} has no function type to give the lambdas in its {parts}, so their "
-                + "parameters and results have no types. Write the {named} where a function type is "
-                + "declared, {places}";
+                + "parameters and results have no types. Write the {named} where {declared} is declared, "
+                + "{places}";
         },
         is StructLiteralExpressionNode ignored -> {
+            string declared = inArrays ? "an array type" : "a struct type";
             string literal = one ? "the '\{...\}' literal in one of its {parts}"
                 : "the '\{...\}' literals in its {parts}";
             return "This {named} has no declared struct type for {literal} to build. Write the {named} where "
-                + "a struct type is declared, {places}";
+                + "{declared} is declared, {places}";
         },
         default -> {
             string empty = one ? "the empty '[]' in one of its {parts}" : "each empty '[]' in its {parts}";
@@ -683,6 +718,20 @@ public holdMismatch(BodyChecker checker, string message, Span span) {
     checker.targets().joinMismatches().push(new HeldMismatch(message, span));
 }
 
+// Reports 'message', the refusal of 'value', which has no type of its own, for the type it is given.
+// A value of a join is reported once for the join: every value of a join is given the same type, so a
+// second value refused the same way is the same problem.
+public reportTargetRefusal(BodyChecker checker, string message, Expression value) {
+    if (checker.targets().isAnalyzedValue(value.green())) {
+        let reported = checker.targets().joinTargetRefusals();
+        if (reported.contains(message)) {
+            return;
+        }
+        reported.push(message);
+    }
+    checker.reporter().report(message, value.span());
+}
+
 // Ends the join 'join' began with 'scope', reporting the literals it kept when it is outermost.
 public endJoin(BodyChecker checker, Expression join, JoinScope scope) {
     if (scope.created()) {
@@ -697,10 +746,12 @@ public endJoin(BodyChecker checker, Expression join, JoinScope scope) {
     checker.targets().endJoin(scope);
 }
 
-// Marks 'value' as the next value of the current join, when it is a join itself, or with 'arrays'
-// an array literal, which the elements of an array literal share their join with.
+// Marks 'value' as the next value of the current join, and as its nested join when it is a join
+// itself, or with 'arrays' an array literal, which the elements of an array literal share their join
+// with.
 public noteJoinValue(BodyChecker checker, Expression value, bool arrays = false) {
     Expression core = syntax.unwrapParentheses(value);
+    checker.targets().setAnalyzedValue(core.green());
     if (nullguidance.isJoin(core) || (arrays && core is ArrayLiteralExpressionNode)) {
         checker.targets().setJoinChild(core.green());
     }
