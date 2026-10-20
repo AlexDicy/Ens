@@ -67,6 +67,10 @@ task("test")
         local plat = config.get("plat") or os.host()
         local arch = config.get("arch") or os.arch()
         local build_dir = path.join(os.projectdir(), "build", plat, arch, mode)
+        -- every ens the suite starts compiles against this tree's standard library where it is, so
+        -- a note into the library names a file in the tree and no run writes the copy ens carries
+        -- into the user's cache; the cli_build assertions about that copy unset it
+        os.setenv("ENS_STDLIB", path.join(os.projectdir(), "libs"))
         local exe_suffix = is_host("windows") and ".exe" or ""
         -- what `ens` names the artifacts it is not told the name of: it follows the target's object
         -- format, and every assertion about a default-named file has to as well.
@@ -1585,6 +1589,62 @@ task("test")
                 2, "ens: '--stdlib' names '", "', which is the 'std' folder itself. Write "
                 .. "'--stdlib ", "!Cannot find standard library module", "!problem")
 
+            -- with no library named, a build uses the copy ens carries, written into the cache
+            -- once under the digest of what it holds and read from there by every later build
+            local carried_env = {}
+            for key, value in pairs(env) do carried_env[key] = value end
+            -- the run's environment is merged into what a command gets, so a variable is cleared
+            -- by setting it empty, which ens reads as not set
+            carried_env.ENS_STDLIB = ""
+            local carried_cache = path.join(root, "carriedcache")
+            carried_env.ENS_CACHE = carried_cache
+            run({"check", hello_file}, {envs = carried_env}, 0, "nothing to report")
+            local carried = os.dirs(path.join(carried_cache, "trees", "sha256-*"))
+            if #carried ~= 1 or not os.isfile(path.join(carried[1], "std", "src", "core.ens")) then
+                table.insert(failures, string.format("the carried library was not written as one "
+                    .. "tree under '%s'", carried_cache))
+            end
+            if #os.filedirs(path.join(carried_cache, "staging", "*")) > 0 then
+                table.insert(failures, "writing the carried library left its staging folder")
+            end
+            run({"build", hello_file, "--output", path.join(root, "carried" .. exe_suffix)},
+                {envs = carried_env}, 0)
+            run_program(path.join(root, "carried" .. exe_suffix), 0, "Hello, world!")
+            if #os.dirs(path.join(carried_cache, "trees", "sha256-*")) ~= 1 then
+                table.insert(failures, "a second build wrote the carried library again")
+            end
+            -- a note into the library names the file in the cache, which is there to be opened
+            local into_library = path.join(root, "intolibrary.ens")
+            io.writefile(into_library, "import @std.testing;\n\nstruct Key {\n"
+                .. "    () -> int make;\n}\n\nmain() -> int throws {\n"
+                .. "    Key first = {make: () -> 1};\n    try testing.assertEqual(first, first);\n"
+                .. "    return 0;\n}\n")
+            local _, noted = run({"check", into_library}, {envs = carried_env}, 1,
+                "note: 'assertEqual<T>' interpolates a value of type 'T' here")
+            local noted_file = noted:match("([^\r\n]-testing%.ens):%d+:%d+: note:")
+            local function slashed(p) return (p:gsub("\\", "/")) end
+            if not noted_file or not slashed(noted_file):find(slashed(carried_cache), 1, true)
+                    or not os.isfile(noted_file) then
+                table.insert(failures, string.format("the note into the carried library does not "
+                    .. "name a file in '%s':\n%s", carried_cache, noted))
+            end
+            local blocked_cache = path.join(root, "blockedcache")
+            io.writefile(blocked_cache, "a file where the cache would be")
+            carried_env.ENS_CACHE = blocked_cache
+            run({"check", hello_file}, {envs = carried_env}, 2, "ens: the standard library could "
+                .. "not be put in the cache: could not create the directory '", "': something in "
+                .. "the path is a file, not a directory. Set 'ENS_CACHE' to a folder that can be "
+                .. "written to, or pass '--stdlib <folder>' naming the folder that contains 'std/'",
+                "!problem")
+            carried_env.ENS_CACHE = ""
+            carried_env.HOME = ""
+            carried_env.USERPROFILE = ""
+            local user_variable = is_host("windows") and "USERPROFILE" or "HOME"
+            run({"check", hello_file}, {envs = carried_env}, 2, "ens: there is no cache folder to "
+                .. "write the standard library into: neither 'ENS_CACHE' nor '" .. user_variable
+                .. "' is set. Set 'ENS_CACHE' to a folder that can be written to, or pass "
+                .. "'--stdlib <folder>' naming the folder that contains 'std/'", "!problem")
+
             -- a package of the user's own named 'std' is refused for the name the standard
             -- library reserves, at the name
             local user_std = path.join(root, "userstd", "std")
@@ -2126,7 +2186,6 @@ task("test")
             local failures = {}
 
             local env = linkEnvironment()
-            env.ENS_STDLIB = path.join(os.projectdir(), "libs")
 
             io.writefile(path.join(ws_dir, "ens.package"),
                 'workspace {\n    member "app";\n    member "tool";\n}\n')
@@ -2338,7 +2397,6 @@ task("test")
             local failures = {}
 
             local env = linkEnvironment()
-            env.ENS_STDLIB = path.join(os.projectdir(), "libs")
 
             local repos = path.join(root, "repos")
             local cache = path.join(root, "cache")
@@ -2803,7 +2861,6 @@ task("test")
             local failures = {}
 
             local env = linkEnvironment()
-            env.ENS_STDLIB = path.join(os.projectdir(), "libs")
 
             local cache = path.join(root, "cache")
             local cold = path.join(root, "cold")
