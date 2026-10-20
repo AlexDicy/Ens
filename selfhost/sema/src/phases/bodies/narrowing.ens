@@ -382,45 +382,71 @@ enclosingUpdate(Expression read, Span write) -> Expression? {
 }
 
 // The advice to test 'object' for the class 'tested' in the 'for' update 'update', which reads the member
-// 'member' through it: with the update written to read the member only where the test holds, or with the
-// test alone where that cannot be written.
+// 'member' through it: the update written to read the member only where the test holds, with a placeholder
+// value where it does not, or where that is too long to quote, the read to replace and what replaces it.
+// The test alone is named where no placeholder has the type the read gives.
 updateTestAdvice(BodyChecker checker, Expression object, string member, Expression update, Type tested)
                  -> string {
     string place = wording.oneLineSpelling(syntax.unwrapParentheses(object));
-    let guarded = guardedUpdate(checker, object, member, update, tested);
-    if (guarded != null) {
-        return "Test '{place}' in the update, as in {guarded}.";
+    let read = memberRead(object);
+    let placeholder = read == null ? null : readPlaceholder(checker, read, member, tested);
+    if (read != null && placeholder != null) {
+        string readText = wording.oneLineSpelling(read);
+        string written = wording.oneLineSpelling(update);
+        string before = "({place} is ";
+        string after = " ? {readText} : {placeholder})";
+        long at = written.indexOf(readText);
+        bool once = at >= 0 && written.indexOf(readText, at + 1) < 0;
+        long length = checker.names().of(tested).length;
+        if (once && written.length - readText.length + before.length + length + after.length
+                <= wording.quotedCodeLimit()) {
+            string guarded = checker.names().quotedCode(["{written.substring(0, at)}{before}",
+                "{after}{written.substring(at + readText.length)}"], [tested]);
+            return "Test '{place}' in the update, as in {guarded}.";
+        }
+        if (before.length + length + after.length <= wording.quotedCodeLimit()) {
+            string each = once || at < 0 ? "" : "each ";
+            return "Test '{place}' in the update by replacing {each}'{readText}' with "
+                + "{checker.names().quotedCode([before, after], [tested])}.";
+        }
     }
     return "Test '{place}' with {checker.names().quotedCode(["{place} is ", ""], [tested])} in the update.";
 }
 
-// The 'for' update 'update' written to read the field 'member' through 'object' only where 'object' is a
-// 'tested', with a placeholder value where it is not, in quotes. Null where 'member' is not a field, no
-// placeholder has its type, the read is not written once in the update or the code is too long to quote.
-guardedUpdate(BodyChecker checker, Expression object, string member, Expression update, Type tested)
-              -> string? {
+// The read of a member through 'object': the member read, or the call of it where the member is a method
+// called there. Null where 'object' is not read through.
+memberRead(Expression object) -> Expression? {
     SyntaxNode? read = object.parent();
     while (read is ParenthesizedExpressionNode) {
         read = read.parent();
     }
-    let field = typemembers.inheritedOrOwnField(tested, member);
-    if (!(read is MemberExpressionNode) || read.parent() is CallExpressionNode || field == null) {
+    if (!(read is MemberExpressionNode)) {
         return null;
     }
-    let placeholder = wording.placeholderLiteral(field.type());
-    string written = wording.oneLineSpelling(update);
-    string readText = wording.oneLineSpelling(read);
-    long at = written.indexOf(readText);
-    if (placeholder == null || at < 0 || written.indexOf(readText, at + 1) >= 0) {
-        return null;
+    let call = read.parent();
+    if (call is CallExpressionNode && call.callee().green() == read.green()) {
+        return call;
     }
-    string place = wording.oneLineSpelling(syntax.unwrapParentheses(object));
-    string before = "{written.substring(0, at)}({place} is ";
-    string after = " ? {readText} : {placeholder}){written.substring(at + readText.length)}";
-    if (before.length + checker.names().of(tested).length + after.length > wording.quotedCodeLimit()) {
-        return null;
+    return read;
+}
+
+// A value of the type the read 'read' of the member 'member' of a 'tested' gives, to write where the read
+// cannot be made: of the field's type, or of the type every method of that name returns. Null where no
+// such value can be written.
+readPlaceholder(BodyChecker checker, Expression read, string member, Type tested) -> string? {
+    if (!(read is CallExpressionNode)) {
+        let field = typemembers.inheritedOrOwnField(tested, member);
+        return field == null ? null : wording.placeholderLiteral(field.type());
     }
-    return checker.names().quotedCode([before, after], [tested]);
+    Type? returned = null;
+    for (let method in memberaccess.methodsRead(checker, tested, member)) {
+        Type type = method.signature().returnType();
+        if (returned != null && returned != type) {
+            return null;
+        }
+        returned = type;
+    }
+    return returned == null ? null : wording.placeholderLiteral(returned);
 }
 
 // Recognizes '(x as? T) != null' and '(x as? T) == null' over a narrowable 'x' and a class or
