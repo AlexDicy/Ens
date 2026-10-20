@@ -995,6 +995,23 @@ betterThan(ViableCandidate left, ViableCandidate right) -> bool {
     return left.defaulted < right.defaulted;
 }
 
+// Whether every rank of 'left' is at least the one of 'right' at its index, and one is higher.
+ranksDominate(long[] left, long[] right) -> bool {
+    bool higher = false;
+    for (long i = 0; i < left.length; i++) {
+        if (left[i] < right[i]) {
+            return false;
+        }
+        higher = higher || left[i] > right[i];
+    }
+    return higher;
+}
+
+// The type of the parameter the argument at 'index' fills in 'viable'.
+parameterTypeOf(ViableCandidate viable, long index) -> Type {
+    return viable.candidate.signature().parameters()[viable.mapping[index]].type();
+}
+
 // The refusal of a call no declaration of the name accepts: for how many arguments it passes where none
 // of them takes that many, and otherwise naming the argument types it passes.
 public noMatchMessage(List<CallCandidate> candidates, CallShape shape, string displayName,
@@ -1429,11 +1446,11 @@ joinText(ArgumentValue argument, TypeNames names, Type? wanted) -> string {
     return "a {argument.joinName()} that gives {diagnostics.andJoined(described.toArray(), "or")}";
 }
 
-// The refusal of a call that several declarations accept equally well. The fix converts every
-// argument whose parameter type differs among them to the type the first of them takes, which
-// makes that one match best, or declares them as locals of that type where one of them names no type
-// of its own. When the passed arguments agree, the fix passes the first defaulted argument whose type
-// differs among them.
+// The refusal of a call that several declarations accept equally well. The fix converts the
+// arguments whose parameter types differ among them so that one of them matches best, with 'as'
+// where every converted argument is a number and with locals otherwise, and stops after the problem
+// where no such conversion makes one of them match best. When the parameter types the arguments
+// fill agree, the fix passes the first defaulted argument whose type differs among them.
 ambiguityMessage(List<ViableCandidate> best, CallShape shape, string displayName, string kindWord,
                  TypeNames names) -> string {
     let shown = new List<CallCandidate>();
@@ -1442,59 +1459,122 @@ ambiguityMessage(List<ViableCandidate> best, CallShape shape, string displayName
     }
     string problem = "This call matches {candidateList(shown, names)} equally well, so it is not "
         + "clear which one to call.";
-    let first = best.get(0);
-    Parameter[] wanted = first.candidate.signature().parameters();
-    let differing = new List<long>();
-    bool untyped = false;
-    for (long i = 0; i < shape.argumentCount(); i++) {
-        Type target = wanted[first.mapping[i]].type();
-        bool differs = false;
-        for (long c = 1; c < best.length(); c++) {
-            let other = best.get(c);
-            if (other.candidate.signature().parameters()[other.mapping[i]].type() != target) {
-                differs = true;
-            }
-        }
-        let argument = shape.argumentAt(i);
-        if (differs && argument.type() != target) {
-            differing.push(i);
-            untyped = untyped || argument.needsTarget();
-        }
-    }
     let ending = endingAmbiguity(best, shape, displayName, kindWord, names);
     if (ending != null) {
         return "{problem} {ending}";
     }
-    if (untyped) {
-        return "{problem} {localsFix(differing, first, shape, names)}";
+    if (!differInArguments(best)) {
+        return "{problem} {defaultedArgumentFix(best, shape, displayName, kindWord, names)}";
     }
+    for (let target in best) {
+        let conversions = conversionsTo(target, best, shape);
+        if (conversions != null) {
+            return "{problem} {conversionFix(conversions, target, shape, names)}";
+        }
+    }
+    return problem;
+}
+
+// An argument a fix converts, and the type it converts it to.
+class Conversion {
+    protected long index;
+    protected Type type;
+
+    protected constructor(this.index, this.type);
+}
+
+// Whether the candidates 'best' take some argument as different types.
+differInArguments(List<ViableCandidate> best) -> bool {
+    let first = best.get(0);
+    for (long i = 0; i < first.ranks.length; i++) {
+        for (let other in best) {
+            if (parameterTypeOf(other, i) != parameterTypeOf(first, i)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// The arguments to convert, and the types to convert them to, so that 'target' fits the call
+// better than every other candidate of 'best', or null where no such conversion does. An argument
+// is converted to the type 'target' takes it as without its '?', unless it is 'null', because a
+// local of a nullable type holds the type of the value assigned to it.
+conversionsTo(ViableCandidate target, List<ViableCandidate> best, CallShape shape)
+        -> List<Conversion>? {
+    let conversions = new List<Conversion>();
+    let arguments = new List<ArgumentValue>();
+    for (long i = 0; i < target.ranks.length; i++) {
+        let argument = shape.argumentAt(i);
+        Type wanted = parameterTypeOf(target, i);
+        bool differs = false;
+        for (let other in best) {
+            differs = differs || parameterTypeOf(other, i) != wanted;
+        }
+        if (!(argument.type() is NullType)) {
+            wanted = convert.coreOf(wanted);
+        }
+        if (!differs || (argument.shape() == ArgumentShape.Typed && argument.type() == wanted)) {
+            arguments.push(argument);
+            continue;
+        }
+        conversions.push(new Conversion(i, wanted));
+        arguments.push(new ArgumentValue(argument.name(), wanted, false, false, 0, false,
+            argument.span()));
+    }
+    if (conversions.length() == 0) {
+        return null;
+    }
+    long[] fits = ranksOf(target, arguments);
+    for (let other in best) {
+        if (other != target && !ranksDominate(fits, ranksOf(other, arguments))) {
+            return null;
+        }
+    }
+    return conversions;
+}
+
+// How well each of 'arguments' fits the parameter it fills in 'viable'.
+ranksOf(ViableCandidate viable, List<ArgumentValue> arguments) -> long[] {
+    let ranks = new List<long>();
+    for (long i = 0; i < arguments.length(); i++) {
+        ranks.push(conversionRank(arguments.get(i), parameterTypeOf(viable, i)));
+    }
+    return ranks.toArray();
+}
+
+// The fix that makes 'target' match a call best by converting the arguments 'conversions' names:
+// with 'as' where each of them is a number converted to a number type, and as locals otherwise.
+conversionFix(List<Conversion> conversions, ViableCandidate target, CallShape shape,
+              TypeNames names) -> string {
     let written = new List<string>();
     let described = new List<string>();
-    bool renderable = true;
-    for (let i in differing) {
-        let argument = shape.argumentAt(i);
-        Type target = wanted[first.mapping[i]].type();
+    bool literal = true;
+    for (let conversion in conversions) {
+        let argument = shape.argumentAt(conversion.index);
+        if (argument.shape() != ArgumentShape.Typed || !convert.isNumericType(argument.type())
+                || !convert.isNumericType(conversion.type)) {
+            return localsFix(conversions, target, shape, names);
+        }
         string? text = literalText(argument);
         if (text == null) {
-            renderable = false;
+            literal = false;
         } else {
-            written.push(names.quotedCode(["{text} as ", ""], [target]));
+            written.push(names.quotedCode(["{text} as ", ""], [conversion.type]));
         }
-        described.push("argument {i + 1} to {names.quoted(target)}");
+        described.push("{argumentPosition(argument, conversion.index)} to "
+            + "{names.quoted(conversion.type)}");
     }
-    if (described.length() > 0) {
-        if (!renderable) {
-            return "{problem} Convert {diagnostics.andJoined(described.toArray())} with 'as', so "
-                + "the call matches one of them exactly.";
-        }
-        if (written.length() == 1) {
-            return "{problem} Convert an argument with 'as', such as {written.get(0)}, so the call "
-                + "matches one of them exactly.";
-        }
-        return "{problem} Convert the arguments with 'as', as in "
-            + "{diagnostics.andJoined(written.toArray())}, so the call matches one of them exactly.";
+    if (!literal) {
+        return "Convert {diagnostics.andJoined(described.toArray())} with 'as', so the call matches "
+            + "one of them exactly.";
     }
-    return "{problem} {defaultedArgumentFix(best, shape, displayName, kindWord, names)}";
+    if (written.length() == 1) {
+        return "Convert an argument with 'as', such as {written.get(0)}, so the call matches one of "
+            + "them exactly.";
+    }
+    return "Convert the arguments with 'as', as in {diagnostics.andJoined(written.toArray())}, so "
+        + "the call matches one of them exactly.";
 }
 
 // Why the choice among the candidates 'best' still matters when an argument never returns, so
@@ -1569,35 +1649,34 @@ differentResults(List<ViableCandidate> best, TypeNames names) -> string? {
     return diagnostics.andJoined(returns.toArray());
 }
 
-// The fix for a call whose arguments that differ among the candidates include one that names no type
-// of its own, which 'as' cannot convert: declare each of them as a local of the type the first
-// candidate takes, and pass the locals.
-localsFix(List<long> differing, ViableCandidate first, CallShape shape, TypeNames names) -> string {
-    Parameter[] wanted = first.candidate.signature().parameters();
-    if (differing.length() > 1) {
+// The fix that declares each argument 'conversions' names as a local of the type it names, and
+// passes the locals, which makes 'target' match the call best.
+localsFix(List<Conversion> conversions, ViableCandidate target, CallShape shape, TypeNames names)
+        -> string {
+    if (conversions.length() > 1) {
         let declared = new List<string>();
-        for (let i in differing) {
-            Type type = wanted[first.mapping[i]].type();
-            declared.push("argument {i + 1} as a local of type {names.quoted(type)}");
+        for (let conversion in conversions) {
+            string position = argumentPosition(shape.argumentAt(conversion.index), conversion.index);
+            declared.push("{position} as a local of type {names.quoted(conversion.type)}");
         }
         return "Declare {diagnostics.andJoined(declared.toArray())} first, and pass the locals.";
     }
-    long index = differing.get(0);
+    let conversion = conversions.get(0);
+    long index = conversion.index;
     let argument = shape.argumentAt(index);
-    let parameter = wanted[first.mapping[index]];
-    Type type = parameter.type();
+    Type type = conversion.type;
     string noun = switch (argument.shape()) {
         Lambda -> "the lambda",
         ArrayLiteral -> "the array",
         StructLiteral -> "the struct",
         Join -> "the {argument.joinName()}",
-        default -> "argument {index + 1}",
+        default -> argumentPosition(argument, index),
     };
     string? spelled = argument.spelling();
     if (spelled == null) {
         return "Declare {noun} as a local of type {names.quoted(type)} first, and pass the local.";
     }
-    string base = parameter.name();
+    string base = target.candidate.signature().parameters()[target.mapping[index]].name();
     if (base.length == 0) {
         base = "value";
     }
