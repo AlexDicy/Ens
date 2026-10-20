@@ -479,7 +479,7 @@ shapedArgumentOf(ArgumentOrder order, string name, Expression value, bool single
 // Resolves the call over 'candidates'. Where none is chosen, a method or function name among the
 // arguments is refused on its own, because resolution reports nothing for a call that passes one, and
 // so is a '?:' or a switch whose values have no common type. The arguments analyzed only in a trial are
-// then analyzed, since no candidate types them.
+// then analyzed, and the lambdas checked without types, since no candidate types them.
 public resolveBuiltCall(BodyChecker checker, List<CallCandidate> candidates, BuiltShape built, Span span,
                         string displayName, string kindWord) -> CallResolution {
     for (long i = built.pendingFrom; i < built.values.length(); i++) {
@@ -506,6 +506,7 @@ public resolveBuiltCall(BodyChecker checker, List<CallCandidate> candidates, Bui
                 if (i >= built.pendingFrom) {
                     analyzeUnchosenArgument(checker, built, built.shape().argumentAt(i), value, i);
                 }
+                checkUnchosenLambdas(checker, built.shape().argumentAt(i), value);
                 refuseHeldNames(checker, built.shape().argumentAt(i), value,
                     parametersAt(candidates, built.shape(), i), takers);
             }
@@ -515,13 +516,37 @@ public resolveBuiltCall(BodyChecker checker, List<CallCandidate> candidates, Bui
 }
 
 // Analyzes, where no candidate is chosen, the arguments from the one a trial started in, which were
-// analyzed only in that trial.
+// analyzed only in that trial, and checks the lambdas without types.
 public analyzeUnchosenArguments(BodyChecker checker, BuiltShape built) {
-    for (long i = built.pendingFrom; i < built.values.length(); i++) {
+    for (long i = 0; i < built.values.length(); i++) {
         let value = built.values.get(i);
-        if (value != null) {
+        if (value != null && i >= built.pendingFrom) {
             analyzeUnchosenArgument(checker, built, built.shape().argumentAt(i), value, i);
         }
+        if (value != null) {
+            checkUnchosenLambdas(checker, built.shape().argumentAt(i), value);
+        }
+    }
+}
+
+// Checks without types the body of each lambda that 'value', shaped as 'argument', is or holds as an
+// element of an array literal, where no candidate is chosen to type it.
+checkUnchosenLambdas(BodyChecker checker, ArgumentValue argument, Expression value) {
+    Expression written = syntax.unwrapParentheses(value);
+    switch (argument.shape()) {
+        Lambda -> {
+            if (written is LambdaExpressionNode) {
+                lambdas.checkBodyWithoutTypes(checker, written);
+            }
+        },
+        ArrayLiteral -> {
+            if (written is ArrayLiteralExpressionNode) {
+                for (long i = 0; i < written.elementsCount() && i < argument.elements().length; i++) {
+                    checkUnchosenLambdas(checker, argument.elements()[i], written.elements(i));
+                }
+            }
+        },
+        default -> { },
     }
 }
 
@@ -1785,10 +1810,12 @@ takesArgumentAt(List<Signature> signatures, long index) -> bool {
 // its parameter on. The call settles them once whatever path it takes: where it chose a candidate, the
 // ones beyond the parameters it analyzed them against, and where it is refused, each one against no
 // parameter, so their problems are reported with the refusal. A refusal that settles the type parameters
-// of a lambda's parameters has the lambda checked against them too.
+// of a lambda's parameters has the lambda checked against them too, and any other lambda the call did
+// not analyze has its body checked without types.
 public final class PendingArguments {
     protected ArgumentListNode arguments;
     protected long from;
+    protected long lambdasFrom = 0;
     protected bool written = false;
     protected Parameter[] parameters = [];
     protected TypeArgumentInference? inference = null;
@@ -1817,15 +1844,18 @@ public final class PendingArguments {
         if (count > this.from) {
             this.from = count;
         }
+        this.lambdasFrom = count;
     }
 
     // Leaves every argument to the call, which hands them to a resolution that analyzes them.
     public handedOver() {
         this.from = this.arguments.argumentsCount();
+        this.lambdasFrom = this.from;
     }
 
-    // Analyzes each argument still pending, once: outside a trial, each lambda against the parameter
-    // types the inference settles, and each other one from 'from' on that is not analyzed yet.
+    // Analyzes each argument still pending, once: outside a trial, each lambda from 'lambdasFrom' on
+    // against the parameter types the inference settles, or without types where it settles none, and each
+    // other one from 'from' on that is not analyzed yet.
     public settle(BodyChecker checker) {
         if (this.settled) {
             return;
@@ -1835,8 +1865,13 @@ public final class PendingArguments {
             let argument = this.arguments.arguments(i);
             let inference = this.inference;
             if (argument is LambdaExpressionNode) {
-                if (inference != null && i < this.parameters.length && !checker.inTrial()) {
+                if (checker.inTrial() || i < this.lambdasFrom) {
+                    continue;
+                }
+                if (inference != null && i < this.parameters.length) {
                     voidtypearguments.checkRefusedLambda(checker, argument, this.parameters[i], inference);
+                } else {
+                    lambdas.checkBodyWithoutTypes(checker, argument);
                 }
             } else if (argument is Expression && i >= this.from && !checker.takePlaced(argument)) {
                 let ignored = analyzeWithoutParameter(checker, argument, this.written);
