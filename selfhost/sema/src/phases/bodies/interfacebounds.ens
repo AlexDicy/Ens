@@ -1,0 +1,338 @@
+// What a refusal says about a value of a type parameter bounded only by interfaces where one of those
+// interfaces is expected: a struct can be the type argument, and a struct value is never an interface
+// value, so the place takes the type parameter, the value is used through its bound, or the parameter
+// is bounded by a class.
+import Expression from @ens.frontend.syntax.generated.nodes;
+import AssignmentExpressionNode from @ens.frontend.syntax.generated.nodes;
+import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
+import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
+import InitializerNode from @ens.frontend.syntax.generated.nodes;
+import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import NullCoalesceExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ParenthesizedExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SyntaxNode from @ens.frontend.syntax.node;
+import GreenNode from @ens.frontend.syntax.green;
+import List from @std.collections.list;
+import model.convert;
+import model.hierarchy;
+import Method from model.typemembers;
+import Parameter from model.typemembers;
+import Signature from model.typemembers;
+import model.typenames;
+import model.types;
+import Type from model.types;
+import TypeParamType from model.types;
+import OptionalType from model.types;
+import ClassType from model.types;
+import Visibility from model.types;
+import BodyChecker from phases.bodies;
+import phases.bodies.literalfixes;
+import LiteralOrigin from phases.bodies.literaltargets;
+import OriginKind from phases.bodies.literaltargets;
+import phases.bodies.nullguidance;
+import phases.bodies.wording;
+import support.diagnostics;
+import support.syntax;
+
+// A value of type 'parameter' where the interface 'expected' is expected, which 'bound', one of the
+// bounds of 'parameter', is or extends.
+final class BoundConversion {
+    TypeParamType parameter;
+    Type expected;
+    Type bound;
+
+    constructor(this.parameter, this.expected, this.bound);
+}
+
+// The reason and the fixes, opening with a space, after the refusal of 'value', of type 'source', where
+// 'target' is expected, or empty where 'source' is not a type parameter that such a reason explains.
+// The place at 'origin' is declared with the type parameter where the parameter can be written there,
+// and the value of a '??' whose result a call is made on is replaced by that call on it.
+public valueHint(BodyChecker checker, Type target, Type source, Expression? value, LiteralOrigin? origin)
+        -> string {
+    let conversion = conversionOf(target, source);
+    if (conversion == null) {
+        return "";
+    }
+    string first = "";
+    if (origin != null) {
+        first = declarationFix(checker, conversion, target, value, origin);
+    } else if (value != null) {
+        let fallback = fallbackOf(value);
+        if (fallback != null) {
+            first = callFix(checker, conversion, value, fallback);
+        }
+    }
+    return reason(checker, conversion) + fixes(first, classFix(checker, conversion));
+}
+
+// valueHint for the argument 'value' passed as 'parameter' of 'signature', the signature of 'method' or
+// of a function, which a function of this file that is not generic can take as a new type parameter.
+public argumentHint(BodyChecker checker, Type target, Type source, Expression? value, Signature signature,
+                    Method? method, Parameter parameter) -> string {
+    let conversion = conversionOf(target, source);
+    if (conversion == null) {
+        return "";
+    }
+    string first = "";
+    if (method == null && !signature.isGeneric() && declaresFunction(checker, signature)) {
+        let names = checker.names();
+        string name = conversion.parameter.name();
+        first = "Declare {names.quotedCode(["<{name}: ", ">"], [conversion.expected])} after "
+            + "'{signature.name()}' and declare parameter '{parameter.name()}' as "
+            + names.quoted(placeType(checker, conversion, target));
+    }
+    return reason(checker, conversion) + fixes(first, classFix(checker, conversion));
+}
+
+// valueHint for the loop variable 'name' declared with the type 'declared' where the loop gives it
+// 'element' values, whose fix declares the variable with the type parameter.
+public loopVariableHint(BodyChecker checker, Type declared, Type element, string name) -> string {
+    let conversion = conversionOf(declared, element);
+    if (conversion == null) {
+        return "";
+    }
+    string declaration = "Declare it as {checker.names().quotedCode(["", " {name}"], [element])}";
+    return reason(checker, conversion) + fixes(declaration, classFix(checker, conversion));
+}
+
+// valueHint for the '?:' or the switch 'join' whose values of types 'first' and 'second', among
+// 'values', have no common type, or null 'join' where no call can be made on its result.
+public joinHint(BodyChecker checker, Type first, Type second, Expression[] values, Expression? join)
+        -> string {
+    let conversion = conversionOf(second, first) ?? conversionOf(first, second);
+    if (conversion == null) {
+        return "";
+    }
+    string call = "";
+    if (join != null) {
+        for (let candidate in values) {
+            if (checker.recordedType(candidate) == conversion.parameter) {
+                call = callFix(checker, conversion, candidate, join);
+                break;
+            }
+        }
+    }
+    return reason(checker, conversion) + fixes(call, classFix(checker, conversion));
+}
+
+// The conversion a value of 'source' would need to fit 'target', or null where 'source' is not a type
+// parameter bounded only by interfaces, one of which is or extends the interface 'target' expects.
+// A nullable target takes the parameter with as many '?' as it has.
+conversionOf(Type target, Type source) -> BoundConversion? {
+    Type parameter = source;
+    for (long i = 0; i < wording.optionalLevels(target) && parameter is OptionalType; i++) {
+        parameter = parameter.inner();
+    }
+    if (!(parameter is TypeParamType) || hierarchy.classBoundOf(parameter) != null) {
+        return null;
+    }
+    Type expected = convert.coreOf(target);
+    if (!types.isInterfaceLike(expected)) {
+        return null;
+    }
+    for (let bound in parameter.bounds()) {
+        if (hierarchy.isSubclassOrConforms(bound, expected)) {
+            return new BoundConversion(parameter, expected, bound);
+        }
+    }
+    return null;
+}
+
+reason(BodyChecker checker, BoundConversion conversion) -> string {
+    let names = checker.names();
+    let bounds = new List<string>();
+    for (let bound in conversion.parameter.bounds()) {
+        bounds.push(names.quoted(bound));
+    }
+    return " {names.quoted(conversion.parameter)} can be any type that implements "
+        + "{diagnostics.andJoined(bounds.toArray())}, including a struct. "
+        + nullguidance.notAnObject(names.quoted(conversion.expected), "struct");
+}
+
+// The sentence, opening with a space, that offers 'first' and 'second', either of which may be empty.
+fixes(string first, string second) -> string {
+    if (first.length > 0 && second.length > 0) {
+        return " {first}, or {second}.";
+    }
+    if (first.length > 0) {
+        return " {first}.";
+    }
+    if (second.length > 0) {
+        return " {typenames.capitalizedAscii(second)}.";
+    }
+    return "";
+}
+
+// The type parameter with as many '?' as 'target' has, which a place of type 'target' is declared with.
+placeType(BodyChecker checker, BoundConversion conversion, Type target) -> Type {
+    Type wanted = conversion.parameter;
+    for (long i = 0; i < wording.optionalLevels(target); i++) {
+        wanted = checker.store().optionalOf(wanted);
+    }
+    return wanted;
+}
+
+// The fix that declares the place at 'origin' with the type parameter, or empty where the parameter
+// cannot be written there: a field of a type other than the one that declares the parameter, or a
+// place that is neither a local, a parameter nor a field.
+declarationFix(BodyChecker checker, BoundConversion conversion, Type target, Expression? value,
+               LiteralOrigin origin) -> string {
+    if (origin.kind() == OriginKind.Declared) {
+        let fieldOwner = origin.fieldOwner();
+        if (fieldOwner != null) {
+            let declared = types.authorityOf(fieldOwner);
+            if (declared == null || declared.declaration() != conversion.parameter.owner()) {
+                return "";
+            }
+        } else if (value == null || !initializesOrAssignsName(value)) {
+            return "";
+        }
+    }
+    string wanted = checker.names().of(placeType(checker, conversion, target));
+    return typenames.capitalizedAscii(literalfixes.declarationChange(origin, wanted));
+}
+
+// Whether 'value' is the initial value of a declaration or is assigned to a name.
+initializesOrAssignsName(Expression value) -> bool {
+    let holder = enclosingOf(value);
+    if (holder is InitializerNode) {
+        return true;
+    }
+    return holder is AssignmentExpressionNode
+        && syntax.unwrapParentheses(holder.target()) is IdentifierExpressionNode;
+}
+
+// The '??' whose fallback 'value' is, or null where it is not one.
+fallbackOf(Expression value) -> Expression? {
+    let holder = enclosingOf(value);
+    if (holder is NullCoalesceExpressionNode && holder.right().span().start == value.span().start) {
+        return holder;
+    }
+    return null;
+}
+
+// The node around 'node', outside the parentheses written around it.
+enclosingOf(SyntaxNode node) -> SyntaxNode? {
+    SyntaxNode? holder = node.parent();
+    while (holder is ParenthesizedExpressionNode) {
+        holder = holder.parent();
+    }
+    return holder;
+}
+
+// The call made on the result of 'whole', as in '(a ?? b).name()', or null where none is.
+callOn(Expression whole) -> CallExpressionNode? {
+    let member = enclosingOf(whole);
+    if (!(member is MemberExpressionNode)) {
+        return null;
+    }
+    let call = member.parent();
+    if (call is CallExpressionNode) {
+        return call;
+    }
+    return null;
+}
+
+// The fix that makes the call made on the result of 'whole' on 'value' instead, as in 'value.name()',
+// or empty where no call is made on that result or 'value' is too long to repeat.
+callFix(BodyChecker checker, BoundConversion conversion, Expression value, Expression whole) -> string {
+    let call = callOn(whole);
+    let spelled = wording.shortSpelling(value);
+    if (call == null || spelled == null || !wording.isSingleTerm(syntax.unwrapParentheses(value))
+            || checker.recordedType(value) != conversion.parameter) {
+        return "";
+    }
+    let callee = call.callee();
+    if (!(callee is MemberExpressionNode)) {
+        return "";
+    }
+    let replaced = new List<GreenNode>();
+    replaced.push(callee.object().green());
+    let replacements = new List<string>();
+    replacements.push(spelled);
+    string example = wording.spellingWithNodes(call.green(), replaced, replacements);
+    string fix = "Call the methods of {checker.names().quoted(conversion.expected)} on '{spelled}' directly";
+    if (example.length > wording.quotedCodeLimit()) {
+        return fix;
+    }
+    return "{fix}, as in '{example}'";
+}
+
+// Whether a function of this file declares 'signature'.
+declaresFunction(BodyChecker checker, Signature signature) -> bool {
+    for (let entry in checker.context().functions().all()) {
+        if (entry.signature() == signature && !entry.isExternal() && !entry.isBuiltin()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The fix that bounds the type parameter by a class implementing the bound the conversion goes
+// through, with the bound list to write where the file declares such a class, or empty where the
+// bound names a type parameter, which no class implements for every type argument.
+classFix(BodyChecker checker, BoundConversion conversion) -> string {
+    if (convert.containsTypeParam(conversion.bound)) {
+        return "";
+    }
+    let names = checker.names();
+    string fix = "bound {names.quoted(conversion.parameter)} by a class that implements "
+        + names.quoted(conversion.bound);
+    let candidate = boundingClass(checker, conversion);
+    if (candidate == null) {
+        return fix;
+    }
+    let pieces = new List<string>();
+    let written = new List<Type>();
+    pieces.push("<{conversion.parameter.name()}: ");
+    written.push(candidate);
+    for (let bound in conversion.parameter.bounds()) {
+        if (bound != conversion.bound) {
+            pieces.push(" + ");
+            written.push(bound);
+        }
+    }
+    pieces.push(">");
+    return "{fix}, as in {names.quotedCode(pieces.toArray(), written.toArray())}";
+}
+
+// The first class the file declares that can replace the bound the conversion goes through: one that
+// implements it, is neither generic nor final, is at least as visible as the declaration of the type
+// parameter, and is spelled by its name where the value is. Null where there is none.
+boundingClass(BodyChecker checker, BoundConversion conversion) -> ClassType? {
+    let owner = ownerVisibility(checker, conversion.parameter);
+    if (owner == null) {
+        return null;
+    }
+    let store = checker.store();
+    for (let declared in checker.context().declarations().types()) {
+        let found = store.findDeclared(checker.modulePath(), declared.name());
+        if (found is ClassType && found.declaration() == declared.node() && !found.isGeneric()
+                && !found.isFinal() && hierarchy.conformsTo(found, conversion.bound)
+                && types.visibilityTier(found.visibility()) >= types.visibilityTier(owner)
+                && checker.names().canSpell(found)) {
+            return found;
+        }
+    }
+    return null;
+}
+
+// The visibility of the type or the function of this file that declares 'parameter', or null where
+// neither declares it.
+ownerVisibility(BodyChecker checker, TypeParamType parameter) -> Visibility? {
+    let owner = checker.store().findDeclared(checker.modulePath(), parameter.ownerName());
+    if (owner != null && owner.declaration() == parameter.owner()) {
+        return owner.visibility();
+    }
+    let functions = checker.context().functions().entriesNamed(parameter.ownerName());
+    if (functions == null) {
+        return null;
+    }
+    for (let entry in functions) {
+        if (entry.signature().declaration() == parameter.owner()) {
+            return entry.visibility();
+        }
+    }
+    return null;
+}

@@ -141,6 +141,8 @@ That conformance is a compile-time judgment and nothing more, because a struct v
 Storing a struct in an interface-typed variable, field, array element, or parameter is an error, and so is `is` or `as?` against an interface; each message names the bound the conformance does serve.
 A call on a bound type parameter therefore reaches the struct's own method directly, with no allocation and no dispatch.
 A struct that implements `Iterable<T>` can be walked by a for-each loop for the same reason, since the loop calls `makeIterator()` on the struct itself.
+A value of a type parameter bounded only by interfaces cannot be stored where one of those interfaces is expected, because the type argument can be a struct.
+Bound the parameter by a class that implements the interface, and the value is then an object of that class.
 
 A struct method that changes the struct it is called on is marked `mutating`, written with the other modifiers before its name, as in `mutating bump() { this.count += 1; }`.
 A method changes the struct when it writes a field of `this` at any depth, with `=`, a compound assignment, `++`, or `--`, or when it calls a `mutating` method on `this` or on a struct field of `this`.
