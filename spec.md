@@ -957,8 +957,10 @@ Commands use the same three exit codes: `0` when the command did what was asked,
   The program then runs on that version of macOS and later ones, and on macOS 11 and later when no version is written.
   `windows-msvc` may also end in a version, as in `windows-msvc19.40.0`.
   A triple naming any other system, such as `linux-musl` or `windows-gnu`, or naming none, is refused.
-- `--stdlib <folder>` names the folder holding `std/` instead of letting the build look for one by walking up from the sources; `ENS_STDLIB` does the same thing.
+- `--stdlib <folder>` names the folder holding `std/` to compile against; `ENS_STDLIB` does the same thing.
   A folder either one names that is not there, or that does not hold the standard library in its `std/` folder, is refused before anything is compiled.
+  Without either, the build uses the standard library `ens` itself carries, the one it was built with, so a single `ens` file needs nothing else on the machine.
+  The first build that needs it writes it into the cache, in a folder named after a hash of its files, and every later build reads it from there; the notes of a diagnostic inside the library name those files.
 - `--explain-arc` reports what the reference-counting optimizer elided, as described in the section on memory management.
 - `--explain-reachability` reports how much of the program is reached from its entry point: one line per module giving how many function bodies it defines and how many of them are reached, then the name of every function it declares that nothing reaches.
   A program with no entry point is a library, and what a library reaches is counted from its `export` declarations instead.

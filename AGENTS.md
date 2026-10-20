@@ -41,6 +41,7 @@ If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surf
   - `cli/` - the command-line library: the immutable declaration model, the pure argv walk, generated help, nearest-match suggestions.
   - `link/` - the linker bridge binding plus all link policy: flavor from triple, per-flavor argument vector, C runtime, unwinder and SDK discovery.
   - `packages/` - dependency resolution: `ens.overrides`, `ens.lock`, the content store, sha256, git fetching, prebuilt artifacts, version selection.
+  - `bundled/` - what `ens` carries inside itself, the standard library it was built with, and writing it into the cache the first time a build needs it, so a single `ens` file needs nothing else on the machine.
   - `build/` - target resolution, the toolchain decision, build and check orchestration, test discovery and runner synthesis, reporting.
   - `driver/` - the `ens` executable itself: command declarations, dispatch, exit codes.
   - `corpus/` - a harness asserting the front end parses every `.ens` file in the repo losslessly.
