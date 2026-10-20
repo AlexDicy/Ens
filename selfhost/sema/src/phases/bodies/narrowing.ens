@@ -385,7 +385,7 @@ public applyFacts(BodyChecker checker, List<NarrowingFact> facts) {
             checker.narrowing().noteWrite(fact.path, write);
             continue;
         }
-        checker.narrowing().narrow(fact.path, fact.proven);
+        narrowByTest(checker, fact.path, fact.proven);
         if (fact.castHint.length > 0) {
             checker.recordCastHint(fact.path, fact.castHint);
         }
@@ -565,7 +565,8 @@ public widenedReadHint(BodyChecker checker, Expression object, string member) ->
     if (path == null) {
         return null;
     }
-    let widening = checker.narrowing().writeOf(path) ?? checker.narrowing().endOf(path);
+    let state = checker.narrowing();
+    let widening = state.writeOf(path) ?? state.endOf(path);
     if (widening == null) {
         return null;
     }
@@ -606,11 +607,11 @@ public widenedReadHint(BodyChecker checker, Expression object, string member) ->
     return "{reason} Test '{place}' after the {widening.joinedStatement()}, as in {example}.";
 }
 
-// The type the write 'end' stores, as in " a 'Square'", where it writes the place spelled 'place' and the
-// type is known, or empty.
+// The type the write 'end' stores, as in " a 'Square'", where it writes the place spelled 'place', the type
+// is known and no test after the write narrowed it, or empty.
 storedClause(BodyChecker checker, NarrowingEnd end, string place) -> string {
     let stored = end.stored();
-    if (end.place() != place || stored == null || stored is ErrorType) {
+    if (end.place() != place || stored == null || stored is ErrorType || end.followedByTest()) {
         return "";
     }
     Type core = convert.coreOf(stored);
@@ -772,12 +773,23 @@ public castComparisonHint(BodyChecker checker, Expression object, Type core, str
 public narrowArmValue(BodyChecker checker, Expression scrutinee, Type armType) {
     let path = buildNarrowingPath(checker, scrutinee);
     if (path != null) {
-        checker.narrowing().narrow(path, armType);
+        narrowByTest(checker, path, armType);
     }
 }
 
-// What holds where a branch ends: the narrowings proven there, the writes that left those a write left,
-// and the writes there that ended the narrowings made before it.
+// Narrows 'path' to 'proven', which a test proves, and keeps the write that last left a proof of it or ended
+// one as the write before that test.
+narrowByTest(BodyChecker checker, NarrowingPath path, Type proven) {
+    let state = checker.narrowing();
+    let before = state.writeOf(path) ?? state.endOf(path);
+    state.narrow(path, proven);
+    if (before != null) {
+        state.noteWrite(path, before.beforeTest());
+    }
+}
+
+// What holds where a branch ends: the narrowings proven there, the writes that left those a write left or
+// that come before the test that made one, and the writes there that ended the narrowings made before it.
 public final class BranchNarrowings {
     protected Map<NarrowingPath, Type> proofs;
     protected Map<NarrowingPath, NarrowingEnd> writes;
@@ -786,10 +798,16 @@ public final class BranchNarrowings {
     public constructor(this.proofs, this.writes, this.ends);
 }
 
+// Whether 'write' counts as a change made in 'at'. A write that a test after it narrowed counts only where
+// it is inside 'at' or where a loop around 'at' recorded it when the loop started.
+writtenIn(NarrowingEnd write, Span at) -> bool {
+    return !write.followedByTest() || within(write.at(), at) || firstPassProof(write, at) != null;
+}
+
 // What holds where the branch being checked ends.
 public branchNarrowings(BodyChecker checker) -> BranchNarrowings {
-    return new BranchNarrowings(checker.narrowing().flatten(), checker.narrowing().writes(),
-        checker.narrowing().ends());
+    let state = checker.narrowing();
+    return new BranchNarrowings(state.flatten(), state.writes(), state.ends());
 }
 
 // What holds where nothing is proven, written or ended.
@@ -1067,6 +1085,10 @@ joinNarrowings(BodyChecker checker, Map<NarrowingPath, Type> proven, Map<Narrowi
         if (write == null) {
             continue;
         }
+        if (!writtenIn(write, at)) {
+            checker.narrowing().noteWrite(key, write);
+            continue;
+        }
         let joinedEnd = write.throughJoin(statement, branch);
         if (before != null && before != joinedType
                 && convert.isAssignableStrict(joinedType, before)) {
@@ -1098,7 +1120,8 @@ droppedEnd(List<BranchNarrowings> survivors, NarrowingPath path, Type dropped, S
     for (let survivor in survivors) {
         let proven = survivor.proofs.get(path);
         let write = survivor.writes.get(path);
-        if (proven != null && write != null && !convert.isAssignableStrict(dropped, proven)) {
+        if (proven != null && write != null && writtenIn(write, at)
+                && !convert.isAssignableStrict(dropped, proven)) {
             return write;
         }
     }
@@ -1108,20 +1131,20 @@ droppedEnd(List<BranchNarrowings> survivors, NarrowingPath path, Type dropped, S
 // The write that left the proof 'joined' of 'path' where branches meet, after the proof 'before' held: the
 // first branch's write that left that proof itself, or else the first that left a proof wider than
 // 'before' or not related to it, or else the first that left a proof at all, each before one that the start
-// of a loop around 'at' recorded. Null where no write left one.
+// of a loop around 'at' recorded or one before 'at' that a test narrowed. Null where no write left one.
 joinedWrite(List<BranchNarrowings> survivors, NarrowingPath path, Type joined, Type? before, Span at)
             -> NarrowingEnd? {
     NarrowingEnd? widening = null;
     NarrowingEnd? first = null;
-    NarrowingEnd? started = null;
+    NarrowingEnd? outside = null;
     for (let survivor in survivors) {
         let write = survivor.writes.get(path);
         let proven = survivor.proofs.get(path);
         if (write == null || proven == null) {
             continue;
         }
-        if (firstPassProof(write, at) != null) {
-            started = started ?? write;
+        if (firstPassProof(write, at) != null || !writtenIn(write, at)) {
+            outside = outside ?? write;
             continue;
         }
         if (proven == joined) {
@@ -1132,7 +1155,7 @@ joinedWrite(List<BranchNarrowings> survivors, NarrowingPath path, Type joined, T
         }
         first = first ?? write;
     }
-    return widening ?? first ?? started;
+    return widening ?? first ?? outside;
 }
 
 // The branches of a '?:' analyzed so far, each from what holds where they start: their values, and what
@@ -1528,7 +1551,10 @@ final class NarrowingTrace {
             if (kept == held) {
                 continue;
             }
-            let write = proven == null ? reached.ends.get(path) : reached.writes.get(path);
+            NarrowingEnd? write = proven == null ? reached.ends.get(path) : reached.writes.get(path);
+            if (write != null && !writtenIn(write, loop)) {
+                write = null;
+            }
             if (write != null && write.loop() == loop) {
                 continue;
             }
@@ -2110,7 +2136,7 @@ passLoop(BodyChecker checker, LoopSettlement settlement, SyntaxNode loop, (BodyC
 noteCopiesReached(LoopSettlement settlement, LoopWatch watch, BranchNarrowings reached) {
     for (let path in watch.starts.keys()) {
         let write = reached.writes.get(path);
-        if (write == null || !watch.trace.holds(path)) {
+        if (write == null || write.followedByTest() || !watch.trace.holds(path)) {
             continue;
         }
         let copy = settlement.copiesAt.get(write.at().start);
@@ -2778,7 +2804,7 @@ writtenTestRefusal(BodyChecker checker, Expression test, Expression value, Type 
     Type core = convert.coreOf(proven);
     Type declaredCore = convert.coreOf(declared);
     let stored = write.stored();
-    bool storedProof = stored != null && convert.coreOf(stored) == core;
+    bool storedProof = stored != null && convert.coreOf(stored) == core && !write.followedByTest();
     if (!types.isClassLike(core) || !types.isClassLike(declaredCore)
             || hierarchy.isSubclassOrConforms(declaredCore, target) || (!storedProof && !write.inJoin())) {
         return null;
