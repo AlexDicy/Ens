@@ -372,14 +372,16 @@ local windowsLibraries = {
 }
 
 -- The library folder of the Windows SDK xmake's MSVC toolchain finds, which holds a folder for
--- each kind of library and, in each, one for each processor.
+-- each kind of library and, in each, one for each processor. LIB names other SDKs laid out the same
+-- way, such as the .NET Framework's, so the folder taken is the one holding the C runtime's.
 local function windowsSdkRoot()
     import("core.tool.toolchain")
     local msvc = toolchain.load("msvc", {plat = "windows", arch = "x64"})
     local lib = msvc and msvc:check() and msvc:runenvs().LIB or ""
     for folder in lib:gmatch("[^;]+") do
         local root = folder:match("^(.-)[/\\]um[/\\]x64[/\\]?$")
-        if root then
+        if root and os.isfile(path.join(root, "um", "x64", "kernel32.lib"))
+                and os.isfile(path.join(root, "ucrt", "x64", "ucrt.lib")) then
             return root
         end
     end
