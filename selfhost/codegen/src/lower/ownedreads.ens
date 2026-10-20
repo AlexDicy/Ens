@@ -6,7 +6,8 @@
 // field, an element or a mutating struct method's receiver is replaced by an assignment through any
 // path, and by any code a call, a constructor, a destructor or a user's 'equals', 'hash' or
 // 'toString' runs. The set is computed once per full expression, from its root down, before the
-// expression is lowered.
+// expression is lowered. The set also holds the receiver of a 'mutating' method called through '?.'
+// on an optional kept anywhere but in a local, and such a call runs over a copy of the payload.
 import Expression from @ens.frontend.syntax.generated.nodes;
 import Statement from @ens.frontend.syntax.generated.nodes;
 import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
@@ -391,6 +392,16 @@ final class Analysis {
                 let index = this.visit(subscript.index(), new Writes());
                 return index.with(this.visit(subscript.object(), index.with(after)));
             },
+            is SafeMemberExpressionNode member -> {
+                if (this.isStruct(member.object())) {
+                    return this.visitPlace(member.object(), after);
+                }
+                return this.visit(member.object(), after);
+            },
+            is SafeSubscriptExpressionNode subscript -> {
+                let index = this.visit(subscript.index(), new Writes());
+                return index.with(this.visit(subscript.object(), index.with(after)));
+            },
             default -> {
                 return this.visit(node, after);
             },
@@ -575,10 +586,28 @@ final class Analysis {
 
     visitReceiver(Expression callee, Expression receiver, Writes untilReturn) -> Writes {
         let type = this.typeOf(receiver);
-        if (type != null && primitives.isStructType(type) && this.isMutatingCall(callee)) {
+        if (type == null || !this.isMutatingCall(callee)) {
+            return this.visit(receiver, untilReturn);
+        }
+        if (primitives.isStructType(type)) {
             return this.visitPlace(receiver, untilReturn);
         }
+        if (primitives.taggedPayloadOf(type) != null) {
+            return this.visitStoredOptional(receiver, untilReturn);
+        }
         return this.visit(receiver, untilReturn);
+    }
+
+    // A 'mutating' method called through '?.' runs over the payload where the storage keeps it.
+    // The code the call runs may write any storage but a local, and could set it to null under the
+    // call, so such a receiver is owned instead, which runs the call over a copy.
+    visitStoredOptional(Expression receiver, Writes untilReturn) -> Writes {
+        let containers = this.visitPlace(receiver, untilReturn);
+        let location = this.locationOf(receiver);
+        if (location == null || location.isShared()) {
+            this.owned.add(receiver);
+        }
+        return containers;
     }
 
     // What running a call may replace: nothing for a member the compiler implements, unless it is
@@ -609,8 +638,9 @@ final class Analysis {
             }
         }
         let effect = codeRuns();
-        if (callee is MemberExpressionNode && this.isMutatingCall(callee)) {
-            let location = this.locationOf(callee.object());
+        let receiver = receiverOf(callee);
+        if (receiver != null && this.isMutatingCall(callee)) {
+            let location = this.locationOf(receiver);
             if (location != null) {
                 effect.locations.push(location);
             }
@@ -878,17 +908,61 @@ final class Analysis {
                 return base.projected(member.member().text());
             },
             is SubscriptExpressionNode subscript -> {
-                let arrayType = this.typeOf(subscript.object());
-                if (arrayType == null) {
-                    return null;
-                }
-                return new Location(LocationRoot.Element, null,
-                    primitives.underOptionals(arrayType), "", new List<string>());
+                return this.elementLocation(subscript.object());
+            },
+            is SafeMemberExpressionNode member -> {
+                return this.safeMemberLocation(member);
+            },
+            is SafeSubscriptExpressionNode subscript -> {
+                return this.elementLocation(subscript.object());
             },
             default -> {
                 return null;
             },
         }
+    }
+
+    // A field read through '?.': part of the struct before the '?.', or a field of the object it
+    // names.
+    safeMemberLocation(SafeMemberExpressionNode member) -> Location? {
+        string name = member.member().text();
+        if (this.isStruct(member.object())) {
+            let base = this.locationOf(member.object());
+            if (base == null) {
+                return null;
+            }
+            return base.projected(name);
+        }
+        let objectType = this.typeOf(member.object());
+        if (objectType == null) {
+            return null;
+        }
+        let classType = types.classOf(primitives.underOptionals(objectType));
+        if (classType == null) {
+            return null;
+        }
+        long index = typemembers.inheritedOrOwnFieldIndex(classType, name);
+        let fields = records.fieldsOf(classType);
+        if (index < 0 || fields == null) {
+            return null;
+        }
+        return fieldLocation(fields.get(index));
+    }
+
+    // True when 'node' gives a struct or an optional struct, whose fields are part of its storage.
+    isStruct(Expression node) -> bool {
+        let type = this.typeOf(node);
+        return type != null && primitives.isStructType(primitives.underOptionals(type));
+    }
+
+    // Any element of an array of the type 'array' has, which is what an element access names.
+    elementLocation(Expression array) -> Location? {
+        let arrayType = this.typeOf(array);
+        if (arrayType == null) {
+            return null;
+        }
+        return new Location(LocationRoot.Element, null, primitives.underOptionals(arrayType), "",
+            new List<string>());
     }
 
     // True when the language's 'equals', 'hash' or 'toString' over a value of this type may run a
@@ -946,6 +1020,21 @@ unwrapped(Expression node) -> Expression {
         return unwrapped(node.inner());
     }
     return node;
+}
+
+// The receiver a method is called on through 'callee', or null when the callee names no member.
+receiverOf(Expression callee) -> Expression? {
+    switch (callee) {
+        is MemberExpressionNode member -> {
+            return member.object();
+        },
+        is SafeMemberExpressionNode member -> {
+            return member.object();
+        },
+        default -> {
+            return null;
+        },
+    }
 }
 
 single(Location? location) -> List<Location>? {

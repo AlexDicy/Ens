@@ -275,6 +275,110 @@ test "a struct method writing a field 'this' does not have is reported for the m
     try testing.assertEqual(reported.length, 1L);
 }
 
+// A '?.' chain that ends in storage takes the change at every link: a local, a parameter, a field
+// of an object, of a struct local or of 'this' in a 'mutating' method, an array element, and a
+// field of an object a call returns.
+test "a 'mutating' call through '?.' is allowed on an optional struct kept in storage" {
+    let analysis = try sema_support.analyzeOne(storedProgram()
+        + "stored(Holder holder, Holder? maybe, Counter?[]? rows, Counter? parameter) \{\n"
+        + "    Counter? local = null;\n"
+        + "    local?.bump();\n"
+        + "    parameter?.bump();\n"
+        + "    holder.counter?.bump();\n"
+        + "    holder.outer?.inner?.bump();\n"
+        + "    holder.row[0]?.bump();\n"
+        + "    maybe?.counter?.bump();\n"
+        + "    maybe?.outer?.inner?.bump();\n"
+        + "    rows?[0]?.bump();\n"
+        + "    Outer outer = \{inner: null, fixed: null\};\n"
+        + "    outer.inner?.bump();\n"
+        + "    Outer? maybeOuter = null;\n"
+        + "    maybeOuter?.inner?.bump();\n"
+        + "    (maybeOuter?.inner)?.bump();\n"
+        + "    makeHolder()?.counter?.bump();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try testing.assertEqual(analysis.bodyDiagnostics().length, 0L);
+}
+
+// Each refusal names why the change could not land, at whichever link of the chain the reason is.
+test "a 'mutating' call through '?.' is refused where the change would be refused or lost" {
+    let analysis = try sema_support.analyzeOne(storedProgram()
+        + "public struct Pair \{\n"
+        + "    public Counter? first;\n"
+        + "    public peek() \{\n"
+        + "        this.first?.bump();\n"
+        + "    \}\n"
+        + "\}\n"
+        + "refused(Holder holder, Outer?[] outers) \{\n"
+        + "    makeOuter()?.inner?.bump();\n"
+        + "    makeCounter()?.bump();\n"
+        + "    const Outer? fixedOuter = null;\n"
+        + "    fixedOuter?.inner?.bump();\n"
+        + "    holder.kept?.bump();\n"
+        + "    holder.outer?.fixed?.bump();\n"
+        + "    Settings.outer?.inner?.bump();\n"
+        + "    Outer? captured = null;\n"
+        + "    () -> void later = () -> \{\n"
+        + "        captured?.inner?.bump();\n"
+        + "    \};\n"
+        + "    later();\n"
+        + "    for (let each in outers) \{\n"
+        + "        each?.inner?.bump();\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string file = "/proj/src/main.ens";
+    string gloss = "'bump' is 'mutating', which marks a method that changes the struct it is called on.";
+    try sema_support.assertDiagnostic(reported, 0, file,
+        "Method 'peek' of struct 'Pair' changes the struct it is called on, so it must be marked "
+        + "'mutating'. Write 'mutating' before 'peek'.");
+    try testing.assertEqual((try sema_support.relatedOf(reported[0])).note(),
+        "'bump' is 'mutating' and is called on 'this.first' here");
+    try sema_support.assertDiagnostic(reported, 1, file,
+        "Cannot call 'bump' on 'makeOuter()?.inner', because it is part of 'makeOuter()', which is "
+        + "not a variable, a field or an array element. 'bump' is 'mutating', which marks a method "
+        + "that changes the struct it is called on, so the change would be lost. A struct's fields "
+        + "are part of its value. Store 'makeOuter()' in a local first, as in "
+        + "'let value = makeOuter();', and call 'bump' on 'value?.inner'.");
+    try sema_support.assertDiagnostic(reported, 2, file,
+        "Cannot call 'bump' on 'makeCounter()', because 'makeCounter()' is not a variable, a field "
+        + "or an array element. 'bump' is 'mutating', which marks a method that changes the struct "
+        + "it is called on, so the change would be lost. Store the value in a local first, as in "
+        + "'let value = makeCounter();', and call 'bump' on the local, as in 'value?.bump();'.");
+    try sema_support.assertDiagnostic(reported, 3, file,
+        "Cannot call 'bump' on 'fixedOuter?.inner', because it is part of 'fixedOuter', which is "
+        + "declared 'const'. {gloss} A struct's fields are part of its value. Remove 'const' from "
+        + "the declaration of 'fixedOuter' if it needs to change.");
+    try sema_support.assertDiagnostic(reported, 4, file,
+        "Cannot call 'bump' on 'holder.kept', because field 'kept' is 'const'. {gloss} Remove "
+        + "'const' from the field if it needs to change.");
+    try sema_support.assertDiagnostic(reported, 5, file,
+        "Cannot call 'bump' on 'holder.outer?.fixed', because field 'fixed' is 'const'. {gloss} "
+        + "Remove 'const' from the field if it needs to change.");
+    try sema_support.assertDiagnostic(reported, 6, file,
+        "Cannot call 'bump' on 'Settings.outer?.inner', because it is part of the lazy const "
+        + "'Settings.outer'. {gloss} A struct's fields are part of its value. A lazy const keeps the "
+        + "value its initializer gives it. Change the initializer, or copy the value into a variable "
+        + "and call 'bump' on the copy, as in 'let outer = Settings.outer;' and then "
+        + "'outer?.inner?.bump();'.");
+    try sema_support.assertDiagnostic(reported, 7, file,
+        "Cannot call 'bump' on 'captured?.inner' inside a lambda. {gloss} A lambda works on copies "
+        + "of what it captures, so the 'captured' outside it would not change. Return the value the "
+        + "lambda computes and store it where the lambda is called, or keep the value in a field of "
+        + "an object the lambda uses.");
+    try sema_support.assertDiagnostic(reported, 8, file,
+        "Cannot call 'bump' on 'each?.inner', because 'each' is a copy of an element of 'outers', so "
+        + "'outers' would not change. {gloss} Loop over the indexes of 'outers', as in "
+        + "'for (long i = 0; i < outers.length; i++)', and write 'outers[i]' instead of 'each'.");
+    try testing.assertEqual(reported.length, 9L);
+}
+
 program() -> string {
     return "public interface Bumpable \{\n"
         + "    mutating bump();\n"
@@ -355,5 +459,40 @@ program() -> string {
         + "\}\n"
         + "main() -> int \{\n"
         + "    return 0;\n"
+        + "\}\n";
+}
+
+// The types the '?.' calls are made on, with a constant at each kind of link.
+storedProgram() -> string {
+    return "public struct Counter \{\n"
+        + "    public int value;\n"
+        + "    public mutating bump() \{\n"
+        + "        this.value += 1;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public struct Outer \{\n"
+        + "    public Counter? inner;\n"
+        + "    public const Counter? fixed;\n"
+        + "    public mutating bumpInner() \{\n"
+        + "        this.inner?.bump();\n"
+        + "    \}\n"
+        + "\}\n"
+        + "public class Holder \{\n"
+        + "    public Counter? counter = null;\n"
+        + "    public Outer? outer = null;\n"
+        + "    public Counter?[] row = [];\n"
+        + "    public const Counter? kept = null;\n"
+        + "\}\n"
+        + "public class Settings \{\n"
+        + "    public lazy const Outer? outer = null;\n"
+        + "\}\n"
+        + "makeHolder() -> Holder? \{\n"
+        + "    return null;\n"
+        + "\}\n"
+        + "makeOuter() -> Outer? \{\n"
+        + "    return null;\n"
+        + "\}\n"
+        + "makeCounter() -> Counter? \{\n"
+        + "    return null;\n"
         + "\}\n";
 }

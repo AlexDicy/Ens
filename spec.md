@@ -150,6 +150,25 @@ A `mutating` method is called only on a value that may change, so a call on a `c
 An interface method may be marked `mutating`, a struct that implements it marks its method exactly when the interface does, and a call through a generic bound follows the interface's marker.
 A class implementing that interface writes no marker, because a class method changes its object through a reference.
 
+A `mutating` method called through `?.` on an optional struct changes the struct where the optional is kept, and does nothing when the optional is null.
+When the optional holds a value, the arguments are evaluated first, and the method is called only if it still holds one after them.
+An optional struct on the way to it, such as `outer` in `outer?.inner?.bump()`, is checked again after the arguments in the same way.
+A class or array reference on the way, such as `holder` in `holder?.maybe?.bump()`, is not, because the object it names is already held, so the method runs on that object even when an argument sets the reference to null.
+That call is an error on the same values as one written with `.`, at every link of a chain such as `holder.outer?.inner?.bump()`.
+An optional kept in a local variable or a parameter, directly or inside a struct, changes in place, exactly as a struct does when its method is called with `.`.
+An optional kept anywhere else, such as in a field or an array element, changes through a copy that is stored back when the method returns or throws, so the call differs from one written with `.` in these ways:
+
+- Code that reads the optional by any means other than `this` while the method runs sees the value from before the call.
+- When the method returns or throws, the copy replaces what the optional holds, so a change made to the optional by any means other than `this` during the call is lost.
+- When the optional, or a struct on the way to it, has been set to null by then, the copy is discarded and nothing is stored back.
+- When a struct on the way to the optional, such as the `Outer` that `holder.outer` holds, is replaced during the call, the copy is stored into the replacement.
+
+```ens
+Counter? counter = {count: 0};
+counter?.bump();               // counter now holds a count of 1
+holder.outer?.inner?.bump();   // changes 'inner' inside the 'Outer' that 'holder.outer' holds
+```
+
 Overloading is allowed, best match arguments first, then visibility.
 Two declarations of the same name must differ in parameter count or parameter types.
 A call picks the overload whose parameter types match the arguments exactly; when there is no exact match, an overload reachable through implicit widening is chosen.

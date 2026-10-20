@@ -3,6 +3,7 @@
 // value out of it, so the expression produces its value owned and each path settles its own
 // references. A receiver or a payload copy the access owns is released where the access ends.
 import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
+import Expression from @ens.frontend.syntax.generated.nodes;
 import NullCoalesceExpressionNode from @ens.frontend.syntax.generated.nodes;
 import SafeMemberExpressionNode from @ens.frontend.syntax.generated.nodes;
 import SafeSubscriptExpressionNode from @ens.frontend.syntax.generated.nodes;
@@ -25,11 +26,15 @@ import EirCastOp from eir.model;
 import EirFieldAddress from eir.model;
 import EirJump from eir.model;
 import EirOptionalPayload from eir.model;
+import EirOptionalPayloadAddress from eir.model;
 import EirPayloadRead from eir.model;
 import EirOptionalPresence from eir.model;
 import EirStoreSlot from eir.model;
 import EirStringLength from eir.model;
+import CallTemporaries from lower.calls;
 import LoweringContext from lower.context;
+import FunctionInfo from lower.index;
+import Operand from lower.stores;
 import lower.arrays;
 import lower.calls;
 import lower.classes;
@@ -40,8 +45,10 @@ import lower.ownership;
 import lower.places;
 import lower.records;
 import lower.stores;
+import lower.structs;
 import lower.weakfields;
 import support.primitives;
+import @ens.sema.support.syntax;
 
 // The presence of an optional value as a bool: the tag of a tagged optional, a null test for a
 // reference. A value whose type sema already narrowed to non-optional is simply present.
@@ -338,7 +345,8 @@ public lowerSafeCall(LoweringContext lowering, CallExpressionNode call,
 }
 
 // '?.method(args)' through an optional struct: the tag guards, and the call runs over a copy of
-// the present payload, released once the call returns.
+// the present payload, released once the call returns. A 'mutating' method runs over the storage
+// instead, so the change lands where the optional is kept.
 lowerTaggedSafeCall(LoweringContext lowering, CallExpressionNode call,
                     SafeMemberExpressionNode callee, Method method, Type receiverType) -> long {
     let payloadType = primitives.taggedPayloadOf(receiverType);
@@ -366,13 +374,16 @@ lowerTaggedSafeCall(LoweringContext lowering, CallExpressionNode call,
     if (!calls.supportedCallee(lowering, info, "method {path}", call.span())) {
         return -1;
     }
+    let returned = lowering.substituted(resolved.signature().returnType());
+    if (method.isMutating()) {
+        return lowerStoredSafeCall(lowering, call, callee, info, structType, payloadType, returned);
+    }
     long receiver = expressions.lowerConverted(lowering, callee.object(), receiverType);
     if (receiver < 0) {
         return -1;
     }
     bool owned = places.producesOwnedValue(lowering, callee.object());
     let builder = lowering.builder();
-    let returned = lowering.substituted(resolved.signature().returnType());
     if (types.isVoidType(returned)) {
         long present = presenceOf(lowering, receiver, receiverType);
         long presentBlock = builder.newBlock("safecall.present");
@@ -415,6 +426,241 @@ lowerTaggedSafeCall(LoweringContext lowering, CallExpressionNode call,
     }
     releasePayloadCopy(lowering, copy, payloadType);
     return closeGuard(lowering, guard, call.span());
+}
+
+// A 'mutating' method called through '?.' on an optional struct in storage. The arguments run once
+// every optional on the way there holds a value, and the method is called only if each optional
+// struct on the way still does after them; a class or array reference on the way is held and is not
+// checked again. The call runs over the payload where the storage keeps it, or over a copy written
+// back afterwards where the receiver is an owned read.
+lowerStoredSafeCall(LoweringContext lowering, CallExpressionNode call,
+                    SafeMemberExpressionNode callee, FunctionInfo info, Type structType,
+                    Type payloadType, Type returned) -> long {
+    let builder = lowering.builder();
+    long absentBlock = builder.newBlock("safecall.absent");
+    let walk = new StorageWalk(absentBlock);
+    long pair = storedAddress(lowering, callee.object(), walk);
+    if (pair < 0) {
+        if (!lowering.failed()) {
+            lowering.internalError("the receiver of the safe call to '{callee.member().text()}' "
+                + "names no storage", call.span());
+        }
+        return -1;
+    }
+    if (primitives.taggedPayloadOf(builder.tempType(pair)) == null) {
+        lowering.internalError("the receiver of the safe call to '{callee.member().text()}' is "
+            + "stored as no optional", call.span());
+        return -1;
+    }
+    long payload = presentPayload(lowering, pair, walk);
+    let temporaries = new CallTemporaries();
+    let arguments = calls.lowerArguments(lowering, info, call.arguments(), call.green(),
+        call.span(), temporaries);
+    if (arguments == null) {
+        return -1;
+    }
+    long clearedBlock = -1;
+    if (arguments.length > 0) {
+        clearedBlock = builder.newBlock("safecall.cleared");
+        for (let checked in walk.checkedPairs) {
+            continueWhenPresent(lowering, checked, clearedBlock);
+        }
+    }
+    long result = -1;
+    if (lowering.ownsRead(callee.object())) {
+        result = callOverCopy(lowering, info, structType, payloadType, pair, payload, arguments,
+            call.span());
+    } else {
+        result = calls.emitCall(lowering, info, structType, payload, arguments, -1, null,
+            call.span());
+    }
+    temporaries.release(lowering);
+    if (clearedBlock >= 0) {
+        long called = builder.current();
+        builder.moveTo(clearedBlock);
+        temporaries.release(lowering);
+        builder.terminate(new EirJump(absentBlock));
+        builder.moveTo(called);
+    }
+    if (lowering.failed()) {
+        return -1;
+    }
+    if (types.isVoidType(returned)) {
+        long mergeBlock = builder.newBlock("safecall.end");
+        if (!builder.terminated()) {
+            builder.terminate(new EirJump(mergeBlock));
+        }
+        builder.moveTo(absentBlock);
+        builder.terminate(new EirJump(mergeBlock));
+        builder.moveTo(mergeBlock);
+        return -1;
+    }
+    let resultType = lowering.typeOf(call);
+    if (resultType == null) {
+        return -1;
+    }
+    let guard = new SafeGuard(ownership.defineJoinSlot(lowering, "safecall", resultType),
+        absentBlock, builder.newBlock("safecall.end"), resultType);
+    if (!storePresent(lowering, guard, result, primitives.hasArcContent(returned), call.span())) {
+        return -1;
+    }
+    return closeGuard(lowering, guard, call.span());
+}
+
+// The call with the lowered 'arguments' over a copy of the payload the pair at 'pair' holds at
+// 'payload', written back into the pair once the call returns or throws.
+callOverCopy(LoweringContext lowering, FunctionInfo info, Type structType, Type payloadType,
+             long pair, long payload, long[] arguments, Span span) -> long {
+    let builder = lowering.builder();
+    long copy = builder.addSlot("safepayload", payloadType, false, false);
+    long value = places.loadFrom(lowering, payload, payloadType);
+    if (!stores.initializeSlot(lowering, copy, payloadType, new Operand(value, false, payload))) {
+        lowering.internalError("the payload copy of a safe call has no storage to retain", span);
+        return -1;
+    }
+    lowering.protectStoredBack(copy, pair);
+    long result = calls.emitCall(lowering, info, structType,
+        ownership.slotAddress(lowering, copy, payloadType), arguments, -1, null, span);
+    lowering.unprotectStorage(copy);
+    stores.storePayloadBack(lowering, copy, pair);
+    return result;
+}
+
+// The way to the storage a safe call's receiver names: the block an absent link jumps to, and the
+// address of each optional pair checked on the way, outermost first.
+final class StorageWalk {
+    long absentBlock;
+    List<long> checkedPairs;
+
+    constructor(long absentBlock) {
+        this.absentBlock = absentBlock;
+        this.checkedPairs = new List<long>();
+    }
+}
+
+// The address of the storage a safe call's receiver names, with each '?.' and '?[' on the way
+// there checked: an absent optional jumps to the walk's absent block. A link is stepped through in
+// place, so a struct is reached inside the optional it is kept in, and a field or an element
+// inside the object or the array a reference names. Returns -1 when the receiver names no storage.
+storedAddress(LoweringContext lowering, Expression node, StorageWalk walk) -> long {
+    switch (syntax.unwrapParentheses(node)) {
+        is SafeMemberExpressionNode member -> {
+            return storedFieldAddress(lowering, member, walk);
+        },
+        is SafeSubscriptExpressionNode element -> {
+            return storedElementAddress(lowering, element, walk);
+        },
+        default -> {
+            return places.storageAddress(lowering, syntax.unwrapParentheses(node), EirAccess.Read);
+        },
+    }
+}
+
+storedFieldAddress(LoweringContext lowering, SafeMemberExpressionNode member, StorageWalk walk)
+        -> long {
+    let objectType = lowering.typeOf(member.object());
+    if (objectType == null) {
+        return -1;
+    }
+    string name = member.member().text();
+    let core = primitives.underOptionals(objectType);
+    let structType = primitives.structOf(core);
+    if (structType != null) {
+        long stored = storedAddress(lowering, member.object(), walk);
+        if (stored < 0) {
+            return -1;
+        }
+        long index = typemembers.inheritedOrOwnFieldIndex(structType, name);
+        let fields = records.fieldsOf(structType);
+        if (index < 0 || fields == null) {
+            return -1;
+        }
+        return structs.fieldAddressAt(lowering, presentPayload(lowering, stored, walk),
+            fields.get(index).type(), index);
+    }
+    let classType = types.classOf(core);
+    if (classType == null || !lowering.supportsClassLayout(classType)) {
+        lowering.unsupported("calling a method through '?.{name}' on "
+            + "{lowering.names().quoted(objectType)}", member.span());
+        return -1;
+    }
+    long index = typemembers.inheritedOrOwnFieldIndex(classType, name);
+    let fields = records.fieldsOf(classType);
+    if (index < 0 || fields == null) {
+        return -1;
+    }
+    long object = presentReference(lowering, member.object(), objectType, walk.absentBlock);
+    if (object < 0) {
+        return -1;
+    }
+    return records.fieldAddressIn(lowering, object, classType, fields.get(index).type(), index);
+}
+
+storedElementAddress(LoweringContext lowering, SafeSubscriptExpressionNode element,
+                     StorageWalk walk) -> long {
+    let arrayType = lowering.typeOf(element.object());
+    if (arrayType == null) {
+        return -1;
+    }
+    let array = primitives.arrayOf(arrayType);
+    if (array == null) {
+        lowering.unsupported("'?[' on {lowering.names().quoted(arrayType)}", element.span());
+        return -1;
+    }
+    long reference = presentReference(lowering, element.object(), arrayType, walk.absentBlock);
+    if (reference < 0) {
+        return -1;
+    }
+    let longType = lowering.store().primitive(PrimitiveKind.Long);
+    long index = expressions.lowerConverted(lowering, element.index(), longType);
+    if (index < 0) {
+        return -1;
+    }
+    return arrays.elementAddress(lowering, reference, index, array.element(), EirAccess.Read,
+        lowering.lineAt(element.span()));
+}
+
+// The reference 'node' names, kept alive until the statement ends, once a check that it is not
+// null has passed: null jumps to 'absentBlock'.
+presentReference(LoweringContext lowering, Expression node, Type type, long absentBlock) -> long {
+    long reference = classes.borrowedReference(lowering, node, type);
+    if (reference < 0) {
+        return -1;
+    }
+    let builder = lowering.builder();
+    long presentBlock = builder.newBlock("safecall.link");
+    builder.terminate(new EirBranch(presenceOf(lowering, reference, type), presentBlock,
+        absentBlock));
+    builder.moveTo(presentBlock);
+    return reference;
+}
+
+// The address of the payload of the pair stored at 'address', once a check of its tag has passed:
+// an absent pair jumps to the walk's absent block. Storage that holds a struct with no optional
+// around it is the struct itself.
+presentPayload(LoweringContext lowering, long address, StorageWalk walk) -> long {
+    let builder = lowering.builder();
+    let payloadType = primitives.taggedPayloadOf(builder.tempType(address));
+    if (payloadType == null) {
+        return address;
+    }
+    continueWhenPresent(lowering, address, walk.absentBlock);
+    walk.checkedPairs.push(address);
+    long payload = builder.newTemp(payloadType);
+    builder.append(new EirOptionalPayloadAddress(payload, payloadType, address));
+    return payload;
+}
+
+// Continues in a new block when the pair stored at 'address' holds a value, and jumps to
+// 'absentBlock' when it does not.
+continueWhenPresent(LoweringContext lowering, long address, long absentBlock) {
+    let builder = lowering.builder();
+    let storedType = builder.tempType(address);
+    long pair = places.loadFrom(lowering, address, storedType);
+    long presentBlock = builder.newBlock("safecall.link");
+    builder.terminate(new EirBranch(presenceOf(lowering, pair, storedType), presentBlock,
+        absentBlock));
+    builder.moveTo(presentBlock);
 }
 
 // The address of a present pair's payload, in a slot that borrows it, so a read runs over
