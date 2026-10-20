@@ -76,8 +76,23 @@ public final class NarrowingFact {
     // For a comparison of an 'as?' cast with null, which narrows nothing, the fix that writes the
     // 'is' test that would narrow; empty for every fact that narrows.
     protected string castHint = "";
+    // The write on the right of a '&&' or '||' that leaves 'proven', or with 'ended' no proof, and whether
+    // the fact is what that write leaves rather than what a test proves.
+    protected NarrowingEnd? write = null;
+    protected bool ended = false;
+    protected bool fromWrite = false;
 
     protected constructor(this.path, this.proven, this.narrowsWhenTrue);
+
+    // The same fact, with 'write' as the write that leaves what it proves.
+    protected writtenBy(NarrowingEnd write) -> NarrowingFact {
+        let copied = new NarrowingFact(this.path, this.proven, this.narrowsWhenTrue);
+        copied.castHint = this.castHint;
+        copied.ended = this.ended;
+        copied.fromWrite = this.fromWrite;
+        copied.write = write;
+        return copied;
+    }
 }
 
 // The path of a stable place, or null when the expression names none. A stable place is a
@@ -214,14 +229,28 @@ detectTypeTest(BodyChecker checker, TypeTestExpressionNode test) -> NarrowingFac
     return new NarrowingFact(path, target, true);
 }
 
-// The facts a condition proves on the side where it evaluated to 'conditionHolds':
-// negation flips the polarity, '&&' facts hold where the conjunction held, '||' facts
-// hold where the disjunction failed, and both descend into their operands.
+// Adds to 'sink' the facts 'condition' proves where it evaluates to 'conditionHolds'. A write after a test
+// in it is marked with the value the condition has only where the written place is null, if there is one.
 public collectNarrowings(BodyChecker checker, Expression condition, bool conditionHolds,
                          List<NarrowingFact> sink, ConditionSite? site = null) {
+    long first = sink.length();
+    collectFacts(checker, condition, conditionHolds, sink, site);
+    for (long i = first; i < sink.length(); i++) {
+        let fact = sink.get(i);
+        let write = fact.write;
+        if (write != null && write.afterTestInCondition()
+                && endsInNullCheck(checker, condition, conditionHolds, fact.path)) {
+            sink.set(i, fact.writtenBy(write.inCondition(conditionHolds)));
+        }
+    }
+}
+
+// Adds to 'sink' the facts collectNarrowings collects for 'condition'.
+collectFacts(BodyChecker checker, Expression condition, bool conditionHolds, List<NarrowingFact> sink,
+             ConditionSite? site) {
     Expression core = syntax.unwrapParentheses(condition);
     if (core is PrefixExpressionNode && core.operator().kind() == SyntaxKind.Exclamation) {
-        collectNarrowings(checker, core.operand(), !conditionHolds, sink, site);
+        collectFacts(checker, core.operand(), !conditionHolds, sink, site);
         return;
     }
     if (core is TypeTestExpressionNode) {
@@ -232,12 +261,13 @@ public collectNarrowings(BodyChecker checker, Expression condition, bool conditi
         return;
     }
     if (core is BinaryExpressionNode) {
-        SyntaxKind operator = core.operator().kind();
-        bool descend = (conditionHolds && operator == SyntaxKind.AmpersandAmpersand)
-            || (!conditionHolds && operator == SyntaxKind.PipePipe);
-        if (descend) {
-            collectNarrowings(checker, core.left(), conditionHolds, sink, site);
-            collectNarrowings(checker, core.right(), conditionHolds, sink, site);
+        if (runsRight(core.operator().kind(), conditionHolds)) {
+            long left = sink.length();
+            collectFacts(checker, core.left(), conditionHolds, sink, site);
+            if (!writeNamesOf(checker, core).isEmpty()) {
+                afterRightOperand(sink, left, checker.rightOperandWrites(core));
+            }
+            collectFacts(checker, core.right(), conditionHolds, sink, site);
             return;
         }
     }
@@ -251,9 +281,100 @@ public collectNarrowings(BodyChecker checker, Expression condition, bool conditi
     }
 }
 
+// Whether the right operand of the '&&' or '||' written 'operator' runs where the whole of it evaluates to
+// 'conditionHolds'.
+runsRight(SyntaxKind operator, bool conditionHolds) -> bool {
+    return (conditionHolds && operator == SyntaxKind.AmpersandAmpersand)
+        || (!conditionHolds && operator == SyntaxKind.PipePipe);
+}
+
+// Replaces the facts in 'sink' from 'left' on, which the left operand of a '&&' or '||' proves, with
+// what they prove after its right operand, and adds the facts in 'written' for the other places it writes.
+afterRightOperand(List<NarrowingFact> sink, long left, Map<NarrowingPath, NarrowingFact> written) {
+    long end = sink.length();
+    for (long i = left; i < end; i++) {
+        sink.set(i, leftFactAfter(sink.get(i), written));
+    }
+    for (let path in written.keys()) {
+        let changed = written.get(path);
+        if (changed != null && !provesPlace(sink, left, end, path)) {
+            sink.push(changed);
+        }
+    }
+}
+
+// What 'fact', which the left operand of a '&&' or '||' proves, proves after its right operand, from
+// 'written', as afterRightOperand reads it. Where a test proved 'fact', a write in the right operand is named
+// as a write in the condition after that test.
+leftFactAfter(NarrowingFact fact, Map<NarrowingPath, NarrowingFact> written) -> NarrowingFact {
+    let changed = written.get(fact.path);
+    let write = changed?.write;
+    if (changed == null || write == null || fact.fromWrite) {
+        return changed ?? fact;
+    }
+    let after = new NarrowingFact(fact.path, changed.proven, fact.narrowsWhenTrue);
+    after.ended = changed.ended;
+    after.write = write.inCondition(null).narrowedFrom(fact.proven);
+    return after;
+}
+
+// Whether one of the facts in 'facts' from 'first' up to 'end' is about the place 'path'.
+provesPlace(List<NarrowingFact> facts, long first, long end, NarrowingPath path) -> bool {
+    for (long i = first; i < end; i++) {
+        if (facts.get(i).path == path) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The facts 'ran' holds where the right operand 'right' of a '&&' or '||' ends, for each place a write in
+// 'right' changes.
+factsAfterWrites(BranchChanges ran, Expression right) -> Map<NarrowingPath, NarrowingFact> {
+    let written = new Map<NarrowingPath, NarrowingFact>();
+    for (let path in ran.places) {
+        let held = ran.held.proofs.get(path);
+        let write = held == null ? ran.held.ends.get(path) : ran.held.writes.get(path);
+        if (write != null && within(write.at(), right.span())) {
+            let changed = new NarrowingFact(path, held ?? path.rootType(), true);
+            changed.write = write;
+            changed.ended = held == null;
+            changed.fromWrite = true;
+            written.set(path, changed);
+        }
+    }
+    return written;
+}
+
+// Whether 'condition', where it evaluates to 'conditionHolds', holds only where the place 'path' is null,
+// because it is a null check of that place or a '&&' or '||' whose right operand ends in one.
+endsInNullCheck(BodyChecker checker, Expression condition, bool conditionHolds, NarrowingPath path) -> bool {
+    Expression core = syntax.unwrapParentheses(condition);
+    if (core is PrefixExpressionNode && core.operator().kind() == SyntaxKind.Exclamation) {
+        return endsInNullCheck(checker, core.operand(), !conditionHolds, path);
+    }
+    if (core is BinaryExpressionNode && runsRight(core.operator().kind(), conditionHolds)) {
+        return endsInNullCheck(checker, core.right(), conditionHolds, path);
+    }
+    let check = detectNullCheck(checker, core);
+    return check != null && check.narrowsWhenTrue != conditionHolds && check.path == path;
+}
+
 public applyFacts(BodyChecker checker, List<NarrowingFact> facts) {
     for (long i = 0; i < facts.length(); i++) {
         let fact = facts.get(i);
+        let write = fact.write;
+        if (fact.ended) {
+            if (write != null) {
+                checker.narrowing().endProof(fact.path, write);
+            }
+            continue;
+        }
+        if (write != null) {
+            checker.narrowing().narrow(fact.path, fact.proven);
+            checker.narrowing().noteWrite(fact.path, write);
+            continue;
+        }
         checker.narrowing().narrow(fact.path, fact.proven);
         if (fact.castHint.length > 0) {
             checker.recordCastHint(fact.path, fact.castHint);
@@ -299,6 +420,121 @@ castHintPath(NarrowingPath path) -> NarrowingPath {
     return path.extended(narrow.fieldSegment(CastHintHop.name));
 }
 
+// The advice to test 'place' for 'tested' again right after the write at 'write', for the read 'read' after
+// it in the same condition, or empty where the read is not after the write in one condition.
+conditionRetest(BodyChecker checker, Expression read, Span write, string place, Type tested) -> string {
+    let site = recheckSite(checker, read, write, tested);
+    if (site == null) {
+        return "";
+    }
+    string[] pieces = ["{site.operand} && {place} is ", ""];
+    if (!site.whenTrue) {
+        pieces = ["{site.operand} || !({place} is ", ")"];
+    }
+    long length = pieces[0].length + checker.names().of(tested).length + pieces[1].length;
+    if (length > wording.quotedCodeLimit()) {
+        return " Test '{place}' again after the assignment, in the same condition.";
+    }
+    string example = checker.names().quotedCode(pieces, [tested]);
+    return " Test '{place}' again after the assignment, as in {example}.";
+}
+
+// Where a read after a write in the same condition can test the written place again: the operand of a '&&'
+// or '||' that holds the write, spelled so that a test can follow it, and whether the read runs where that
+// operand is true.
+public final class RecheckSite {
+    public string operand;
+    public bool whenTrue;
+
+    protected constructor(this.operand, this.whenTrue);
+}
+
+// Where the read 'read' can test its place again after the write at 'write', where the read runs only after
+// the write in one condition. Null anywhere else, and where a part of the condition after the write proves
+// the place null, or with 'tested' proves it is not a 'tested', so that no test after the write can pass.
+public recheckSite(BodyChecker checker, Expression read, Span write, Type? tested) -> RecheckSite? {
+    SyntaxNode? holder = read.parent();
+    while (holder != null && !within(write, holder.span())) {
+        holder = holder.parent();
+    }
+    Expression? held = null;
+    bool whenTrue = true;
+    if (holder is BinaryExpressionNode && within(write, holder.left().span())) {
+        SyntaxKind operator = holder.operator().kind();
+        if (operator == SyntaxKind.AmpersandAmpersand || operator == SyntaxKind.PipePipe) {
+            held = holder.left();
+            whenTrue = operator == SyntaxKind.AmpersandAmpersand;
+        }
+    } else if (holder is TernaryExpressionNode && within(write, holder.condition().span())) {
+        held = holder.condition();
+        whenTrue = within(read.span(), holder.thenValue().span());
+    }
+    if (held == null) {
+        return null;
+    }
+    SyntaxKind chain = whenTrue ? SyntaxKind.AmpersandAmpersand : SyntaxKind.PipePipe;
+    let path = buildNarrowingPath(checker, read);
+    if (path == null) {
+        return null;
+    }
+    let parts = new List<Expression>();
+    chainParts(held, chain, parts);
+    for (let part in parts) {
+        if (part.span().end() >= write.end() && refutes(checker, part, whenTrue, path, tested)) {
+            return null;
+        }
+    }
+    Expression operand = held;
+    while (operand is BinaryExpressionNode && operand.operator().kind() == chain
+            && within(write, operand.right().span())) {
+        operand = operand.right();
+    }
+    string spelled = wording.oneLineSpelling(operand);
+    if (whenTrue && operand is BinaryExpressionNode && operand.operator().kind() == SyntaxKind.PipePipe) {
+        spelled = "({spelled})";
+    }
+    return new RecheckSite(spelled, whenTrue);
+}
+
+// Adds to 'parts' the operands of the chain of 'operator' that 'expression' is, or 'expression' itself.
+chainParts(Expression expression, SyntaxKind operator, List<Expression> parts) {
+    if (expression is BinaryExpressionNode && expression.operator().kind() == operator) {
+        chainParts(expression.left(), operator, parts);
+        chainParts(expression.right(), operator, parts);
+        return;
+    }
+    parts.push(expression);
+}
+
+// Whether 'part', which has the value 'holds' where a read runs, proves that 'path' is null, or with
+// 'tested' that it is not a 'tested'.
+refutes(BodyChecker checker, Expression part, bool holds, NarrowingPath path, Type? tested) -> bool {
+    Expression core = syntax.unwrapParentheses(part);
+    if (core is PrefixExpressionNode && core.operator().kind() == SyntaxKind.Exclamation) {
+        return refutes(checker, core.operand(), !holds, path, tested);
+    }
+    if (tested != null) {
+        if (holds || !(core is TypeTestExpressionNode)
+                || buildNarrowingPath(checker, core.value()) != path) {
+            return false;
+        }
+        let target = checker.result().typeOf(core.target().green());
+        return target != null && !(target is ErrorType) && hierarchy.isSubclassOrConforms(tested, target);
+    }
+    if (!(core is BinaryExpressionNode)) {
+        return false;
+    }
+    SyntaxKind operator = core.operator().kind();
+    Expression left = syntax.unwrapParentheses(core.left());
+    Expression right = syntax.unwrapParentheses(core.right());
+    Expression checked = wording.isNullLiteral(right) ? left : right;
+    if ((!wording.isNullLiteral(left) && !wording.isNullLiteral(right))
+            || buildNarrowingPath(checker, checked) != path) {
+        return false;
+    }
+    return (operator == SyntaxKind.EqualsEquals && holds) || (operator == SyntaxKind.NotEquals && !holds);
+}
+
 // The type test that narrows 'value' to 'tested', written the way the code being checked can hold
 // it: an 'if' where a statement can go, and a '?:' anywhere else.
 public typeTestExample(BodyChecker checker, Expression value, Type tested) -> string {
@@ -310,10 +546,10 @@ public typeTestExample(BodyChecker checker, Expression value, Type tested) -> st
 }
 
 // The sentences that follow the refusal of the member 'member' read through 'object', where 'object' has
-// a type with the member where a loop starts or before a branch of a statement whose branches meet, but a
-// write in the loop or the branch leaves a wider proof of it, or none, with that write as a note. Inside the
-// loop that holds on a later pass, and after the statement or in a 'for' update it holds here. Null anywhere
-// else.
+// a type with the member where a loop starts, before a branch of a statement whose branches meet or where a
+// test in a condition holds, but a write in the loop, the branch or the condition after the test leaves a
+// wider proof of it, or none, with that write as a note. Inside the loop that holds on a later pass, and
+// after the statement, in a 'for' update or after the condition it holds here. Null anywhere else.
 public widenedReadHint(BodyChecker checker, Expression object, string member) -> string? {
     let path = buildNarrowingPath(checker, object);
     if (path == null) {
@@ -326,7 +562,7 @@ public widenedReadHint(BodyChecker checker, Expression object, string member) ->
     let narrower = widening.narrower();
     let loop = widening.loop();
     bool inLoop = loop != null && within(object.span(), loop);
-    if (narrower == null || (!inLoop && !widening.inJoin())
+    if (narrower == null || (!inLoop && !widening.inJoin() && !widening.afterTestInCondition())
             || memberaccess.lookupMember(checker, narrower, member) is MissingMember) {
         return null;
     }
@@ -334,14 +570,22 @@ public widenedReadHint(BodyChecker checker, Expression object, string member) ->
     Type tested = convert.coreOf(narrower);
     string wider = checker.names().quoted(convert.coreOf(checker.recordedType(object)));
     string stored = storedClause(checker, widening, place);
+    string example = typeTestExample(checker, object, tested);
     string note = diagnostics.carriedNote(widening.at(), "'{widening.place()}' is assigned here");
+    if (widening.afterTestInCondition()) {
+        string reason = "'{widening.place()}' is assigned{stored} in the condition after the test, so "
+            + "'{place}' may be any {wider} here.{note}";
+        if (within(widening.at(), nullguidance.enclosingStatement(object).span())) {
+            return "{reason}{conditionRetest(checker, object, widening.at(), place, tested)}";
+        }
+        return "{reason} Test '{place}' again after the assignment, as in {example}.";
+    }
     if (inLoop) {
         string held = "{typenames.typeArticle(checker.names().of(tested))} {checker.names().quoted(tested)}";
         string assigned = widening.place() != place ? "'{widening.place()}'" : "it{stored}";
         string outcome = widening.place() != place ? "'{place}' may be" : "it may be";
         return "'{place}' is {held} when the loop starts, but the loop assigns {assigned}, so {outcome} any "
-            + "{wider} on a later pass.{note} Test '{place}' inside the loop, as in "
-            + "{typeTestExample(checker, object, tested)}.";
+            + "{wider} on a later pass.{note} Test '{place}' inside the loop, as in {example}.";
     }
     string reason = "'{widening.place()}' is assigned{stored} {widening.joinedIn()}, so '{place}' may be any "
         + "{wider} here.{note}";
@@ -349,8 +593,7 @@ public widenedReadHint(BodyChecker checker, Expression object, string member) ->
     if (update != null) {
         return "{reason} {updateTestAdvice(checker, object, member, update, tested)}";
     }
-    return "{reason} Test '{place}' after the {widening.joinedStatement()}, as in "
-        + "{typeTestExample(checker, object, tested)}.";
+    return "{reason} Test '{place}' after the {widening.joinedStatement()}, as in {example}.";
 }
 
 // The type the write 'end' stores, as in " a 'Square'", where it writes the place spelled 'place' and the
@@ -629,6 +872,20 @@ public joinBranchChanges(BodyChecker checker, List<BranchChanges> survivors, Spa
         held.push(survivor.held);
     }
     applyNarrowingJoin(checker, entry, held, at, statement, branch);
+    if (survivors.length() == 1) {
+        keepEnds(checker, entry, held.get(0));
+    }
+}
+
+// Records what ended each place that 'only', the one branch that falls through, ends and that held no proof
+// where the branches start, since a read after them comes after that end.
+keepEnds(BodyChecker checker, BranchNarrowings entry, BranchNarrowings only) {
+    for (let path in only.ends.keys()) {
+        let ended = only.ends.get(path);
+        if (ended != null && entry.proofs.get(path) == null && pathRootInScope(checker, path)) {
+            checker.narrowing().endProof(path, ended);
+        }
+    }
 }
 
 // Adds to 'proofs' the type that the start of a loop around 'at' ended for each place 'reached' holds.
@@ -885,7 +1142,7 @@ public final class TernaryBranches {
 // writes no local or parameter, so that each branch starts from what holds before it and leaves it as
 // it is.
 public enterBranches(BodyChecker checker, TernaryExpressionNode ternary) -> TernaryBranches? {
-    if (ternaryWriteNames(checker, ternary).isEmpty()) {
+    if (writeNamesOf(checker, ternary).isEmpty()) {
         return null;
     }
     checker.narrowing().startBranches();
@@ -907,9 +1164,9 @@ public joinBranches(BodyChecker checker, TernaryBranches? branches) {
     joinBranchChanges(checker, survivors, branches.at, "'?:'", "in one branch of the '?:'");
 }
 
-// Analyzes a '?:' branch or the right side of '&&' or '||' under the facts the condition proves
-// there. 'target' is the type the branch is checked against, set at 'origin', or null. A branch of
-// 'branches' starts from what holds where they start, and what holds at its end is kept there.
+// Analyzes a '?:' branch under the facts the condition proves there. 'target' is the type the branch is
+// checked against, set at 'origin', or null. A branch of 'branches' starts from what holds where they start,
+// and what holds at its end is kept there.
 public analyzeGuardedBranch(BodyChecker checker, Expression condition, Expression branch, bool conditionHolds,
                             Type? target, LiteralOrigin? origin = null, ConditionSite? site = null,
                             TernaryBranches? branches = null) -> Type {
@@ -931,6 +1188,38 @@ public analyzeGuardedBranch(BodyChecker checker, Expression condition, Expressio
         branches.ends.push(branchChanges(checker));
     }
     checker.narrowing().pop();
+    return analyzed;
+}
+
+// Analyzes the right operand of the '&&' or '||' 'node' under what the left one proves where it evaluates
+// to 'runsWhen'. After 'node', what the right operand leaves joins what held where it did not run.
+public analyzeRightOperand(BodyChecker checker, BinaryExpressionNode node, bool runsWhen) -> Type {
+    let facts = new List<NarrowingFact>();
+    collectNarrowings(checker, node.left(), runsWhen, facts, new ConditionSite("", node, ""));
+    let state = checker.narrowing();
+    bool writes = !writeNamesOf(checker, node).isEmpty();
+    if (writes) {
+        state.startBranches();
+    }
+    state.push();
+    applyFacts(checker, facts);
+    Type analyzed = checker.analyzeExpression(node.right());
+    if (!writes) {
+        state.pop();
+        return analyzed;
+    }
+    let ran = branchChanges(checker);
+    checker.noteRightOperand(node, factsAfterWrites(ran, node.right()));
+    state.pop();
+    if (!state.changedOutside()) {
+        state.endBranches();
+        return analyzed;
+    }
+    let survivors = new List<BranchChanges>();
+    survivors.push(ran);
+    survivors.push(new BranchChanges(new Set<NarrowingPath>(), emptyNarrowings()));
+    string operator = "'{node.operator().text()}'";
+    joinBranchChanges(checker, survivors, node.span(), operator, "on the right of {operator}");
     return analyzed;
 }
 
@@ -2175,8 +2464,9 @@ collectLoopNames(SyntaxNode loop, Map<GreenNode, Set<string>> recorded) -> Set<s
     return names;
 }
 
-// Adds to 'names' each local and parameter 'node' may write by an assignment, '++', '--' or 'out'. A loop
-// inside records its own names, and its initializer or iterable is written once, outside it.
+// Adds to 'names' each local and parameter 'node' may write by an assignment, '++', '--' or 'out'. A loop, a
+// '?:', a '&&' or a '||' inside records its own names, and a loop's initializer or iterable is written once,
+// outside it.
 collectWrittenNames(SyntaxNode node, Map<GreenNode, Set<string>> recorded, Set<string> names) {
     switch (node) {
         is WhileStatementNode ignored -> {
@@ -2202,8 +2492,15 @@ collectWrittenNames(SyntaxNode node, Map<GreenNode, Set<string>> recorded, Set<s
             return;
         },
         is TernaryExpressionNode ignored -> {
-            addNames(names, recorded.get(node.green()) ?? collectTernaryNames(node, recorded));
+            addNames(names, recorded.get(node.green()) ?? collectNodeNames(node, recorded));
             return;
+        },
+        is BinaryExpressionNode binary -> {
+            let operator = binary.operator().kind();
+            if (operator == SyntaxKind.AmpersandAmpersand || operator == SyntaxKind.PipePipe) {
+                addNames(names, recorded.get(node.green()) ?? collectNodeNames(node, recorded));
+                return;
+            }
         },
         is AssignmentExpressionNode assignment -> {
             addTargetName(assignment.target(), names);
@@ -2230,20 +2527,20 @@ collectWrittenNames(SyntaxNode node, Map<GreenNode, Set<string>> recorded, Set<s
     }
 }
 
-// The names of the locals and the parameters the '?:' 'ternary' may write, which one walk over it records
-// for it and for each loop and each '?:' inside it.
-ternaryWriteNames(BodyChecker checker, TernaryExpressionNode ternary) -> Set<string> {
-    return checker.writeNames().get(ternary.green()) ?? collectTernaryNames(ternary, checker.writeNames());
+// The names of the locals and the parameters the '?:', '&&' or '||' 'node' may write, which one walk over it
+// records for it and for each loop, '?:', '&&' and '||' inside it.
+writeNamesOf(BodyChecker checker, SyntaxNode node) -> Set<string> {
+    return checker.writeNames().get(node.green()) ?? collectNodeNames(node, checker.writeNames());
 }
 
-// Records in 'recorded', for the '?:' 'ternary' and for each loop and each '?:' inside it, the names of the
-// locals and the parameters it may write, and returns the names 'ternary' may write.
-collectTernaryNames(SyntaxNode ternary, Map<GreenNode, Set<string>> recorded) -> Set<string> {
+// Records in 'recorded', for the '?:', '&&' or '||' 'node' and for each loop, '?:', '&&' and '||' inside it,
+// the names of the locals and the parameters it may write, and returns the names 'node' may write.
+collectNodeNames(SyntaxNode node, Map<GreenNode, Set<string>> recorded) -> Set<string> {
     let names = new Set<string>();
-    for (let child in ternary.childNodes()) {
+    for (let child in node.childNodes()) {
         collectWrittenNames(child, recorded, names);
     }
-    recorded.set(ternary.green(), names);
+    recorded.set(node.green(), names);
     return names;
 }
 

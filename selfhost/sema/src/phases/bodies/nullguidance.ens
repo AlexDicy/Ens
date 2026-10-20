@@ -824,6 +824,11 @@ noteEndedNarrowing(BodyChecker checker, Expression operand, NullableOperand clas
     string carried = diagnostics.carriedNote(end.at(), note);
     let loop = end.loop();
     let stored = end.stored();
+    Span statement = enclosingStatement(operand).span();
+    if (end.afterTestInCondition()) {
+        noteConditionWrite(checker, end, operand, place, carried, classified);
+        return;
+    }
     if (loop != null && narrowing.within(operand.span(), loop)) {
         string reason = "'{place}' is not null when the loop starts, but the loop {write}, so {outcome} "
             + "on a later pass.{carried}";
@@ -835,7 +840,6 @@ noteEndedNarrowing(BodyChecker checker, Expression operand, NullableOperand clas
         }
         return;
     }
-    Span statement = enclosingStatement(operand).span();
     bool sameStatement = loop == null && narrowing.within(end.at(), statement);
     if (end.kind() == NarrowingEndKind.PassedOut) {
         classified.endedReason = "Passing 'out {place}' lets '{callee}' write any value to "
@@ -853,6 +857,65 @@ noteEndedNarrowing(BodyChecker checker, Expression operand, NullableOperand clas
             + "which can be null.{carried}";
         classified.endedWhere = checkPlace(end, sameStatement, "after the assignment");
     }
+}
+
+// Records on 'classified' why the value 'place', which 'read' reads, may be null here where the write 'end'
+// in a condition, after the check that proved it is not null, ended that proof, with the note 'carried' at
+// the write. Where the read is in the statement of the write, the check goes in the condition.
+noteConditionWrite(BodyChecker checker, NarrowingEnd end, Expression read, string place, string carried,
+                   NullableOperand classified) {
+    let stored = end.stored();
+    let outcome = end.nullWhereCondition();
+    bool sameStatement = narrowing.within(end.at(), enclosingStatement(read).span());
+    string recheck = sameStatement ? conditionRecheck(checker, read, end, place, classified.levels) : "";
+    if (end.kind() == NarrowingEndKind.PassedOut) {
+        classified.endedReason = "Passing 'out {place}' in the condition after the check lets "
+            + "'{end.calleeName()}' write any value to '{place}'.{carried}{recheck}";
+        classified.endedWhere = sameStatement ? "" : "again after the call";
+    } else if (end.place() != place) {
+        classified.endedReason = "'{end.place()}' is assigned in the condition after the check, so '{place}' "
+            + "may be null.{carried}{recheck}";
+        classified.endedWhere = sameStatement ? "" : "again after the assignment";
+    } else if (stored is NullType) {
+        classified.endedReason = "'{place}' is assigned 'null' in the condition after the check.{carried}";
+    } else if (outcome != null) {
+        string value = outcome ? "true" : "false";
+        classified.endedReason = "'{place}' is assigned {assignedValue(checker, stored)} in the condition "
+            + "after the check, and the condition is only {value} when '{place}' is null.{carried}";
+    } else {
+        classified.endedReason = "'{place}' is assigned {assignedValue(checker, stored)} in the condition "
+            + "after the check, which can be null.{carried}{recheck}";
+        classified.endedWhere = sameStatement ? "" : "again after the assignment";
+    }
+}
+
+// The advice to check 'place' for null again right after the write 'end', for the read 'read' after it in
+// the same condition, or empty where the read is not after the write in one condition or needs more than
+// one check.
+conditionRecheck(BodyChecker checker, Expression read, NarrowingEnd end, string place,
+                 long levels) -> string {
+    let site = narrowing.recheckSite(checker, read, end.at(), null);
+    if (site == null || levels != 1) {
+        return "";
+    }
+    string written = end.kind() == NarrowingEndKind.PassedOut ? "the call" : "the assignment";
+    string check = "{site.operand} && {place} != null";
+    if (!site.whenTrue) {
+        check = "{site.operand} || {place} == null";
+    }
+    if (check.length > wording.quotedCodeLimit()) {
+        return " Check '{place}' for null again after {written}, in the same condition.";
+    }
+    return " Check '{place}' for null again after {written}, as in '{check}'.";
+}
+
+// What an assignment that stores a 'stored' assigns, as in "a value of type 'string?'", or "a value" where
+// the type is not known.
+assignedValue(BodyChecker checker, Type? stored) -> string {
+    if (stored == null || stored is ErrorType) {
+        return "a value";
+    }
+    return "a value of type {checker.names().quoted(stored)}";
 }
 
 // The write that left the proof of 'path' that holds here, where that proof can be null because of it: the
@@ -889,7 +952,7 @@ checkPlace(NarrowingEnd end, bool sameStatement, string after) -> string {
 }
 
 // The statement 'node' is in.
-enclosingStatement(SyntaxNode node) -> SyntaxNode {
+public enclosingStatement(SyntaxNode node) -> SyntaxNode {
     SyntaxNode current = node;
     while (!(current is Statement)) {
         let holder = current.parent();
