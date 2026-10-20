@@ -88,6 +88,14 @@ task("test")
         local lld_library = path.join(build_dir, is_host("windows") and "ens-lld.dll"
             or (is_host("macosx") and "libens-lld.dylib" or "libens-lld.so"))
 
+        -- what `ens version` prints: the release this tree is and the language version it
+        -- implements, both read from the one file that declares them.
+        local version_source = io.readfile(path.join(os.projectdir(), "selfhost", "build", "src",
+            "version.ens")) or ""
+        local version_line = string.format("ens %s (language %s)",
+            version_source:match('string release = "([^"]*)"') or "?",
+            version_source:match('string toolchain = "([^"]*)"') or "?")
+
         -- the seed: the published `ens` this tree pins for this host. Its one job is to build the
         -- compiler out of this tree, and nothing else in the suite runs it. Nothing it produces is
         -- ever compared against anything either, so a seed left behind by the tree shows up as a
@@ -1320,8 +1328,8 @@ task("test")
                 "!cst-dump")
             run({"help", "build"}, nil, 0, "Usage: ens build", "-o, --output <file>",
                 "-O, --optimization-level <level>", "!--objects")
-            run({"version"}, nil, 0, "ens 0.1")
-            run({"--version"}, nil, 0, "ens 0.1")
+            run({"version"}, nil, 0, version_line)
+            run({"--version"}, nil, 0, version_line)
             run({}, nil, 2, "no command given")
 
             -- argv the command refuses, each one naming what to write instead
@@ -3367,7 +3375,7 @@ task("test")
 
             -- the commands that never delegate, however the environment is set
             run(host_exe, {"version"}, {ENS_TOOLCHAINS = toolchains, ENS_TOOLCHAIN = "9.9"}, 0,
-                "ens 0.1")
+                version_line)
             run(host_exe, {"help", "build"}, chains, 0, "--toolchain <version>")
 
             if #failures == 0 then
