@@ -84,9 +84,6 @@ task("test")
         -- fresh clone needs it built before anything can reach an executable.
         local native_archive = path.join(build_dir, is_host("windows") and "ens-llvm.lib"
             or "libens-llvm.a")
-        -- the linker bridge as the shared library the pinned seed loads when it runs.
-        local lld_library = path.join(build_dir, is_host("windows") and "ens-lld.dll"
-            or (is_host("macosx") and "libens-lld.dylib" or "libens-lld.so"))
 
         -- what `ens version` prints: the release this tree is and the language version it
         -- implements, both read from the one file that declares them.
@@ -519,82 +516,28 @@ task("test")
             return false
         end
 
-        -- find the native libraries an Ens build links or the seed loads - the ens-llvm archive and
-        -- the ens-lld linker bridge from this build, and the local LLVM package - and build the
-        -- environment a process linking or loading them needs: on Windows lld-link reads LIB (and finds nothing
-        -- else once LIB is set, so the MSVC and SDK folders must be added too) and the loader
-        -- searches PATH; on Linux/macOS the ens linker turns LIBRARY_PATH into -L and -rpath, and
-        -- the loader honors LD_LIBRARY_PATH / DYLD_FALLBACK_LIBRARY_PATH. A machine without the
-        -- LLVM library cannot build the compiler either, so a clear hard failure is the right
-        -- outcome.
-        -- Returns env, the shared libraries to place beside an executable, nil, or nil, nil, message.
-        local function llvmEnvironment()
-            local on_windows = is_host("windows")
-            local packages = path.join(global.directory(), "packages", "l")
-            local llvm_lib, llvm_bin, looked
-            if on_windows then
-                looked = "bin/LLVM-C.dll with lib/LLVM-C.lib"
-                for _, dll in ipairs(os.files(path.join(packages, "*", "*", "*", "bin",
-                        "LLVM-C.dll"))) do
-                    local bindir = path.directory(dll)
-                    local libdir = path.join(path.directory(bindir), "lib")
-                    if os.isfile(path.join(libdir, "LLVM-C.lib")) then
-                        llvm_bin = bindir
-                        llvm_lib = libdir
-                        break
-                    end
-                end
-            else
-                local pattern = is_host("macosx") and "libLLVM*.dylib" or "libLLVM*.so*"
-                looked = "lib/" .. pattern
-                local matches = os.files(path.join(packages, "*", "*", "*", "lib", pattern))
-                table.sort(matches)
-                if #matches > 0 then
-                    llvm_lib = path.directory(matches[1])
-                end
-            end
-            if not llvm_lib then
-                return nil, nil, string.format("could not find %s under %s; install the LLVM "
-                    .. "package the compiler builds against", looked, packages)
-            end
+        -- the environment a process that links an Ens program needs, which is the folder holding
+        -- the ens-llvm archive on the linker's search path: LIBRARY_PATH on Linux and macOS, which
+        -- ens turns into -L, and LIB on Windows, where lld-link finds nothing else once LIB is set,
+        -- so the MSVC and Windows SDK folders are added to it too.
+        local function linkEnvironment()
             local env = os.getenvs()
-            if on_windows then
+            if is_host("windows") then
                 local msvc = toolchain.load("msvc", {plat = plat, arch = arch})
                 local msvc_lib = ""
                 if msvc then
                     local envs = msvc:runenvs()
                     if envs and envs.LIB then msvc_lib = envs.LIB end
                 end
-                env.LIB = msvc_lib .. ";" .. llvm_lib .. ";" .. build_dir
-                env.PATH = llvm_bin .. ";" .. build_dir .. ";" .. (env.PATH or "")
-                return env, {path.join(llvm_bin, "LLVM-C.dll"), lld_library}, nil
+                env.LIB = msvc_lib .. ";" .. build_dir
+                return env
             end
-            local function prepend(current, dir)
-                if current and #current > 0 then return dir .. ":" .. current end
-                return dir
-            end
-            env.LIBRARY_PATH = prepend(prepend(env.LIBRARY_PATH, llvm_lib), build_dir)
-            if is_host("macosx") then
-                -- the fallback list rather than DYLD_LIBRARY_PATH, which is consulted first and
-                -- by file name alone: the LLVM package ships its own libc++, and shadowing the
-                -- system one leaves every process started here without the C++ runtime this
-                -- macOS builds against.
-                env.DYLD_FALLBACK_LIBRARY_PATH = prepend(prepend(
-                    env.DYLD_FALLBACK_LIBRARY_PATH or "/usr/local/lib:/usr/lib", llvm_lib),
-                    build_dir)
+            if env.LIBRARY_PATH and #env.LIBRARY_PATH > 0 then
+                env.LIBRARY_PATH = build_dir .. ":" .. env.LIBRARY_PATH
             else
-                env.LD_LIBRARY_PATH = prepend(prepend(env.LD_LIBRARY_PATH, llvm_lib), build_dir)
+                env.LIBRARY_PATH = build_dir
             end
-            return env, {}, nil
-        end
-
-        -- the Windows loader searches an executable's own folder first, so a shared library an Ens
-        -- program links has to sit beside it; on Linux/macOS the rpath the linker wrote and the
-        -- library-path environment cover it and the list is empty.
-        local function placeNativeLibraries(libraries, folder)
-            for _, library in ipairs(libraries) do
-                os.cp(library, path.join(folder, path.filename(library)))
-            end
+            return env
         end
 
         -- whether ENS_SEEDS holds a seed for `tag`, which is how a host the pin names no seed for
@@ -727,10 +670,6 @@ task("test")
                         .. "downloaded again.", seed_host, installed, sha256, found)
                 end
             end
-            local env, native_libraries, env_error = llvmEnvironment()
-            if not env then
-                os.raise("could not place the seed compiler: %s", env_error)
-            end
             os.tryrm(seed_dir)
             os.mkdir(seed_dir)
             os.cp(installed, seed_exe)
@@ -738,28 +677,15 @@ task("test")
                 -- a release asset carries no permissions, so the executable bit is set here.
                 os.runv("chmod", {"+x", seed_exe})
             end
-            -- the seed loads LLVM and the linker bridge at run time, and on Windows the loader
-            -- looks beside the executable first.
-            placeNativeLibraries(native_libraries, seed_dir)
         end
 
-        -- the native archive, and the shared bridge the seed loads, built every run. The build is
-        -- incremental. A run whose bridge sources are unchanged pays nothing for it. A run that
-        -- skipped it would link every fixture through whatever archive an earlier build left
-        -- behind. The build carries the environment a link carries. On Windows that puts the LLVM
-        -- package's bin folder on PATH, where the bridge resolves its own linker.
-        local function buildNativeLibraries()
-            local env, _, env_error = llvmEnvironment()
-            if not env then
-                os.raise("could not build the native libraries: %s", env_error)
-            end
-            os.execv("xmake", {"build", "ens-llvm"}, {envs = env})
+        -- the native archive, built every run. The build is incremental. A run whose bridge
+        -- sources are unchanged pays nothing for it. A run that skipped it would link every fixture
+        -- through whatever archive an earlier build left behind.
+        local function buildNativeArchive()
+            os.execv("xmake", {"build", "ens-llvm"})
             if not os.isfile(native_archive) then
                 os.raise("Could not locate the native archive at " .. native_archive)
-            end
-            os.execv("xmake", {"build", "ens-lld"}, {envs = env})
-            if not os.isfile(lld_library) then
-                os.raise("Could not locate the linker bridge at " .. lld_library)
             end
         end
 
@@ -769,10 +695,7 @@ task("test")
         -- construction: a seed that cannot build the tree stops the run before any job starts.
         local function buildHostCompiler()
             local log = path.join(out_dir, "host.log")
-            local env, native_libraries, env_error = llvmEnvironment()
-            if not env then
-                os.raise("could not build the compiler: %s", env_error)
-            end
+            local env = linkEnvironment()
             os.tryrm(host_dir)
             os.mkdir(host_dir)
             local rc = execMerged(seed_exe, {"build",
@@ -784,7 +707,6 @@ task("test")
                     .. "older than the sources has to be replaced:\n%s", seed_host, tostring(rc),
                     captured(log))
             end
-            placeNativeLibraries(native_libraries, host_dir)
         end
 
         -- the corpus round-trip harness: build the harness exe fresh from its own workspace (it
@@ -803,7 +725,7 @@ task("test")
                 os.mkdir(corpus_dir)
             end
             os.tryrm(exe_file)
-            local env = llvmEnvironment()
+            local env = linkEnvironment()
             local compile_rc = execMerged(host_exe, {"build", corpus_src, "--output", exe_file},
                 log, {envs = env})
             if not os.isfile(exe_file) then
@@ -860,7 +782,7 @@ task("test")
                 os.mkdir(check_dir)
             end
             os.tryrm(exe_file)
-            local env = llvmEnvironment()
+            local env = linkEnvironment()
             local compile_rc = execMerged(host_exe, {"build", check_src, "--output", exe_file}, log,
                 {envs = env})
             if not os.isfile(exe_file) then
@@ -943,11 +865,7 @@ task("test")
             os.mkdir(check_dir)
             os.mkdir(scratch)
 
-            local env, native_libraries, env_error = llvmEnvironment()
-            if not env then
-                return {name = name, ok = false, short = "no LLVM library",
-                    full = string.format("%s: %s", name, env_error)}
-            end
+            local env = linkEnvironment()
 
             -- the harness itself links the native LLVM binding through ens.codegen, so its
             -- build needs the same linker environment as the spike.
@@ -974,7 +892,6 @@ task("test")
                     full = string.format("%s: spike build failed (exit %s)\n%s", name,
                         tostring(spike_rc), (io.readfile(log) or ""):gsub("[\r\n]+$", ""))}
             end
-            placeNativeLibraries(native_libraries, check_dir)
 
             -- list every candidate fixture, naming the file whose header carries the directives;
             -- the harness reads each one and works out for itself what the fixture asks for.
@@ -1059,13 +976,7 @@ task("test")
             os.mkdir(stage2_dir)
             os.mkdir(stage3_dir)
 
-            local env, native_libraries, env_error = llvmEnvironment()
-            if not env then
-                return {name = name, ok = false, short = "no LLVM library",
-                    full = string.format("%s: %s", name, env_error)}
-            end
-            -- stage2's ens loads LLVM and the linker bridge at run time.
-            placeNativeLibraries(native_libraries, stage2_dir)
+            local env = linkEnvironment()
 
             local seconds = {}
             local function staged(stage, program, argv, produced)
@@ -1274,7 +1185,7 @@ task("test")
             local log = path.join(out_dir, name .. ".log")
             local failures = {}
 
-            local env = llvmEnvironment()
+            local env = linkEnvironment()
 
             -- run the command and assert its exit code and the fragments its output must carry; a
             -- fragment prefixed '!' must not appear.
@@ -1818,7 +1729,7 @@ task("test")
             local log = path.join(out_dir, name .. ".log")
             local failures = {}
 
-            local base = llvmEnvironment()
+            local base = linkEnvironment()
             base.TMP = temp
             base.TEMP = temp
             base.TMPDIR = temp
@@ -2204,11 +2115,7 @@ task("test")
             local log = path.join(out_dir, name .. ".log")
             local failures = {}
 
-            local env, native_libraries, env_error = llvmEnvironment()
-            if not env then
-                return {name = name, ok = false, short = "no LLVM library",
-                    full = string.format("%s: %s", name, env_error)}
-            end
+            local env = linkEnvironment()
             env.ENS_STDLIB = path.join(os.projectdir(), "libs")
 
             io.writefile(path.join(ws_dir, "ens.package"),
@@ -2420,11 +2327,7 @@ task("test")
             local log = path.join(out_dir, name .. ".log")
             local failures = {}
 
-            local env, native_libraries, env_error = llvmEnvironment()
-            if not env then
-                return {name = name, ok = false, short = "no LLVM library",
-                    full = string.format("%s: %s", name, env_error)}
-            end
+            local env = linkEnvironment()
             env.ENS_STDLIB = path.join(os.projectdir(), "libs")
 
             local repos = path.join(root, "repos")
@@ -2889,11 +2792,7 @@ task("test")
             local log = path.join(out_dir, name .. ".log")
             local failures = {}
 
-            local env, native_libraries, env_error = llvmEnvironment()
-            if not env then
-                return {name = name, ok = false, short = "no LLVM library",
-                    full = string.format("%s: %s", name, env_error)}
-            end
+            local env = linkEnvironment()
             env.ENS_STDLIB = path.join(os.projectdir(), "libs")
 
             local cache = path.join(root, "cache")
@@ -3181,20 +3080,13 @@ task("test")
             local log = path.join(out_dir, name .. ".log")
             local failures = {}
 
-            local env, native_libraries, env_error = llvmEnvironment()
-            if not env then
-                return {name = name, ok = false, short = "no LLVM library",
-                    full = string.format("%s: %s", name, env_error)}
-            end
+            local env = linkEnvironment()
 
             local toolchains = path.join(root, "toolchains")
             local installed_dir = path.join(toolchains, "9.9")
             local installed_exe = path.join(installed_dir, "ens" .. exe_suffix)
             os.mkdir(installed_dir)
             os.cp(host_exe, installed_exe)
-            -- the copy loads LLVM and the linker bridge at run time, and on Windows the loader
-            -- looks beside the executable first.
-            placeNativeLibraries(native_libraries, installed_dir)
             local empty = path.join(root, "empty")
             os.mkdir(empty)
 
@@ -3580,7 +3472,7 @@ task("test")
             -- package and of the standard library, and the @ens-test fixtures. The command under
             -- test runs them, so its sema and code generator see every one of those tests. Its
             -- builds link through ens-llvm and some of the suites bind native libraries, so the job
-            -- carries the same linker and loader environment the codegen harness does.
+            -- carries the same linker environment the codegen harness does.
             if ens_test_args ~= nil then
                 os.tryrm(stdout_file)
                 os.tryrm(stderr_file)
@@ -3592,11 +3484,7 @@ task("test")
                 for _, a in ipairs(ens_test_args) do
                     table.insert(argv, (a:gsub("{dir}", (job.source:gsub("\\", "/")))))
                 end
-                local env, _, env_error = llvmEnvironment()
-                if not env then
-                    return {name = name, ok = false, short = "no LLVM environment",
-                        full = string.format("%s: %s", name, env_error)}
-                end
+                local env = linkEnvironment()
                 -- a package's own tests run in an empty folder of their own, which has to stay
                 -- empty: whatever a test writes goes in a scratch folder it removes, never in the
                 -- folder it ran in
@@ -3637,11 +3525,7 @@ task("test")
             -- the objects go beside the executable rather than under a build root of their own:
             -- every fixture is built for the same target and level, and one object name per
             -- fixture keeps the jobs that share this folder out of each other's way.
-            local env, _, env_error = llvmEnvironment()
-            if not env then
-                return {name = name, ok = false, short = "no LLVM environment",
-                    full = string.format("%s: %s", name, env_error)}
-            end
+            local env = linkEnvironment()
             local build_argv = {"build", job.source, "--output", exe_file, "--objects", out_dir}
             if stdlib_root then
                 table.insert(build_argv, "--stdlib")
@@ -3702,7 +3586,7 @@ task("test")
         -- parallel, so the seed is placed and the compiler built here rather than on demand inside
         -- one of them. The bridge is first. The compiler is the first program linked through it.
         print("Building the ens-llvm native archive...")
-        buildNativeLibraries()
+        buildNativeArchive()
         locateSeed()
         print(string.format("Building the compiler with the pinned %s seed...", seed_host))
         local host_started = os.mclock()

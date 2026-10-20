@@ -30,7 +30,6 @@ If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surf
 
 - `libs/std/` - the standard library, written in Ens, imported as the built-in `@std` package; its own `AGENTS.md` holds the conventions its API follows.
 - `runtime/lld/` - `ens_lld.cpp`, one C entry point over lld's C++ link drivers, built into `ens-llvm`: one static library holding the bridge, LLVM, lld, their support libraries and the C++ runtime, so `ens` links one library and needs nothing beside it. It carries no link policy; that all lives in `selfhost/link/`.
-  Until the pin names a seed linked that way, the bridge is also built as the `ens-lld` shared library the seed loads.
 - `selfhost/` - the `ens` compiler and build tool, written in Ens, as one workspace of packages:
   - `syntax.grammar` + `syntaxgen/` - the declarative grammar and the generator that emits the syntax-tree sources.
   - `frontend/` - lexer, event parser, red-green syntax tree.
@@ -66,7 +65,6 @@ If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surf
 - Run everything: `xmake test` (subset: `xmake test <name>...`).
   The full suite must be green before every commit, with no exceptions.
   `xmake test` builds `ens-llvm` itself before any job starts, so it is the one command that always works from a clean checkout, and an edit to the bridge is gated by the run that follows it rather than by the run after that.
-  On Windows it builds the bridge with the LLVM package's `bin` folder on PATH whatever the calling shell has, so the bridge's own linker resolves the same way in a suite run as it does by hand.
 - `xmake test` starts by building the compiler it then tests: the **seed** for this host compiles `selfhost/driver` into `build/host/ens`, and every job that compiles Ens drives that.
   Everything Ens-related is therefore built by the Ens compiler as this tree defines it, so nothing frozen into the seed can shape what the suite measures.
   It is built before the jobs start, because they run in parallel and all of them need it.
@@ -76,10 +74,7 @@ If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surf
   Placing the seed is the one thing in a run that does, and it happens before any job starts.
 - `xmake test` uses the binary of the currently configured mode.
   Never run `xmake f -m release` to "fix" staleness; rebuild instead.
-  If linking fails with unresolved LLVM symbols, put the LLVM package's `bin` folder (containing `clang++.exe`) on PATH, run `xmake f -c -m <current mode> -p windows -a x64`, then `xmake build ens-llvm`.
-  Pass the platform and architecture explicitly: with `clang++` on PATH and no `-p`/`-a`, xmake detects `mingw/x86_64` and then refuses the packages.
-  Building without that `bin` folder on PATH re-resolves the linker to MSVC `link.exe`, which silently ignores `-lLLVMCGData` and leaves unresolved LLVM CGData symbols.
-  That choice is written into the config, so later builds keep failing even once PATH is fixed until the reconfigure above is rerun.
+  On Windows, configure with the platform and architecture written out, as in `xmake f -c -m <current mode> -p windows -a x64`: with `clang++` on PATH and no `-p`/`-a`, xmake detects `mingw/x86_64` and then refuses the packages.
 - Run only one build/test session at a time; concurrent xmake invocations collide.
 
 ### Test conventions
