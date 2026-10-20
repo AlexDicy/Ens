@@ -23,6 +23,7 @@ import ArrayType from model.types;
 import FunctionType from model.types;
 import PrimitiveType from model.types;
 import PrimitiveKind from model.types;
+import TypeStore from model.types;
 import List from @std.collections.list;
 
 // What an argument fits a parameter by: its type, or for an argument that names no type of its own,
@@ -878,7 +879,7 @@ class ViableCandidate {
 // neither, because that name is refused on its own.
 public resolveCall(List<CallCandidate> candidates, CallShape shape, Reporter reporter,
                    Span span, string displayName, string kindWord,
-                   TypeNames names) -> CallResolution {
+                   TypeNames names, TypeStore store) -> CallResolution {
     if (shape.isMalformed()) {
         return new CallResolution(true, null, []);
     }
@@ -895,7 +896,7 @@ public resolveCall(List<CallCandidate> candidates, CallShape shape, Reporter rep
         if (candidates.length() == 1) {
             singleFailure = mapArguments(candidates.get(0).signature(), shape, kindWord, displayName).failure;
         }
-        let sole = soleCountRefusal(candidates, shape, displayName, kindWord, names);
+        let sole = soleCountRefusal(candidates, shape, displayName, kindWord, names, store);
         if (singleFailure.length > 0) {
             reporter.report(singleFailure, span);
         } else if (sole != null) {
@@ -1121,7 +1122,7 @@ argumentPosition(ArgumentValue argument, long index) -> string {
 // candidate: the first argument it does not take, and what it takes there. Null where no candidate or
 // several take that many.
 soleCountRefusal(List<CallCandidate> candidates, CallShape shape, string displayName, string kindWord,
-                 TypeNames names) -> string? {
+                 TypeNames names, TypeStore store) -> string? {
     long count = shape.argumentCount();
     CallCandidate? sole = null;
     for (let candidate in candidates) {
@@ -1141,7 +1142,8 @@ soleCountRefusal(List<CallCandidate> candidates, CallShape shape, string display
     }
     for (long i = 0; i < count; i++) {
         let argument = shape.argumentAt(i);
-        Type wanted = sole.signature().parameters()[outcome.mapping[i]].type();
+        let parameter = sole.signature().parameters()[outcome.mapping[i]];
+        Type wanted = parameter.type();
         if (conversionRank(argument, wanted, true) > 0) {
             continue;
         }
@@ -1157,7 +1159,11 @@ soleCountRefusal(List<CallCandidate> candidates, CallShape shape, string display
         }
         string taken = "{typenames.typeArticle(names.of(wanted))} {names.quoted(wanted)}";
         string signature = quotedSignature(sole.signature(), names);
-        string misfit = elementMisfit(argument, wanted, names);
+        ElementDeclaration? declaration = null;
+        if (parameter.name().length > 0) {
+            declaration = new ElementDeclaration("parameter '{parameter.name()}' of {callee}", wanted);
+        }
+        string misfit = elementMisfit(argument, wanted, declaration, names, store);
         string why = "";
         let reason = shapeReason(argument, wanted);
         Type core = convert.coreOf(wanted);
@@ -1201,9 +1207,43 @@ public neverNullHint(string quoted, string fix) -> string {
     return " {quoted} can never be null. {fix} if it should allow null.";
 }
 
+// Why a 'null' element does not fit the element type 'quoted', which allows no null, followed by
+// 'change', the words that declare the array so its elements do, opening with a space.
+public neverNullElementsHint(string quoted, string change) -> string {
+    return " {quoted} can never be null. {change} if its elements should allow null.";
+}
+
+// The parameter an array literal is passed to, which the refusal of a 'null' element inside it names
+// as the declaration to change: its words, as in "parameter 'steps' of 'run'", and its type.
+class ElementDeclaration {
+    protected string described;
+    protected Type declared;
+
+    protected constructor(this.described, this.declared);
+}
+
+// Why 'element' does not fit 'elementType' where it is 'null' and 'elementType' allows no null,
+// opening with a space, with the change to 'declaration' that takes null elements where there is
+// one. Empty where 'element' is no such 'null'.
+elementNullHint(ArgumentValue element, Type elementType, ElementDeclaration? declaration,
+                TypeNames names, TypeStore store) -> string {
+    string hint = nullHint(element, elementType, names);
+    if (hint.length == 0 || declaration == null) {
+        return hint;
+    }
+    let nullable = convert.withNullableElements(declaration.declared, elementType, store);
+    if (nullable == null) {
+        return hint;
+    }
+    return neverNullElementsHint(names.quoted(elementType),
+        "Declare {declaration.described} as {names.quoted(nullable)}");
+}
+
 // The sentence naming the first element that does not fit in an array literal 'argument' passes where
 // 'wanted' is taken, opening with a space, or empty where 'argument' passes no such array literal.
-elementMisfit(ArgumentValue argument, Type wanted, TypeNames names) -> string {
+// A 'null' element names 'declaration' as the place to change.
+elementMisfit(ArgumentValue argument, Type wanted, ElementDeclaration? declaration, TypeNames names,
+              TypeStore store) -> string {
     let literal = firstMisfitArrayLiteral(argument, wanted);
     if (literal == null) {
         return "";
@@ -1212,7 +1252,7 @@ elementMisfit(ArgumentValue argument, Type wanted, TypeNames names) -> string {
     if (literal.place().length > 0) {
         owner = "{owner} {literal.place()}";
     }
-    let misfit = elementMisfitText(literal, wanted, owner, false, names);
+    let misfit = elementMisfitText(literal, wanted, owner, false, declaration, names, store);
     if (misfit == null) {
         return "";
     }
@@ -1252,7 +1292,7 @@ firstMisfitArrayLiteral(ArgumentValue argument, Type wanted) -> ArgumentValue? {
 // down to the element inside it that does not fit. 'nested' marks a literal that is itself an element,
 // whose element type no earlier sentence names. Null where every element fits.
 elementMisfitText(ArgumentValue literal, Type wanted, string owner, bool nested,
-                  TypeNames names) -> string? {
+                  ElementDeclaration? declaration, TypeNames names, TypeStore store) -> string? {
     Type core = convert.coreOf(wanted);
     if (!(core is ArrayType)) {
         return null;
@@ -1266,12 +1306,13 @@ elementMisfitText(ArgumentValue literal, Type wanted, string owner, bool nested,
         }
         string position = "element {i + 1} of {owner}";
         if (element.shape() == ArgumentShape.ArrayLiteral && element.aloneType() == null) {
-            let inner = elementMisfitText(element, elementType, position, true, names);
+            let inner = elementMisfitText(element, elementType, position, true, declaration, names,
+                store);
             if (inner != null) {
                 return inner;
             }
         }
-        string hint = nullHint(element, elementType, names);
+        string hint = elementNullHint(element, elementType, declaration, names, store);
         string why = "";
         let reason = shapeReason(element, elementType);
         if (reason != null) {
