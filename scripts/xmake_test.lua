@@ -1296,6 +1296,34 @@ task("test")
                                     label, dll))
                             end
                         end
+                        -- the startup code runs the initializers between its two null pointers
+                        -- in '.CRT', and every module that traces registers its tables through
+                        -- one of them, so the section holds a null, at least one pointer, a null
+                        local pointers = {}
+                        execMerged(readobj, {"--hex-dump=.CRT", exe}, log)
+                        for line in captured(log):gmatch("[^\r\n]+") do
+                            local words = line:match("^0x%x+%s+([%x ]+%x)")
+                            if words then
+                                local low = nil
+                                for word in words:gmatch("%x%x%x%x%x%x%x%x") do
+                                    if low then
+                                        table.insert(pointers, low ~= "00000000" or word ~= "00000000")
+                                        low = nil
+                                    else
+                                        low = word
+                                    end
+                                end
+                            end
+                        end
+                        local present = 0
+                        for i = 2, #pointers - 1 do
+                            if pointers[i] then present = present + 1 end
+                        end
+                        if #pointers < 3 or pointers[1] or pointers[#pointers] or present == 0 then
+                            table.insert(failures, string.format("%s has %d pointers in '.CRT', "
+                                .. "expected a null, the initializers, and a null", label,
+                                #pointers))
+                        end
                         if is_host("windows") and os.arch() == target.processor then
                             local stdout_file = path.join(root, program.fixture .. ".out")
                             local stderr_file = path.join(root, program.fixture .. ".err")

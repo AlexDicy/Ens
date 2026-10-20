@@ -1,7 +1,9 @@
 // The code a program starts at when it does not start through a C compiler's runtime. On Linux it
 // hands the arguments and the environment the kernel left on the stack to glibc's
 // __libc_start_main, and with them the program's main; its outermost frame marks its return
-// address as undefined, so a stack walk ends there. On Windows it reads the command line, hands
+// address as undefined, so a stack walk ends there. On Windows it runs the initializers the
+// program's modules placed in the '.CRT$XCU' section, which register their stack-trace tables and
+// which the C compiler's startup code would otherwise run, then reads the command line, hands
 // main the arguments as UTF-8, and ends the program through the C runtime's exit, which flushes
 // the program's streams. It also defines what a Windows program takes from the C compiler's
 // runtime rather than from the system: snprintf, over the system C runtime's
@@ -75,8 +77,49 @@ defineWindowsStartup(Context context, Module module) {
     let mainType = int32.functionType([int32, pointer]);
     let main = module.addFunction("main", mainType);
 
+    // The linker lays the '.CRT$XC*' sections out in name order, so a pointer in '.CRT$XCA' and one
+    // in '.CRT$XCZ' bracket every initializer the modules placed in '.CRT$XCU', with padding the
+    // linker added read as null and skipped.
+    let firstInitializer = globals.addGlobal(module, pointer, "ens_initializers_first");
+    globals.setInitializer(firstInitializer, pointer.constNull());
+    globals.setSection(firstInitializer, ".CRT$XCA");
+    let lastInitializer = globals.addGlobal(module, pointer, "ens_initializers_last");
+    globals.setInitializer(lastInitializer, pointer.constNull());
+    globals.setSection(lastInitializer, ".CRT$XCZ");
+    let initializerType = nothing.functionType([]);
+
     let start = module.addFunction("mainCRTStartup", nothing.functionType([]));
     builder.positionAtEnd(context.appendBasicBlock(start, "entry"));
+    let cursor = memory.buildAlloca(builder, pointer, "initializer.slot");
+    memory.buildStore(builder,
+        memory.buildGEP(builder, pointer, firstInitializer, [int64.constInt(1, false)], ""), cursor);
+    let initializerTest = context.appendBasicBlock(start, "initializer.test");
+    let initializerCall = context.appendBasicBlock(start, "initializer.call");
+    let initializerNext = context.appendBasicBlock(start, "initializer.next");
+    let initialized = context.appendBasicBlock(start, "initialized");
+    instructions.buildBr(builder, initializerTest);
+
+    builder.positionAtEnd(initializerTest);
+    let slot = memory.buildLoad(builder, pointer, cursor, "slot");
+    instructions.buildCondBr(builder, instructions.buildICmpULT(builder, slot, lastInitializer, ""),
+        initializerCall, initialized);
+
+    builder.positionAtEnd(initializerCall);
+    let initializer = memory.buildLoad(builder, pointer, slot, "initializer");
+    let present = context.appendBasicBlock(start, "initializer.present");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpNE(builder, initializer, pointer.constNull(), ""), present,
+        initializerNext);
+    builder.positionAtEnd(present);
+    instructions.buildCall(builder, initializerType, initializer, [], "");
+    instructions.buildBr(builder, initializerNext);
+
+    builder.positionAtEnd(initializerNext);
+    memory.buildStore(builder,
+        memory.buildGEP(builder, pointer, slot, [int64.constInt(1, false)], ""), cursor);
+    instructions.buildBr(builder, initializerTest);
+
+    builder.positionAtEnd(initialized);
     let line = instructions.buildCall(builder, commandLineType, commandLine, [], "line");
     let countSlot = memory.buildAlloca(builder, int32, "count.slot");
     let wide = instructions.buildCall(builder, splitType, split, [line, countSlot], "wide");
