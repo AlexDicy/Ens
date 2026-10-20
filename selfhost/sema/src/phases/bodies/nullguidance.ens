@@ -3,7 +3,10 @@
 import CatchClauseNode from @ens.frontend.syntax.generated.nodes;
 import SyntaxNode from @ens.frontend.syntax.node;
 import Expression from @ens.frontend.syntax.generated.nodes;
+import InitializerNode from @ens.frontend.syntax.generated.nodes;
+import ParenthesizedExpressionNode from @ens.frontend.syntax.generated.nodes;
 import VariableDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import FieldDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import ForEachStatementNode from @ens.frontend.syntax.generated.nodes;
 import SwitchExpressionNode from @ens.frontend.syntax.generated.nodes;
 import TypeArmNode from @ens.frontend.syntax.generated.nodes;
@@ -31,6 +34,7 @@ import model.convert;
 import phases.bodies.literalfixes;
 import phases.bodies.literaltyping;
 import LiteralOrigin from phases.bodies.literaltargets;
+import OriginKind from phases.bodies.literaltargets;
 import phases.bodies.wording;
 import phases.bodies.narrowing;
 import phases.bodies.lambdas;
@@ -55,6 +59,7 @@ import PrimitiveType from model.types;
 import PrimitiveKind from model.types;
 import ErrorType from model.types;
 import NullType from model.types;
+import StringType from model.types;
 import OptionalType from model.types;
 import ArrayType from model.types;
 import DeclaredType from model.types;
@@ -105,6 +110,8 @@ public final class NullableOperand {
     protected bool calls;
     protected bool everyLevel = true;
     protected bool writes = false;
+    // Whether a null check on a value written the same way comes before this one in its callable.
+    protected bool checkedEarlier = false;
     // Whether a fallback written after the value needs it in parentheses.
     protected bool fallbackParenthesized = false;
     // Where a proof made where the lambda being checked is created covers the value but does not hold
@@ -309,6 +316,11 @@ public nullGuidance(BodyChecker checker, Expression value, Type type, long level
         operands.push(operand);
     }
     NullableOperand[] classified = operands.toArray();
+    for (let operand in classified) {
+        if (operand.wholeCall) {
+            return joinAdvice(checker, value, levels, levels == wording.optionalLevels(type));
+        }
+    }
     let advice = operandsAdvice(classified);
     if (advice == null || advice.endsWith("'??'.") || advice.endsWith("once for each '?'.")) {
         return advice;
@@ -318,6 +330,255 @@ public nullGuidance(BodyChecker checker, Expression value, Type type, long level
         return advice;
     }
     return "{advice.substring(0, advice.length - 1)}, or s{clause.substring(1)}";
+}
+
+// The advice for the '?:' or the switch 'join', one of whose values is a call that can return null,
+// where 'levels' of its '?' are taken away, or 'everyLevel' all of them: its whole value stored in one
+// local, or one fallback after it where nothing is read from it, so that it still makes only the calls
+// it makes now.
+joinAdvice(BodyChecker checker, Expression join, long levels, bool everyLevel) -> string {
+    string named = wording.joinName(join);
+    string times = "";
+    if (levels > 1 && everyLevel) {
+        times = " {timesWord(levels)}, once for each '?'";
+    } else if (levels > 1) {
+        times = " {timesWord(levels)}";
+    }
+    string fallback = fallbackClause(join, times);
+    if (!checker.frame().statementsAllowed() || checker.frame().inLoopCondition()) {
+        return "S{fallback.substring(1)}.";
+    }
+    string local = freeLocalName(checker, "", sharedResultName(join) ?? "value");
+    string checked = "check the local{repeatedCheck("{local} != null", levels, everyLevel)}";
+    string stored = "Store the value of the {named} in a local first";
+    let spelled = wording.shortSpelling(join);
+    if (spelled != null) {
+        stored = "{stored} ('let {local} = {spelled};')";
+    }
+    if (readFrom(join)) {
+        return "{stored} and {checked}.";
+    }
+    return "{stored} and {checked}, or {fallback}.";
+}
+
+// Whether a member of 'value', an element or its call is read from it, so that a fallback written
+// after it would belong to that read.
+readFrom(Expression value) -> bool {
+    SyntaxNode outer = value;
+    SyntaxNode? holder = value.parent();
+    while (holder is ParenthesizedExpressionNode) {
+        outer = holder;
+        holder = holder.parent();
+    }
+    long start = outer.span().start;
+    return switch (holder) {
+        is MemberExpressionNode member -> member.object().span().start == start,
+        is SafeMemberExpressionNode member -> member.object().span().start == start,
+        is SubscriptExpressionNode element -> element.object().span().start == start,
+        is SafeSubscriptExpressionNode element -> element.object().span().start == start,
+        is CallExpressionNode call -> call.callee().span().start == start,
+        default -> false,
+    };
+}
+
+// Whether a value of the '?:' or the switch 'join' is a call.
+joinCalls(Expression join) -> bool {
+    for (let value in syntax.joinValues(join)) {
+        if (value is CallExpressionNode) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The base name of a local for the value of the '?:' or the switch 'join' where every value of it that
+// is a call calls the same function, as in 'pickResult' for 'up ? pick() : pick()', or null otherwise.
+sharedResultName(Expression join) -> string? {
+    string? shared = null;
+    for (let value in syntax.joinValues(join)) {
+        if (!(value is CallExpressionNode)) {
+            continue;
+        }
+        let callee = calleeName(value);
+        if (callee == null) {
+            return null;
+        }
+        string name = storedResultName(value, callee);
+        if (shared != null && shared != name) {
+            return null;
+        }
+        shared = name;
+    }
+    return shared;
+}
+
+// The calls that make 'value' null where it is, each quoted once, as in "'pick()' and 'other()'": the
+// value itself, or the values of a '?:' or a switch that may be null. Null where a part of the value
+// that may be null is not a call.
+nullableCalls(BodyChecker checker, Expression value) -> string? {
+    let calls = new List<string>();
+    for (let branch in syntax.joinValues(value)) {
+        Type type = checker.recordedType(branch);
+        if (!(type is OptionalType) && !(type is NullType)) {
+            continue;
+        }
+        if (!(branch is CallExpressionNode) || calleeName(branch) == null) {
+            return null;
+        }
+        string quoted = "'{wording.oneLineSpelling(branch)}'";
+        if (!calls.contains(quoted)) {
+            calls.push(quoted);
+        }
+    }
+    if (calls.length() == 0) {
+        return null;
+    }
+    return diagnostics.andJoined(calls.toArray());
+}
+
+// The fix for 'value', a call or a '?:' or a switch that makes one, where it is the initial value of the
+// variable or field 'origin' declares, of type 'target', or is assigned to it: declare it so that it
+// allows null, or give the value a fallback. Null for any other value, where 'origin' declares no such
+// variable or field, where 'target' already allows null, and where a null check on an earlier call
+// written the same way shows the result was meant to be checked.
+declarationFix(BodyChecker checker, Type target, Expression value, LiteralOrigin? origin) -> string? {
+    if (origin == null || origin.kind() != OriginKind.Declared || origin.name().length == 0
+            || origin.forElement() || target is OptionalType || target is ErrorType) {
+        return null;
+    }
+    Expression core = syntax.unwrapParentheses(value);
+    bool joined = isJoin(core);
+    if (!joined && (!(core is CallExpressionNode) || checkedBefore(checker, core))) {
+        return null;
+    }
+    if (joined && !joinCalls(core)) {
+        return null;
+    }
+    string declared = "Declare '{origin.name()}'";
+    if (origin.quotedFieldOwner().length > 0) {
+        declared = "Declare field '{origin.name()}' of {origin.quotedFieldOwner()}";
+    }
+    string fallback = fallbackClause(value, "");
+    string fix = "S{fallback.substring(1)}";
+    if (convert.isAssignableStrict(checker.store().optionalOf(target), checker.recordedType(value))) {
+        fix = "{declared} as {checker.names().quotedNullable(target)} and check it for null, or {fallback}";
+    }
+    let example = fallbackExample(checker, value, origin.name());
+    if (example == null) {
+        return "{fix}.";
+    }
+    return "{fix}, as in '{example}'.";
+}
+
+// How to supply a fallback after 'value' with '??', 'times' over: after the closing '}' of a switch,
+// and after a '?:' in parentheses, because '??' would take only the last branch of a '?:' without them.
+fallbackClause(Expression value, string times) -> string {
+    Expression core = syntax.unwrapParentheses(value);
+    if (core is SwitchExpressionNode) {
+        return "supply a fallback after the switch's closing '\}' with '??'{times}";
+    }
+    if (!(core is TernaryExpressionNode)) {
+        return "supply a fallback with '??'{times}";
+    }
+    if (value is ParenthesizedExpressionNode || value.parent() is ParenthesizedExpressionNode) {
+        return "supply a fallback after the '?:' with '??'{times}";
+    }
+    return "put the '?:' in parentheses and supply a fallback after them with '??'{times}";
+}
+
+// The declaration or the assignment that gives 'value' a fallback after '??' where it is the initial
+// value of 'name' or is assigned to it, as in 'string name = pick() ?? "";', or the value with its
+// fallback elsewhere. Where a '?:' or a switch is too long to repeat, the end of it with the fallback,
+// as in '} ?? "";'. Null where the type of 'value' has no value plain enough to show as the fallback, or
+// where any other value is too long to repeat.
+fallbackExample(BodyChecker checker, Expression value, string name) -> string? {
+    Type type = checker.recordedType(value);
+    if (type is OptionalType) {
+        type = type.inner();
+    }
+    string? fallback = calls.zeroText(type, checker.names());
+    if (type is StringType) {
+        fallback = "\"\"";
+    }
+    if (fallback == null) {
+        return null;
+    }
+    SyntaxNode? holder = value.parent();
+    while (holder is ParenthesizedExpressionNode) {
+        holder = holder.parent();
+    }
+    if (holder is InitializerNode) {
+        holder = holder.parent();
+    }
+    string start = "";
+    string end = "";
+    if (holder is VariableDeclarationNode) {
+        let written = holder.declaredType();
+        if (written != null) {
+            start = "{wording.greenSpelling(written.green())} {name} = ";
+            end = ";";
+        }
+    } else if (holder is FieldDeclarationNode) {
+        start = "{wording.greenSpelling(holder.declaredType().green())} {name} = ";
+        end = ";";
+    } else if (holder is ParameterNode) {
+        let written = holder.declaredType();
+        if (written != null) {
+            start = "{wording.greenSpelling(written.green())} {name} = ";
+        }
+    } else if (holder is AssignmentExpressionNode) {
+        start = "{wording.oneLineSpelling(syntax.unwrapParentheses(holder.target()))} = ";
+        end = ";";
+    }
+    Expression core = syntax.unwrapParentheses(value);
+    let spelled = wording.shortSpelling(core);
+    if (spelled == null && core is SwitchExpressionNode) {
+        return "\} ?? {fallback}{end}";
+    }
+    if (spelled == null && core is TernaryExpressionNode) {
+        return ") ?? {fallback}{end}";
+    }
+    if (spelled == null) {
+        return null;
+    }
+    if (wording.bindsLooserThanFallback(core)) {
+        return "{start}({spelled}) ?? {fallback}{end}";
+    }
+    return "{start}{spelled} ?? {fallback}{end}";
+}
+
+// Whether a null check on a value written the same way as 'read', which reads the result of a call,
+// comes before it in the callable that holds it.
+checkedBefore(BodyChecker checker, Expression read) -> bool {
+    let callable = checker.frame().callableSyntax();
+    if (callable == null) {
+        return false;
+    }
+    return holdsNullCheckBefore(callable, wording.oneLineSpelling(read), read.span().start);
+}
+
+// Whether 'node' holds a comparison of the expression spelled 'spelled' with 'null' that ends before
+// the offset 'before'.
+holdsNullCheckBefore(SyntaxNode node, string spelled, long before) -> bool {
+    if (node.span().start >= before) {
+        return false;
+    }
+    if (node is BinaryExpressionNode && node.span().end() <= before
+            && (node.operator().text() == "==" || node.operator().text() == "!=")) {
+        Expression left = syntax.unwrapParentheses(node.left());
+        Expression right = syntax.unwrapParentheses(node.right());
+        if ((wording.isNullLiteral(right) && wording.oneLineSpelling(left) == spelled)
+                || (wording.isNullLiteral(left) && wording.oneLineSpelling(right) == spelled)) {
+            return true;
+        }
+    }
+    let children = node.childNodes();
+    for (long i = 0; i < children.length(); i++) {
+        if (holdsNullCheckBefore(children.get(i), spelled, before)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // 'opening', which the words 'may be null' continue, with the null guidance for 'value' of type
@@ -471,6 +732,9 @@ public classifyOperand(BodyChecker checker, Expression operand, long levels, str
         containsCall(operand.green()));
     classified.writes = writesBack;
     classified.fallbackParenthesized = wording.bindsLooserThanFallback(operand);
+    if (form == OperandForm.Stored) {
+        classified.checkedEarlier = checkedBefore(checker, syntax.unwrapParentheses(operand));
+    }
     if (!writesBack && levels > 0 && (form == OperandForm.Stable || form == OperandForm.NoFix)) {
         noteObjectRead(checker, operand, levels, classified);
     }
@@ -866,9 +1130,9 @@ charNarrowingHint(BodyChecker checker, Type target, Type source, Expression? val
 }
 
 // assignabilityHint with the mismatched value in hand, which a value that fits once its null is
-// gone extends with the null guidance for the place it is read from. A value that does not fit for
-// another reason gets the conversion that keeps it, or the change of the declaration at 'origin' that
-// takes it, where either applies.
+// gone extends with the null guidance for the place it is read from, unless 'target' allows as many
+// levels of null as the value has. A value that does not fit for another reason gets the conversion
+// that keeps it, or the change of the declaration at 'origin' that takes it, where either applies.
 public valueAssignabilityHint(BodyChecker checker, Type target, Type source, Expression? value,
                               LiteralOrigin? origin = null, ElsewhereDeclaration? elsewhere = null)
                               -> string {
@@ -881,9 +1145,20 @@ public valueAssignabilityHint(BodyChecker checker, Type target, Type source, Exp
     if (target is ErrorType || hint.length > 0) {
         return hint;
     }
+    if (levels > 0 && wording.optionalLevels(source) <= wording.optionalLevels(target)) {
+        return "";
+    }
     if (levels > 0 && value != null) {
-        return withGuidance(checker, " The value may be null here.",
-            nullGuidance(checker, value, source, levels));
+        let calls = nullableCalls(checker, value);
+        string why = " The value may be null here.";
+        if (calls != null) {
+            why = " {calls} can return null.";
+        }
+        let declaration = declarationFix(checker, target, value, origin);
+        if (declaration != null) {
+            return "{why} {declaration}";
+        }
+        return withGuidance(checker, why, nullGuidance(checker, value, source, levels));
     }
     if (levels > 0) {
         return "";
@@ -1183,13 +1458,22 @@ storedAdvice(NullableOperand[] operands) -> string? {
         callees = "{callees} and to '{second.callee}'";
     }
     string fix = localsFix(operands, "check", true, "");
+    bool checked = first.checkedEarlier || second.checkedEarlier;
     if (first.wholeCall) {
-        string results = "the result";
-        if (operands.length == 2) {
-            results = "both results";
+        if (!checked && operands.length == 2) {
+            return "Store both results in {fix}";
         }
-        return "Each call to {callees} returns its own result. A later call can return null even after "
-            + "a null check on an earlier one. Store {results} in {fix}";
+        if (!checked) {
+            return "Store the result in {fix}";
+        }
+        if (operands.length == 2) {
+            return "Each call to {callees} returns its own result, so a null check on an earlier call does "
+                + "not cover a later one. Store both results in {fix}";
+        }
+        return "Each call to {callees} returns its own result, so the null check on an earlier call does "
+            + "not cover this one. Store the result in a local before that check "
+            + "('{first.declaration()}'), and check and use the local instead of calling '{first.callee}' "
+            + "again.";
     }
     string fields = "'{first.spelling}' is a field of the result of a call";
     string read = "'{first.spelling}'";
@@ -1201,6 +1485,9 @@ storedAdvice(NullableOperand[] operands) -> string? {
         fields = "'{first.spelling}' and '{second.spelling}' are fields of the results of calls";
         read = "them";
         stored = "'{first.spelling}' and '{second.spelling}'";
+    }
+    if (!checked) {
+        return "Store {stored} in {fix}";
     }
     return "{fields}. Each call to {callees} returns its own result, so a later read of {read} can be "
         + "null even after a null check. Store {stored} in {fix}";
