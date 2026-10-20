@@ -534,9 +534,11 @@ public typeTestExample(BodyChecker checker, Expression value, Type tested) -> st
     return checker.names().quotedCode(["{spelled} is ", " ? ... : ..."], [tested]);
 }
 
-// The sentences that follow the refusal of the member 'member' read through 'object' inside a loop, where
-// 'object' has a type with the member where the loop starts but a write in the loop leaves a wider proof
-// of it, or none, on a later pass, with that write as a note. Null anywhere else.
+// The sentences that follow the refusal of the member 'member' read through 'object', where 'object' has
+// a type with the member where a loop starts or before a branch of a statement whose branches meet, but a
+// write in the loop or the branch leaves a wider proof of it, or none, with that write as a note. Inside the
+// loop that holds on a later pass, and after the statement or in a 'for' update it holds here. Null anywhere
+// else.
 public widenedReadHint(BodyChecker checker, Expression object, string member) -> string? {
     let path = buildNarrowingPath(checker, object);
     if (path == null) {
@@ -548,29 +550,102 @@ public widenedReadHint(BodyChecker checker, Expression object, string member) ->
     }
     let narrower = widening.narrower();
     let loop = widening.loop();
-    if (narrower == null || loop == null || object.span().start < loop.start
-            || object.span().end() > loop.end()
+    bool inLoop = loop != null && within(object.span(), loop);
+    if (narrower == null || (!inLoop && !widening.inJoin())
             || memberaccess.lookupMember(checker, narrower, member) is MissingMember) {
         return null;
     }
     string place = wording.oneLineSpelling(syntax.unwrapParentheses(object));
     Type tested = convert.coreOf(narrower);
-    Type wider = convert.coreOf(checker.recordedType(object));
-    string write = "assigns it";
-    string outcome = "it may be";
-    let stored = widening.stored();
-    if (widening.place() != place) {
-        write = "assigns '{widening.place()}'";
-        outcome = "'{place}' may be";
-    } else if (stored != null && !(stored is ErrorType)) {
-        Type core = convert.coreOf(stored);
-        write = "assigns it {typenames.typeArticle(checker.names().of(core))} {checker.names().quoted(core)}";
-    }
-    string article = typenames.typeArticle(checker.names().of(tested));
+    string wider = checker.names().quoted(convert.coreOf(checker.recordedType(object)));
+    string stored = storedClause(checker, widening, place);
     string note = diagnostics.carriedNote(widening.at(), "'{widening.place()}' is assigned here");
-    return "'{place}' is {article} {checker.names().quoted(tested)} when the loop starts, but the loop "
-        + "{write}, so {outcome} any {checker.names().quoted(wider)} on a later pass.{note} Test '{place}' "
-        + "inside the loop, as in {typeTestExample(checker, object, tested)}.";
+    if (inLoop) {
+        string held = "{typenames.typeArticle(checker.names().of(tested))} {checker.names().quoted(tested)}";
+        string assigned = widening.place() != place ? "'{widening.place()}'" : "it{stored}";
+        string outcome = widening.place() != place ? "'{place}' may be" : "it may be";
+        return "'{place}' is {held} when the loop starts, but the loop assigns {assigned}, so {outcome} any "
+            + "{wider} on a later pass.{note} Test '{place}' inside the loop, as in "
+            + "{typeTestExample(checker, object, tested)}.";
+    }
+    string reason = "'{widening.place()}' is assigned{stored} {widening.joinedIn()}, so '{place}' may be any "
+        + "{wider} here.{note}";
+    let update = enclosingUpdate(object, widening.at());
+    if (update != null) {
+        return "{reason} {updateTestAdvice(checker, object, member, update, tested)}";
+    }
+    return "{reason} Test '{place}' after the {widening.joinedStatement()}, as in "
+        + "{typeTestExample(checker, object, tested)}.";
+}
+
+// The type the write 'end' stores, as in " a 'Square'", where it writes the place spelled 'place' and the
+// type is known, or empty.
+storedClause(BodyChecker checker, NarrowingEnd end, string place) -> string {
+    let stored = end.stored();
+    if (end.place() != place || stored == null || stored is ErrorType) {
+        return "";
+    }
+    Type core = convert.coreOf(stored);
+    return " {typenames.typeArticle(checker.names().of(core))} {checker.names().quoted(core)}";
+}
+
+// The update of the 'for' loop whose update reads 'read' and whose body makes the write at 'write', or
+// null where no such loop holds the read.
+enclosingUpdate(Expression read, Span write) -> Expression? {
+    SyntaxNode? holder = read.parent();
+    while (holder != null && !(holder is Statement)) {
+        holder = holder.parent();
+    }
+    if (!(holder is ForStatementNode)) {
+        return null;
+    }
+    let update = holder.update();
+    if (update == null || !within(read.span(), update.span()) || !within(write, holder.body().span())) {
+        return null;
+    }
+    return update;
+}
+
+// The advice to test 'object' for the class 'tested' in the 'for' update 'update', which reads the member
+// 'member' through it: with the update written to read the member only where the test holds, or with the
+// test alone where that cannot be written.
+updateTestAdvice(BodyChecker checker, Expression object, string member, Expression update, Type tested)
+                 -> string {
+    string place = wording.oneLineSpelling(syntax.unwrapParentheses(object));
+    let guarded = guardedUpdate(checker, object, member, update, tested);
+    if (guarded != null) {
+        return "Test '{place}' in the update, as in {guarded}.";
+    }
+    return "Test '{place}' with {checker.names().quotedCode(["{place} is ", ""], [tested])} in the update.";
+}
+
+// The 'for' update 'update' written to read the field 'member' through 'object' only where 'object' is a
+// 'tested', with a placeholder value where it is not, in quotes. Null where 'member' is not a field, no
+// placeholder has its type, the read is not written once in the update or the code is too long to quote.
+guardedUpdate(BodyChecker checker, Expression object, string member, Expression update, Type tested)
+              -> string? {
+    SyntaxNode? read = object.parent();
+    while (read is ParenthesizedExpressionNode) {
+        read = read.parent();
+    }
+    let field = typemembers.inheritedOrOwnField(tested, member);
+    if (!(read is MemberExpressionNode) || read.parent() is CallExpressionNode || field == null) {
+        return null;
+    }
+    let placeholder = wording.placeholderLiteral(field.type());
+    string written = wording.oneLineSpelling(update);
+    string readText = wording.oneLineSpelling(read);
+    long at = written.indexOf(readText);
+    if (placeholder == null || at < 0 || written.indexOf(readText, at + 1) >= 0) {
+        return null;
+    }
+    string place = wording.oneLineSpelling(syntax.unwrapParentheses(object));
+    string before = "{written.substring(0, at)}({place} is ";
+    string after = " ? {readText} : {placeholder}){written.substring(at + readText.length)}";
+    if (before.length + checker.names().of(tested).length + after.length > wording.quotedCodeLimit()) {
+        return null;
+    }
+    return checker.names().quotedCode([before, after], [tested]);
 }
 
 // The sentences that follow the refusal of the member 'member' read through 'object' inside a lambda,
@@ -910,7 +985,7 @@ joinNarrowings(BodyChecker checker, Map<NarrowingPath, Type> proven, Map<Narrowi
         }
         let ended = droppedEnd(survivors, key, provenType);
         if (ended != null) {
-            checker.narrowing().endProof(key, ended.throughJoin(statement, branch));
+            checker.narrowing().endProof(key, ended.throughJoin(statement, branch).narrowedFrom(provenType));
         } else {
             checker.narrowing().clearPath(key);
         }
@@ -925,10 +1000,17 @@ joinNarrowings(BodyChecker checker, Map<NarrowingPath, Type> proven, Map<Narrowi
         }
         checker.narrowing().clearPath(key);
         checker.narrowing().narrow(key, joinedType);
-        let write = joinedWrite(survivors, key, joinedType, proven.get(key));
-        if (write != null) {
-            checker.narrowing().noteWrite(key, write.throughJoin(statement, branch));
+        let before = proven.get(key);
+        let write = joinedWrite(survivors, key, joinedType, before);
+        if (write == null) {
+            continue;
         }
+        let joinedEnd = write.throughJoin(statement, branch);
+        if (before != null && before != joinedType
+                && convert.isAssignableStrict(joinedType, before)) {
+            joinedEnd = joinedEnd.narrowedFrom(before);
+        }
+        checker.narrowing().noteWrite(key, joinedEnd);
     }
 }
 
