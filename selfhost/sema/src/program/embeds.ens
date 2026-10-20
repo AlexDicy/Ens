@@ -1,0 +1,288 @@
+// What a module's 'embed' expressions read. The files are read while the graph is built, the one
+// stage that reads files, so every phase after it works on the bytes as values.
+import FileLoader from support.loader;
+import FileError from support.loader;
+import Span from @ens.frontend.support.source;
+import ParseResult from @ens.frontend.parse.parser;
+import @ens.frontend.syntax.generated.factory;
+import SyntaxNode from @ens.frontend.syntax.node;
+import EmbedExpressionNode from @ens.frontend.syntax.generated.nodes;
+import model.literalvalues;
+import Path from @std.fs;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+
+// One file an 'embed folder' read, by its path inside the folder, with '/' between folders.
+export final class EmbeddedEntry {
+    export const string path;
+    export const byte[] contents;
+
+    protected constructor(this.path, this.contents);
+}
+
+// What one 'embed' expression read: the file's bytes, or with 'folder' every file under the folder
+// in path order.
+export final class EmbeddedContent {
+    export const bool folderForm;
+    export const byte[] contents;
+    export const EmbeddedEntry[] entries;
+
+    protected constructor(this.folderForm, this.contents, this.entries);
+}
+
+// Where a module's package may embed files from: its own folder, and the folders outside it that
+// its manifest lists.
+export final class EmbedScope {
+    export const Path packageFolder;
+    export const Path[] listedFolders;
+    export const string packageName;
+    export const Path manifestFile;
+    export const bool hasManifest;
+    export const bool editable;
+
+    export constructor(this.packageFolder, this.listedFolders, this.packageName,
+                this.manifestFile, this.hasManifest, this.editable);
+}
+
+export final class EmbedProblem {
+    export const Span span;
+    export const string message;
+
+    protected constructor(this.span, this.message);
+}
+
+// Every 'embed' of one module, keyed by where the expression starts, and what could not be read.
+export final class EmbedScan {
+    export const Map<long, EmbeddedContent> contents;
+    export const EmbedProblem[] problems;
+    export const bool readsFolder;
+
+    protected constructor(this.contents, this.problems, this.readsFolder);
+}
+
+// No 'embed' at all, which is what nearly every module has.
+export emptyScan() -> EmbedScan {
+    return new EmbedScan(new Map<long, EmbeddedContent>(), [], false);
+}
+
+export scanEmbeds(FileLoader loader, Path filePath, string text, ParseResult parsed,
+                  EmbedScope scope) -> EmbedScan {
+    if (!text.contains("embed")) {
+        return emptyScan();
+    }
+    let found = new List<EmbedExpressionNode>();
+    collect(factory.createRoot(parsed.root()), found);
+    if (found.length() == 0) {
+        return emptyScan();
+    }
+    let reader = new EmbedReader(loader, filePath, scope);
+    for (long i = 0; i < found.length(); i++) {
+        reader.read(found.get(i));
+    }
+    return new EmbedScan(reader.contents, reader.problems.toArray(), reader.readsFolder);
+}
+
+collect(SyntaxNode node, List<EmbedExpressionNode> found) {
+    if (node is EmbedExpressionNode) {
+        found.push(node);
+        return;
+    }
+    let children = node.childNodes();
+    for (long i = 0; i < children.length(); i++) {
+        collect(children.get(i), found);
+    }
+}
+
+class EmbedReader {
+    FileLoader loader;
+    Path filePath;
+    EmbedScope scope;
+    Map<long, EmbeddedContent> contents;
+    List<EmbedProblem> problems;
+    bool readsFolder;
+
+    protected constructor(FileLoader loader, Path filePath, EmbedScope scope) {
+        this.loader = loader;
+        this.filePath = filePath;
+        this.scope = scope;
+        this.contents = new Map<long, EmbeddedContent>();
+        this.problems = new List<EmbedProblem>();
+        this.readsFolder = false;
+    }
+
+    read(EmbedExpressionNode node) {
+        let token = node.path();
+        if (token.text().length == 0) {
+            return;
+        }
+        bool folderForm = node.folderKeyword() != null;
+        if (folderForm) {
+            this.readsFolder = true;
+        }
+        let span = token.span();
+        string written = literalvalues.decodeString(token.text());
+        string form = "embed";
+        string what = "file";
+        if (folderForm) {
+            form = "embed folder";
+            what = "folder";
+        }
+        if (written.length == 0) {
+            this.report(span, "'{form}' needs the path of a {what} between the quotes, as in "
+                + "'{form} \"{example(folderForm)}\"'.");
+            return;
+        }
+        if (written.contains("\\")) {
+            string separated = written.replace("\\", "/");
+            this.report(span, "Folders in an 'embed' path are separated with '/' on every system. "
+                + "Write '{separated}'.");
+            return;
+        }
+        if (Path(written).isAbsolute()) {
+            this.report(span, "'{written}' is an absolute path, so the program would build only "
+                + "where that {what} is. Write the path relative to the folder "
+                + "'{this.filePath.fileName()}' is in.");
+            return;
+        }
+        Path target = (this.filePath.parent() ?? Path(".")).join(written).normalize();
+        if (!this.allowed(target)) {
+            this.reportOutside(span, written, target);
+            return;
+        }
+        if (!this.loader.exists(target)) {
+            this.report(span, "Cannot embed '{written}': there is no {what} at '{target}'. Check "
+                + "the spelling, or create the {what}.");
+            return;
+        }
+        bool isFile = this.loader.isFile(target);
+        if (folderForm && isFile) {
+            this.report(span, "'{written}' is a file, and 'embed folder' reads every file in a "
+                + "folder. Remove 'folder' to embed this one file.");
+            return;
+        }
+        if (!folderForm && !isFile) {
+            this.report(span, "'{written}' is a folder, and 'embed' reads one file. Write "
+                + "'embed folder \"{written}\"' to embed every file in it.");
+            return;
+        }
+        if (folderForm) {
+            this.readFolder(node, span, written, target);
+            return;
+        }
+        let bytes = this.readFile(span, written, target);
+        if (bytes != null) {
+            this.contents.set(node.span().start, new EmbeddedContent(false, bytes, []));
+        }
+    }
+
+    readFolder(EmbedExpressionNode node, Span span, string written, Path folder) {
+        Path[] files = try this.loader.filesUnder(folder);
+        let paths = new List<string>();
+        for (let file in files) {
+            Path? relative = file.relativeTo(folder);
+            if (relative != null && !hidden(relative.toString())) {
+                paths.push(relative.toString());
+            }
+        }
+        paths.sort();
+        let entries = new List<EmbeddedEntry>();
+        for (long i = 0; i < paths.length(); i++) {
+            string path = paths.get(i);
+            let bytes = this.readFile(span, written + "/" + path, folder.join(path));
+            if (bytes == null) {
+                return;
+            }
+            entries.push(new EmbeddedEntry(path, bytes));
+        }
+        this.contents.set(node.span().start, new EmbeddedContent(true, [], entries.toArray()));
+    } catch (FileError refused) {
+        this.report(span, "Cannot embed folder '{written}': {refused.reason}.");
+    }
+
+    readFile(Span span, string written, Path file) -> byte[]? {
+        return try this.loader.readBytes(file);
+    } catch (FileError refused) {
+        this.report(span, "Cannot embed '{written}': {refused.reason}.");
+        return null;
+    }
+
+    allowed(Path target) -> bool {
+        if (target.relativeTo(this.scope.packageFolder) != null) {
+            return true;
+        }
+        for (let folder in this.scope.listedFolders) {
+            if (target.relativeTo(folder) != null) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    reportOutside(Span span, string written, Path target) {
+        if (!this.scope.hasManifest) {
+            this.report(span, "'{written}' names '{target}', which is outside "
+                + "'{this.scope.packageFolder}', the folder this program is built from. Move the "
+                + "file into that folder.");
+            return;
+        }
+        string name = this.scope.packageName;
+        if (!this.scope.editable) {
+            this.report(span, "'{written}' names '{target}', which is outside package '{name}', "
+                + "and a package that was fetched may embed only files inside its own folder.");
+            return;
+        }
+        Path manifestFolder = this.scope.manifestFile.parent() ?? Path(".");
+        Path holder = target.parent() ?? target;
+        string listed = relativePath(holder, manifestFolder);
+        this.report(span, "'{written}' names '{target}', which is outside package '{name}'. A "
+            + "package embeds files from its own folder, or from a folder its 'ens.package' "
+            + "lists. Add 'embed \"{listed}\";' to '{this.scope.manifestFile}', or move the file "
+            + "into the package.");
+    }
+
+    report(Span span, string message) {
+        this.problems.push(new EmbedProblem(span, message));
+    }
+}
+
+example(bool folderForm) -> string {
+    if (folderForm) {
+        return "assets";
+    }
+    return "logo.png";
+}
+
+// Whether a part of the path starts with '.', which marks a file or folder the system and tools
+// keep out of sight, such as '.git' or '.DS_Store'.
+hidden(string relative) -> bool {
+    for (let part in relative.split("/")) {
+        if (part.startsWith(".")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// `target` written relative to `base`, with '..' for each part of `base` it does not share.
+relativePath(Path target, Path base) -> string {
+    string[] targetParts = target.normalize().toString().split("/");
+    string[] baseParts = base.normalize().toString().split("/");
+    long shared = 0;
+    while (shared < targetParts.length && shared < baseParts.length
+            && targetParts[shared] == baseParts[shared]) {
+        shared++;
+    }
+    let parts = new List<string>();
+    for (long i = shared; i < baseParts.length; i++) {
+        if (baseParts[i].length > 0 && baseParts[i] != ".") {
+            parts.push("..");
+        }
+    }
+    for (long i = shared; i < targetParts.length; i++) {
+        parts.push(targetParts[i]);
+    }
+    if (parts.length() == 0) {
+        return ".";
+    }
+    return string.joined(parts.toArray(), "/");
+}
