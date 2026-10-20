@@ -1081,29 +1081,34 @@ renewEndsForWrite(BodyChecker checker, Expression target, NarrowingEnd end) {
     }
 }
 
-// The narrowings a pass over the loop 'loop', written at 'span', watches on the locals and parameters it
-// may write. 'trace' follows each from the type the loop starts it with to the proofs that reach the back
-// edges of the pass, and 'changed' is whether one changed it. 'entryTrace' follows the same way each
-// narrowing the loop starts weaker than the proof where it is entered, from that proof, which finds the
-// back edge and the write of the pass that widen or break it. The copies that read a start are kept by
-// the local they read, and 'lambdaDepth' counts the lambdas the loop is in.
+// What a pass over a loop follows, from what holds where the loop is entered and where it starts, to its back
+// edges, for the locals and parameters the loop may write.
 public final class LoopWatch {
     protected GreenNode loop;
     protected Span span;
+    protected Map<NarrowingPath, Type> entry;
     protected Map<NarrowingPath, Type> starts;
+    // The narrowings followed from where the loop starts, and from where it is entered for those it starts
+    // weaker.
     protected NarrowingTrace trace;
     protected NarrowingTrace entryTrace;
     protected bool changed;
     protected Map<NarrowingPath, List<LoopCopy>> startReaders;
+    // The lambdas the loop is in.
     protected long lambdaDepth;
 
-    protected constructor(this.loop, this.span, Map<NarrowingPath, Type> starts,
+    protected constructor(this.loop, this.span, this.entry, Map<NarrowingPath, Type> starts,
                           Map<NarrowingPath, Type> weakened, this.lambdaDepth) {
         this.starts = starts;
         this.trace = new NarrowingTrace(starts);
         this.entryTrace = new NarrowingTrace(weakened);
         this.changed = false;
         this.startReaders = new Map<NarrowingPath, List<LoopCopy>>();
+    }
+
+    // Whether the loop can write a narrowing that holds where it is entered.
+    protected watchesAny() -> bool {
+        return !this.trace.held.isEmpty() || !this.entryTrace.held.isEmpty();
     }
 }
 
@@ -1189,17 +1194,17 @@ public final class LoopFlow {
     }
 }
 
-// The ways out of one pass through a loop and its back edges: the names of the locals and parameters its
-// condition writes, what holds where the pass starts, where its condition is tested false, null where it
-// never is, at each back edge to its start and at each 'break'.
+// The ways out of one pass through the loop 'watch' watches and its back edges: the names of the locals and
+// parameters its condition writes, what holds where its condition is tested false, null where it never is, at
+// each back edge to its start and at each 'break'.
 final class LoopExits {
+    protected LoopWatch watch;
     protected Set<string> conditionWrites;
-    protected Map<NarrowingPath, Type> entry;
     protected BranchNarrowings? exit;
     protected List<BranchNarrowings> backEdges;
     protected List<BranchNarrowings> breaks;
 
-    protected constructor(this.conditionWrites, this.entry) {
+    protected constructor(this.watch, this.conditionWrites) {
         this.exit = null;
         this.backEdges = new List<BranchNarrowings>();
         this.breaks = new List<BranchNarrowings>();
@@ -1308,17 +1313,17 @@ passEnds(BodyChecker checker, LoopFlow flow) -> List<BranchNarrowings> {
     return ends;
 }
 
-// Walks one pass through 'loop' with 'walk' and returns what reached its ends, where 'watched' says the
-// pass watches a narrowing the loop can write. Where it watches none and the condition writes nothing and
-// can be false, what holds after the loop is what holds where it starts, so nothing is kept for a join,
-// and what holds at a 'continue' is kept only for a 'for' update.
-walkPass(BodyChecker checker, SyntaxNode loop, (BodyChecker) -> void walk, bool watched) -> LoopFlow {
+// Walks one pass through 'loop' with 'walk' and returns what reached its ends, where 'watch' says what the
+// pass watches. Where the loop can write no narrowing that holds where it is entered, and the condition
+// writes nothing and can be false, what holds after the loop is what holds where it starts, so nothing is
+// kept for a join, and what holds at a 'continue' is kept only for a 'for' update.
+walkPass(BodyChecker checker, SyntaxNode loop, (BodyChecker) -> void walk, LoopWatch watch) -> LoopFlow {
     let condition = loopCondition(loop);
     let conditionWrites = condition == null ? null : conditionWriteNames(checker, loop, condition);
     bool writes = conditionWrites != null && !conditionWrites.isEmpty();
     LoopExits? exits = null;
-    if (watched || writes || !leavesAtCondition(loop, condition)) {
-        exits = new LoopExits(conditionWrites ?? new Set<string>(), checker.narrowing().flatten());
+    if (watch.watchesAny() || writes || !leavesAtCondition(loop, condition)) {
+        exits = new LoopExits(watch, conditionWrites ?? new Set<string>());
     }
     bool updated = loop is ForStatementNode && loop.update() != null;
     let flow = new LoopFlow(exits, exits != null || updated);
@@ -1594,8 +1599,9 @@ public settleLoop(BodyChecker checker, SyntaxNode loop, (BodyChecker) -> void wa
         return passLoop(checker, enclosing, loop, walk);
     }
     let settlement = new LoopSettlement();
-    if (startLoop(checker, settlement, loop).starts.isEmpty()) {
-        return walkPass(checker, loop, walk, false);
+    let unsettled = startLoop(checker, settlement, loop);
+    if (unsettled.starts.isEmpty()) {
+        return walkPass(checker, loop, walk, unsettled);
     }
     while (true) {
         settlement.changed = false;
@@ -1621,7 +1627,7 @@ public settleLoop(BodyChecker checker, SyntaxNode loop, (BodyChecker) -> void wa
 // Installs what holds after 'loop', from 'flow', what reached the ends of the pass that analyzed it: what
 // holds where its condition is tested false, at each 'break', and where each back edge leads, since the
 // next pass can leave there, with a place the condition writes holding what the condition stores. A proof
-// that held where the loop starts or that its condition made is dropped where a way out does not keep
+// that held where the loop is entered or that its condition made is dropped where a way out does not keep
 // it. A write in the loop that ended a proof is then recorded as one in the loop, for a read after it.
 public leaveLoop(BodyChecker checker, SyntaxNode loop, LoopFlow flow) {
     string statement = loopStatement(loop);
@@ -1640,7 +1646,7 @@ public leaveLoop(BodyChecker checker, SyntaxNode loop, LoopFlow flow) {
         }
         leaving.pushAll(exits.breaks);
         addProofs(proven, held);
-        addProofs(proven, exits.entry);
+        addProofs(proven, exits.watch.entry);
         joinNarrowings(checker, proven, held, leaving, statement, "in the {statement}");
     }
     markLoopEnds(checker, loop);
@@ -1692,7 +1698,7 @@ passLoop(BodyChecker checker, LoopSettlement settlement, SyntaxNode loop, (BodyC
          -> LoopFlow {
     let watch = startLoop(checker, settlement, loop);
     if (settlement.settled) {
-        return walkPass(checker, loop, walk, !watch.starts.isEmpty());
+        return walkPass(checker, loop, walk, watch);
     }
     checker.loopWatches().push(watch);
     for (let path in watch.starts.keys()) {
@@ -1700,7 +1706,7 @@ passLoop(BodyChecker checker, LoopSettlement settlement, SyntaxNode loop, (BodyC
             settlement.touches.set(path, new LoopTouch(watch, null, watch.lambdaDepth));
         }
     }
-    let flow = walkPass(checker, loop, walk, !watch.starts.isEmpty());
+    let flow = walkPass(checker, loop, walk, watch);
     checker.loopWatches().pop();
     let exits = flow.exits;
     if (exits != null) {
@@ -1783,7 +1789,7 @@ startLoop(BodyChecker checker, LoopSettlement settlement, SyntaxNode loop) -> Lo
         }
         held.set(path, start);
     }
-    return new LoopWatch(loop.green(), loop.span(), held, weakened, checker.lambdaFrames().length());
+    return new LoopWatch(loop.green(), loop.span(), entry, held, weakened, checker.lambdaFrames().length());
 }
 
 // Records in 'settlement' that a pass reached the loop 'loop', and what 'watch' saw at its back edges: the
