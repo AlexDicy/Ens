@@ -5,11 +5,11 @@ Ens is a compiled programming language with automatic reference counting, checke
 ## Building and testing
 
 ```pwsh
-xmake build ens-lld
+xmake build ens-llvm
 xmake test
 ```
 
-`ens-lld` is the linker bridge every Ens program links through, and the only C++ a build of Ens needs.
+`ens-llvm` is the one static library `ens` links for LLVM and lld: the linker bridge every Ens program links through, together with LLVM itself, and the only C++ a build of Ens needs.
 `xmake test` builds `ens` from source with the seed committed for this platform under `seed/`, then runs the whole suite through it.
 
 ## Editor support
