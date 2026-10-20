@@ -18,7 +18,6 @@ import QuotedCode from model.typenames;
 import model.types;
 import Type from model.types;
 import ErrorType from model.types;
-import TypeParamType from model.types;
 import NullType from model.types;
 import OptionalType from model.types;
 import ArrayType from model.types;
@@ -1020,22 +1019,12 @@ isMoreSpecific(ViableCandidate left, ViableCandidate right) -> bool {
     return narrower;
 }
 
-// Whether every value of 'narrower' fits 'wider' and not the other way round, because it is a
-// subclass of it or the same type with fewer '?': 'Circle' is more specific than 'Shape', 'Circle?'
-// and 'Shape?'. A number type that widens to another, or a type implementing an interface, is not
-// more specific than it.
+// Whether every value of 'narrower' converts implicitly to 'wider' and not the other way round:
+// 'Circle' is more specific than 'Shape', 'Circle?', 'Shape?' and an interface 'Circle' implements,
+// and 'int' than 'long' and 'int?'.
 public isMoreSpecificType(Type narrower, Type wider) -> bool {
-    if (!convert.isAssignableStrict(wider, narrower)
-            || convert.isAssignableStrict(narrower, wider)) {
-        return false;
-    }
-    Type narrowerCore = convert.coreOf(narrower);
-    Type widerCore = convert.coreOf(wider);
-    if (narrowerCore == widerCore) {
-        return true;
-    }
-    return types.classOf(narrowerCore) != null && types.classOf(widerCore) != null
-        && hierarchy.isSubclassOf(narrowerCore, widerCore);
+    return convert.isAssignableStrict(wider, narrower)
+        && !convert.isAssignableStrict(narrower, wider);
 }
 
 // Whether 'left' and 'right' take every argument as the same type, 'left' never writes a type
@@ -1735,69 +1724,74 @@ narrowerText(ViableCandidate viable, long index, CallShape shape, TypeNames name
 }
 
 // Why neither of 'left' and 'right', which two candidates take the argument at 'index' as, is
-// more specific than the other, or null where one of them is a type parameter or has two '?'.
+// more specific than the other, or null where their types without '?' are neither both numbers nor
+// both classes or interfaces.
 unrelatedText(CallShape shape, long index, Type left, Type right, TypeNames names) -> string? {
     let argument = shape.argumentAt(index);
-    Type leftCore = convert.coreOf(left);
-    Type rightCore = convert.coreOf(right);
-    if (convert.isNumericType(leftCore) && convert.isNumericType(rightCore)) {
-        string subject = "Argument {index + 1}";
-        if (argument.name().length > 0) {
-            subject = "The argument '{argument.name()}'";
-        }
-        string described = "has type {names.quoted(argument.type())}";
-        string? literal = literalText(argument);
-        if (argument.type() is NullType) {
-            described = "is 'null'";
-        } else if (literal != null) {
-            described = "is '{literal}'";
-        }
-        return "{subject} {described}, which fits {names.quoted(left)} and {names.quoted(right)} "
-            + "alike.";
-    }
-    if (leftCore is TypeParamType || rightCore is TypeParamType
-            || convert.bareOf(left) is OptionalType || convert.bareOf(right) is OptionalType) {
-        return null;
-    }
     string opening = "";
-    string neither = "Neither";
     if (shape.argumentCount() > 1) {
         opening = "For {argumentPosition(argument, index)}, ";
-        neither = "neither";
     }
-    if (isMoreSpecificType(leftCore, rightCore)) {
+    if (left is OptionalType && !(right is OptionalType)
+            && isMoreSpecificType(convert.coreOf(left), right)) {
         return opening + nullableText(left, right, names);
     }
-    if (isMoreSpecificType(rightCore, leftCore)) {
+    if (right is OptionalType && !(left is OptionalType)
+            && isMoreSpecificType(convert.coreOf(right), left)) {
         return opening + nullableText(right, left, names);
     }
-    if (types.isInterfaceLike(rightCore) && convert.isAssignableStrict(rightCore, leftCore)) {
-        return opening + conformanceText(leftCore, rightCore, names);
+    Type leftCore = convert.coreOf(left);
+    Type rightCore = convert.coreOf(right);
+    string fits = "{fittingArgumentText(argument, index, names)}, which fits both "
+        + "{names.quoted(left)} and {names.quoted(right)}.";
+    if (isMoreSpecificType(leftCore, rightCore)
+            && wording.optionalLevels(left) > wording.optionalLevels(right)) {
+        return "{fits} {levelsText(left, right, names)}";
     }
-    if (types.isInterfaceLike(leftCore) && convert.isAssignableStrict(leftCore, rightCore)) {
-        return opening + conformanceText(rightCore, leftCore, names);
+    if (isMoreSpecificType(rightCore, leftCore)
+            && wording.optionalLevels(right) > wording.optionalLevels(left)) {
+        return "{fits} {levelsText(right, left, names)}";
     }
-    return "{opening}{neither} {names.quoted(leftCore)} nor {names.quoted(rightCore)} is a subclass "
-        + "of the other, so neither is more specific.";
+    string neither = "Neither {names.quoted(leftCore)} nor {names.quoted(rightCore)}";
+    if (convert.isNumericType(leftCore) && convert.isNumericType(rightCore)) {
+        return "{fits} {neither} converts to the other without 'as', so neither is more specific.";
+    }
+    if (types.isClassLike(leftCore) && types.isClassLike(rightCore)) {
+        return "{fits} {neither} is a kind of the other, so neither is more specific.";
+    }
+    return null;
 }
 
-// Why the nullable 'nullable', whose type without '?' is a subclass of 'wider', is not more
-// specific than 'wider'.
+// "Argument 1 has type 'int'", "The argument 'limit' is 'null'" or "Argument 2 is '1'".
+fittingArgumentText(ArgumentValue argument, long index, TypeNames names) -> string {
+    string subject = "Argument {index + 1}";
+    if (argument.name().length > 0) {
+        subject = "The argument '{argument.name()}'";
+    }
+    if (argument.type() is NullType) {
+        return "{subject} is 'null'";
+    }
+    string? literal = literalText(argument);
+    if (literal != null) {
+        return "{subject} is '{literal}'";
+    }
+    return "{subject} has type {names.quoted(argument.type())}";
+}
+
+// Why 'deeper', whose type without '?' converts to that of 'wider' but which has more levels of
+// null, is not more specific than 'wider'.
+levelsText(Type deeper, Type wider, TypeNames names) -> string {
+    return "{names.quoted(deeper)} has more levels of null than {names.quoted(wider)}, and "
+        + "{names.quoted(wider)} accepts values of type {names.quoted(convert.coreOf(wider))} that "
+        + "are not of type {names.quoted(convert.coreOf(deeper))}, so neither is more specific.";
+}
+
+// Why the nullable 'nullable', whose type without '?' converts to 'wider', is not more specific
+// than 'wider'.
 nullableText(Type nullable, Type wider, TypeNames names) -> string {
     return "{names.quoted(nullable)} accepts 'null', which {names.quoted(wider)} does not, and "
-        + "{names.quoted(wider)} accepts values of type {names.quoted(convert.coreOf(wider))} that "
-        + "are not of type {names.quoted(convert.coreOf(nullable))}, so neither is more specific.";
-}
-
-// Why 'source', which converts to the interface 'target' because it implements or extends it, is
-// not more specific than it.
-conformanceText(Type source, Type target, TypeNames names) -> string {
-    if (types.isInterfaceLike(source)) {
-        return "{names.quoted(source)} extends {names.quoted(target)}, but extending an interface "
-            + "does not make a parameter more specific.";
-    }
-    return "{names.quoted(source)} implements {names.quoted(target)}, but implementing an "
-        + "interface does not make a parameter more specific.";
+        + "{names.quoted(wider)} accepts values of type {names.quoted(wider)} that are not of type "
+        + "{names.quoted(convert.coreOf(nullable))}, so neither is more specific.";
 }
 
 // Why the choice among the candidates 'best' still matters when an argument never returns, so
