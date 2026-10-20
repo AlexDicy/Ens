@@ -1,14 +1,20 @@
 // Conversions between primitive value types, applied wherever a value has to reach a declared
 // type: initializers, arguments, returns, operator operands, and explicit casts.
 import Span from @ens.frontend.support.source;
+import PrimitiveKind from @ens.sema.model.types;
 import Type from @ens.sema.model.types;
 import EirAbsentOptional from eir.model;
+import EirBranch from eir.model;
 import EirCastOp from eir.model;
 import EirCast from eir.model;
+import EirJump from eir.model;
 import EirOptionalPayload from eir.model;
+import EirOptionalPresence from eir.model;
 import EirPayloadRead from eir.model;
+import EirStoreSlot from eir.model;
 import EirWrapOptional from eir.model;
 import LoweringContext from lower.context;
+import lower.ownership;
 import support.primitives;
 
 // Converts a temp between primitive value types, matching the reference semantics: integer
@@ -49,6 +55,10 @@ public convert(LoweringContext lowering, long value, Type target, Span span) -> 
         }
     }
     let sourcePayload = primitives.taggedPayloadOf(source);
+    if (targetPayload != null && sourcePayload != null
+            && primitives.optionalDepth(source) == primitives.optionalDepth(target)) {
+        return widenPresent(lowering, value, sourcePayload, target, targetPayload, span);
+    }
     if (sourcePayload != null && primitives.optionalDepth(source) > primitives.optionalDepth(target)) {
         long payload = builder.newTemp(sourcePayload);
         builder.append(new EirOptionalPayload(payload, sourcePayload, value, EirPayloadRead.Move));
@@ -95,4 +105,40 @@ public convert(LoweringContext lowering, long value, Type target, Span span) -> 
     long temp = builder.newTemp(target);
     builder.append(new EirCast(temp, target, op, value));
     return temp;
+}
+
+// A nullable number converted to the nullable number 'target' at the same level of null: the
+// payload converts only where it is present, and an absent value stays absent.
+widenPresent(LoweringContext lowering, long value, Type sourcePayload, Type target,
+             Type targetPayload, Span span) -> long {
+    let builder = lowering.builder();
+    let boolType = lowering.store().primitive(PrimitiveKind.Bool);
+    long slot = ownership.defineJoinSlot(lowering, "widen", target);
+    long present = builder.newTemp(boolType);
+    builder.append(new EirOptionalPresence(present, boolType, value));
+    long presentBlock = builder.newBlock("widen.present");
+    long absentBlock = builder.newBlock("widen.absent");
+    long mergeBlock = builder.newBlock("widen.end");
+    builder.terminate(new EirBranch(present, presentBlock, absentBlock));
+
+    builder.moveTo(presentBlock);
+    long payload = builder.newTemp(sourcePayload);
+    builder.append(new EirOptionalPayload(payload, sourcePayload, value, EirPayloadRead.Move));
+    long converted = convert(lowering, payload, targetPayload, span);
+    if (converted < 0) {
+        return -1;
+    }
+    long wrapped = builder.newTemp(target);
+    builder.append(new EirWrapOptional(wrapped, target, converted));
+    builder.append(new EirStoreSlot(slot, wrapped));
+    builder.terminate(new EirJump(mergeBlock));
+
+    builder.moveTo(absentBlock);
+    long absent = builder.newTemp(target);
+    builder.append(new EirAbsentOptional(absent, target));
+    builder.append(new EirStoreSlot(slot, absent));
+    builder.terminate(new EirJump(mergeBlock));
+
+    builder.moveTo(mergeBlock);
+    return ownership.moveOutOf(lowering, slot, target);
 }

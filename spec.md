@@ -1453,6 +1453,9 @@ long y = x;              // int -> long, automatic
 int n = arr.length;      // error: long -> int, can be forced with `arr.length as int`
 ```
 
+A nullable number widens the same way under each level of null, so an `int?` converts to a `long?` and an `int??` to a `long??`, and a `null` stays `null`.
+Two numbers that meet, as the two results of a `?:` or the two sides of `==`, take the wider type under as many levels of null as either has, so an `int?` beside a `long` gives a `long?`.
+
 Integer literals without a type suffix adapt to the surrounding type when it's an integer that fits the value. With no context they default to `int`. Values out of range produce a specific error.
 Where a nullable type such as `byte?` is expected, a literal adapts to the type without the `?`, so `byte? small = 1;` compiles, and so does `small += 1;` right after it.
 A literal in parentheses adapts the same way as the literal alone.
