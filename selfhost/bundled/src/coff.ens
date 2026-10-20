@@ -1,0 +1,160 @@
+// Import libraries for Windows, written straight from a symbol list: an archive holding one short
+// import member a symbol, the form the linker turns into an entry of the program's import table,
+// and a symbol table naming the member each symbol is in. The archive is in the GNU form, which
+// lld-link reads like Microsoft's own.
+import BytesWriter from @std.io.memory;
+import List from @std.collections.list;
+import Architecture from @ens.target.triple;
+import ListedLibrary from symbols;
+import ExportKind from symbols;
+
+// The library as an import library for the architecture.
+export importLibrary(ListedLibrary library, Architecture architecture) -> byte[] {
+    string dll = library.name();
+    let names = new List<string>();
+    let members = new List<byte[]>();
+    let memberSymbols = new List<string[]>();
+    for (let entry in library.exports()) {
+        members.push(shortImport(entry.name(), dll, entry.kind() == ExportKind.Data,
+            machineOf(architecture)));
+        if (entry.kind() == ExportKind.Data) {
+            memberSymbols.push(["__imp_" + entry.name()]);
+        } else {
+            memberSymbols.push(["__imp_" + entry.name(), entry.name()]);
+        }
+    }
+
+    let longNames = new BytesWriter();
+    longNames.write(dll.toBytes());
+    longNames.write("/\n".toBytes());
+    byte[] longNamesBytes = padded(longNames.toBytes());
+
+    long symbolCount = 0;
+    long namesSize = 0;
+    for (let symbols in memberSymbols) {
+        for (let symbol in symbols) {
+            symbolCount++;
+            namesSize = namesSize + symbol.toBytes().length + 1;
+        }
+    }
+    long tableSize = 4 + 4 * symbolCount + namesSize;
+    long tablePadded = tableSize + tableSize % 2;
+    long at = Archive.magic.length + Archive.headerSize + tablePadded + Archive.headerSize
+        + longNamesBytes.length;
+
+    let offsets = new BytesWriter();
+    let symbolNames = new BytesWriter();
+    for (long i = 0; i < members.length(); i++) {
+        for (let symbol in memberSymbols.get(i)) {
+            offsets.write(bigEndianWord(at));
+            symbolNames.write(symbol.toBytes());
+            symbolNames.write([0]);
+        }
+        at = at + Archive.headerSize + members.get(i).length + members.get(i).length % 2;
+    }
+    let table = new BytesWriter();
+    table.write(bigEndianWord(symbolCount));
+    table.write(offsets.toBytes());
+    table.write(symbolNames.toBytes());
+
+    let out = new BytesWriter();
+    out.write(Archive.magic.toBytes());
+    appendMember(out, "/", table.toBytes());
+    appendMember(out, "//", longNamesBytes);
+    for (let member in members) {
+        appendMember(out, "/0", member);
+    }
+    return out.toBytes();
+}
+
+// The import of one symbol from `dll`: the header that says which machine and kind it is, and
+// the symbol's and the DLL's names after it. The name the DLL exports is the symbol's own.
+shortImport(string symbol, string dll, bool data, long machine) -> byte[] {
+    let out = new BytesWriter();
+    long namesSize = symbol.toBytes().length + 1 + dll.toBytes().length + 1;
+    out.write(half(0));
+    out.write(half(0xffff));
+    out.write(half(0));
+    out.write(half(machine));
+    out.write(word(0));
+    out.write(word(namesSize));
+    out.write(half(0));
+    long kind = 0;
+    if (data) {
+        kind = 1;
+    }
+    out.write(half(kind | (Archive.importByName << 2)));
+    out.write(symbol.toBytes());
+    out.write([0]);
+    out.write(dll.toBytes());
+    out.write([0]);
+    return out.toBytes();
+}
+
+// A member's header and contents, with the byte that keeps the next member on an even offset.
+appendMember(BytesWriter out, string name, byte[] contents) {
+    out.write(field(name, 16));
+    out.write(field("0", 12));
+    out.write(field("0", 6));
+    out.write(field("0", 6));
+    out.write(field("644", 8));
+    out.write(field("{contents.length}", 10));
+    out.write("`\n".toBytes());
+    out.write(contents);
+    if (contents.length % 2 == 1) {
+        out.write("\n".toBytes());
+    }
+}
+
+// `text` padded with spaces to `width`, the way an archive header writes each field.
+field(string text, long width) -> byte[] {
+    byte[] bytes = new byte[width];
+    byte[] written = text.toBytes();
+    for (long i = 0; i < width; i++) {
+        if (i < written.length) {
+            bytes[i] = written[i];
+        } else {
+            bytes[i] = ' ';
+        }
+    }
+    return bytes;
+}
+
+padded(byte[] bytes) -> byte[] {
+    if (bytes.length % 2 == 0) {
+        return bytes;
+    }
+    let out = new BytesWriter();
+    out.write(bytes);
+    out.write("\n".toBytes());
+    return out.toBytes();
+}
+
+machineOf(Architecture architecture) -> long {
+    return switch (architecture) {
+        Architecture.X64 -> 0x8664,
+        Architecture.Arm64 -> 0xaa64,
+    };
+}
+
+half(long value) -> byte[] {
+    return [(value & 0xff) as byte, ((value >> 8) & 0xff) as byte];
+}
+
+word(long value) -> byte[] {
+    return [(value & 0xff) as byte, ((value >> 8) & 0xff) as byte,
+        ((value >> 16) & 0xff) as byte, ((value >> 24) & 0xff) as byte];
+}
+
+bigEndianWord(long value) -> byte[] {
+    return [((value >> 24) & 0xff) as byte, ((value >> 16) & 0xff) as byte,
+        ((value >> 8) & 0xff) as byte, (value & 0xff) as byte];
+}
+
+// The numbers the archive and the import header use.
+final class Archive {
+    protected static const string magic = "!<arch>\n";
+    protected static const long headerSize = 60;
+    // The import is looked up by the symbol's name, written exactly as it is.
+    protected static const long importByName = 1;
+}

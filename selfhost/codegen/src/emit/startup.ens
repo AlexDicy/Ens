@@ -1,11 +1,27 @@
-// The code a Linux program starts at, which hands the arguments and the environment the kernel left
-// on the stack to glibc's __libc_start_main, and with them the program's main. It is the job a C
-// compiler's Scrt1.o does, written here so a Linux program links with no C compiler on the machine.
-// The outermost frame marks its return address as undefined, so a stack walk ends there.
+// The code a program starts at when it does not start through a C compiler's runtime. On Linux it
+// hands the arguments and the environment the kernel left on the stack to glibc's
+// __libc_start_main, and with them the program's main; its outermost frame marks its return
+// address as undefined, so a stack walk ends there. On Windows it reads the command line, hands
+// main the arguments as UTF-8, and ends the program through the C runtime's exit, which flushes
+// the program's streams. It also defines what a Windows program takes from the C compiler's
+// runtime rather than from the system: snprintf, over the system C runtime's
+// __stdio_common_vsprintf; _fltused, which a program that uses floating point refers to; memcpy,
+// memmove, memset and memcmp, over the memory routines kernel32 provides; and __chkstk, which
+// a function with a large frame calls to touch each page of it in turn, so the system grows the
+// stack into it.
 import @ens.llvm.core;
 import @ens.llvm.target;
+import @ens.llvm.globals;
+import @ens.llvm.instructions;
+import @ens.llvm.memory;
+import Builder from @ens.llvm.core;
+import Context from @ens.llvm.core;
+import Module from @ens.llvm.core;
+import TypeRef from @ens.llvm.types;
+import Value from @ens.llvm.values;
 import Architecture from @ens.target.triple;
 import TargetTriple from @ens.target.triple;
+import Platform from @std.platform;
 
 // Writes the startup object for `program` to `objectPath`. Returns "" when it was written, or why
 // it was not.
@@ -19,8 +35,14 @@ export writeStartupObject(TargetTriple program, string objectPath) -> string {
     let context = core.createContext();
     let module = context.createModule("ens.startup");
     module.setTarget(triple);
-    module.setModuleInlineAsm(assemblyFor(program.architecture()));
     let machine = resolved.createTargetMachine(triple, 0);
+    target.setModuleDataLayout(module, machine.createDataLayout());
+    if (program.platform() == Platform.Windows) {
+        defineWindowsStartup(context, module);
+        module.setModuleInlineAsm(stackProbeFor(program.architecture()));
+    } else {
+        module.setModuleInlineAsm(assemblyFor(program.architecture()));
+    }
     string written = machine.emitObjectFile(module, objectPath);
     machine.dispose();
     module.dispose();
@@ -28,8 +50,162 @@ export writeStartupObject(TargetTriple program, string objectPath) -> string {
     return written;
 }
 
-// The entry point, and '_IO_stdin_used', which glibc reads to tell which stdio a program was built
-// against.
+// mainCRTStartup, snprintf, _fltused and the memory routines, for a Windows program.
+defineWindowsStartup(Context context, Module module) {
+    let builder = context.createBuilder();
+    TypeRef int32 = context.int32Type();
+    TypeRef int64 = context.int64Type();
+    TypeRef pointer = context.pointerType();
+    TypeRef nothing = context.voidType();
+
+    let floatingPointUsed = globals.addGlobal(module, int32, "_fltused");
+    globals.setInitializer(floatingPointUsed, int32.constInt(0x9875, false));
+
+    let commandLineType = pointer.functionType([]);
+    let commandLine = module.addFunction("GetCommandLineW", commandLineType);
+    let splitType = pointer.functionType([pointer, pointer]);
+    let split = module.addFunction("CommandLineToArgvW", splitType);
+    let narrowType = int32.functionType([int32, int32, pointer, int32, pointer, int32, pointer,
+        pointer]);
+    let narrow = module.addFunction("WideCharToMultiByte", narrowType);
+    let allocateType = pointer.functionType([int64]);
+    let allocate = module.addFunction("malloc", allocateType);
+    let exitType = nothing.functionType([int32]);
+    let exit = module.addFunction("exit", exitType);
+    let mainType = int32.functionType([int32, pointer]);
+    let main = module.addFunction("main", mainType);
+
+    let start = module.addFunction("mainCRTStartup", nothing.functionType([]));
+    builder.positionAtEnd(context.appendBasicBlock(start, "entry"));
+    let line = instructions.buildCall(builder, commandLineType, commandLine, [], "line");
+    let countSlot = memory.buildAlloca(builder, int32, "count.slot");
+    let wide = instructions.buildCall(builder, splitType, split, [line, countSlot], "wide");
+    let count = memory.buildLoad(builder, int32, countSlot, "count");
+    let count64 = instructions.buildSExt(builder, count, int64, "count64");
+    let bytes = instructions.buildMul(builder,
+        instructions.buildAdd(builder, count64, int64.constInt(1, false), ""),
+        int64.constInt(8, false), "bytes");
+    let arguments = instructions.buildCall(builder, allocateType, allocate, [bytes], "argv");
+    let index = memory.buildAlloca(builder, int64, "i");
+    memory.buildStore(builder, int64.constInt(0, false), index);
+    let test = context.appendBasicBlock(start, "test");
+    let body = context.appendBasicBlock(start, "body");
+    let done = context.appendBasicBlock(start, "done");
+    instructions.buildBr(builder, test);
+
+    builder.positionAtEnd(test);
+    let position = memory.buildLoad(builder, int64, index, "i.cur");
+    instructions.buildCondBr(builder, instructions.buildICmpSLT(builder, position, count64, ""),
+        body, done);
+
+    builder.positionAtEnd(body);
+    let argument = memory.buildLoad(builder, pointer,
+        memory.buildGEP(builder, pointer, wide, [position], ""), "wide.i");
+    Value utf8 = int32.constInt(65001, false);
+    Value zero = int32.constInt(0, false);
+    Value wholeString = int32.constInt(-1 as ulong, true);
+    let needed = instructions.buildCall(builder, narrowType, narrow,
+        [utf8, zero, argument, wholeString, pointer.constNull(), zero, pointer.constNull(),
+            pointer.constNull()], "needed");
+    let converted = instructions.buildCall(builder, allocateType, allocate,
+        [instructions.buildSExt(builder, needed, int64, "")], "utf8");
+    instructions.buildCall(builder, narrowType, narrow,
+        [utf8, zero, argument, wholeString, converted, needed, pointer.constNull(),
+            pointer.constNull()], "");
+    memory.buildStore(builder, converted,
+        memory.buildGEP(builder, pointer, arguments, [position], ""));
+    memory.buildStore(builder,
+        instructions.buildAdd(builder, position, int64.constInt(1, false), ""), index);
+    instructions.buildBr(builder, test);
+
+    builder.positionAtEnd(done);
+    memory.buildStore(builder, pointer.constNull(),
+        memory.buildGEP(builder, pointer, arguments, [count64], ""));
+    let code = instructions.buildCall(builder, mainType, main, [count, arguments], "code");
+    instructions.buildCall(builder, exitType, exit, [code], "");
+    instructions.buildUnreachable(builder);
+
+    // _CRT_INTERNAL_PRINTF_STANDARD_SNPRINTF_BEHAVIOR: return the length the whole text needs and
+    // end what fits with a zero byte, as C's snprintf does.
+    Value standardBehavior = int64.constInt(2, false);
+    let formatType = int32.functionType([int64, pointer, int64, pointer, pointer, pointer]);
+    let format = module.addFunction("__stdio_common_vsprintf", formatType);
+    let listType = nothing.functionType([pointer]);
+    let listStart = module.addFunction("llvm.va_start.p0", listType);
+    let listEnd = module.addFunction("llvm.va_end.p0", listType);
+    let print = module.addFunction("snprintf", int32.variadicFunctionType([pointer, int64,
+        pointer]));
+    builder.positionAtEnd(context.appendBasicBlock(print, "entry"));
+    let list = memory.buildAlloca(builder, pointer, "list");
+    instructions.buildCall(builder, listType, listStart, [list], "");
+    let written = instructions.buildCall(builder, formatType, format,
+        [standardBehavior, globals.getParam(print, 0), globals.getParam(print, 1),
+            globals.getParam(print, 2), pointer.constNull(),
+            memory.buildLoad(builder, pointer, list, "arguments")], "written");
+    instructions.buildCall(builder, listType, listEnd, [list], "");
+    instructions.buildRet(builder, written);
+
+    defineMemoryRoutines(context, module, builder);
+    builder.dispose();
+}
+
+// memcpy, memmove, memset and memcmp over kernel32's RtlCopyMemory, RtlMoveMemory, RtlFillMemory
+// and RtlCompareMemory, which take the same arguments in Windows's own order and, for the copies,
+// return nothing. RtlCompareMemory returns how many bytes match from the start, so memcmp
+// compares the first byte that differs when fewer match than were compared.
+defineMemoryRoutines(Context context, Module module, Builder builder) {
+    TypeRef int8 = context.int8Type();
+    TypeRef int32 = context.int32Type();
+    TypeRef int64 = context.int64Type();
+    TypeRef pointer = context.pointerType();
+    TypeRef nothing = context.voidType();
+    let copyType = nothing.functionType([pointer, pointer, int64]);
+    let routineType = pointer.functionType([pointer, pointer, int64]);
+    for (let names in [["memcpy", "RtlCopyMemory"], ["memmove", "RtlMoveMemory"]]) {
+        let system = module.addFunction(names[1], copyType);
+        let routine = module.addFunction(names[0], routineType);
+        builder.positionAtEnd(context.appendBasicBlock(routine, "entry"));
+        instructions.buildCall(builder, copyType, system, [globals.getParam(routine, 0),
+            globals.getParam(routine, 1), globals.getParam(routine, 2)], "");
+        instructions.buildRet(builder, globals.getParam(routine, 0));
+    }
+
+    let fillType = nothing.functionType([pointer, int64, int8]);
+    let fill = module.addFunction("RtlFillMemory", fillType);
+    let set = module.addFunction("memset", pointer.functionType([pointer, int32, int64]));
+    builder.positionAtEnd(context.appendBasicBlock(set, "entry"));
+    instructions.buildCall(builder, fillType, fill, [globals.getParam(set, 0),
+        globals.getParam(set, 2),
+        instructions.buildTrunc(builder, globals.getParam(set, 1), int8, "value")], "");
+    instructions.buildRet(builder, globals.getParam(set, 0));
+
+    let matchType = int64.functionType([pointer, pointer, int64]);
+    let match = module.addFunction("RtlCompareMemory", matchType);
+    let compare = module.addFunction("memcmp", int32.functionType([pointer, pointer, int64]));
+    builder.positionAtEnd(context.appendBasicBlock(compare, "entry"));
+    Value first = globals.getParam(compare, 0);
+    Value second = globals.getParam(compare, 1);
+    Value length = globals.getParam(compare, 2);
+    let matched = instructions.buildCall(builder, matchType, match, [first, second, length],
+        "matched");
+    let same = context.appendBasicBlock(compare, "same");
+    let differ = context.appendBasicBlock(compare, "differ");
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, matched, length, ""),
+        same, differ);
+    builder.positionAtEnd(same);
+    instructions.buildRet(builder, int32.constInt(0, false));
+    builder.positionAtEnd(differ);
+    let firstByte = memory.buildLoad(builder, int8,
+        memory.buildGEP(builder, int8, first, [matched], ""), "first.byte");
+    let secondByte = memory.buildLoad(builder, int8,
+        memory.buildGEP(builder, int8, second, [matched], ""), "second.byte");
+    instructions.buildRet(builder, instructions.buildSub(builder,
+        instructions.buildZExt(builder, firstByte, int32, ""),
+        instructions.buildZExt(builder, secondByte, int32, ""), "difference"));
+}
+
+// A Linux program's entry point, and '_IO_stdin_used', which glibc reads to tell which stdio a
+// program was built against.
 export assemblyFor(Architecture architecture) -> string {
     return switch (architecture) {
         Architecture.X64 -> "\t.text\n"
@@ -88,4 +264,45 @@ stdinUsed(string marker) -> string {
         + "_IO_stdin_used:\n"
         + "\t.long 0x20001\n"
         + "\t.size _IO_stdin_used, 4\n";
+}
+
+// __chkstk for a Windows program, as LLVM's compiler-rt writes it: the frame's size arrives in
+// rax on x64 and, counted in 16-byte units, in x15 on arm64, and each page below the stack
+// pointer is read in turn without moving it. On x64 every register but the two it saves is left
+// as it was, which is what the caller relies on.
+export stackProbeFor(Architecture architecture) -> string {
+    return switch (architecture) {
+        Architecture.X64 -> "\t.text\n"
+            + "\t.globl __chkstk\n"
+            + "__chkstk:\n"
+            + "\tpushq %rcx\n"
+            + "\tpushq %rax\n"
+            + "\tcmpq $0x1000, %rax\n"
+            + "\tleaq 24(%rsp), %rcx\n"
+            + "\tjb 1f\n"
+            + "2:\n"
+            + "\tsubq $0x1000, %rcx\n"
+            + "\ttestq %rcx, (%rcx)\n"
+            + "\tsubq $0x1000, %rax\n"
+            + "\tcmpq $0x1000, %rax\n"
+            + "\tja 2b\n"
+            + "1:\n"
+            + "\tsubq %rax, %rcx\n"
+            + "\ttestq %rcx, (%rcx)\n"
+            + "\tpopq %rax\n"
+            + "\tpopq %rcx\n"
+            + "\tretq\n",
+        Architecture.Arm64 -> "\t.text\n"
+            + "\t.globl __chkstk\n"
+            + "\t.p2align 2\n"
+            + "__chkstk:\n"
+            + "\tlsl x16, x15, #4\n"
+            + "\tmov x17, sp\n"
+            + "1:\n"
+            + "\tsub x17, x17, #4096\n"
+            + "\tsubs x16, x16, #4096\n"
+            + "\tldr xzr, [x17]\n"
+            + "\tb.gt 1b\n"
+            + "\tret\n",
+    };
 }

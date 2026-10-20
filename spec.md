@@ -893,6 +893,8 @@ For a Linux target, `ens` links glibc's C library, maths library and loader, and
 A Linux program built this way runs on any system with glibc 2.34 or later.
 `pthread`, `dl`, `rt`, `util` and `anl`, which glibc 2.34 folded into its C library, and `c`, `m` and `gcc_s` are already among those libraries, so naming one for Linux adds nothing to the link.
 Any other native library a Linux program links is looked for in the folders `LIBRARY_PATH` names and, when the program is built for the machine building it, in the folders that machine's distribution keeps its libraries in.
+For a Windows target, a program that names no native library beyond the system's own links `kernel32`, `shell32` and the C runtime Windows ships with the system from lists `ens` carries of what each provides, and starts with code of its own, so the build needs no Visual Studio and no Windows SDK on the machine, and any machine can build for Windows.
+A Windows program that links any other native library links the way that library was built, with Visual Studio's static C runtime from the folders `LIB` names, because that library was compiled against it.
 `native zlib;` links the library under its conventional platform name.
 The block form spells out base names per platform (`windows`, `linux`, `macos`), several per platform when needed.
 A platform may instead bind a prebuilt artifact: `windows artifact "https://example.com/z.lib" hash "sha256:...";` downloads the file once into the cache, verifies it against the declared sha256 hash (a mismatch fails the build), and passes it to the linker.

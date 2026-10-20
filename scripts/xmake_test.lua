@@ -398,6 +398,16 @@ task("test")
             })
         end
 
+        -- a Windows program linked on whatever machine this is, for both Windows targets, through
+        -- only the files ens carries: which DLLs it imports from, read back from the file, and on
+        -- a Windows machine of the same processor, what it prints when it runs.
+        if want("windows_link") then
+            table.insert(jobs, {
+                name = "windows_link",
+                windows_link = true,
+            })
+        end
+
         -- the Ens-written command's own behavior: its help, the argv it refuses, each optimization
         -- level, a library against an application, the order a workspace's members build in, and a
         -- workspace whose members disagree on the Ens version.
@@ -1240,6 +1250,75 @@ task("test")
             return {name = name, ok = true}
         end
 
+        local function run_windows_link(job)
+            local name = job.name
+            local log = path.join(out_dir, name .. ".log")
+            local root = path.join(os.projectdir(), "build", "windowslink")
+            os.tryrm(root)
+            os.mkdir(root)
+            local readobj = os.files(path.join(global.directory(), "packages", "l", "llvm", "*",
+                "*", "bin", "llvm-readobj" .. exe_suffix))[1]
+            if not readobj then
+                return {name = name, ok = false, short = "no llvm-readobj in the LLVM package"}
+            end
+            local failures = {}
+            local targets = {
+                {triple = "x86_64-pc-windows-msvc", processor = "x64"},
+                {triple = "aarch64-pc-windows-msvc", processor = "arm64"},
+            }
+            local programs = {
+                {fixture = "hello", rc = 0, stdout = "Hello, world!", stderr = ""},
+                {fixture = "exc_main_unhandled", rc = 1, stdout = "",
+                    stderr = "at main (exc_main_unhandled.ens:10)"},
+            }
+            -- the DLLs every Windows has: the system's own, and the C runtime it ships with
+            local function systemDll(dll)
+                local lower = dll:lower()
+                return lower == "kernel32.dll" or lower == "shell32.dll"
+                    or lower:startswith("api-ms-win-crt-")
+            end
+            for _, target in ipairs(targets) do
+                for _, program in ipairs(programs) do
+                    local exe = path.join(root, program.fixture .. "-" .. target.processor .. ".exe")
+                    local label = program.fixture .. " for " .. target.triple
+                    local rc = execMerged(host_exe, {"build",
+                        path.join(tests_dir, program.fixture .. ".ens"), "--target", target.triple,
+                        "--output", exe}, log)
+                    if rc ~= 0 then
+                        table.insert(failures, string.format("%s did not build:\n%s", label,
+                            captured(log)))
+                    else
+                        execMerged(readobj, {"--coff-imports", exe}, log)
+                        for line in captured(log):gmatch("[^\r\n]+") do
+                            local dll = line:match("^%s*Name:%s*(.+)$")
+                            if dll and not systemDll(dll) then
+                                table.insert(failures, string.format("%s imports from '%s'",
+                                    label, dll))
+                            end
+                        end
+                        if is_host("windows") and os.arch() == target.processor then
+                            local stdout_file = path.join(root, program.fixture .. ".out")
+                            local stderr_file = path.join(root, program.fixture .. ".err")
+                            local ran = execSplit(exe, {}, stdout_file, stderr_file)
+                            local printed = captured(stdout_file):gsub("\r\n", "\n")
+                            local reported = captured(stderr_file)
+                            if ran ~= program.rc or printed ~= program.stdout
+                                    or not reported:find(program.stderr, 1, true) then
+                                table.insert(failures, string.format("%s exited %s, printing "
+                                    .. "%q and reporting %q", label, tostring(ran), printed,
+                                    reported))
+                            end
+                        end
+                    end
+                end
+            end
+            if #failures > 0 then
+                return {name = name, ok = false, short = failures[1]:match("^[^\n]*"),
+                    full = name .. ": " .. table.concat(failures, "\n")}
+            end
+            return {name = name, ok = true}
+        end
+
         local function run_standalone(job)
             local name = job.name
             local log = path.join(out_dir, name .. ".log")
@@ -1735,18 +1814,20 @@ task("test")
                 .. "the path is a file, not a directory. Set 'ENS_CACHE' to a folder that can be "
                 .. "written to, or pass '--stdlib <folder>' naming the folder that contains 'std/'",
                 "!problem")
-            -- an arm64 macOS program links against the libSystem ens carries, which goes into the
-            -- cache too, so a cache that cannot be written stops the link and says why
-            if is_host("macosx") and os.arch() == "arm64" then
+            -- a program for this machine links against the system libraries ens carries, which
+            -- go into the cache too, so a cache that cannot be written stops the link and says why
+            local system = is_host("windows") and "Windows" or is_host("linux") and "Linux"
+                or os.arch() == "arm64" and "macOS" or nil
+            if system then
                 local linking_env = {}
                 for key, value in pairs(env) do linking_env[key] = value end
                 linking_env.ENS_CACHE = blocked_cache
                 run({"build", hello_file, "--output", path.join(root, "blocked" .. exe_suffix)},
-                    {envs = linking_env}, 1, "a macOS program is linked against lists of what "
-                    .. "macOS's system libraries provide, which ens writes into its cache, and the "
-                    .. "lists could not be put there: could not create the directory '",
-                    "': something in the path is a file, not a directory. Set 'ENS_CACHE' to a "
-                    .. "folder that can be written to")
+                    {envs = linking_env}, 1, "a " .. system .. " program is linked against lists "
+                    .. "of what " .. system .. "'s system libraries provide, which ens writes into "
+                    .. "its cache, and the lists could not be put there: could not create the "
+                    .. "directory '", "': something in the path is a file, not a directory. Set "
+                    .. "'ENS_CACHE' to a folder that can be written to")
             end
             carried_env.ENS_CACHE = ""
             carried_env.HOME = ""
@@ -3490,6 +3571,7 @@ task("test")
             if job.semacheck then return run_semacheck(job) end
             if job.standalone then return run_standalone(job) end
             if job.linux_link then return run_linux_link(job) end
+            if job.windows_link then return run_windows_link(job) end
             if job.cli_build then return run_cli_build(job) end
             if job.cli_runtest then return run_cli_runtest(job) end
             if job.cli_toolchain then return run_cli_toolchain(job) end
