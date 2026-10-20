@@ -26,12 +26,6 @@ LLD_HAS_DRIVER(coff)
 LLD_HAS_DRIVER(elf)
 LLD_HAS_DRIVER(macho)
 
-#if defined(_WIN32)
-#define ENS_LLD_EXPORT __declspec(dllexport)
-#else
-#define ENS_LLD_EXPORT __attribute__((visibility("default")))
-#endif
-
 namespace {
 
 constexpr int kFlavorCoff = 0;
@@ -177,9 +171,8 @@ extern "C" {
 // printed, or stays null when it printed nothing; a null `output` is accepted and drops the text.
 // Returns 0 when the executable was written, 1 when the linker refused or gave up on the link, and
 // 2 when the request itself was unusable.
-ENS_LLD_EXPORT int ens_lld_link_program(int flavor, const char* argumentBlock,
-                                        long long argumentCount, const char* program,
-                                        char** output) {
+int ens_lld_link_program(int flavor, const char* argumentBlock, long long argumentCount,
+                         const char* program, char** output) {
     if (output != nullptr) *output = nullptr;
     if (argumentBlock == nullptr || argumentCount <= 0) {
         if (output != nullptr) {
@@ -215,7 +208,7 @@ ENS_LLD_EXPORT int ens_lld_link_program(int flavor, const char* argumentBlock,
 
 // Releases a text ens_lld_link_program handed back, so ownership stays with the allocator that
 // made it.
-ENS_LLD_EXPORT void ens_lld_free(char* output) {
+void ens_lld_free(char* output) {
     std::free(output);
 }
 
@@ -229,7 +222,7 @@ ENS_LLD_EXPORT void ens_lld_free(char* output) {
 // crashes on Windows due to a race condition between thread creation and process exit." Stopping it
 // here, while every thread is still alive, is what lets the pool's destructor at process exit return
 // at once instead of waiting on threads Windows has already ended.
-ENS_LLD_EXPORT void ens_lld_shutdown() {
+void ens_lld_shutdown() {
     llvm::llvm_shutdown();
 }
 
