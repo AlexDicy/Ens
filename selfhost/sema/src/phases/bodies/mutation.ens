@@ -291,9 +291,11 @@ public refuseUnmarkedWrite(BodyChecker checker, Expression target, Span at) -> b
 
 // Refuses a call to the 'mutating' method 'method' on 'receiver' where the change could not land:
 // a constant, a struct a lambda captured, the variable of a for-each loop, 'this' in a method that
-// is not 'mutating', or a value with no storage of its own. A class object or an interface value
-// changes through its reference instead, so a call on one is never refused.
-public checkMutatingCall(BodyChecker checker, Expression receiver, Method method, Span at) {
+// is not 'mutating', or a value with no storage of its own, or part of one. A class object or an
+// interface value changes through its reference instead, so a call on one is never refused. 'safe'
+// says the call is written with '?.'.
+public checkMutatingCall(BodyChecker checker, Expression receiver, Method method, Span at,
+                         bool safe) {
     if (!method.isMutating()) {
         return;
     }
@@ -308,11 +310,8 @@ public checkMutatingCall(BodyChecker checker, Expression receiver, Method method
     let root = placeRoot(checker, receiver);
     if (root == null) {
         if (!assignments.isLValue(checker, receiver)) {
-            string local = nullguidance.freeLocalName(checker, "", "value");
-            checker.reporter().report("{opening}, because '{spelled}' is not a variable, a field or an "
-                + "array element. '{name}' is 'mutating', which marks a method that changes the struct "
-                + "it is called on, so the change would be lost. Store the value in a local first, as "
-                + "in 'let {local} = {spelled};', and call '{name}' on the local.", at);
+            checker.reporter().report(unstoredCallRefusal(checker, opening, method, receiver, spelled,
+                safe), at);
         }
         return;
     }
@@ -360,6 +359,71 @@ public checkMutatingCall(BodyChecker checker, Expression receiver, Method method
             }
         },
     }
+}
+
+// The struct value the field 'access' reads is part of, or null where the field is read through '.'
+// or '?.' on anything else, such as an object.
+structHolding(BodyChecker checker, Expression access) -> Expression? {
+    let step = nullguidance.accessStep(access);
+    if (step == null || step.member() == null) {
+        return null;
+    }
+    let holderType = checker.result().typeOf(step.receiver().green());
+    if (holderType == null || !changesWithItsValue(convert.coreOf(holderType))) {
+        return null;
+    }
+    return syntax.unwrapParentheses(step.receiver());
+}
+
+// The refusal of 'method' on 'receiver', spelled 'spelled', which no storage holds: a value an
+// expression produces, or a field of one. The fix stores that value in a local and calls the
+// method through the local, with '?.' where 'safe' says the call is written with it.
+unstoredCallRefusal(BodyChecker checker, string opening, Method method, Expression receiver,
+                    string spelled, bool safe) -> string {
+    string name = method.name();
+    string local = nullguidance.freeLocalName(checker, "", "value");
+    string lost = "'{name}' is 'mutating', which marks a method that changes the struct it is called "
+        + "on, so the change would be lost.";
+    Expression produced = syntax.unwrapParentheses(receiver);
+    let holder = structHolding(checker, produced);
+    if (holder == null) {
+        string call = "call '{name}' on the local";
+        if (safe) {
+            call = "{call}, as in '{callStatement(method, "{local}?.")}'";
+        }
+        return "{opening}, because '{spelled}' is not a variable, a field or an array element. {lost} "
+            + "Store the value in a local first, as in 'let {local} = {spelled};', and {call}.";
+    }
+    while (holder != null) {
+        produced = holder;
+        holder = structHolding(checker, produced);
+    }
+    string value = wording.oneLineSpelling(produced);
+    return "{opening}, because it is part of '{value}', which is not a variable, a field or an array "
+        + "element. {lost} A struct's fields are part of its value. Store '{value}' in a local first, "
+        + "as in 'let {local} = {value};', and call '{name}' on "
+        + "'{local}{fieldPath(receiver, produced)}'.";
+}
+
+// The field accesses that lead from 'outer' down to 'receiver', written as they are after 'outer',
+// as in '.inner' or '?.inner.count'. Each step from 'receiver' up to 'outer' reads a field.
+fieldPath(Expression receiver, Expression outer) -> string {
+    string path = "";
+    Expression current = syntax.unwrapParentheses(receiver);
+    Span end = syntax.unwrapParentheses(outer).span();
+    while (current.span() != end) {
+        let step = nullguidance.accessStep(current);
+        if (step == null) {
+            return path;
+        }
+        string operator = ".";
+        if (step.safe()) {
+            operator = "?.";
+        }
+        path = "{operator}{step.member() ?? ""}{path}";
+        current = syntax.unwrapParentheses(step.receiver());
+    }
+    return path;
 }
 
 capturedCallRefusal(string opening, string gloss, LocalBinding binding) -> string {
@@ -414,16 +478,21 @@ lazyCallRefusal(BodyChecker checker, string opening, string gloss, MemberExpress
         parts = " A struct's fields are part of its value.";
         if (spelled.startsWith(constant)) {
             string path = spelled.substring(constant.length);
-            string call = "{local}{path}.{method.name()}{callArguments(method)};";
-            if (method.signature().declaresThrows()) {
-                call = "try {call}";
-            }
-            copy = "{copy} and then '{call}'";
+            copy = "{copy} and then '{callStatement(method, "{local}{path}.")}'";
         }
     }
     return "{opening}, because {reason}. {gloss}{parts} A lazy const keeps the value its initializer "
         + "gives it. Change the initializer, or copy the value into a variable and call '{method.name()}' "
         + "on the copy, as in {copy}.";
+}
+
+// A call to 'method' as a statement in an example, after 'receiver', which ends in '.' or '?.'.
+callStatement(Method method, string receiver) -> string {
+    string call = "{receiver}{method.name()}{callArguments(method)};";
+    if (method.signature().declaresThrows()) {
+        return "try {call}";
+    }
+    return call;
 }
 
 // How a call to 'method' writes its arguments in an example: '()' when it takes none, '(...)' else.
