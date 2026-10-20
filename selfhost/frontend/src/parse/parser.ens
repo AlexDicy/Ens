@@ -180,7 +180,7 @@ public struct ParserMark {
     protected long depthLimitCount;
     protected long roomRefusalCount;
     protected long recoveryCount;
-    protected bool limitReported;
+    protected long limitReportScope;
     protected long closedAtHeader;
     protected long missingReportedAt;
     protected string missingReportedMessage;
@@ -222,9 +222,12 @@ public final class Parser {
     List<Diagnostic> carriedDepthLimits;
     // How many constructs refuseWithoutRoom has refused.
     long roomRefusals;
-    // True once the construct under way at the limit has reported reaching it, so the other slots
-    // of that construct that reach it too report nothing more.
-    bool limitReported;
+    // How many limit scopes are open: declarations, members, statements and call arguments, the
+    // places whose code can be split out on its own. The limit is reported once in each innermost
+    // scope, so the other places in it that reach the limit report nothing. limitReportScope is how
+    // many scopes were open at the last report, or -1 once the parser has left that scope.
+    long openLimitScopes;
+    long limitReportScope;
     // How many blocks are open around the statement being parsed, and the token a block was last
     // closed at for a declaration header, so the blocks around it that close there report nothing.
     long openBlocks;
@@ -259,7 +262,8 @@ public final class Parser {
         this.depthLimits = new RewindableList<Diagnostic>();
         this.carriedDepthLimits = new List<Diagnostic>();
         this.roomRefusals = 0;
-        this.limitReported = false;
+        this.openLimitScopes = 0;
+        this.limitReportScope = -1;
         this.parsingArmLabels = false;
         this.openBlocks = 0;
         this.closedAtHeader = -1;
@@ -329,7 +333,9 @@ public final class Parser {
         let marker = this.start();
         let items = this.start();
         while (!this.atEnd()) {
+            this.enterLimitScope();
             declarations.parseTopLevelItem(this);
+            this.leaveLimitScope();
         }
         this.complete(items, SyntaxKind.List);
         this.emitEndOfFile();
@@ -676,7 +682,7 @@ public final class Parser {
             depthLimitCount: this.depthLimits.count(),
             roomRefusalCount: this.roomRefusals,
             recoveryCount: this.recoveries.count(),
-            limitReported: this.limitReported,
+            limitReportScope: this.limitReportScope,
             closedAtHeader: this.closedAtHeader,
             missingReportedAt: this.missingReportedAt,
             missingReportedMessage: this.missingReportedMessage,
@@ -695,7 +701,7 @@ public final class Parser {
         this.depthLimits.truncate(restore.depthLimitCount);
         this.roomRefusals = restore.roomRefusalCount;
         this.recoveries.truncate(restore.recoveryCount);
-        this.limitReported = restore.limitReported;
+        this.limitReportScope = restore.limitReportScope;
         this.closedAtHeader = restore.closedAtHeader;
         this.missingReportedAt = restore.missingReportedAt;
         this.missingReportedMessage = restore.missingReportedMessage;
@@ -932,23 +938,26 @@ public final class Parser {
             return false;
         }
         this.nestingDepth++;
-        this.endLimitReport();
         return true;
     }
 
-    // Reports reaching the limit unless the construct under way already reported it. Nesting that
-    // drops more than one level below the limit ends that construct, as endLimitReport records.
+    // Reports reaching the limit unless a place in the same innermost limit scope already did.
     public reportLimitOnce(string message, Span span) {
-        if (this.limitReported) {
+        if (this.limitReportScope != -1) {
             return;
         }
         this.reportDepthLimit(message, span);
-        this.limitReported = true;
+        this.limitReportScope = this.openLimitScopes;
     }
 
-    endLimitReport() {
-        if (this.nestingDepth < Nesting.maximumDepth - 1) {
-            this.limitReported = false;
+    public enterLimitScope() {
+        this.openLimitScopes++;
+    }
+
+    public leaveLimitScope() {
+        this.openLimitScopes--;
+        if (this.openLimitScopes < this.limitReportScope) {
+            this.limitReportScope = -1;
         }
     }
 
@@ -971,14 +980,12 @@ public final class Parser {
     // Gives back the level enterNesting took.
     public leaveNesting() {
         this.nestingDepth--;
-        this.endLimitReport();
     }
 
     // Gives back the levels one construct took together: a chain of operators is one expression,
     // so its links are entered one at a time and left in a single step when it finishes.
     public leaveNestingTimes(long count) {
         this.nestingDepth = this.nestingDepth - count;
-        this.endLimitReport();
     }
 
     // A node standing in for a construct the parser abandoned, holding that construct's tokens.
