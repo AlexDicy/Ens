@@ -1,0 +1,82 @@
+# Rewrites the symbol lists ens links a program's system libraries against, on each platform they
+# are read from, and opens one pull request with whatever changed. Dispatch only: a list changes
+# when a platform's SDK or libraries do, which somebody decides to pick up.
+#
+# Each host runs scripts/refresh_system_symbols.lua, the same command a maintainer runs by hand on
+# that platform, so nobody needs a machine of every kind to refresh them all.
+name: refresh-system-symbols
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: refresh-system-symbols
+  cancel-in-progress: false
+
+jobs:
+  read:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { os: macos-latest, host: macos }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: latest
+      - name: Read the lists
+        run: xmake l scripts/refresh_system_symbols.lua
+      - uses: actions/upload-artifact@v4
+        with:
+          name: symbols-${{ matrix.host }}
+          path: selfhost/bundled/symbols/*.symbols
+          if-no-files-found: error
+
+  pull-request:
+    needs: read
+    runs-on: ubuntu-latest
+    steps:
+      # the checkout keeps the token the branch is pushed with, which has to be one other workflows
+      # run for, so the suite runs on the pull request.
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.SEED_PR_TOKEN || github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: selfhost/bundled/symbols
+          merge-multiple: true
+
+      - name: Open the pull request that updates the lists
+        env:
+          GH_TOKEN: ${{ secrets.SEED_PR_TOKEN || github.token }}
+        run: |
+          if git diff --quiet -- selfhost/bundled/symbols; then
+            echo "Every list is already what the platforms provide."
+            exit 0
+          fi
+          git diff --stat -- selfhost/bundled/symbols
+          branch="refresh-system-symbols/${{ github.run_id }}"
+          title="Refresh the system symbol lists"
+          git switch -c "$branch"
+          git add selfhost/bundled/symbols
+          git -c user.name="${{ github.actor }}" \
+            -c user.email="${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com" \
+            commit -m "$title"
+          git push origin "$branch"
+          sdks="$(grep -h '^# What' selfhost/bundled/symbols/*.symbols | sed 's/^# /- /')"
+          body="$(cat <<EOF
+          This pull request rewrites the system symbol lists from the platforms' own libraries, with \`scripts/refresh_system_symbols.lua\` run on each host:
+
+          $sdks
+
+          The lists decide what a program can link against on each target, so check the removals in the diff before merging.
+          EOF
+          )"
+          gh pr create --base "${{ github.ref_name }}" --head "$branch" --title "$title" \
+            --body "$body"
