@@ -1430,28 +1430,37 @@ final class NarrowingTrace {
     }
 }
 
-// What reaches the ends of one pass through the loop being walked: the names of the locals and parameters
-// its condition writes, and where 'joins' says what holds after the loop can differ from where it starts,
-// what holds where it starts, where its condition is tested false, null where it never is, at each back
-// edge to its start and at each 'break'. A 'for' loop's update runs from what holds at the end of the body
-// and at each 'continue', and 'updateReached' says a pass reaches it.
+// What reaches the ends of one pass through the loop being walked. Where what holds after the loop can
+// differ from where it starts, 'exits' gathers the ways out of the loop and its back edges, and is null
+// anywhere else. A 'for' loop's update runs from what holds at the end of the body and at each 'continue',
+// and 'updateReached' says a pass reaches it. What holds at a 'continue' is kept where 'keepsContinues'
+// says an update or a back edge reads it.
 public final class LoopFlow {
+    protected LoopExits? exits;
+    protected bool keepsContinues;
+    protected List<BranchNarrowings>? continues;
+    protected bool updateReached;
+
+    protected constructor(this.exits, this.keepsContinues) {
+        this.continues = null;
+        this.updateReached = false;
+    }
+}
+
+// The ways out of one pass through a loop and its back edges: the names of the locals and parameters its
+// condition writes, what holds where the pass starts, where its condition is tested false, null where it
+// never is, at each back edge to its start and at each 'break'.
+final class LoopExits {
     protected Set<string> conditionWrites;
-    protected bool joins;
     protected Map<NarrowingPath, Type> entry;
     protected BranchNarrowings? exit;
     protected List<BranchNarrowings> backEdges;
-    protected List<BranchNarrowings> continues;
     protected List<BranchNarrowings> breaks;
-    protected bool updateReached;
 
-    protected constructor(this.conditionWrites, this.joins) {
-        this.entry = new Map<NarrowingPath, Type>();
+    protected constructor(this.conditionWrites, this.entry) {
         this.exit = null;
         this.backEdges = new List<BranchNarrowings>();
-        this.continues = new List<BranchNarrowings>();
         this.breaks = new List<BranchNarrowings>();
-        this.updateReached = false;
     }
 }
 
@@ -1472,9 +1481,9 @@ public noteLoopCondition(BodyChecker checker, bool alwaysHolds) {
     if (flows.isEmpty()) {
         return;
     }
-    let flow = flows.get(flows.length() - 1);
-    if (flow.joins && !alwaysHolds) {
-        flow.exit = branchNarrowings(checker);
+    let exits = flows.get(flows.length() - 1).exits;
+    if (exits != null && !alwaysHolds) {
+        exits.exit = branchNarrowings(checker);
     }
 }
 
@@ -1485,12 +1494,15 @@ public noteLoopExit(BodyChecker checker, bool leaves) {
     if (flow == null || checker.assignment().terminated()) {
         return;
     }
+    let exits = flow.exits;
     if (leaves) {
-        if (flow.joins) {
-            flow.breaks.push(branchNarrowings(checker));
+        if (exits != null) {
+            exits.breaks.push(branchNarrowings(checker));
         }
-    } else {
-        flow.continues.push(branchNarrowings(checker));
+    } else if (flow.keepsContinues) {
+        let continues = flow.continues ?? new List<BranchNarrowings>();
+        continues.push(branchNarrowings(checker));
+        flow.continues = continues;
     }
 }
 
@@ -1508,16 +1520,21 @@ public walkLoopBody(BodyChecker checker, BlockNode body, List<NarrowingFact> fac
 // edges of the pass.
 public endPass(BodyChecker checker) {
     let flow = currentFlow(checker);
-    if (flow != null && flow.joins) {
-        flow.backEdges = passEnds(checker, flow);
+    let exits = flow?.exits;
+    if (flow != null && exits != null) {
+        exits.backEdges = passEnds(checker, flow);
     }
 }
 
 // Joins what holds at the end of the body of the 'for' loop being walked and at each 'continue', which is
-// where its update runs from.
+// where its update runs from. Without a 'continue', what holds at the end of the body holds there.
 public joinPassEnds(BodyChecker checker) {
     let flow = currentFlow(checker);
     if (flow == null) {
+        return;
+    }
+    if (flow.continues == null) {
+        flow.updateReached = !checker.assignment().terminated();
         return;
     }
     let ends = passEnds(checker, flow);
@@ -1530,8 +1547,9 @@ public joinPassEnds(BodyChecker checker) {
 // a pass reaches the update and, as 'neverReturns' says, the update returns.
 public endUpdate(BodyChecker checker, bool neverReturns) {
     let flow = currentFlow(checker);
-    if (flow != null && flow.joins && flow.updateReached && !neverReturns) {
-        flow.backEdges.push(branchNarrowings(checker));
+    let exits = flow?.exits;
+    if (flow != null && exits != null && flow.updateReached && !neverReturns) {
+        exits.backEdges.push(branchNarrowings(checker));
     }
 }
 
@@ -1541,21 +1559,27 @@ passEnds(BodyChecker checker, LoopFlow flow) -> List<BranchNarrowings> {
     if (!checker.assignment().terminated()) {
         ends.push(branchNarrowings(checker));
     }
-    ends.pushAll(flow.continues);
+    let continues = flow.continues;
+    if (continues != null) {
+        ends.pushAll(continues);
+    }
     return ends;
 }
 
 // Walks one pass through 'loop' with 'walk' and returns what reached its ends, where 'watched' says the
 // pass watches a narrowing the loop can write. Where it watches none and the condition writes nothing and
-// can be false, what holds after the loop is what holds where it starts, so nothing is kept for a join.
+// can be false, what holds after the loop is what holds where it starts, so nothing is kept for a join,
+// and what holds at a 'continue' is kept only for a 'for' update.
 walkPass(BodyChecker checker, SyntaxNode loop, (BodyChecker) -> void walk, bool watched) -> LoopFlow {
     let condition = loopCondition(loop);
-    let conditionWrites = condition == null ? new Set<string>() : conditionWriteNames(checker, condition);
-    let flow = new LoopFlow(conditionWrites,
-        watched || !conditionWrites.isEmpty() || !leavesAtCondition(loop, condition));
-    if (flow.joins) {
-        flow.entry = checker.narrowing().flatten();
+    let conditionWrites = condition == null ? null : conditionWriteNames(checker, loop, condition);
+    bool writes = conditionWrites != null && !conditionWrites.isEmpty();
+    LoopExits? exits = null;
+    if (watched || writes || !leavesAtCondition(loop, condition)) {
+        exits = new LoopExits(conditionWrites ?? new Set<string>(), checker.narrowing().flatten());
     }
+    bool updated = loop is ForStatementNode && loop.update() != null;
+    let flow = new LoopFlow(exits, exits != null || updated);
     checker.loopFlows().push(flow);
     walk(checker);
     checker.loopFlows().pop();
@@ -1859,21 +1883,22 @@ public settleLoop(BodyChecker checker, SyntaxNode loop, (BodyChecker) -> void wa
 // it. A write in the loop that ended a proof is then recorded as one in the loop, for a read after it.
 public leaveLoop(BodyChecker checker, SyntaxNode loop, LoopFlow flow) {
     string statement = loopStatement(loop);
-    if (flow.joins) {
+    let exits = flow.exits;
+    if (exits != null) {
         let leaving = new List<BranchNarrowings>();
         let held = checker.narrowing().flatten();
         let proven = new Map<NarrowingPath, Type>();
-        let exit = flow.exit;
+        let exit = exits.exit;
         if (exit != null) {
             leaving.push(exit);
-            for (let reached in flow.backEdges) {
-                leaving.push(conditionRun(reached, exit, flow.conditionWrites));
+            for (let reached in exits.backEdges) {
+                leaving.push(conditionRun(reached, exit, exits.conditionWrites));
             }
             addProofs(proven, exit.proofs);
         }
-        leaving.pushAll(flow.breaks);
+        leaving.pushAll(exits.breaks);
         addProofs(proven, held);
-        addProofs(proven, flow.entry);
+        addProofs(proven, exits.entry);
         joinNarrowings(checker, proven, held, leaving, statement, "in the {statement}");
     }
     markLoopEnds(checker, loop);
@@ -1935,12 +1960,15 @@ passLoop(BodyChecker checker, LoopSettlement settlement, SyntaxNode loop, (BodyC
     }
     let flow = walkPass(checker, loop, walk, !watch.starts.isEmpty());
     checker.loopWatches().pop();
-    for (let reached in flow.backEdges) {
-        noteCopiesReached(settlement, watch, reached);
-        if (watch.trace.follow(checker, reached, watch.span)) {
-            watch.changed = true;
+    let exits = flow.exits;
+    if (exits != null) {
+        for (let reached in exits.backEdges) {
+            noteCopiesReached(settlement, watch, reached);
+            if (watch.trace.follow(checker, reached, watch.span)) {
+                watch.changed = true;
+            }
+            watch.entryTrace.follow(checker, reached, watch.span);
         }
-        watch.entryTrace.follow(checker, reached, watch.span);
     }
     learnLoop(settlement, loop.green(), watch);
     return flow;
@@ -2277,25 +2305,30 @@ loopWriteNames(BodyChecker checker, SyntaxNode loop) -> Set<string> {
     return checker.writeNames().get(loop.green()) ?? collectLoopNames(loop, checker.writeNames());
 }
 
-// The names of the locals and the parameters the loop condition 'condition' may write, which one walk over
-// it records for it and for each loop and each '?:' inside it.
-conditionWriteNames(BodyChecker checker, Expression condition) -> Set<string> {
-    let recorded = checker.writeNames().get(condition.green());
-    if (recorded != null) {
-        return recorded;
-    }
-    let names = new Set<string>();
-    collectWrittenNames(condition, checker.writeNames(), names);
-    checker.writeNames().set(condition.green(), names);
-    return names;
+// The names of the locals and the parameters the condition 'condition' of 'loop' may write, or null where
+// it writes none, which the walk that records what 'loop' may write records.
+conditionWriteNames(BodyChecker checker, SyntaxNode loop, Expression condition) -> Set<string>? {
+    loopWriteNames(checker, loop);
+    return checker.writeNames().get(condition.green());
 }
 
 // Records in 'recorded', for 'loop' and for each loop inside it, the names of the locals and the
-// parameters it may write, and returns the names 'loop' may write.
+// parameters it may write, and for its condition where that writes any, and returns the names 'loop' may
+// write.
 collectLoopNames(SyntaxNode loop, Map<GreenNode, Set<string>> recorded) -> Set<string> {
     let names = new Set<string>();
+    let condition = loopCondition(loop);
     for (let part in loopParts(loop)) {
-        collectWrittenNames(part, recorded, names);
+        if (condition == null || part.green() != condition.green()) {
+            collectWrittenNames(part, recorded, names);
+            continue;
+        }
+        let written = new Set<string>();
+        collectWrittenNames(part, recorded, written);
+        if (!written.isEmpty()) {
+            recorded.set(condition.green(), written);
+            addNames(names, written);
+        }
     }
     recorded.set(loop.green(), names);
     return names;
