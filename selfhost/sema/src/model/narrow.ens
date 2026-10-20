@@ -6,6 +6,7 @@ import Type from model.types;
 import LocalBinding from model.scopes;
 import List from @std.collections.list;
 import Map from @std.collections.map;
+import Set from @std.collections.set;
 import Span from @ens.frontend.support.source;
 
 // One field hop in a narrowing path.
@@ -300,19 +301,46 @@ public final class NarrowingLayer {
     }
 }
 
+// What one layer held for one place before a change to it: the proof, the write that ended the proof and
+// the write that left it.
+final class LayerEntry {
+    protected long layer;
+    protected NarrowingPath path;
+    protected Type? proof;
+    protected NarrowingEnd? end;
+    protected NarrowingEnd? write;
+
+    protected constructor(this.layer, this.path, this.proof, this.end, this.write);
+}
+
+// The changes made to the layers below 'depth', where the branches of a statement start, while those
+// branches are analyzed: what each change replaced, in the order of the changes.
+final class BranchJournal {
+    protected long depth;
+    protected List<LayerEntry> replaced;
+
+    protected constructor(this.depth) {
+        this.replaced = new List<LayerEntry>();
+    }
+}
+
 // The proven types, one layer per branch of control flow. Establishment writes the top layer;
 // lookup prefers the innermost layer; invalidation erases from every layer, since a write inside a
 // branch may have happened by any later read, and records the write that ended each proof in the top
-// layer. Only the layers that have held a proof, an end or a write are read.
+// layer. Only the layers that have held a proof, an end or a write are read. Each statement whose
+// branches are being analyzed, innermost last, has a journal of what its branches change in the layers
+// where they start.
 public class NarrowingState {
     List<NarrowingLayer> layers;
     // The layers that have held a proof, an end or a write since they were pushed, outermost first.
     List<NarrowingLayer> filled;
+    List<BranchJournal> journals;
 
     public constructor() {
         this.layers = new List<NarrowingLayer>();
         this.layers.push(new NarrowingLayer(0));
         this.filled = new List<NarrowingLayer>();
+        this.journals = new List<BranchJournal>();
     }
 
     // A state whose one layer holds the proofs in 'proven'.
@@ -327,10 +355,12 @@ public class NarrowingState {
         }
         this.layers.push(layer);
         this.filled = new List<NarrowingLayer>();
+        this.journals = new List<BranchJournal>();
         this.fill(0);
     }
 
-    // A state with the same proofs and ends in copies of the same layers.
+    // A state with the same proofs and ends in copies of the same layers, where no branches are being
+    // analyzed.
     public copy() -> NarrowingState {
         let copied = new NarrowingState();
         copied.layers = copyLayers(this.layers);
@@ -338,6 +368,87 @@ public class NarrowingState {
             copied.filled.push(copied.layers.get(layer.index));
         }
         return copied;
+    }
+
+    // Starts the branches of a statement here: until endBranches, what each branch changes in the layers
+    // that hold here is recorded, so that restartBranches can put it back.
+    public startBranches() {
+        this.journals.push(new BranchJournal(this.layers.length()));
+    }
+
+    // Puts back what held where the branches of the innermost statement started.
+    public restartBranches() {
+        let journal = this.journals.get(this.journals.length() - 1);
+        while (this.layers.length() > journal.depth) {
+            this.popLayer();
+        }
+        for (long i = journal.replaced.length() - 1; i >= 0; i--) {
+            let entry = journal.replaced.get(i);
+            this.fill(entry.layer);
+            let layer = this.layers.get(entry.layer);
+            layer.proofs.remove(entry.path);
+            layer.ends.remove(entry.path);
+            layer.writes.remove(entry.path);
+            let proof = entry.proof;
+            if (proof != null) {
+                layer.proofs.set(entry.path, proof);
+            }
+            let end = entry.end;
+            if (end != null) {
+                layer.ends.set(entry.path, end);
+            }
+            let write = entry.write;
+            if (write != null) {
+                layer.writes.set(entry.path, write);
+            }
+        }
+        journal.replaced.clear();
+    }
+
+    // Puts back what held where the branches of the innermost statement started, and ends them.
+    public endBranches() {
+        this.restartBranches();
+        this.journals.pop();
+    }
+
+    // The places the branch of the innermost statement being analyzed has changed: those it changed in the
+    // layers where the branches start, and those that the layers it pushed prove, end or write.
+    public changedPlaces() -> Set<NarrowingPath> {
+        let places = new Set<NarrowingPath>();
+        let journal = this.journals.get(this.journals.length() - 1);
+        for (let entry in journal.replaced) {
+            places.add(entry.path);
+        }
+        for (long i = this.filled.length() - 1; i >= 0; i--) {
+            let layer = this.filled.get(i);
+            if (layer.index < journal.depth) {
+                break;
+            }
+            for (let key in layer.proofs.keys()) {
+                places.add(key);
+            }
+            for (let key in layer.ends.keys()) {
+                places.add(key);
+            }
+            for (let key in layer.writes.keys()) {
+                places.add(key);
+            }
+        }
+        return places;
+    }
+
+    // Records what 'layer' holds for 'path' before a change to it, where that layer holds where the branches
+    // of the innermost statement being analyzed start.
+    record(NarrowingLayer layer, NarrowingPath path) {
+        if (this.journals.isEmpty()) {
+            return;
+        }
+        let journal = this.journals.get(this.journals.length() - 1);
+        if (layer.index >= journal.depth) {
+            return;
+        }
+        journal.replaced.push(new LayerEntry(layer.index, path, layer.proofs.get(path), layer.ends.get(path),
+            layer.writes.get(path)));
     }
 
     public push() {
@@ -371,6 +482,7 @@ public class NarrowingState {
     }
 
     public narrow(NarrowingPath path, Type proven) {
+        this.record(this.layers.get(this.layers.length() - 1), path);
         this.fill(this.layers.length() - 1);
         let top = this.layers.get(this.layers.length() - 1);
         top.proofs.set(path, proven);
@@ -380,6 +492,7 @@ public class NarrowingState {
 
     // Records 'write' as the write that left the proof of 'path' made here last.
     public noteWrite(NarrowingPath path, NarrowingEnd write) {
+        this.record(this.layers.get(this.layers.length() - 1), path);
         this.fill(this.layers.length() - 1);
         this.layers.get(this.layers.length() - 1).writes.set(path, write);
     }
@@ -472,8 +585,10 @@ public class NarrowingState {
         this.clearWhere((key) -> key == path, end);
         this.renewWhere((key) -> key == path, end);
         if (this.endOf(path) == null) {
-            this.fill(this.layers.length() - 1);
-            this.layers.get(this.layers.length() - 1).ends.set(path, end);
+            let top = this.layers.get(this.layers.length() - 1);
+            this.record(top, path);
+            this.fill(top.index);
+            top.ends.set(path, end);
         }
     }
 
@@ -509,6 +624,7 @@ public class NarrowingState {
             }
             for (let key in layer.proofs.keys()) {
                 if (cleared(key)) {
+                    this.record(layer, key);
                     layer.ends.set(key, end);
                 }
             }
@@ -526,6 +642,7 @@ public class NarrowingState {
             }
             for (let key in layer.ends.keys()) {
                 if (renewed(key) && this.provenType(key) == null) {
+                    this.record(layer, key);
                     layer.ends.set(key, end);
                 }
             }
@@ -569,8 +686,11 @@ public class NarrowingState {
 
     public clearPath(NarrowingPath path) {
         for (let layer in this.filled) {
-            layer.proofs.remove(path);
-            layer.writes.remove(path);
+            if (layer.proofs.get(path) != null || layer.writes.get(path) != null) {
+                this.record(layer, path);
+                layer.proofs.remove(path);
+                layer.writes.remove(path);
+            }
         }
     }
 }
