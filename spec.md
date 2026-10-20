@@ -886,6 +886,9 @@ Builds keep the lock current: when the manifests' requirements change, the build
 
 `native` declarations name the native libraries the package's `external` blocks bind to (see the section on native calls), and the linker links each library they name.
 `native libc system;` declares a library the platform links by default, so nothing extra is passed to the linker.
+For an arm64 macOS target, `ens` links that library from a list it carries of what macOS's system library provides, so the build needs no Xcode and no macOS SDK on the machine.
+A program that links no other native library is then the same file whichever machine built it, and it records the version of the SDK the list was read from as the SDK it was built against.
+Any other native library a macOS program links is looked for in the folders `LIBRARY_PATH` names and in the SDK that `SDKROOT` or `xcrun` names.
 `native zlib;` links the library under its conventional platform name.
 The block form spells out base names per platform (`windows`, `linux`, `macos`), several per platform when needed.
 A platform may instead bind a prebuilt artifact: `windows artifact "https://example.com/z.lib" hash "sha256:...";` downloads the file once into the cache, verifies it against the declared sha256 hash (a mismatch fails the build), and passes it to the linker.

@@ -68,9 +68,11 @@ task("test")
         local arch = config.get("arch") or os.arch()
         local build_dir = path.join(os.projectdir(), "build", plat, arch, mode)
         -- every ens the suite starts compiles against this tree's standard library where it is, so
-        -- a note into the library names a file in the tree and no run writes the copy ens carries
-        -- into the user's cache; the cli_build assertions about that copy unset it
+        -- a note into the library names a file in the tree; the cli_build assertions about the copy
+        -- ens carries unset it. What a link writes into the cache, such as the libSystem a macOS
+        -- program links against, goes into a cache of the run's own, never the user's.
         os.setenv("ENS_STDLIB", path.join(os.projectdir(), "libs"))
+        os.setenv("ENS_CACHE", path.join(os.projectdir(), "build", "cache"))
         local exe_suffix = is_host("windows") and ".exe" or ""
         -- what `ens` names the artifacts it is not told the name of: it follows the target's object
         -- format, and every assertion about a default-named file has to as well.
@@ -1599,8 +1601,11 @@ task("test")
             local carried_cache = path.join(root, "carriedcache")
             carried_env.ENS_CACHE = carried_cache
             run({"check", hello_file}, {envs = carried_env}, 0, "nothing to report")
-            local carried = os.dirs(path.join(carried_cache, "trees", "sha256-*"))
-            if #carried ~= 1 or not os.isfile(path.join(carried[1], "std", "src", "core.ens")) then
+            local function libraryTrees()
+                return os.dirs(path.join(carried_cache, "trees", "sha256-*", "std"))
+            end
+            local carried = libraryTrees()
+            if #carried ~= 1 or not os.isfile(path.join(carried[1], "src", "core.ens")) then
                 table.insert(failures, string.format("the carried library was not written as one "
                     .. "tree under '%s'", carried_cache))
             end
@@ -1610,7 +1615,7 @@ task("test")
             run({"build", hello_file, "--output", path.join(root, "carried" .. exe_suffix)},
                 {envs = carried_env}, 0)
             run_program(path.join(root, "carried" .. exe_suffix), 0, "Hello, world!")
-            if #os.dirs(path.join(carried_cache, "trees", "sha256-*")) ~= 1 then
+            if #libraryTrees() ~= 1 then
                 table.insert(failures, "a second build wrote the carried library again")
             end
             -- a note into the library names the file in the cache, which is there to be opened
@@ -1636,6 +1641,19 @@ task("test")
                 .. "the path is a file, not a directory. Set 'ENS_CACHE' to a folder that can be "
                 .. "written to, or pass '--stdlib <folder>' naming the folder that contains 'std/'",
                 "!problem")
+            -- an arm64 macOS program links against the libSystem ens carries, which goes into the
+            -- cache too, so a cache that cannot be written stops the link and says why
+            if is_host("macosx") and os.arch() == "arm64" then
+                local linking_env = {}
+                for key, value in pairs(env) do linking_env[key] = value end
+                linking_env.ENS_CACHE = blocked_cache
+                run({"build", hello_file, "--output", path.join(root, "blocked" .. exe_suffix)},
+                    {envs = linking_env}, 1, "a macOS program is linked against a list of what "
+                    .. "macOS's system library provides, which ens writes into its cache, and the "
+                    .. "list could not be put there: could not create the directory '",
+                    "': something in the path is a file, not a directory. Set 'ENS_CACHE' to a "
+                    .. "folder that can be written to")
+            end
             carried_env.ENS_CACHE = ""
             carried_env.HOME = ""
             carried_env.USERPROFILE = ""

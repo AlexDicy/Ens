@@ -41,7 +41,8 @@ If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surf
   - `cli/` - the command-line library: the immutable declaration model, the pure argv walk, generated help, nearest-match suggestions.
   - `link/` - the linker bridge binding plus all link policy: flavor from triple, per-flavor argument vector, C runtime, unwinder and SDK discovery.
   - `packages/` - dependency resolution: `ens.overrides`, `ens.lock`, the content store, sha256, git fetching, prebuilt artifacts, version selection.
-  - `bundled/` - what `ens` carries inside itself, the standard library it was built with, and writing it into the cache the first time a build needs it, so a single `ens` file needs nothing else on the machine.
+  - `bundled/` - what `ens` carries inside itself, the standard library it was built with and the link-only system libraries of the targets it links for, and writing them into the cache the first time a build needs them, so a single `ens` file needs nothing else on the machine.
+    `bundled/symbols/` holds the symbol lists those libraries are written from; they are generated, so refresh them with `xmake l scripts/refresh_system_symbols.lua` on the platform they come from, or with the `refresh-system-symbols` workflow, and never edit them by hand.
   - `build/` - target resolution, the toolchain decision, build and check orchestration, test discovery and runner synthesis, reporting.
   - `driver/` - the `ens` executable itself: command declarations, dispatch, exit codes.
   - `corpus/` - a harness asserting the front end parses every `.ens` file in the repo losslessly.
@@ -54,8 +55,9 @@ If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surf
 - `tools/` - editor integrations; `tools/grammar/` is canonical for the shared grammar/config files.
 - `seed/seed.json` - which published release every host's bootstrap seed is downloaded from, and the sha256 of each; see The bootstrap seed.
 - `scripts/xmake_test.lua` - the test runner; read its header comment for the fixture directives.
+- `scripts/refresh_system_symbols.lua` - rewrites the symbol lists in `selfhost/bundled/symbols/` that this machine's platform provides, printing what was added and removed.
 - `scripts/xmake_packages.lua` - local overrides of xmake-repo package definitions, each one a workaround for an upstream bug and each carrying the condition for deleting it.
-- `.github/workflows/` - `test.yml` runs the suite on every host; `release.yml` is dispatch-only and publishes a release plus the pull request that repins the seed.
+- `.github/workflows/` - `test.yml` runs the suite on every host; `release.yml` is dispatch-only and publishes a release plus the pull request that repins the seed; `refresh-system-symbols.yml` is dispatch-only and opens a pull request rewriting the symbol lists on every platform they come from.
 
 ## Building and testing
 
