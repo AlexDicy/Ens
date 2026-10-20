@@ -2,84 +2,213 @@
 // scripts/refresh_system_symbols.lua writes: one entry a line, a word saying what it is first, and
 // '#' starting a comment.
 import List from @std.collections.list;
+import @std.text.parse;
 
-// What one system library exports, and which SDK the list was read from.
+// What one entry of a library is.
+export enum ExportKind {
+    // Code, which a program calls.
+    Code,
+
+    // Code a macOS library defines as weak, which a program links against like any other.
+    WeakCode,
+
+    // Data, which a program on Linux may copy into its own memory, so its size is listed.
+    Data,
+
+    // Data every thread has its own copy of.
+    ThreadData,
+}
+
+// One symbol a library exports.
+export final class Export {
+    string symbolName;
+    ExportKind symbolKind;
+    string versionNode;
+    long byteSize;
+
+    protected constructor(this.symbolName, this.symbolKind, this.versionNode, this.byteSize);
+
+    export name() -> string {
+        return this.symbolName;
+    }
+
+    export kind() -> ExportKind {
+        return this.symbolKind;
+    }
+
+    // The version node a program records the symbol under on Linux, as in 'GLIBC_2.34', or empty
+    // text on a system without them.
+    export version() -> string {
+        return this.versionNode;
+    }
+
+    // The size in bytes of a Linux library's data, and 0 for code.
+    export size() -> long {
+        return this.byteSize;
+    }
+}
+
+// One system library and what it exports.
+export final class ListedLibrary {
+    string libraryName;
+    string libraryVersion;
+    Export[] libraryExports;
+
+    protected constructor(this.libraryName, this.libraryVersion, this.libraryExports);
+
+    // The name a program records for the library and loads it by when it runs: the install path
+    // on macOS, the soname on Linux.
+    export name() -> string {
+        return this.libraryName;
+    }
+
+    // The current version a macOS library records, or empty text on Linux.
+    export currentVersion() -> string {
+        return this.libraryVersion;
+    }
+
+    export exports() -> Export[] {
+        return this.libraryExports;
+    }
+}
+
+// What one target's system libraries export, and what they were read from.
 export final class SymbolList {
     string sdk;
-    string install;
-    string current;
-    string[] exported;
-    string[] weakExported;
+    string glibc;
+    ListedLibrary[] listed;
 
-    protected constructor(this.sdk, this.install, this.current, this.exported, this.weakExported);
+    protected constructor(this.sdk, this.glibc, this.listed);
 
-    // The version of the SDK the list was read from, which a program records as the SDK it was
-    // built against.
+    // The version of the SDK a macOS list was read from, which a program records as the SDK it
+    // was built against, or empty text for another system.
     export sdkVersion() -> string {
         return this.sdk;
     }
 
-    // The path a program records for the library and loads it from when it runs.
-    export installName() -> string {
-        return this.install;
+    // The oldest glibc a program linked against a Linux list runs on, or empty text for another
+    // system.
+    export glibcVersion() -> string {
+        return this.glibc;
     }
 
-    export currentVersion() -> string {
-        return this.current;
-    }
-
-    export symbols() -> string[] {
-        return this.exported;
-    }
-
-    // The symbols the library defines as weak, which a program links against like any other.
-    export weakSymbols() -> string[] {
-        return this.weakExported;
+    export libraries() -> ListedLibrary[] {
+        return this.listed;
     }
 }
 
 // The list `text` holds. The lists are generated and carried inside ens, so a line this cannot
 // read is a bug in the script that wrote it.
 export read(string text) -> SymbolList {
-    string sdk = "";
-    string install = "";
-    string current = "";
-    let exported = new List<string>();
-    let weakExported = new List<string>();
+    let reading = new ListReading();
     for (let line in text.split("\n")) {
-        if (line.length == 0 || line.startsWith("#")) {
-            continue;
+        if (line.length > 0 && !line.startsWith("#")) {
+            reading.take(line);
         }
-        long space = line.indexOf(" ");
-        if (space <= 0) {
-            panic("Internal: the symbol list line '{line}' names no value");
-        }
-        string value = line.substring(space + 1, line.length);
-        switch (line.substring(0, space)) {
+    }
+    return reading.finished();
+}
+
+final class ListReading {
+    string sdk;
+    string glibc;
+    List<ListedLibrary> libraries;
+    string currentName;
+    string currentVersion;
+    List<Export> currentExports;
+
+    protected constructor() {
+        this.sdk = "";
+        this.glibc = "";
+        this.libraries = new List<ListedLibrary>();
+        this.currentName = "";
+        this.currentVersion = "";
+        this.currentExports = new List<Export>();
+    }
+
+    protected take(string line) {
+        string[] words = line.split(" ");
+        switch (words[0]) {
             "sdk" -> {
-                sdk = value;
+                this.sdk = value(line, words, 2);
+            },
+            "glibc" -> {
+                this.glibc = value(line, words, 2);
             },
             "library" -> {
-                long versionAt = value.lastIndexOf(" ");
-                if (versionAt <= 0) {
-                    panic("Internal: the symbol list line '{line}' names no library version");
+                this.close();
+                if (words.length < 2 || words.length > 3) {
+                    panic("Internal: the symbol list line '{line}' is not a library line");
                 }
-                install = value.substring(0, versionAt);
-                current = value.substring(versionAt + 1, value.length);
+                this.currentName = words[1];
+                this.currentVersion = "";
+                if (words.length == 3) {
+                    this.currentVersion = words[2];
+                }
             },
             "symbol" -> {
-                exported.push(value);
+                if (words.length != 2 && words.length != 3) {
+                    panic("Internal: the symbol list line '{line}' is not a symbol line");
+                }
+                string version = "";
+                if (words.length == 3) {
+                    version = words[2];
+                }
+                this.add(line, new Export(words[1], ExportKind.Code, version, 0));
             },
             "weak-symbol" -> {
-                weakExported.push(value);
+                this.add(line, new Export(value(line, words, 2), ExportKind.WeakCode, "", 0));
+            },
+            "object" -> {
+                this.add(line, new Export(value(line, words, 4), ExportKind.Data, words[2],
+                    sizeOf(line, words[3])));
+            },
+            "tls" -> {
+                this.add(line, new Export(value(line, words, 4), ExportKind.ThreadData, words[2],
+                    sizeOf(line, words[3])));
             },
             default -> {
                 panic("Internal: the symbol list line '{line}' starts with a word no list uses");
             },
         }
     }
-    if (sdk.length == 0 || install.length == 0) {
-        panic("Internal: a symbol list names no SDK or no library");
+
+    add(string line, Export entry) {
+        if (this.currentName.length == 0) {
+            panic("Internal: the symbol list line '{line}' comes before any library");
+        }
+        this.currentExports.push(entry);
     }
-    return new SymbolList(sdk, install, current, exported.toArray(), weakExported.toArray());
+
+    close() {
+        if (this.currentName.length > 0) {
+            this.libraries.push(new ListedLibrary(this.currentName, this.currentVersion,
+                this.currentExports.toArray()));
+        }
+        this.currentExports = new List<Export>();
+    }
+
+    protected finished() -> SymbolList {
+        this.close();
+        if (this.libraries.length() == 0) {
+            panic("Internal: a symbol list names no library");
+        }
+        return new SymbolList(this.sdk, this.glibc, this.libraries.toArray());
+    }
+}
+
+// The second word of a line that has exactly `count` words.
+value(string line, string[] words, long count) -> string {
+    if (words.length != count) {
+        panic("Internal: the symbol list line '{line}' does not have {count} words");
+    }
+    return words[1];
+}
+
+sizeOf(string line, string text) -> long {
+    long? size = parse.parseLong(text);
+    if (size == null) {
+        panic("Internal: the symbol list line '{line}' gives no size");
+    }
+    return size;
 }
