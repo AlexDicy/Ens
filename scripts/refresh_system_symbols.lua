@@ -6,22 +6,42 @@
 -- A Linux list can also be read from a folder holding another machine's libraries, such as the
 -- unpacked libc6 and libgcc-s1 packages of a distribution:
 -- `xmake l scripts/refresh_system_symbols.lua linux-arm64 <folder>`.
+-- On Windows both Windows lists are read from the Windows SDK, which holds the libraries of every
+-- processor, and from another machine they can be read from that SDK's library folder:
+-- `xmake l scripts/refresh_system_symbols.lua windows "<Windows Kits>/10/Lib/<version>"`.
 --
 -- A list is text of our own, one entry per line, read by selfhost/bundled/src/symbols.ens:
---   sdk <version>                    the version of the SDK a macOS list was read from
+--   sdk <version>                    the version of the SDK a macOS or Windows list was read from
 --   glibc <version>                  the oldest glibc a program linked against a Linux list runs on
 --   library <name> [<version>]       the library the entries after it belong to: its install name
---                                    and current version on macOS, its soname on Linux
+--                                    and current version on macOS, its soname on Linux, its DLL
+--                                    on Windows
 --   symbol <name> [<version>]        code the library exports, with its version node on Linux
 --   weak-symbol <name>               code a macOS library exports as a weak definition
 --   object <name> <version> <size>   data a Linux library exports, with its size in bytes
 --   tls <name> <version> <size>      thread-local data a Linux library exports
+--   data <name>                      data a Windows DLL exports, which a program reads through
+--                                    the pointer its import table holds
 -- Lines starting with '#' are comments.
 
 import("core.base.json")
 import("core.base.global")
+import("lib.detect.find_tool")
 
 local lists = path.join(os.scriptdir(), "..", "selfhost", "bundled", "symbols")
+
+-- Whether `a` sorts before `b` by their bytes. Lua compares text the way the machine's locale
+-- orders it, so every list is sorted with this instead, and reads the same whichever machine
+-- wrote it.
+local function byteOrder(a, b)
+    for i = 1, math.min(#a, #b) do
+        local x, y = a:byte(i), b:byte(i)
+        if x ~= y then
+            return x < y
+        end
+    end
+    return #a < #b
+end
 
 -- The quoted or plain names of a tbd list, written between '[' and ']' and possibly across lines.
 local function names(text)
@@ -177,7 +197,7 @@ local function macosList()
     for entry in pairs(entries) do
         table.insert(lines, entry)
     end
-    table.sort(lines)
+    table.sort(lines, byteOrder)
     if #lines < 1000 then
         raise("'%s' gave only %d symbols for arm64, which is not the whole of libSystem", tbd,
             #lines)
@@ -253,22 +273,39 @@ end
 
 local function readobjProgram()
     local found = os.files(path.join(global.directory(), "packages", "l", "llvm", "*", "*", "bin",
-        "llvm-readobj"))[1]
+        "llvm-readobj" .. (is_host("windows") and ".exe" or "")))[1]
     if found then
         return found
     end
+    local newest = -1
     for _, candidate in ipairs(os.files("/usr/lib/llvm-*/bin/llvm-readobj")) do
-        found = candidate
+        local version = tonumber(candidate:match("llvm%-(%d+)")) or 0
+        if version > newest then
+            found = candidate
+            newest = version
+        end
     end
     if found then
         return found
     end
-    local onPath = try { function() return os.iorunv("which", {"llvm-readobj"}):trim() end }
-    if onPath and #onPath > 0 then
-        return onPath
+    local onPath = find_tool("llvm-readobj")
+    if onPath then
+        return onPath.program
     end
     raise("could not find llvm-readobj, which reads the libraries. Run 'xmake build ens-llvm' "
         .. "first, which installs it with the LLVM package, or install LLVM")
+end
+
+-- A field of llvm-readobj's JSON as text: one release writes the name alone, another an object
+-- holding the name beside its number.
+local function named(field)
+    if type(field) == "table" then
+        field = field.Name
+    end
+    if type(field) ~= "string" then
+        raise("llvm-readobj wrote a symbol field this script cannot read: %s", tostring(field))
+    end
+    return field
 end
 
 -- The entries one library contributes to a list, after its 'library' line.
@@ -280,14 +317,14 @@ local function libraryEntries(readobj, file, soname)
     end
     local versions = {}
     local hasDefault = {}
-    for _, entry in ipairs(dump[1].DynamicSymbols) do
+    for _, entry in ipairs(dump[1].DynamicSymbols or {}) do
         local symbol = entry.Symbol
-        local full = symbol.Name.Name
+        local full = named(symbol.Name)
         local name, marker, node = full:match("^(.-)(@@?)(.+)$")
-        local defined = symbol.Section.Name ~= "Undefined"
+        local defined = named(symbol.Section) ~= "Undefined"
         local kind = ({Function = "symbol", GNU_IFunc = "symbol", Object = "object",
-            TLS = "tls"})[symbol.Type.Name]
-        if name and name ~= node and defined and kind and symbol.Binding.Name ~= "Local" then
+            TLS = "tls"})[named(symbol.Type)]
+        if name and name ~= node and defined and kind and named(symbol.Binding) ~= "Local" then
             local numbered = withinBaseline(node)
             if marker == "@@" then
                 hasDefault[name] = true
@@ -312,7 +349,7 @@ local function libraryEntries(readobj, file, soname)
             end
         end
     end
-    table.sort(lines)
+    table.sort(lines, byteOrder)
     if #lines == 0 then
         raise("'%s' gave no symbols at or below the baseline", file)
     end
@@ -326,6 +363,7 @@ local function linuxList(host, root)
         raise("'%s' is not a Linux host a list is kept for. Name 'linux-x64' or 'linux-arm64'", host)
     end
     local readobj = readobjProgram()
+    print("reading the libraries under '%s' with '%s'", root, readobj)
     local lines = {
         "# What glibc and libgcc_s export to a " .. described.machine .. " Linux program, at the "
             .. "baselines scripts/refresh_system_symbols.lua names.",
@@ -354,6 +392,114 @@ local function linuxList(host, root)
     return host .. ".symbols", table.concat(lines, "\n") .. "\n"
 end
 
+-- The import libraries a Windows program links against, in the order a symbol more than one of
+-- them names is taken from: kernel32, the C runtime Windows ships with the system, and shell32,
+-- for reading the command line. What else a C program takes from the Visual C++ runtime, such as
+-- memcpy, ens defines itself.
+local windowsLibraries = {
+    {folder = "um", file = "kernel32.lib"},
+    {folder = "ucrt", file = "ucrt.lib"},
+    {folder = "um", file = "shell32.lib"},
+}
+
+-- The library folder of the Windows SDK xmake's MSVC toolchain finds, which holds a folder for
+-- each kind of library and, in each, one for each processor. LIB names other SDKs laid out the same
+-- way, such as the .NET Framework's, so the folder taken is the one holding the C runtime's.
+local function windowsSdkRoot()
+    import("core.tool.toolchain")
+    local msvc = toolchain.load("msvc", {plat = "windows", arch = "x64"})
+    local lib = msvc and msvc:check() and msvc:runenvs().LIB or ""
+    for folder in lib:gmatch("[^;]+") do
+        local root = folder:match("^(.-)[/\\]um[/\\]x64[/\\]?$")
+        if root and os.isfile(path.join(root, "um", "x64", "kernel32.lib"))
+                and os.isfile(path.join(root, "ucrt", "x64", "ucrt.lib")) then
+            return root
+        end
+    end
+    raise("could not find the Windows SDK: the MSVC toolchain names no 'um\\x64' library "
+        .. "folder. Install the Windows SDK with Visual Studio, or name its library folder after "
+        .. "'windows'")
+end
+
+-- What one import library names, as {dll = {name = kind}}, where kind is 'symbol' for code and
+-- 'data' for data. A member that is not an import, or imports by ordinal alone, names nothing.
+local function importsOf(readobj, file)
+    local found = {}
+    local function take(block)
+        if not (block.format or ""):startswith("COFF-import-file") or not block.name then
+            return
+        end
+        local kind = ({code = "symbol", data = "data", const = "data"})[block.type]
+        if not kind then
+            raise("'%s' imports '%s' as '%s', which this script does not read", file, block.name,
+                tostring(block.type))
+        end
+        found[block.dll] = found[block.dll] or {}
+        found[block.dll][block.name] = kind
+    end
+    local block = {}
+    for line in os.iorunv(readobj, {file}):gmatch("[^\r\n]+") do
+        local dll = line:match("^File: (.+)$")
+        if dll then
+            take(block)
+            block = {dll = dll}
+        end
+        block.format = line:match("^Format: (.+)$") or block.format
+        block.type = line:match("^Type: (.+)$") or block.type
+        block.name = line:match("^Export name: (.+)$") or block.name
+    end
+    take(block)
+    return found
+end
+
+-- What the Windows SDK under `root` lets a program for `processor` import, and the SDK's version.
+local function windowsList(processor, root)
+    local readobj = readobjProgram()
+    print("reading the import libraries under '%s' with '%s'", root, readobj)
+    local taken = {}
+    local byDll = {}
+    for _, library in ipairs(windowsLibraries) do
+        local file = path.join(root, library.folder, processor, library.file)
+        if not os.isfile(file) then
+            raise("there is no '%s' under '%s'", path.join(library.folder, processor,
+                library.file), root)
+        end
+        for dll, names in pairs(importsOf(readobj, file)) do
+            for name, kind in pairs(names) do
+                if not taken[name] then
+                    taken[name] = true
+                    byDll[dll] = byDll[dll] or {}
+                    table.insert(byDll[dll], kind .. " " .. name)
+                end
+            end
+        end
+    end
+    local dlls = {}
+    for dll in pairs(byDll) do
+        table.insert(dlls, dll)
+    end
+    table.sort(dlls, byteOrder)
+    local version = root:match("([^/\\]+)[/\\]*$") or ""
+    local lines = {
+        "# What a Windows program on " .. processor .. " imports from the system, read from the "
+            .. "import libraries of Windows SDK " .. version .. ".",
+        "# Generated by scripts/refresh_system_symbols.lua; run it on Windows, or on that SDK's "
+            .. "library folder, instead of editing.",
+        "sdk " .. version,
+    }
+    for _, dll in ipairs(dlls) do
+        table.insert(lines, "library " .. dll)
+        table.sort(byDll[dll], byteOrder)
+        for _, line in ipairs(byDll[dll]) do
+            table.insert(lines, line)
+        end
+    end
+    if #lines < 1000 then
+        raise("the Windows SDK under '%s' gave only %d imports for %s", root, #lines, processor)
+    end
+    return "windows-" .. processor .. ".symbols", table.concat(lines, "\n") .. "\n"
+end
+
 -- The entries of a list, without its comments, as a set.
 local function entriesOf(text)
     local found = {}
@@ -373,8 +519,8 @@ local function report(name, before, after)
     for line in pairs(before) do
         if not after[line] then table.insert(removed, line) end
     end
-    table.sort(added)
-    table.sort(removed)
+    table.sort(added, byteOrder)
+    table.sort(removed, byteOrder)
     print("%s: %d added, %d removed", name, #added, #removed)
     for _, line in ipairs(added) do print("  + " .. line) end
     for _, line in ipairs(removed) do print("  - " .. line) end
@@ -388,8 +534,21 @@ function main(host, root)
                 .. "after it, as in 'xmake l scripts/refresh_system_symbols.lua %s <folder>'",
                 host, host)
         end
-        local name, text = linuxList(host, path.absolute(root))
-        written[name] = text
+        if host == "windows" then
+            for _, processor in ipairs({"x64", "arm64"}) do
+                local name, text = windowsList(processor, path.absolute(root))
+                written[name] = text
+            end
+        else
+            local name, text = linuxList(host, path.absolute(root))
+            written[name] = text
+        end
+    elseif is_host("windows") then
+        local root = windowsSdkRoot()
+        for _, processor in ipairs({"x64", "arm64"}) do
+            local name, text = windowsList(processor, root)
+            written[name] = text
+        end
     elseif is_host("macosx") then
         local name, text = macosList()
         written[name] = text
@@ -399,7 +558,7 @@ function main(host, root)
         written[name] = text
     else
         raise("this machine's system libraries have no list ens links against. Run the script "
-            .. "on a Mac or on Linux")
+            .. "on a Mac, on Linux or on Windows")
     end
     for name, text in pairs(written) do
         local file = path.join(lists, name)
