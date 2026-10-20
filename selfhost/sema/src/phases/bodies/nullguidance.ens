@@ -52,6 +52,7 @@ import Signature from model.typemembers;
 import RelatedLocation from support.diagnostics;
 import ModuleContext from context;
 import Span from @ens.frontend.support.source;
+import BindingKind from model.scopes;
 import model.typenames;
 import TypeNames from model.typenames;
 import model.types;
@@ -124,6 +125,24 @@ public final class NullableOperand {
     // empty where no check helps. Empty anywhere else.
     protected string endedReason = "";
     protected string endedWhere = "";
+    // How many levels of null at the outside of the type the place is declared with are not null here.
+    protected long outerPresent = 0;
+    // How the place is spelled, its declared type and its type here, where 'outerPresent' is not zero.
+    protected string outerPlace = "";
+    protected string outerDeclared = "";
+    protected string outerHere = "";
+    protected string outerArticle = "";
+    // The fallback that replaces the null under those levels where no statement can go.
+    protected string outerFallback = "";
+    // Where the place is a local whose initial value fills only the outer levels of null of its type, and
+    // nothing else writes it: why those levels are never null, and the declaration without them.
+    protected string redeclaredReason = "";
+    protected string redeclaredFix = "";
+    // The locals the fix copies the value into, one before each check that follows the first, and one
+    // before the first as well where 'outerPresent' is not zero. Each copy has the matching type.
+    protected string[] copies = [];
+    protected string[] copyTypes = [];
+    protected string[] copyArticles = [];
 
     protected constructor(this.operandForm, this.levels, this.spelling, this.heldSpelling, this.localName,
                           this.declarationText, this.words, this.callee, this.writeBack, this.stores,
@@ -135,6 +154,32 @@ public final class NullableOperand {
 
     public held() -> string {
         return this.heldSpelling;
+    }
+
+    // The value once every check of the fix is written: the last copy, or else 'held'.
+    public reached() -> string {
+        if (this.copies.length == 0) {
+            return this.heldSpelling;
+        }
+        return this.copies[this.copies.length - 1];
+    }
+
+    // Whether the fix copies the place before its first check.
+    public copiesBeforeCheck() -> bool {
+        return this.outerPresent > 0;
+    }
+
+    // Whether the fix declares the local the place is without the levels of null its initial value fills.
+    public redeclares() -> bool {
+        return this.redeclaredFix.length > 0;
+    }
+
+    // The level a null check or a '??' after the place tests, where 'outerPresent' is not zero.
+    public outerTested() -> string {
+        if (this.outerPresent == 1) {
+            return "that outer level";
+        }
+        return "the outermost of them";
     }
 
     public local() -> string {
@@ -338,16 +383,22 @@ joinAdvice(BodyChecker checker, Expression join, long levels, bool everyLevel) -
         return "S{fallback.substring(1)}.";
     }
     string local = freeLocalName(checker, "", sharedResultName(join) ?? "value");
-    string checked = "check the local{repeatedCheck("{local} != null", levels, everyLevel)}";
     string stored = "Store the value of the {named} in a local first";
     let spelled = wording.shortSpelling(join);
     if (spelled != null) {
         stored = "{stored} ('let {local} = {spelled};')";
     }
-    if (readFrom(join)) {
-        return "{stored} and {checked}.";
+    string checked = " and check the local";
+    if (levels > 1) {
+        let operand = new NullableOperand(OperandForm.Stored, levels, local, local, local, "", null, "",
+            "", "", "", false, true);
+        noteCopies(checker, join, operand, "");
+        checked = ". {checkThenCopy([operand], "the local", "")}";
     }
-    return "{stored} and {checked}, or {fallback}.";
+    if (readFrom(join)) {
+        return "{stored}{checked}.";
+    }
+    return "{stored}{checked}, or {fallback}.";
 }
 
 // Whether a member of 'value', an element or its call is read from it, so that a fallback written
@@ -492,33 +543,9 @@ fallbackExample(BodyChecker checker, Expression value) -> string? {
     if (fallback == null) {
         return null;
     }
-    SyntaxNode? holder = value.parent();
-    while (holder is ParenthesizedExpressionNode) {
-        holder = holder.parent();
-    }
-    if (holder is InitializerNode) {
-        holder = holder.parent();
-    }
-    string start = "";
-    string end = "";
-    if (holder is VariableDeclarationNode) {
-        let written = holder.declaredType();
-        if (written != null) {
-            start = "{wording.greenSpelling(written.green())} {holder.name().text()} = ";
-            end = ";";
-        }
-    } else if (holder is FieldDeclarationNode) {
-        start = "{wording.greenSpelling(holder.declaredType().green())} {holder.name().text()} = ";
-        end = ";";
-    } else if (holder is ParameterNode) {
-        let written = holder.declaredType();
-        if (written != null) {
-            start = "{wording.greenSpelling(written.green())} {holder.name().text()} = ";
-        }
-    } else if (holder is AssignmentExpressionNode) {
-        start = "{wording.oneLineSpelling(syntax.unwrapParentheses(holder.target()))} = ";
-        end = ";";
-    }
+    string[] frame = declarationFrame(value);
+    string start = frame[0];
+    string end = frame[1];
     Expression core = syntax.unwrapParentheses(value);
     let spelled = wording.shortSpelling(core);
     if (spelled == null && core is SwitchExpressionNode) {
@@ -534,6 +561,74 @@ fallbackExample(BodyChecker checker, Expression value) -> string? {
         return "{start}({spelled}) ?? {fallback}{end}";
     }
     return "{start}{spelled} ?? {fallback}{end}";
+}
+
+// The code written before and after 'value' where it is the initial value of a variable, a field or a
+// parameter that writes its type, or is assigned to one, as in 'string name = ' and ';'. Both are empty
+// for any other value.
+declarationFrame(Expression value) -> string[] {
+    SyntaxNode? holder = value.parent();
+    while (holder is ParenthesizedExpressionNode) {
+        holder = holder.parent();
+    }
+    if (holder is InitializerNode) {
+        holder = holder.parent();
+    }
+    if (holder is VariableDeclarationNode) {
+        let written = holder.declaredType();
+        if (written != null) {
+            return ["{wording.greenSpelling(written.green())} {holder.name().text()} = ", ";"];
+        }
+    } else if (holder is FieldDeclarationNode) {
+        return ["{wording.greenSpelling(holder.declaredType().green())} {holder.name().text()} = ", ";"];
+    } else if (holder is ParameterNode) {
+        let written = holder.declaredType();
+        if (written != null) {
+            return ["{wording.greenSpelling(written.green())} {holder.name().text()} = ", ""];
+        }
+    } else if (holder is AssignmentExpressionNode) {
+        return ["{wording.oneLineSpelling(syntax.unwrapParentheses(holder.target()))} = ", ";"];
+    }
+    return ["", ""];
+}
+
+// The advice for 'value' where it is a '??' whose left value may be null at more than one level, of which
+// '??' replaces only the outer one: why the result can be null, and the '?? null' that takes the levels
+// above the last off first. Null for any other value, and where the left value is too long to repeat.
+deepLeftAdvice(BodyChecker checker, Expression value) -> string? {
+    Expression core = syntax.unwrapParentheses(value);
+    if (!(core is NullCoalesceExpressionNode)) {
+        return null;
+    }
+    Type left = checker.recordedType(core.left());
+    long levels = wording.optionalLevels(left);
+    let spelledLeft = wording.shortSpelling(core.left());
+    if (levels < 2 || spelledLeft == null) {
+        return null;
+    }
+    string peeled = spelledLeft;
+    if (wording.bindsLooserThanFallback(core.left())) {
+        peeled = "({peeled})";
+    }
+    for (long level = 1; level < levels; level++) {
+        peeled = "({peeled} ?? null)";
+    }
+    Type result = checker.recordedType(core);
+    string named = "the result of '??'";
+    let spelled = wording.shortSpelling(core);
+    if (spelled != null) {
+        named = "'{spelled}'";
+    }
+    string article = typenames.typeArticle(checker.names().of(result));
+    string why = "'{spelledLeft}' has type {checker.names().quoted(left)}, and '??' replaces null only at "
+        + "its outer level, so {named} is {article} {checker.names().quoted(result)}.";
+    string taken = levels == 2 ? "both levels" : "every level";
+    string[] frame = declarationFrame(value);
+    let spelledRight = wording.shortSpelling(core.right());
+    if (spelledRight == null) {
+        return "{why} Take {taken} off, as in '{peeled} ?? ...'.";
+    }
+    return "{why} Take {taken} off, as in '{frame[0]}{peeled} ?? {spelledRight}{frame[1]}'.";
 }
 
 // The advice for 'value' where it is a chain of '??' whose last value can be null, so that one level of
@@ -621,11 +716,31 @@ classifyOperands(BodyChecker checker, Expression leftNode, Expression rightNode,
     bool writesBack = written != null;
     let first = classifyOperand(checker, leftNode, leftLevels, "", writesBack);
     let second = classifyOperand(checker, rightNode, wording.optionalLevels(right), "", false);
-    if (first.local().length > 0 && first.local() == second.local() && !samePlace(first, second)) {
+    if (sharesName(first, second) && !samePlace(first, second)) {
         first = classifyOperand(checker, leftNode, leftLevels, "left", writesBack);
         second = classifyOperand(checker, rightNode, second.levels, "right", false);
     }
     return [first, second];
+}
+
+// Whether the fixes of 'first' and 'second' declare a local of the same name.
+sharesName(NullableOperand first, NullableOperand second) -> bool {
+    let declared = new List<string>();
+    if (first.local().length > 0) {
+        declared.push(first.local());
+    }
+    for (let copy in first.copies) {
+        declared.push(copy);
+    }
+    if (declared.contains(second.local())) {
+        return true;
+    }
+    for (let copy in second.copies) {
+        if (declared.contains(copy)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // The operand and its fix for the 'levels' of null that a refusal names. An operand gets no fix
@@ -662,7 +777,7 @@ public classifyOperand(BodyChecker checker, Expression operand, long levels, str
             guard = wording.oneLineSpelling(syntax.unwrapParentheses(read.receiver()));
             let slot = assignments.safeSlotType(checker, syntax.unwrapParentheses(operand));
             if (narrowing.buildNarrowingPath(checker, read.receiver()) != null && slot != null
-                    && !(slot is OptionalType)) {
+                    && !(slot is OptionalType) && presentOuterLevels(checker, read.receiver()) == 0) {
                 held = read.plainSpelling();
             }
         }
@@ -750,6 +865,12 @@ public classifyOperand(BodyChecker checker, Expression operand, long levels, str
         containsCall(operand.green()));
     classified.writes = writesBack;
     classified.fallbackParenthesized = wording.bindsLooserThanFallback(operand);
+    if (levels > 0 && (form == OperandForm.Stable || form == OperandForm.NoFix)) {
+        noteOuterLevels(checker, operand, classified);
+    }
+    if (form == OperandForm.Stable || form == OperandForm.Copied || form == OperandForm.Stored) {
+        noteCopies(checker, operand, classified, prefix);
+    }
     if (form == OperandForm.Stored) {
         classified.checkedEarlier = checkedBefore(checker, syntax.unwrapParentheses(operand));
     }
@@ -760,6 +881,378 @@ public classifyOperand(BodyChecker checker, Expression operand, long levels, str
         noteEndedNarrowing(checker, operand, classified);
     }
     return classified;
+}
+
+// How many levels of null at the outside of the type the place 'operand' reads is declared with are not
+// null here, or zero where it reads no place narrowing proves anything of.
+public presentOuterLevels(BodyChecker checker, Expression operand) -> long {
+    let declared = narrowing.declaredSlotType(checker, operand);
+    if (declared == null || narrowing.buildNarrowingPath(checker, operand) == null) {
+        return 0;
+    }
+    long present = wording.optionalLevels(declared) - wording.optionalLevels(checker.recordedType(operand));
+    return present > 0 ? present : 0;
+}
+
+// Records on 'classified' the levels at the outside of the type the place 'operand' is declared with that
+// are not null here, and why its type here has fewer levels than that type. Where the place is a local that
+// only its initial value writes, it records the declaration without those levels instead.
+noteOuterLevels(BodyChecker checker, Expression operand, NullableOperand classified) {
+    long present = presentOuterLevels(checker, operand);
+    let declared = narrowing.declaredSlotType(checker, operand);
+    if (present == 0 || declared == null) {
+        return;
+    }
+    if (classified.form() == OperandForm.Stable && noteRedeclaration(checker, operand, declared, present,
+            classified)) {
+        return;
+    }
+    Type here = checker.recordedType(operand);
+    classified.outerPresent = present;
+    classified.outerPlace = wording.simpleSpelling(operand) ?? classified.spelling;
+    classified.outerDeclared = checker.names().quoted(declared);
+    classified.outerHere = checker.names().quoted(here);
+    classified.outerArticle = typenames.typeArticle(checker.names().of(here));
+    if (classified.form() == OperandForm.NoFix) {
+        classified.outerFallback = outerFallbackFix(checker, operand, classified, declared);
+    }
+}
+
+// Records on 'classified' the fix for 'operand' where it reads a local declared with the type 'declared'
+// whose initial value fills only its outer 'present' levels of null, and which nothing else writes: why
+// those levels are never null, and the declaration without them. False where 'operand' is no such local.
+noteRedeclaration(BodyChecker checker, Expression operand, Type declared, long present,
+                  NullableOperand classified) -> bool {
+    let declaration = unwrittenDeclaration(checker, operand);
+    if (declaration == null) {
+        return false;
+    }
+    let initializer = declaration.initializer();
+    if (initializer == null || declaration.declaredType() == null) {
+        return false;
+    }
+    Type initial = checker.recordedType(initializer.value());
+    Type kept = narrowing.heldAfterStore(checker, declared, initial);
+    if (wording.optionalLevels(declared) - wording.optionalLevels(kept) != present) {
+        return false;
+    }
+    kept = declared;
+    for (long level = 0; level < present; level++) {
+        if (kept is OptionalType) {
+            kept = kept.inner();
+        }
+    }
+    string name = declaration.name().text();
+    string fewer = "one level fewer, so the outer level of '{name}' is never null";
+    if (present > 1) {
+        string count = numberWord(present);
+        fewer = "{count} levels fewer, so the {count} outer levels of '{name}' are never null";
+    }
+    string value = "its initial value";
+    let spelled = wording.shortSpelling(initializer.value());
+    if (spelled != null) {
+        value = "{value} '{spelled}'";
+    }
+    classified.redeclaredReason = "'{name}' is declared as {checker.names().quoted(declared)}, but {value} "
+        + "has type {checker.names().quoted(initial)}, {fewer}.";
+    classified.redeclaredFix = "Declare '{name}' as {checker.names().quoted(kept)}";
+    if (spelled != null) {
+        let modifier = declaration.modifier();
+        string written = modifier == null ? "" : "{modifier.text()} ";
+        string redeclared = "{written}{checker.names().of(kept)} {name} = {spelled};";
+        classified.redeclaredFix = "{classified.redeclaredFix} ('{redeclared}')";
+    }
+    return true;
+}
+
+// The declaration of the local 'operand' reads, where nothing in the scope of the local writes a local or a
+// parameter of its name. Null for any other value.
+unwrittenDeclaration(BodyChecker checker, Expression operand) -> VariableDeclarationNode? {
+    Expression read = syntax.unwrapParentheses(operand);
+    if (!(read is IdentifierExpressionNode)) {
+        return null;
+    }
+    let binding = checker.result().bindingOf(read.green());
+    if (binding == null || binding.kind() != BindingKind.Variable) {
+        return null;
+    }
+    Span named = binding.nameSpan();
+    SyntaxNode? holder = read.parent();
+    while (holder != null && !narrowing.within(named, holder.span())) {
+        holder = holder.parent();
+    }
+    if (holder == null) {
+        return null;
+    }
+    let declaration = declarationAt(holder, named);
+    if (declaration == null) {
+        return null;
+    }
+    let scope = declaration.parent();
+    if (scope == null || narrowing.writeNamesOf(checker, scope).contains(binding.name())) {
+        return null;
+    }
+    return declaration;
+}
+
+// The declaration under 'node' whose name is at 'named', or null where there is none.
+declarationAt(SyntaxNode node, Span named) -> VariableDeclarationNode? {
+    if (node is VariableDeclarationNode && node.name().span() == named) {
+        return node;
+    }
+    for (let child in node.childNodes()) {
+        if (narrowing.within(named, child.span())) {
+            return declarationAt(child, named);
+        }
+    }
+    return null;
+}
+
+// The fix for 'operand', a place declared with the type 'declared' whose outer levels of null are not null
+// here, where no statement can go: '?? null' after it for each level above the value, then the fallback,
+// and where a member or an element of the value is read and one level of null is left, '?.' or '?['.
+outerFallbackFix(BodyChecker checker, Expression operand, NullableOperand classified, Type declared)
+        -> string {
+    string place = classified.outerPlace;
+    long taken = wording.optionalLevels(declared) - 1;
+    string peeled = place;
+    for (long level = 0; level < taken; level++) {
+        peeled = "({peeled} ?? null)";
+    }
+    string levels = "that level";
+    if (taken > 1) {
+        levels = "the {numberWord(taken)} outer levels";
+    }
+    string fix = "A '??' after '{place}' tests only {classified.outerTested()}, so take {levels} off with "
+        + "'{peeled}' before the fallback";
+    let read = valueRead(operand);
+    string suffix = "";
+    if (read != null) {
+        suffix = readSuffix(operand, read) ?? "";
+    }
+    let fallback = plainFallback(convert.coreOf(declared));
+    if (fallback != null && read == null) {
+        fix = "{fix}, as in '{peeled} ?? {fallback}'";
+    } else if (fallback != null && suffix.length > 0) {
+        fix = "{fix}, as in '({peeled} ?? {fallback}){suffix}'";
+    }
+    if (read == null || suffix.length == 0 || classified.levels != 1) {
+        return "{fix}.";
+    }
+    let safe = safeReadExample(checker, operand, read, place, suffix);
+    if (safe == null) {
+        return "{fix}.";
+    }
+    return "{fix}. {safe}";
+}
+
+// The read of a member or an element of 'value', or the call of its method, as in 'held.length' or
+// 'held.trim()'. Null where nothing is read from the value.
+valueRead(Expression value) -> Expression? {
+    SyntaxNode outer = value;
+    SyntaxNode? holder = value.parent();
+    while (holder is ParenthesizedExpressionNode) {
+        outer = holder;
+        holder = holder.parent();
+    }
+    long start = outer.span().start;
+    if (holder is SubscriptExpressionNode && holder.object().span().start == start) {
+        return holder;
+    }
+    if (!(holder is MemberExpressionNode) || holder.object().span().start != start) {
+        return null;
+    }
+    let call = holder.parent();
+    if (call is CallExpressionNode && call.callee().span().start == holder.span().start) {
+        return call;
+    }
+    return holder;
+}
+
+// The code 'read' writes after 'value', as in '.length' for 'held.length', or null where it is too long to
+// repeat.
+readSuffix(Expression value, Expression read) -> string? {
+    let whole = wording.shortSpelling(read);
+    if (whole == null) {
+        return null;
+    }
+    Expression outer = value;
+    SyntaxNode? holder = value.parent();
+    while (holder is ParenthesizedExpressionNode) {
+        outer = holder;
+        holder = holder.parent();
+    }
+    string front = wording.oneLineSpelling(outer);
+    if (!whole.startsWith(front)) {
+        return null;
+    }
+    return whole.substring(front.length);
+}
+
+// The fix that reads 'read', a read of 'value' spelled 'suffix' after it, through '?.' or '?[' and supplies
+// the fallback after it, as in "Or read 'length' with '?.', as in 'held?.length ?? 0'.". Null where the
+// result has no fallback plain enough to show.
+safeReadExample(BodyChecker checker, Expression value, Expression read, string place, string suffix)
+        -> string? {
+    let type = presentReadType(checker, value, read);
+    if (type == null) {
+        return null;
+    }
+    string example = "{place}?{suffix}";
+    if (!types.isVoidType(type)) {
+        let fallback = plainFallback(type);
+        if (fallback == null) {
+            return null;
+        }
+        example = "{example} ?? {fallback}";
+    }
+    if (read is SubscriptExpressionNode) {
+        return "Or read the element with '?[', as in '{example}'.";
+    }
+    if (read is CallExpressionNode) {
+        let callee = syntax.unwrapParentheses(read.callee());
+        if (callee is MemberExpressionNode) {
+            return "Or call '{callee.member().text()}' with '?.', as in '{example}'.";
+        }
+        return null;
+    }
+    if (read is MemberExpressionNode) {
+        return "Or read '{read.member().text()}' with '?.', as in '{example}'.";
+    }
+    return null;
+}
+
+// The type of 'read', a read of the place 'value', analyzed in a trial where the place is not null at any
+// level. Null inside a trial, and where the read has no type.
+presentReadType(BodyChecker checker, Expression value, Expression read) -> Type? {
+    let path = narrowing.buildNarrowingPath(checker, value);
+    if (path == null || checker.inTrial()) {
+        return null;
+    }
+    let trial = checker.trial();
+    trial.narrowing().narrow(path, convert.coreOf(checker.recordedType(value)));
+    Type type = trial.analyzeExpression(read);
+    checker.endTrial();
+    if (type is ErrorType) {
+        return null;
+    }
+    return type;
+}
+
+// A value of the type 'type' to write after '??', as in '""' for a 'string' and '0' for a number, or null
+// where the type has none plain enough to show.
+plainFallback(Type type) -> string? {
+    if (type is StringType) {
+        return "\"\"";
+    }
+    if (convert.isIntegerType(type)) {
+        return "0";
+    }
+    if (convert.isFloatType(type)) {
+        return "0.0";
+    }
+    return null;
+}
+
+// Why the operands, places whose outer levels of null are not null here, have fewer levels than their
+// declared types, said once for two of the same types.
+outerSentence(NullableOperand[] operands) -> string {
+    let first = operands[0];
+    string levels = "outer level is";
+    if (first.outerPresent > 1) {
+        levels = "{numberWord(first.outerPresent)} outer levels are";
+    }
+    if (operands.length == 2) {
+        levels = "outer levels are";
+        if (first.outerPresent > 1) {
+            levels = "{numberWord(first.outerPresent)} outer levels are";
+        }
+        return "'{first.outerPlace}' and '{operands[1].outerPlace}' are declared as {first.outerDeclared}, "
+            + "and their {levels} not null here.";
+    }
+    return "'{first.outerPlace}' is declared as {first.outerDeclared}, but it is {first.outerArticle} "
+        + "{first.outerHere} here, because its {levels} not null.";
+}
+
+// Why a null check of the operands removes none of the levels of null left, where their outer levels of
+// null are not null here.
+public outerLevelReason(NullableOperand[] operands) -> string {
+    string places = joinedValues(operands, false, "'", "'", " or ");
+    return "{outerSentence(operands)} A null check of {places} tests only {operands[0].outerTested()}.";
+}
+
+// The fix for the write 'write' through '?.' or '?[' after 'front', a place whose outer level of null
+// is not null here, or a local declared with a level of null its initial value fills: why a null check of
+// it removes no null, and the write inside a null check, of the local declared without that level, or of
+// a copy where the place holds an object or an array. The write is empty where it is too long to show.
+public copiedReceiverFix(BodyChecker checker, Expression receiver, NullableOperand front,
+                         string write) -> string {
+    if (front.redeclares() && write.length == 0) {
+        return "{front.redeclaredReason} {front.redeclaredFix} and check it for null.";
+    }
+    if (front.redeclares()) {
+        return "{front.redeclaredReason} {front.redeclaredFix} and check it for null, as in "
+            + "'if ({front.held()} != null) \{ {write}; \}'.";
+    }
+    string reason = outerLevelReason([front]);
+    Type core = convert.coreOf(checker.recordedType(receiver));
+    if (front.copies.length != 1 || (!types.isClassLike(core) && !(core is ArrayType))) {
+        return reason;
+    }
+    string copy = front.copies[0];
+    string copied = "Copy it into {front.copyArticles[0]} {front.copyTypes[0]} local and check that";
+    if (write.length == 0) {
+        return "{reason} {copied}.";
+    }
+    return "{reason} {copied}, as in 'let {copy} = {front.held()}; if ({copy} != null) \{ {write}; \}'.";
+}
+
+// Whether the same outer levels of null of two operands are not null here, at the same types, so that
+// one reason covers both.
+sameOuterLevels(NullableOperand first, NullableOperand second) -> bool {
+    return first.outerPresent == second.outerPresent && first.outerDeclared == second.outerDeclared
+        && first.outerHere == second.outerHere;
+}
+
+// Records on 'classified' the locals its fix copies the value into: one before each check after the first,
+// and one before the first as well where a null check of the value tests a level that is not null.
+noteCopies(BodyChecker checker, Expression operand, NullableOperand classified, string prefix) {
+    long count = classified.levels - 1;
+    Type copied = checker.recordedType(operand);
+    if (classified.outerPresent > 0) {
+        count = classified.levels;
+    } else if (copied is OptionalType) {
+        copied = copied.inner();
+    }
+    let names = new List<string>();
+    let types = new List<string>();
+    let articles = new List<string>();
+    let avoided = new List<string>();
+    avoided.push(classified.local());
+    for (long i = 0; i < count; i++) {
+        string name = freeLocalNameAvoiding(checker, prefix, "value", avoided);
+        names.push(name);
+        avoided.push(name);
+        types.push(checker.names().quoted(copied));
+        articles.push(typenames.typeArticle(checker.names().of(copied)));
+        if (copied is OptionalType) {
+            copied = copied.inner();
+        }
+    }
+    classified.copies = names.toArray();
+    classified.copyTypes = types.toArray();
+    classified.copyArticles = articles.toArray();
+}
+
+// "two", "three" or the digits of 'count'.
+numberWord(long count) -> string {
+    if (count == 2) {
+        return "two";
+    }
+    if (count == 3) {
+        return "three";
+    }
+    return "{count}";
 }
 
 // Records on 'classified' the assignment to 'operand', a local the lambda being checked copies, that comes
@@ -834,7 +1327,10 @@ noteEndedNarrowing(BodyChecker checker, Expression operand, NullableOperand clas
         string reason = "'{place}' is not null when the loop starts, but the loop {write}, so {outcome} "
             + "on a later pass.{carried}";
         if (checker.frame().inLoopCondition()) {
-            classified.endedReason = reason + loopConditionCheck(operand, place);
+            classified.endedReason = reason;
+            if (classified.levels == 1 && classified.outerPresent == 0) {
+                classified.endedReason = reason + loopConditionCheck(operand, place);
+            }
         } else {
             classified.endedReason = reason;
             classified.endedWhere = "inside the loop";
@@ -868,7 +1364,10 @@ noteConditionWrite(BodyChecker checker, NarrowingEnd end, Expression read, strin
     let stored = end.stored();
     let outcome = end.nullWhereCondition();
     bool sameStatement = narrowing.within(end.at(), enclosingStatement(read).span());
-    string recheck = sameStatement ? conditionRecheck(checker, read, end, place, classified.levels) : "";
+    string recheck = "";
+    if (sameStatement && classified.outerPresent == 0) {
+        recheck = conditionRecheck(checker, read, end, place, classified.levels);
+    }
     if (end.kind() == NarrowingEndKind.PassedOut) {
         classified.endedReason = "Passing 'out {place}' in the condition after the check lets "
             + "'{end.calleeName()}' write any value to '{place}'.{carried}{recheck}";
@@ -1030,12 +1529,19 @@ storedCall(BodyChecker checker, Expression operand) -> CallExpressionNode? {
 // The base name, joined to the prefix when there is one, and numbered from 2 when the name is
 // taken where the fix would declare it or is the name of another local the same fix declares.
 public freeLocalName(BodyChecker checker, string prefix, string base, string declared = "") -> string {
+    let avoided = new List<string>();
+    avoided.push(declared);
+    return freeLocalNameAvoiding(checker, prefix, base, avoided);
+}
+
+// freeLocalName for a fix that declares the locals named in 'avoided' as well.
+freeLocalNameAvoiding(BodyChecker checker, string prefix, string base, List<string> avoided) -> string {
     string name = base;
     if (prefix.length > 0) {
         name = joinedName(prefix, base);
     }
     string candidate = name;
-    for (long number = 2; nameTaken(checker, candidate) || candidate == declared; number++) {
+    for (long number = 2; nameTaken(checker, candidate) || avoided.contains(candidate); number++) {
         candidate = "{name}{number}";
     }
     return candidate;
@@ -1068,15 +1574,16 @@ public orderingAdvice(BodyChecker checker, string operatorText, Expression leftN
     let operands = classifyOperands(checker, leftNode, rightNode, left, right, null);
     let first = operands[0];
     let second = operands[1];
-    if (first.held().length == 0 || second.held().length == 0) {
+    if (first.reached().length == 0 || second.reached().length == 0) {
         return "Order strings with 'compareTo'. Its result is below zero when the string it is "
             + "called on sorts before the argument.";
     }
-    string receiver = first.held();
+    string receiver = first.reached();
     if (first.form() == OperandForm.Present && !wording.isSingleTerm(leftNode)) {
         receiver = "({first.held()})";
     }
-    return "Order strings with 'compareTo', as in '{receiver}.compareTo({second.held()}) {operatorText} 0'.";
+    return "Order strings with 'compareTo', as in '{receiver}.compareTo({second.reached()}) "
+        + "{operatorText} 0'.";
 }
 
 // How a refusal describes the step that keeps a value from being stable, a field or an element,
@@ -1191,7 +1698,7 @@ public valueAssignabilityHint(BodyChecker checker, Type target, Type source, Exp
         return "";
     }
     if (levels > 0 && value != null) {
-        let chain = chainAdvice(checker, value, levels);
+        let chain = deepLeftAdvice(checker, value) ?? chainAdvice(checker, value, levels);
         if (chain != null) {
             return " {chain}";
         }
@@ -1306,6 +1813,8 @@ valueConversion(BodyChecker checker, Type target, Type source, Expression? value
 operandsAdvice(NullableOperand[] operands, string operatorText = "") -> string? {
     if (operands.length == 2 && operands[0].form() == operands[1].form()
             && operands[0].levels == operands[1].levels && !samePlace(operands[0], operands[1])
+            && sameOuterLevels(operands[0], operands[1]) && !operands[0].redeclares()
+            && !operands[1].redeclares()
             && operands[0].laterAssignment.length == 0 && operands[1].laterAssignment.length == 0
             && operands[0].endedReason.length == 0 && operands[1].endedReason.length == 0) {
         let paired = formAdvice(operands, operatorText);
@@ -1347,10 +1856,26 @@ formAdvice(NullableOperand[] operands, string operatorText) -> string? {
         Stable -> {
             string names = joinedValues(operands, false, "'", "'", " and ");
             string condition = joinedValues(operands, false, "", " != null", " && ");
+            string writeBack = "";
+            if (first.writes) {
+                writeBack = " Then write the result back to '{first.held()}'.";
+            }
+            if (first.outerPresent > 0) {
+                string copied = typenames.capitalizedAscii(copySteps(operands, pronoun(operands)));
+                return "{outerLevelReason(operands)} {copied} ('{checksCode(operands)}').{writeBack}";
+            }
+            string tested = joinedValues(operands, false, "'", "'", " or ");
+            if (first.redeclares()) {
+                string declared = "{first.redeclaredReason} {first.redeclaredFix}";
+                if (first.levels == 1) {
+                    return "{declared} and check it for null.";
+                }
+                return "{declared}. {checkThenCopy(operands, tested, "")}.";
+            }
             if (first.levels == 1) {
                 return "Check {names} for null first ('if ({condition})').";
             }
-            return "Check {names} for null{repeatedCheck(condition, first.levels, first.everyLevel)}.";
+            return "{checkThenCopy(operands, tested, "")}.{writeBack}";
         },
         Copied -> {
             return copiedAdvice(operands, "null check", "check");
@@ -1380,12 +1905,17 @@ endedAdvice(NullableOperand operand) -> string {
     if (operand.endedWhere.length == 0) {
         return operand.endedReason;
     }
-    string condition = "{operand.held()} != null";
-    string check = "Check '{operand.held()}' for null {operand.endedWhere}";
-    if (operand.levels == 1) {
-        return "{operand.endedReason} {check} ('if ({condition})').";
+    string place = operand.held();
+    if (operand.outerPresent > 0) {
+        string copied = typenames.capitalizedAscii(copySteps([operand], "'{place}' {operand.endedWhere}"));
+        return "{operand.endedReason} '{place}' is declared as {operand.outerDeclared}, so a null check of "
+            + "'{place}' tests only its outer level. {copied} ('{checksCode([operand])}').";
     }
-    return "{operand.endedReason} {check}{repeatedCheck(condition, operand.levels, operand.everyLevel)}.";
+    if (operand.levels == 1) {
+        return "{operand.endedReason} Check '{place}' for null {operand.endedWhere} "
+            + "('if ({place} != null)').";
+    }
+    return "{operand.endedReason} {checkThenCopy([operand], "'{place}'", " {operand.endedWhere}")}.";
 }
 
 // The advice for the values read where no statement can go, which only a '??' fallback can give a
@@ -1394,10 +1924,17 @@ fallbackAdvice(NullableOperand[] operands, bool any) -> string? {
     let first = operands[0];
     let named = new List<string>();
     for (let operand in operands) {
-        if (operand.writes || operand.levels == 0 || (!any && operand.form() != OperandForm.NoFix)) {
+        if (operand.writes || operand.levels == 0 || (!any && operand.form() != OperandForm.NoFix)
+                || (operand.outerPresent > 0 && operands.length > 1)) {
             return null;
         }
         named.push(operand.fallbackParenthesized ? "'({operand.spelling})'" : "'{operand.spelling}'");
+    }
+    if (first.outerPresent > 0 && first.outerFallback.length == 0) {
+        return null;
+    }
+    if (first.outerPresent > 0) {
+        return "{outerSentence([first])} {first.outerFallback}";
     }
     string fallbacks = "a fallback for {named.get(0)}";
     if (operands.length > 1) {
@@ -1578,14 +2115,29 @@ localsFix(NullableOperand[] operands, string verb, bool forNull, string place) -
         checked = "{verb} the locals";
         declarations = "{declarations} {operands[1].declaration()}";
     }
+    if (operands[0].copies.length > 0) {
+        string subject = "the local";
+        if (operands[0].stores.length > 0 && words != null) {
+            subject = "'{operands[0].local()}'";
+        }
+        if (operands.length == 2) {
+            subject = "either local";
+        }
+        if (holdsMore(operands)) {
+            subject = joinedValues(operands, false, "'", "'", " or ");
+        }
+        string fix = "{where} first ('{declarations}'). {checkThenCopy(operands, subject, "")}";
+        if (place.length == 0) {
+            return "{fix}.";
+        }
+        return "{fix}. Then write the result back to {place}.";
+    }
     if (holdsMore(operands)) {
         checked = "{verb} {joinedValues(operands, false, "'", "'", " and ")}";
         if (forNull) {
             checked = "{checked} for null";
         }
     }
-    string condition = joinedValues(operands, false, "", " != null", " && ");
-    checked = checked + repeatedCheck(condition, operands[0].levels, operands[0].everyLevel);
     if (place.length == 0) {
         return "{where} first ('{declarations}') and {checked}.";
     }
@@ -1751,23 +2303,80 @@ joinedName(string first, string second) -> string {
     return first + second.substring(0, 1).toUpperAscii() + second.substring(1);
 }
 
-// The words that spell out 'levels' nested null checks of 'condition', or nothing for one level.
-// 'everyLevel' is true when the checks remove every '?' of the type.
-repeatedCheck(string condition, long levels, bool everyLevel) -> string {
-    if (levels < 2) {
-        return "";
+// The fix for operands that may be null at more than one level, without its full stop: a null check of
+// 'subject', the operands or their locals, written 'where', then a copy and a check for each level left.
+checkThenCopy(NullableOperand[] operands, string subject, string where) -> string {
+    string checked = pronoun(operands);
+    return "A null check of {subject} tests only its outer level, so check {checked}{where}, then "
+        + "{copySteps(operands, checked)} ('{checksCode(operands)}')";
+}
+
+// "it" for one operand, "them" for two.
+pronoun(NullableOperand[] operands) -> string {
+    return operands.length == 2 ? "them" : "it";
+}
+
+// The copies of the fix for the operands, each followed by its check, as in "copy it into an 'int?' local
+// and check that", where 'first' names what the first copy copies. Three copies or more are said once,
+// counted by the '?' of the type of the first.
+copySteps(NullableOperand[] operands, string first) -> string {
+    bool pair = operands.length == 2;
+    if (operands[0].copies.length > 2) {
+        string counted = operands[0].copyTypes[0];
+        if (pair && operands[1].copyTypes[0] != counted) {
+            counted = "{counted} or {operands[1].copyTypes[0]}";
+        }
+        if (pair) {
+            return "check copies of {first}, then copies of those copies, and so on, once for each '?' in "
+                + counted;
+        }
+        return "check a copy of {first}, then a copy of that copy, and so on, once for each '?' in "
+            + counted;
     }
-    string times = timesWord(levels);
+    string copy = pair ? "those" : "that";
+    string steps = "";
+    for (long i = 0; i < operands[0].copies.length; i++) {
+        string copied = first;
+        if (i > 0) {
+            copied = copy;
+        }
+        string type = operands[0].copyTypes[i];
+        string into = "{operands[0].copyArticles[i]} {type} local";
+        if (pair && operands[1].copyTypes[i] == type) {
+            into = "{type} locals";
+        } else if (pair) {
+            into = "locals";
+        }
+        string step = "copy {copied} into {into} and check {copy}";
+        steps = i == 0 ? step : "{steps}, then {step}";
+    }
+    return steps;
+}
+
+// The code of the checks and copies of the fix for the operands, as in
+// 'if (twice != null) { let value = twice; if (value != null) { ... } }'.
+checksCode(NullableOperand[] operands) -> string {
     string opened = "";
     string closed = "";
-    for (long i = 0; i < levels; i++) {
-        opened = opened + "if ({condition}) \{ ";
-        closed = closed + " \}";
+    if (operands[0].outerPresent == 0) {
+        opened = "if ({joinedValues(operands, false, "", " != null", " && ")}) \{ ";
+        closed = " \}";
     }
-    if (!everyLevel) {
-        return " {times} ('{opened}...{closed}')";
+    for (long i = 0; i < operands[0].copies.length; i++) {
+        string copies = "";
+        string condition = "";
+        for (let operand in operands) {
+            string from = i == 0 ? operand.held() : operand.copies[i - 1];
+            copies = "{copies}let {operand.copies[i]} = {from}; ";
+            if (condition.length > 0) {
+                condition = condition + " && ";
+            }
+            condition = "{condition}{operand.copies[i]} != null";
+        }
+        opened = "{opened}{copies}if ({condition}) \{ ";
+        closed = "{closed} \}";
     }
-    return " {times}, once for each '?' ('{opened}...{closed}')";
+    return "{opened}...{closed}";
 }
 
 // A value type flowing into an interface-typed slot it conforms to. The conformance is a

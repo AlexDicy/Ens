@@ -1135,10 +1135,10 @@ test "a check inside a lambda narrows what the lambda captures" {
 
 // A lambda copies what it captures where it is created, and nothing writes the copy, so a narrowing
 // that holds there holds inside the body: of a parameter, a local and a value its initializer gives,
-// by a null check, a type test and at every level of null, on 'this', on a 'const' field of a struct
-// it copies, in a lambda nested in it, in a lambda made in a loop or on the right of '&&', in a field
-// default, and in a lambda passed to a generic call. Writing the local after the lambda is created
-// changes neither the copy nor its narrowing.
+// by a null check, a type test and a write that proves every level of null, on 'this', on a 'const'
+// field of a struct it copies, in a lambda nested in it, in a lambda made in a loop or on the right of
+// '&&', in a field default, and in a lambda passed to a generic call. Writing the local after the lambda
+// is created changes neither the copy nor its narrowing.
 test "a narrowing that holds where a lambda is created holds inside it for what it captures" {
     let analysis = try sema_support.analyzeOne("class Shape \{ protected constructor(); \}\n"
         + "class Circle extends Shape \{ protected int radius = 1; protected constructor(); \}\n"
@@ -1176,8 +1176,8 @@ test "a narrowing that holds where a lambda is created holds inside it for what 
         + "    return () -> 0;\n"
         + "\}\n"
         + "levels(string?? held) -> () -> long \{\n"
-        + "    if (held != null && held != null) \{ return () -> held.length; \}\n"
-        + "    return () -> 0;\n"
+        + "    held = \"written\";\n"
+        + "    return () -> held.length;\n"
         + "\}\n"
         + "structField(Pair pair) -> () -> long \{\n"
         + "    if (pair.fixed == null) \{ return () -> 0; \}\n"
@@ -1215,6 +1215,84 @@ test "a narrowing that holds where a lambda is created holds inside it for what 
         + "    return 0;\n"
         + "\}\n");
     try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+}
+
+// A null check tests the outer level of null of the place it names, so where it holds, a 'string??' is a
+// 'string?' that a copy checks in turn, whichever site holds the check: 'if', 'while', 'for', '?:', the
+// right of '&&' and '||', a '!' around it, and an assignment it tests. '??' after the place replaces only
+// a null outer level, and a type test reads through the level that is left.
+test "a null check of a value with two levels of null takes off the outer one at every test site" {
+    let analysis = try sema_support.analyzeOne("class Shape \{ protected constructor(); \}\n"
+        + "class Circle extends Shape \{ protected int radius = 1; protected constructor(); \}\n"
+        + "takes(string? text) -> bool \{ return text != null; \}\n"
+        + "pick() -> string?? \{ return null; \}\n"
+        + "sites(string?? held) -> long \{\n"
+        + "    if (held != null) \{\n"
+        + "        string? inner = held;\n"
+        + "        string? again = held ?? \"unused\";\n"
+        + "        let copy = held;\n"
+        + "        if (copy != null) \{ return copy.length; \}\n"
+        + "    \}\n"
+        + "    while (held != null) \{ string? inner = held; break; \}\n"
+        + "    for (long i = 0; held != null; i++) \{ string? inner = held; break; \}\n"
+        + "    string? viaTernary = held != null ? held : null;\n"
+        + "    bool viaAnd = held != null && takes(held);\n"
+        + "    bool viaOr = held == null || takes(held);\n"
+        + "    if (!(held == null)) \{ string? inner = held; \}\n"
+        + "    string?? slot = null;\n"
+        + "    if ((slot = pick()) != null) \{ string? inner = slot; \}\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "tested(Shape?? shape) -> int \{\n"
+        + "    if (shape != null && shape is Circle) \{ return shape.radius; \}\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+}
+
+// A second null check of the same place tests the same outer level again, however it is written, and so
+// does '??' after it, so none of them reaches the 'string' under both levels. An initial value that fills
+// only the outer level leaves '??' testing that level too.
+test "a second null check of a value with two levels of null leaves it nullable" {
+    let analysis = try sema_support.analyzeOne("recheck(string?? held) -> long \{\n"
+        + "    if (held != null && held != null) \{ return held.length; \}\n"
+        + "    if (held != null) \{\n"
+        + "        if (held != null) \{ return held.length; \}\n"
+        + "    \}\n"
+        + "    if (held == null || held == null) \{ return 0; \}\n"
+        + "    return held.length;\n"
+        + "\}\n"
+        + "fallback(string?? held) -> string \{\n"
+        + "    if (held == null) \{ return \"\"; \}\n"
+        + "    return held ?? \"none\";\n"
+        + "\}\n"
+        + "maybe() -> int? \{ return null; \}\n"
+        + "initialized() -> int \{\n"
+        + "    int?? twice = maybe();\n"
+        + "    return twice ?? 1;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    string file = "/proj/src/main.ens";
+    string read = "Cannot read a member of 'string?' because it may be null here. 'held' is declared as "
+        + "'string??', but it is a 'string?' here, because its outer level is not null. A null check of 'held' "
+        + "tests only that outer level. Copy it into a 'string?' local and check that ('let value = held; if "
+        + "(value != null) \{ ... \}').";
+    try sema_support.assertDiagnostic(reported, 0, file, read);
+    try sema_support.assertDiagnostic(reported, 1, file, read);
+    try sema_support.assertDiagnostic(reported, 2, file, read);
+    try sema_support.assertDiagnostic(reported, 3, file, "Function 'fallback' returns 'string', but this value "
+        + "has type 'string?'. 'held' has type 'string??', and '??' replaces null only at its outer level, so "
+        + "'held ?? \"none\"' is a 'string?'. Take both levels off, as in '(held ?? null) ?? \"none\"'.");
+    try sema_support.assertDiagnostic(reported, 4, file, "Function 'initialized' returns 'int', but this "
+        + "value has type 'int?'. 'twice' has type 'int??', and '??' replaces null only at its outer level, so "
+        + "'twice ?? 1' is an 'int?'. Take both levels off, as in '(twice ?? null) ?? 1'.");
+    try testing.assertEqual(reported.length, 5L);
 }
 
 // A 'const' field of a class object has its one value before any code can reach the object, so a

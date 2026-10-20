@@ -1332,6 +1332,10 @@ An assignment fills the levels it needs in one step: a `string?` written where a
 A value nullable at more levels than the type it flows into never fits, so it has to be unwrapped first.
 
 `x == null` tests the outermost level only, and one null check strips exactly one level; reaching the value under a `string??` therefore takes two checks.
+Once a `string??` named `x` is known to be present at its outer level, it is a `string?`, never a `string`.
+This happens after `x != null`, after an assignment of a `string?`, and from an initializer that is a `string?`.
+`x == null`, `x != null` and `x ?? fallback` still test that outer level, so reaching the value takes a second check on a copy, as in the example below.
+`?.`, `?[`, `is` and `switch` read the `string?`.
 `??` unwraps exactly one level: its result is whatever that level held, and its fallback is typed at the level below, so `x ?? fallback` on a `string??` produces a `string?` and uses the fallback only when the outer level is absent.
 Chaining is how a value reaches its core, as in `(x ?? null) ?? value`.
 
