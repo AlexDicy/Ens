@@ -243,6 +243,16 @@ task("test")
             })
         end
 
+        -- the carried files' tests: writing them into a real store under their digest, reading
+        -- the same folder on a later run, and stepping over a folder an interrupted run left.
+        if want("selfhost_bundled") then
+            table.insert(jobs, {
+                name = "selfhost_bundled",
+                source = path.join(os.projectdir(), "selfhost", "bundled"),
+                ens_test_args = {},
+            })
+        end
+
         -- the target library's unit tests: the processor and the system a triple names, over every
         -- spelling of each.
         if want("selfhost_target") then
@@ -822,7 +832,7 @@ task("test")
             end
             for _, pkg in ipairs({"corpus", "frontend", "sema", "semacheck", "syntaxgen",
                               "target", "llvm", "codegen", "codegencheck", "host", "cli",
-                              "packages", "link", "build", "driver"}) do
+                              "packages", "bundled", "link", "build", "driver"}) do
                 local src = path.join(os.projectdir(), "selfhost", pkg, "src")
                 local seeds = {}
                 for _, f in ipairs(os.files(path.join(src, "**.ens"))) do
