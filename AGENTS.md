@@ -110,6 +110,8 @@ If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surf
 - `bootstrap` is the strongest end-to-end gate: `build/host/ens` compiles `selfhost/driver` into stage 2, stage 2's `ens` compiles the same sources into stage 3, and the two stages' object files must hold the same modules with identical bytes.
   Executables are compared as a note only, because linker output carries timestamps.
   The seed built the host compiler but neither stage, so what the seed generates cannot decide this gate: it answers for this tree's code generation alone.
+- `symbol_audit` compiles the standard library and `hello` for each of the five targets and fails on any symbol their objects call that neither the system libraries `ens` carries for that target nor its own startup object provide, so a library call code generation adds is caught on every host rather than at a user's link.
+  `linux_link` and `windows_link` then link programs for the Linux and Windows targets on every host, read back what they load, and run them on a host of the same system and processor.
 - The `cli_*` jobs (`cli_build`, `cli_runtest`, `cli_overriding`, `cli_dependencies`, `cli_prebuilt`, `cli_toolchain`) all drive `ens`, and each asserts the command's own contract.
   Nothing about another command line is authoritative for them.
 

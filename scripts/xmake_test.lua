@@ -408,6 +408,17 @@ task("test")
             })
         end
 
+        -- every symbol the standard library and a program's entry code call on each of the five
+        -- targets is one the system libraries ens carries for that target provide, or one ens's
+        -- own startup object defines. A library call code generation adds fails here on every
+        -- host, rather than at a user's link.
+        if want("symbol_audit") then
+            table.insert(jobs, {
+                name = "symbol_audit",
+                symbol_audit = true,
+            })
+        end
+
         -- the Ens-written command's own behavior: its help, the argv it refuses, each optimization
         -- level, a library against an application, the order a workspace's members build in, and a
         -- workspace whose members disagree on the Ens version.
@@ -1345,6 +1356,107 @@ task("test")
                     full = name .. ": " .. table.concat(failures, "\n")}
             end
             return {name = name, ok = true}
+        end
+
+        local function run_symbol_audit(job)
+            local name = job.name
+            local log = path.join(out_dir, name .. ".log")
+            local root = path.join(os.projectdir(), "build", "symbolaudit")
+            os.tryrm(root)
+            os.mkdir(root)
+            local nm = os.files(path.join(global.directory(), "packages", "l", "llvm", "*", "*",
+                "bin", "llvm-nm" .. exe_suffix))[1]
+            if not nm then
+                return {name = name, ok = false, short = "no llvm-nm in the LLVM package"}
+            end
+            local lists = path.join(os.projectdir(), "selfhost", "bundled", "symbols")
+            -- what the startup object defines for a Windows program, which no list names; kept
+            -- in step with selfhost/codegen/src/emit/startup.ens
+            local startupDefines = {"__chkstk", "_fltused", "memcpy", "memmove", "memset",
+                "memcmp", "snprintf"}
+            local targets = {
+                {triple = "x86_64-unknown-linux-gnu", list = "linux-x64.symbols", prefix = ""},
+                {triple = "aarch64-unknown-linux-gnu", list = "linux-arm64.symbols", prefix = ""},
+                {triple = "arm64-apple-macosx11.0", list = "macos-arm64.symbols", prefix = "_"},
+                {triple = "x86_64-pc-windows-msvc", list = "windows-x64.symbols", prefix = "",
+                    startup = startupDefines},
+                {triple = "aarch64-pc-windows-msvc", list = "windows-arm64.symbols", prefix = "",
+                    startup = startupDefines},
+            }
+            local failures = {}
+            local audited = 0
+            for _, target in ipairs(targets) do
+                local provided = {}
+                for line in (io.readfile(path.join(lists, target.list)) or ""):gmatch("[^\r\n]+") do
+                    local kind, symbol = line:match("^(%S+) (%S+)")
+                    if kind == "symbol" or kind == "weak-symbol" or kind == "object"
+                            or kind == "tls" or kind == "data" then
+                        provided[symbol] = true
+                    end
+                end
+                for _, symbol in ipairs(target.startup or {}) do
+                    provided[target.prefix .. symbol] = true
+                end
+                local folder = path.join(root, target.triple)
+                local builds = {
+                    {label = "the standard library", argv = {"build",
+                        path.join(os.projectdir(), "libs", "std"), "--target", target.triple,
+                        "--objects", path.join(folder, "std")}},
+                    {label = "hello", argv = {"build", path.join(tests_dir, "hello.ens"),
+                        "--target", target.triple, "--no-link", "--objects",
+                        path.join(folder, "hello")}},
+                }
+                local compiled = true
+                for _, build in ipairs(builds) do
+                    if execMerged(host_exe, build.argv, log) ~= 0 then
+                        table.insert(failures, string.format("%s did not compile for %s:\n%s",
+                            build.label, target.triple, captured(log)))
+                        compiled = false
+                    end
+                end
+                if compiled then
+                    local objects = {}
+                    for _, file in ipairs(os.files(path.join(folder, "**"))) do
+                        if file:endswith(".o") or file:endswith(".obj") then
+                            table.insert(objects, file)
+                        end
+                    end
+                    -- the names llvm-nm lists, one a line, with the file headers left out
+                    local function listed(option)
+                        local argv = {option, "--just-symbol-name"}
+                        for _, object in ipairs(objects) do table.insert(argv, object) end
+                        execMerged(nm, argv, log)
+                        local found = {}
+                        for line in captured(log):gmatch("[^\r\n]+") do
+                            if not line:endswith(":") and #line > 0 then
+                                found[line] = true
+                            end
+                        end
+                        return found
+                    end
+                    local defined = listed("--defined-only")
+                    local missing = {}
+                    for symbol in pairs(listed("--undefined-only")) do
+                        if not defined[symbol] and not provided[symbol] then
+                            table.insert(missing, symbol)
+                        end
+                    end
+                    table.sort(missing)
+                    if #missing > 0 then
+                        table.insert(failures, string.format("for %s, the objects call %d "
+                            .. "symbol%s that neither the carried libraries nor the startup "
+                            .. "object provide: %s", target.triple, #missing,
+                            #missing == 1 and "" or "s", table.concat(missing, ", ")))
+                    end
+                    audited = audited + #objects
+                end
+            end
+            if #failures > 0 then
+                return {name = name, ok = false, short = failures[1]:match("^[^\n]*"),
+                    full = name .. ": " .. table.concat(failures, "\n")}
+            end
+            return {name = name, ok = true,
+                note = string.format("%d objects over %d targets", audited, #targets)}
         end
 
         local function run_standalone(job)
@@ -3600,6 +3712,7 @@ task("test")
             if job.standalone then return run_standalone(job) end
             if job.linux_link then return run_linux_link(job) end
             if job.windows_link then return run_windows_link(job) end
+            if job.symbol_audit then return run_symbol_audit(job) end
             if job.cli_build then return run_cli_build(job) end
             if job.cli_runtest then return run_cli_runtest(job) end
             if job.cli_toolchain then return run_cli_toolchain(job) end
