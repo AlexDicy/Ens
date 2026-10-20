@@ -1,0 +1,301 @@
+// Link-only shared libraries for Linux, written straight from a symbol list. The file holds only
+// what the linker reads from a shared library: its soname, its version nodes, and each symbol with
+// its kind, version and, for data, its size. It has no code and no program headers, so it is
+// never loaded; the system's own library is, when the program runs.
+import BytesWriter from @std.io.memory;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+import Architecture from @ens.target.triple;
+import ListedLibrary from symbols;
+import ExportKind from symbols;
+
+// The library as an ELF shared object for a 64-bit little-endian processor.
+export sharedLibrary(ListedLibrary library, Architecture architecture) -> byte[] {
+    let strings = new StringTable();
+    long sonameAt = strings.add(library.name());
+
+    let versions = new List<string>();
+    let versionIndex = new Map<string, long>();
+    for (let entry in library.exports()) {
+        if (entry.version().length > 0 && versionIndex.get(entry.version()) == null) {
+            versions.push(entry.version());
+            versionIndex.set(entry.version(), versions.length() + 1);
+        }
+    }
+
+    let symbols = new BytesWriter();
+    let versym = new BytesWriter();
+    symbols.write(new byte[Layout.symbolSize]);
+    versym.write(half(0));
+    long dataSize = 0;
+    long threadDataSize = 0;
+    for (let entry in library.exports()) {
+        long section = Sections.text;
+        long kind = Layout.functionType;
+        long value = 0;
+        switch (entry.kind()) {
+            ExportKind.Data -> {
+                section = Sections.data;
+                kind = Layout.objectType;
+                value = dataSize;
+                dataSize = aligned(dataSize + entry.size(), Layout.dataAlignment);
+            },
+            ExportKind.ThreadData -> {
+                section = Sections.threadData;
+                kind = Layout.threadType;
+                value = threadDataSize;
+                threadDataSize = aligned(threadDataSize + entry.size(), Layout.dataAlignment);
+            },
+            default -> { },
+        }
+        symbols.write(word(strings.add(entry.name())));
+        symbols.write([((Layout.globalBinding << 4) | kind) as byte, 0]);
+        symbols.write(half(section));
+        symbols.write(doubleWord(value));
+        symbols.write(doubleWord(entry.size()));
+        versym.write(half(versionIndex.get(entry.version()) ?? 1));
+    }
+
+    let definitions = new BytesWriter();
+    long count = versions.length() + 1;
+    appendDefinition(definitions, 1, 1, sonameAt, library.name(), count == 1);
+    for (long i = 0; i < versions.length(); i++) {
+        string name = versions.get(i);
+        appendDefinition(definitions, 0, i + 2, strings.add(name), name, i + 2 == count);
+    }
+
+    let dynamic = new BytesWriter();
+    dynamic.write(doubleWord(Layout.sonameTag));
+    dynamic.write(doubleWord(sonameAt));
+    dynamic.write(doubleWord(0));
+    dynamic.write(doubleWord(0));
+
+    let names = new StringTable();
+    let sections = [
+        new Section(names.add(".text"), Layout.progbits, Layout.allocated | Layout.executable,
+            [], 0, 16, 0, 0, 0),
+        new Section(names.add(".data"), Layout.nobits, Layout.allocated | Layout.writable, [],
+            dataSize, Layout.dataAlignment, 0, 0, 0),
+        new Section(names.add(".tbss"), Layout.nobits,
+            Layout.allocated | Layout.writable | Layout.threadLocal, [], threadDataSize,
+            Layout.dataAlignment, 0, 0, 0),
+        new Section(names.add(".dynsym"), Layout.dynamicSymbols, Layout.allocated,
+            symbols.toBytes(), 0, 8, Layout.symbolSize, Sections.dynamicStrings, 1),
+        new Section(names.add(".dynstr"), Layout.stringTable, Layout.allocated, strings.bytes(),
+            0, 1, 0, 0, 0),
+        new Section(names.add(".gnu.version"), Layout.versionSymbols, Layout.allocated,
+            versym.toBytes(), 0, 2, 2, Sections.dynamicSymbols, 0),
+        new Section(names.add(".gnu.version_d"), Layout.versionDefinitions, Layout.allocated,
+            definitions.toBytes(), 0, 8, 0, Sections.dynamicStrings, count),
+        new Section(names.add(".dynamic"), Layout.dynamicSection,
+            Layout.allocated | Layout.writable, dynamic.toBytes(), 0, 8, 16,
+            Sections.dynamicStrings, 0),
+        new Section(names.add(".shstrtab"), Layout.stringTable, 0, [], 0, 1, 0, 0, 0),
+    ];
+    sections[sections.length - 1].contents = names.bytes();
+    return written(sections, machineOf(architecture));
+}
+
+// One verdef entry and its single auxiliary name, which the next entry follows directly.
+appendDefinition(BytesWriter out, long flags, long index, long nameAt, string name, bool last) {
+    out.write(half(1));
+    out.write(half(flags));
+    out.write(half(index));
+    out.write(half(1));
+    out.write(word(elfHash(name)));
+    out.write(word(Layout.definitionSize));
+    long next = Layout.definitionSize + Layout.auxiliarySize;
+    if (last) {
+        next = 0;
+    }
+    out.write(word(next));
+    out.write(word(nameAt));
+    out.write(word(0));
+}
+
+// The header, every section's contents in order, and the section headers after them.
+written(Section[] sections, long machine) -> byte[] {
+    let body = new BytesWriter();
+    long[] offsets = new long[sections.length];
+    long at = Layout.headerSize;
+    for (long i = 0; i < sections.length; i++) {
+        long padding = aligned(at, sections[i].alignment) - at;
+        body.write(new byte[padding]);
+        at = at + padding;
+        offsets[i] = at;
+        body.write(sections[i].contents);
+        at = at + sections[i].contents.length;
+    }
+    long headersAt = aligned(at, 8);
+    body.write(new byte[headersAt - at]);
+
+    let out = new BytesWriter();
+    out.write([0x7f, 'E', 'L', 'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    out.write(half(Layout.sharedObject));
+    out.write(half(machine));
+    out.write(word(1));
+    out.write(doubleWord(0));
+    out.write(doubleWord(0));
+    out.write(doubleWord(headersAt));
+    out.write(word(0));
+    out.write(half(Layout.headerSize));
+    out.write(half(0));
+    out.write(half(0));
+    out.write(half(Layout.sectionHeaderSize));
+    out.write(half(sections.length + 1));
+    out.write(half(sections.length));
+    out.write(body.toBytes());
+    out.write(new byte[Layout.sectionHeaderSize]);
+    for (long i = 0; i < sections.length; i++) {
+        let section = sections[i];
+        long size = section.contents.length;
+        if (section.kind == Layout.nobits) {
+            size = section.reserved;
+        }
+        out.write(word(section.nameAt));
+        out.write(word(section.kind));
+        out.write(doubleWord(section.flags));
+        out.write(doubleWord(0));
+        out.write(doubleWord(offsets[i]));
+        out.write(doubleWord(size));
+        out.write(word(section.link));
+        out.write(word(section.info));
+        out.write(doubleWord(section.alignment));
+        out.write(doubleWord(section.entrySize));
+    }
+    return out.toBytes();
+}
+
+// The System V hash of a name, which a version definition records beside it.
+elfHash(string name) -> long {
+    long hash = 0;
+    for (let character in name.bytes()) {
+        hash = (hash << 4) + ((character as long) & 0xff);
+        long high = hash & 0xf0000000;
+        if (high != 0) {
+            hash = hash ^ (high >> 24);
+        }
+        hash = hash & ~high;
+    }
+    return hash;
+}
+
+machineOf(Architecture architecture) -> long {
+    return switch (architecture) {
+        Architecture.X64 -> 62,
+        Architecture.Arm64 -> 183,
+    };
+}
+
+aligned(long value, long alignment) -> long {
+    if (alignment <= 1) {
+        return value;
+    }
+    return (value + alignment - 1) / alignment * alignment;
+}
+
+half(long value) -> byte[] {
+    return littleEndian(value, 2);
+}
+
+word(long value) -> byte[] {
+    return littleEndian(value, 4);
+}
+
+doubleWord(long value) -> byte[] {
+    return littleEndian(value, 8);
+}
+
+littleEndian(long value, long width) -> byte[] {
+    byte[] bytes = new byte[width];
+    for (long i = 0; i < width; i++) {
+        bytes[i] = ((value >> (i * 8)) & 0xff) as byte;
+    }
+    return bytes;
+}
+
+// The strings of a string table, each written once and followed by a zero byte, after the empty
+// string every table starts with.
+final class StringTable {
+    BytesWriter written;
+    Map<string, long> offsets;
+
+    protected constructor() {
+        this.written = new BytesWriter();
+        this.written.write([0]);
+        this.offsets = new Map<string, long>();
+    }
+
+    // Where `text` is in the table, adding it the first time it is asked for.
+    protected add(string text) -> long {
+        long? known = this.offsets.get(text);
+        if (known != null) {
+            return known;
+        }
+        long at = this.written.length();
+        this.written.write(text.toBytes());
+        this.written.write([0]);
+        this.offsets.set(text, at);
+        return at;
+    }
+
+    protected bytes() -> byte[] {
+        return this.written.toBytes();
+    }
+}
+
+final class Section {
+    protected long nameAt;
+    protected long kind;
+    protected long flags;
+    protected byte[] contents;
+    // The size of a section that takes no room in the file.
+    protected long reserved;
+    protected long alignment;
+    protected long entrySize;
+    protected long link;
+    protected long info;
+
+    protected constructor(this.nameAt, this.kind, this.flags, this.contents, this.reserved,
+                          this.alignment, this.entrySize, this.link, this.info);
+}
+
+// The index of each section in the file, counting the empty section header first.
+final class Sections {
+    protected static const long text = 1;
+    protected static const long data = 2;
+    protected static const long threadData = 3;
+    protected static const long dynamicSymbols = 4;
+    protected static const long dynamicStrings = 5;
+}
+
+// The numbers the ELF format gives each field and kind this writer uses.
+final class Layout {
+    protected static const long headerSize = 64;
+    protected static const long sectionHeaderSize = 64;
+    protected static const long symbolSize = 24;
+    protected static const long definitionSize = 20;
+    protected static const long auxiliarySize = 8;
+    protected static const long dataAlignment = 16;
+
+    protected static const long sharedObject = 3;
+    protected static const long sonameTag = 14;
+
+    protected static const long progbits = 1;
+    protected static const long stringTable = 3;
+    protected static const long dynamicSection = 6;
+    protected static const long nobits = 8;
+    protected static const long dynamicSymbols = 11;
+    protected static const long versionDefinitions = 0x6ffffffd;
+    protected static const long versionSymbols = 0x6fffffff;
+
+    protected static const long writable = 1;
+    protected static const long allocated = 2;
+    protected static const long executable = 4;
+    protected static const long threadLocal = 0x400;
+
+    protected static const long globalBinding = 1;
+    protected static const long objectType = 1;
+    protected static const long functionType = 2;
+    protected static const long threadType = 6;
+}

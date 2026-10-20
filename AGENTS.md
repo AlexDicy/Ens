@@ -39,7 +39,7 @@ If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surf
   - `codegen/` - lowering to EIR (the ownership-explicit intermediate form), its verifiers, the optimization passes, and LLVM emission.
   - `host/` - what a run reads from the machine once: the environment snapshot, the user's `.ens` folder, path text, and a scratch folder that removes itself.
   - `cli/` - the command-line library: the immutable declaration model, the pure argv walk, generated help, nearest-match suggestions.
-  - `link/` - the linker bridge binding plus all link policy: flavor from triple, per-flavor argument vector, C runtime, unwinder and SDK discovery.
+  - `link/` - the linker bridge binding plus all link policy: flavor from triple, per-flavor argument vector, and what a machine adds to a link: the folders it names for libraries and, on macOS, its SDK.
   - `packages/` - dependency resolution: `ens.overrides`, `ens.lock`, the content store, sha256, git fetching, prebuilt artifacts, version selection.
   - `bundled/` - what `ens` carries inside itself, the standard library it was built with and the link-only system libraries of the targets it links for, and writing them into the cache the first time a build needs them, so a single `ens` file needs nothing else on the machine.
     `bundled/symbols/` holds the symbol lists those libraries are written from; they are generated, so refresh them with `xmake l scripts/refresh_system_symbols.lua` on the platform they come from, or with the `refresh-system-symbols` workflow, and never edit them by hand.

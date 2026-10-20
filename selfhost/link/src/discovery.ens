@@ -10,21 +10,20 @@ import List from @std.collections.list;
 import LinkerFlavor from flavor;
 import flavor;
 import Toolchain from toolchain;
-import ElfRuntime from toolchain;
 import MacosSdk from toolchain;
 import TargetTriple from @ens.target.triple;
 import triple;
 
-// Everything this machine contributes to a link for the given target. Nothing here fails: a
-// query the machine cannot satisfy leaves its part of the toolchain empty, and the link line then
-// simply reports less.
-export discover(TargetTriple target) -> Toolchain {
+// Everything this machine contributes to a link for the given target, where `runsHere` is whether
+// the program is built for this machine itself. Nothing here fails: a query the machine cannot
+// satisfy leaves its part of the toolchain empty, and the link line then simply reports less.
+export discover(TargetTriple target, bool runsHere) -> Toolchain {
     // The variables are read once here, at this layer's own boundary, so nothing below reads the
     // process about itself.
     let variables = Environment.current();
     return switch (flavor.flavorOf(target)) {
         LinkerFlavor.Coff -> coffToolchain(variables),
-        LinkerFlavor.Elf -> elfToolchain(variables, target),
+        LinkerFlavor.Elf -> elfToolchain(variables, target, runsHere),
         LinkerFlavor.MachO -> machoToolchain(variables),
     };
 }
@@ -68,61 +67,27 @@ export sdkVersionFromRoot(string root) -> string {
 // lld-link brings its own C runtime and finds the Visual Studio and Windows SDK libraries itself,
 // so the one thing the machine adds is the folders LIB names.
 coffToolchain(Environment variables) -> Toolchain {
-    return new Toolchain(searchPathsFrom(variables.get("LIB"), ";"), "",
-        new ElfRuntime("", "", "", ""), new MacosSdk("", ""));
+    return new Toolchain(searchPathsFrom(variables.get("LIB"), ";"), [], new MacosSdk("", ""));
 }
 
-elfToolchain(Environment variables, TargetTriple target) -> Toolchain {
-    return new Toolchain(searchPathsFrom(variables.get("LIBRARY_PATH"), ":"),
-        firstExistingFile(triple.dynamicLinkerCandidates(target.architecture())), elfRuntime(),
+// What LIBRARY_PATH names, and, for a program built for this machine, the folders its distribution
+// keeps libraries in, for the program's own native libraries. The system libraries come from ens.
+elfToolchain(Environment variables, TargetTriple target, bool runsHere) -> Toolchain {
+    let folders = new List<string>();
+    if (runsHere) {
+        for (let candidate in triple.systemFolderCandidates(target.architecture())) {
+            if (Path(candidate).isDirectory()) {
+                folders.push(candidate);
+            }
+        }
+    }
+    return new Toolchain(searchPathsFrom(variables.get("LIBRARY_PATH"), ":"), folders.toArray(),
         new MacosSdk("", ""));
 }
 
 machoToolchain(Environment variables) -> Toolchain {
-    return new Toolchain(searchPathsFrom(variables.get("LIBRARY_PATH"), ":"), "",
-        new ElfRuntime("", "", "", ""), macosSdk(variables));
-}
-
-// The C runtime pieces of the first of cc, clang and gcc this machine can run. One compiler serves
-// every query, so a machine with several of them never ends up mixing two C runtimes.
-elfRuntime() -> ElfRuntime {
-    for (let compiler in ["cc", "clang", "gcc"]) {
-        let startupObject = compilerFile(compiler, "Scrt1.o");
-        if (startupObject == null) {
-            continue;
-        }
-        return new ElfRuntime(startupObject,
-            compilerFile(compiler, "crti.o") ?? "",
-            compilerFile(compiler, "crtn.o") ?? "",
-            unwinderArchive(compiler));
-    }
-    return new ElfRuntime("", "", "", "");
-}
-
-// The static unwinder to link, preferring LLVM's over GCC's. Empty when the compiler ships neither,
-// and the link falls back to the shared libgcc_s.
-unwinderArchive(string compiler) -> string {
-    for (let archive in ["libunwind.a", "libgcc_eh.a"]) {
-        string found = compilerFile(compiler, archive) ?? "";
-        if (found.length > 0) {
-            return found;
-        }
-    }
-    return "";
-}
-
-// Where the C compiler keeps one of its own files, as it reports it: null when the compiler could
-// not be run at all, so the next candidate gets a turn, and empty when it ran but has no such
-// file, which it reports by echoing the name back unchanged.
-compilerFile(string compiler, string fileName) -> string? {
-    let printed = printedByProgram(compiler, ["-print-file-name=" + fileName]);
-    if (printed == null) {
-        return null;
-    }
-    if (printed == fileName || !Path(printed).isFile()) {
-        return "";
-    }
-    return printed;
+    return new Toolchain(searchPathsFrom(variables.get("LIBRARY_PATH"), ":"), [],
+        macosSdk(variables));
 }
 
 // The macOS SDK to link against: the one SDKROOT names, else the one xcrun selects. Empty when
@@ -148,13 +113,4 @@ printedByProgram(string program, string[] arguments) -> string? {
     return asked.stdout.trim();
 } catch (ProcessError refused) {
     return null;
-}
-
-firstExistingFile(string[] candidates) -> string {
-    for (let candidate in candidates) {
-        if (Path(candidate).isFile()) {
-            return candidate;
-        }
-    }
-    return "";
 }

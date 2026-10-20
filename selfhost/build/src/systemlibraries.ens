@@ -1,6 +1,6 @@
 // The link-only system libraries ens carries for a target, written into the cache for a link to
-// read, so the program links against the same files whichever machine builds it. A target ens
-// carries none for links against what the machine has.
+// read, and the object a Linux program starts at, so the program links against the same files
+// whichever machine builds it. A target ens carries none for links against what the machine has.
 import Path from @std.fs;
 import Platform from @std.platform;
 import ContentStore from @ens.packages.store;
@@ -9,6 +9,9 @@ import Architecture from @ens.target.triple;
 import TargetTriple from @ens.target.triple;
 import @ens.host.home;
 import @ens.bundled.macos;
+import @ens.bundled.linux;
+import @ens.codegen.emit.startup;
+import List from @std.collections.list;
 
 // The toolchain a link for `target` runs with, or why it cannot run, and what writing the files
 // left in the cache that nothing removed.
@@ -37,34 +40,86 @@ export final class CarriedLibraries {
 // the variable for the user's own folder.
 export forTarget(Toolchain toolchain, TargetTriple target, ContentStore? store,
                  Platform platform) -> CarriedLibraries {
-    if (target.platform() != Platform.MacOS || target.architecture() != Architecture.Arm64) {
+    bool macosArm64 = target.platform() == Platform.MacOS
+        && target.architecture() == Architecture.Arm64;
+    if (!macosArm64 && target.platform() != Platform.Linux) {
         return new CarriedLibraries(toolchain, "", "");
     }
-    if (store == null) {
-        return new CarriedLibraries(toolchain, noCacheMessage(platform), "");
+    string system = "macOS";
+    if (!macosArm64) {
+        system = "Linux";
     }
-    let written = macos.systemLibrary(store);
+    if (store == null) {
+        return new CarriedLibraries(toolchain, noCacheMessage(system, platform), "");
+    }
+    if (macosArm64) {
+        let written = macos.systemLibrary(store);
+        if (written.failure().length > 0) {
+            return new CarriedLibraries(toolchain, notWrittenMessage(system, written.failure()),
+                written.leftBehind());
+        }
+        Path libSystem = written.path().join(macos.libSystemFile());
+        return new CarriedLibraries(toolchain.withSystemLibraries([libSystem.toString()],
+            macos.arm64List().sdkVersion()), "", written.leftBehind());
+    }
+    let written = linux.systemLibraries(store, target.architecture());
     if (written.failure().length > 0) {
-        return new CarriedLibraries(toolchain, notWrittenMessage(written.failure()),
+        return new CarriedLibraries(toolchain, notWrittenMessage(system, written.failure()),
             written.leftBehind());
     }
-    Path libSystem = written.path().join(macos.libSystemFile());
-    return new CarriedLibraries(toolchain.withSystemLibraries([libSystem.toString()],
-        macos.arm64List().sdkVersion()), "", written.leftBehind());
+    let files = new List<string>();
+    for (let file in linux.libraryFiles(target.architecture())) {
+        files.push(written.path().join(file).toString());
+    }
+    return new CarriedLibraries(toolchain.withSystemLibraries(files.toArray(),
+        toolchain.macosSdk().version()), "", written.leftBehind());
 }
 
-// The message for a macOS link with no cache to write libSystem's list into.
-export noCacheMessage(Platform platform) -> string {
+// Writes the object a program for `target` starts at into `folder`, when the target needs one of
+// ens's own: a Linux program starts there instead of at a C compiler's startup object. The result
+// names the object, or no path when the target needs none, or why it could not be written.
+export startupObjectFor(TargetTriple target, Path folder) -> StartupObject {
+    if (target.platform() != Platform.Linux) {
+        return new StartupObject("", "");
+    }
+    Path object = folder.join("ens.startup.o");
+    string failure = startup.writeStartupObject(target, object.toString());
+    if (failure.length > 0) {
+        return new StartupObject("", failure);
+    }
+    return new StartupObject(object.toString(), "");
+}
+
+// The startup object a link puts before the program's own, or why it could not be written.
+export final class StartupObject {
+    string objectPath;
+    string problem;
+
+    protected constructor(this.objectPath, this.problem);
+
+    // Where the object is, or empty text when the target starts without one of ens's.
+    export path() -> string {
+        return this.objectPath;
+    }
+
+    export failure() -> string {
+        return this.problem;
+    }
+}
+
+// The message for a link for `system` with no cache to write its system libraries' lists into.
+export noCacheMessage(string system, Platform platform) -> string {
     string variable = home.userFolderVariable(platform);
-    return "a macOS program is linked against a list of what macOS's system library provides, "
-        + "which ens writes into its cache, and there is no cache folder: neither 'ENS_CACHE' nor "
-        + "'{variable}' is set. Set 'ENS_CACHE' to a folder that can be written to, or set "
-        + "'{variable}'";
+    return "a {system} program is linked against lists of what {system}'s system libraries "
+        + "provide, which ens writes into its cache, and there is no cache folder: neither "
+        + "'ENS_CACHE' nor '{variable}' is set. Set 'ENS_CACHE' to a folder that can be written "
+        + "to, or set '{variable}'";
 }
 
-// The message for a macOS link whose list of libSystem's symbols could not be written, given why.
-export notWrittenMessage(string failure) -> string {
-    return "a macOS program is linked against a list of what macOS's system library provides, "
-        + "which ens writes into its cache, and the list could not be put there: {failure}. Set "
-        + "'ENS_CACHE' to a folder that can be written to";
+// The message for a link for `system` whose system libraries' lists could not be written, given
+// why.
+export notWrittenMessage(string system, string failure) -> string {
+    return "a {system} program is linked against lists of what {system}'s system libraries "
+        + "provide, which ens writes into its cache, and the lists could not be put there: "
+        + "{failure}. Set 'ENS_CACHE' to a folder that can be written to";
 }

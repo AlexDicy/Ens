@@ -388,6 +388,16 @@ task("test")
             })
         end
 
+        -- a Linux program linked on whatever machine this is, for both Linux targets, through only
+        -- the files ens carries: what it loads and the glibc it needs, read back from the file, and
+        -- on a Linux machine of the same processor, what it prints when it runs.
+        if want("linux_link") then
+            table.insert(jobs, {
+                name = "linux_link",
+                linux_link = true,
+            })
+        end
+
         -- the Ens-written command's own behavior: its help, the argv it refuses, each optimization
         -- level, a library against an application, the order a workspace's members build in, and a
         -- workspace whose members disagree on the Ens version.
@@ -1146,6 +1156,90 @@ task("test")
             return library:match("^ld%-linux.*%.so%.%d+$") ~= nil
         end
 
+        local function run_linux_link(job)
+            local name = job.name
+            local log = path.join(out_dir, name .. ".log")
+            local root = path.join(os.projectdir(), "build", "linuxlink")
+            os.tryrm(root)
+            os.mkdir(root)
+            local readobj = os.files(path.join(global.directory(), "packages", "l", "llvm", "*",
+                "*", "bin", "llvm-readobj" .. exe_suffix))[1]
+            if not readobj then
+                return {name = name, ok = false, short = "no llvm-readobj in the LLVM package"}
+            end
+            local failures = {}
+            local targets = {
+                {triple = "x86_64-unknown-linux-gnu", processor = "x86_64",
+                    loader = "/lib64/ld-linux-x86-64.so.2"},
+                {triple = "aarch64-unknown-linux-gnu", processor = "arm64",
+                    loader = "/lib/ld-linux-aarch64.so.1"},
+            }
+            local programs = {
+                {fixture = "hello", rc = 0, stdout = "Hello, world!", stderr = ""},
+                {fixture = "exc_main_unhandled", rc = 1, stdout = "",
+                    stderr = "at main (exc_main_unhandled.ens:10)"},
+            }
+            local allowed = {["libc.so.6"] = true, ["libm.so.6"] = true,
+                ["libgcc_s.so.1"] = true}
+            for _, target in ipairs(targets) do
+                for _, program in ipairs(programs) do
+                    local exe = path.join(root, program.fixture .. "-" .. target.processor)
+                    local label = program.fixture .. " for " .. target.triple
+                    local rc = execMerged(host_exe, {"build",
+                        path.join(tests_dir, program.fixture .. ".ens"), "--target", target.triple,
+                        "--output", exe}, log)
+                    if rc ~= 0 then
+                        table.insert(failures, string.format("%s did not build:\n%s", label,
+                            captured(log)))
+                    else
+                        execMerged(readobj, {"--needed-libs", "--version-info",
+                            "--string-dump=.interp", exe}, log)
+                        local dump = captured(log)
+                        local listing = false
+                        for line in dump:gmatch("[^\r\n]+") do
+                            local trimmed = line:match("^%s*(.-)%s*$")
+                            if trimmed == "NeededLibraries [" then
+                                listing = true
+                            elseif trimmed == "]" then
+                                listing = false
+                            elseif listing and #trimmed > 0 and not allowed[trimmed]
+                                    and trimmed ~= path.filename(target.loader) then
+                                table.insert(failures, string.format("%s loads '%s'", label,
+                                    trimmed))
+                            end
+                            local major, minor = trimmed:match("^Name: GLIBC_(%d+)%.(%d+)")
+                            if major and (tonumber(major) > 2 or tonumber(minor) > 34) then
+                                table.insert(failures, string.format("%s needs %s, newer than "
+                                    .. "glibc 2.34", label, trimmed:sub(7)))
+                            end
+                        end
+                        if not dump:find("] " .. target.loader, 1, true) then
+                            table.insert(failures, string.format("%s does not start through "
+                                .. "'%s'", label, target.loader))
+                        end
+                        if is_host("linux") and os.arch() == target.processor then
+                            local stdout_file = path.join(root, program.fixture .. ".out")
+                            local stderr_file = path.join(root, program.fixture .. ".err")
+                            local ran = execSplit(exe, {}, stdout_file, stderr_file)
+                            local printed = captured(stdout_file)
+                            local reported = captured(stderr_file)
+                            if ran ~= program.rc or printed ~= program.stdout
+                                    or not reported:find(program.stderr, 1, true) then
+                                table.insert(failures, string.format("%s exited %s, printing "
+                                    .. "%q and reporting %q", label, tostring(ran), printed,
+                                    reported))
+                            end
+                        end
+                    end
+                end
+            end
+            if #failures > 0 then
+                return {name = name, ok = false, short = failures[1]:match("^[^\n]*"),
+                    full = name .. ": " .. table.concat(failures, "\n")}
+            end
+            return {name = name, ok = true}
+        end
+
         local function run_standalone(job)
             local name = job.name
             local log = path.join(out_dir, name .. ".log")
@@ -1648,9 +1742,9 @@ task("test")
                 for key, value in pairs(env) do linking_env[key] = value end
                 linking_env.ENS_CACHE = blocked_cache
                 run({"build", hello_file, "--output", path.join(root, "blocked" .. exe_suffix)},
-                    {envs = linking_env}, 1, "a macOS program is linked against a list of what "
-                    .. "macOS's system library provides, which ens writes into its cache, and the "
-                    .. "list could not be put there: could not create the directory '",
+                    {envs = linking_env}, 1, "a macOS program is linked against lists of what "
+                    .. "macOS's system libraries provide, which ens writes into its cache, and the "
+                    .. "lists could not be put there: could not create the directory '",
                     "': something in the path is a file, not a directory. Set 'ENS_CACHE' to a "
                     .. "folder that can be written to")
             end
@@ -3395,6 +3489,7 @@ task("test")
             if job.corpus then return run_corpus(job) end
             if job.semacheck then return run_semacheck(job) end
             if job.standalone then return run_standalone(job) end
+            if job.linux_link then return run_linux_link(job) end
             if job.cli_build then return run_cli_build(job) end
             if job.cli_runtest then return run_cli_runtest(job) end
             if job.cli_toolchain then return run_cli_toolchain(job) end
