@@ -34,7 +34,7 @@ on:
         type: boolean
         default: false
       first_seed_host:
-        description: A host seed/seed.json pins no seed for yet, such as linux-arm64, whose first seed this run makes
+        description: A host seed/seed.json pins no seed for yet, such as windows-arm64, whose first seed this run makes
         type: string
         default: ''
 
@@ -167,7 +167,10 @@ jobs:
         shell: bash
         run: |
           case "${{ inputs.first_seed_host }}" in
+            linux-x64) triple=x86_64-unknown-linux-gnu ;;
             linux-arm64) triple=aarch64-unknown-linux-gnu ;;
+            windows-x64) triple=x86_64-pc-windows-msvc ;;
+            windows-arm64) triple=aarch64-pc-windows-msvc ;;
             *) echo "no target triple is known for '${{ inputs.first_seed_host }}'"; exit 1 ;;
           esac
           build/host/ens build selfhost/driver --target "$triple" --stdlib libs --no-link \
@@ -189,6 +192,7 @@ jobs:
       matrix:
         include:
           - { os: windows-2022, host: windows-x64,  plat: windows, arch: x64,   suffix: .exe }
+          - { os: windows-11-arm, host: windows-arm64, plat: windows, arch: arm64, suffix: .exe }
           - { os: ubuntu-22.04, host: linux-x64,    plat: linux,   arch: x64,   suffix: '' }
           - { os: ubuntu-22.04-arm, host: linux-arm64, plat: linux, arch: arm64, suffix: '' }
           - { os: macos-15,     host: macos-arm64,  plat: macosx,  arch: arm64, suffix: '' }
@@ -273,20 +277,41 @@ jobs:
           name: first-seed-objects
           path: first-seed-objects
 
-      # stage 1: the driver objects linked here the way ens links an ELF program, against this
-      # host's native archive. ENS_SEEDS then hands it to the suite as the seed for the tag the pin
-      # names, which is how a host with no pinned seed bootstraps.
+      # stage 1: the driver objects linked here the way ens links a program of its own kind,
+      # against this host's native archive: on Linux through the C compiler, and on Windows
+      # through the LLVM package's lld-link, against Visual Studio's static C runtime from the
+      # folders the MSVC toolchain names, as ens.exe itself is linked. ENS_SEEDS then hands it to
+      # the suite as the seed for the tag the pin names, which is how a host with no pinned seed
+      # bootstraps.
       - name: Link the first seed
         if: ${{ matrix.host == inputs.first_seed_host }}
         shell: bash
         run: |
-          archive="$(find build -name 'libens-llvm.a' -print -quit)"
-          test -n "$archive" || { echo "no libens-llvm.a to link with"; exit 1; }
+          archive="$(find build \( -name 'libens-llvm.a' -o -name 'ens-llvm.lib' \) -print -quit)"
+          test -n "$archive" || { echo "no ens-llvm archive to link with"; exit 1; }
           seeds="$RUNNER_TEMP/first-seed"
           tag="$(jq -r .tag seed/seed.json)"
           mkdir -p "$seeds/$tag"
-          cc -no-pie -o "$seeds/$tag/ens" first-seed-objects/*.o \
-            "$archive" -lm -lpthread -ldl -lgcc_s
+          if [ "${{ runner.os }}" = Windows ]; then
+            lld="$(find "${{ steps.packages.outputs.folder }}/l/llvm" \
+              \( -type f -o -type l \) -name 'lld-link.exe' -print -quit)"
+            test -n "$lld" || { echo "no lld-link in the llvm package"; exit 1; }
+            lib="$(xmake l -c 'import("core.tool.toolchain"); print(toolchain.load("msvc", {plat = "windows", arch = "${{ matrix.arch }}"}):runenvs().LIB)' | tr -d '\r')"
+            test -n "$lib" || { echo "the MSVC toolchain names no library folders"; exit 1; }
+            folders=()
+            IFS=';' read -ra parts <<<"$lib"
+            for part in "${parts[@]}"; do
+              test -n "$part" && folders+=("/libpath:$part")
+            done
+            "$lld" /nologo /lldignoreenv /subsystem:console /Brepro "${folders[@]}" \
+              first-seed-objects/*.obj "$archive" "/out:$seeds/$tag/ens.exe" \
+              /defaultlib:libcmt /defaultlib:oldnames /defaultlib:kernel32 \
+              psapi.lib shell32.lib ole32.lib uuid.lib advapi32.lib ws2_32.lib ntdll.lib \
+              version.lib wsock32.lib bcrypt.lib
+          else
+            cc -no-pie -o "$seeds/$tag/ens" first-seed-objects/*.o \
+              "$archive" -lm -lpthread -ldl -lgcc_s
+          fi
           echo "ENS_SEEDS=$seeds" >> "$GITHUB_ENV"
 
       # a release is only ever cut from a tree that is green on the host it is cut for. This also
@@ -404,7 +429,7 @@ jobs:
             hosts="$(jq --arg h "$host" --arg s "$(cat "$file")" '.[$h] = $s' <<<"$hosts")"
           done
           # every host is refreshed together.
-          expected='["linux-arm64","linux-x64","macos-arm64","windows-x64"]'
+          expected='["linux-arm64","linux-x64","macos-arm64","windows-arm64","windows-x64"]'
           found="$(jq -c 'keys' <<<"$hosts")"
           test "$found" = "$expected" || {
             echo "the digests name $found, expected $expected"; exit 1; }
