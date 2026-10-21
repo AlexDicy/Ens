@@ -1710,11 +1710,14 @@ task("test")
                     .. '    native damaged {\n        windows "damaged";\n    }\n}\n')
                 io.writefile(path.join(damaged, "app", "src", "main.ens"),
                     'main() -> int {\n    return 0;\n}\n')
-                -- an x86-64 object whose one relocation names the aux record of its section
-                -- symbol, which the linker reads as a symbol whose name lies past the string table.
-                -- It reads that name only while writing the program, on its thread pool.
+                -- an object for this machine's processor whose one relocation names the aux
+                -- record of its section symbol, which the linker reads as a symbol whose name lies
+                -- past the string table. It reads that name only while writing the program, on
+                -- its thread pool. The machine is the first word, so the linker gets as far as
+                -- that name rather than refusing the object for another processor's.
+                local machine = os.arch() == "arm64" and "64aa" or "6486"
                 local object = table.concat({
-                    "6486010000000000560000000300000000000000",
+                    machine .. "010000000000560000000300000000000000",
                     "2e746578740000000000000000000000100000003c000000",
                     "4c000000000000000100000020005060",
                     "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
