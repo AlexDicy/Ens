@@ -56,7 +56,7 @@ If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surf
 - `seed/seed.json` - which published release every host's bootstrap seed is downloaded from, and the sha256 of each; see The bootstrap seed.
 - `scripts/xmake_test.lua` - the test runner; read its header comment for the fixture directives.
 - `scripts/refresh_system_symbols.lua` - rewrites the symbol lists in `selfhost/bundled/symbols/` that this machine's platform provides, printing what was added and removed.
-- `scripts/xmake_packages.lua` - local overrides of xmake-repo package definitions, each one a workaround for an upstream bug and each carrying the condition for deleting it.
+- `scripts/xmake_packages.lua` - local overrides of xmake-repo package definitions, each one a workaround for an upstream bug and each carrying the condition for deleting it; `scripts/repository/` holds the overrides that need more than one file, as a package repository xmake reads beside xmake-repo.
 - `.github/workflows/` - `test.yml` runs the suite on every host; `release.yml` is dispatch-only and publishes a release plus the pull request that repins the seed; `refresh-system-symbols.yml` is dispatch-only and opens a pull request rewriting the symbol lists on every platform they come from.
 
 ## Building and testing
