@@ -57,7 +57,7 @@ If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surf
 - `scripts/xmake_test.lua` - the test runner; read its header comment for the fixture directives.
 - `scripts/refresh_system_symbols.lua` - rewrites the symbol lists in `selfhost/bundled/symbols/` that this machine's platform provides, printing what was added and removed.
 - `scripts/xmake_packages.lua` - local overrides of xmake-repo package definitions, each one a workaround for an upstream bug and each carrying the condition for deleting it; `scripts/repository/` holds the overrides that need more than one file, as a package repository xmake reads beside xmake-repo.
-- `.github/workflows/` - `test.yml` runs the suite on every host; `release.yml` is dispatch-only and publishes a release plus the pull request that repins the seed; `refresh-system-symbols.yml` is dispatch-only and opens a pull request rewriting the symbol lists on every platform they come from.
+- `.github/workflows/` - `test.yml` runs the suite on every host and then the `cross-platform` gate (see Test conventions); `release.yml` is dispatch-only and publishes a release plus the pull request that repins the seed; `refresh-system-symbols.yml` is dispatch-only and opens a pull request rewriting the symbol lists on every platform they come from.
 
 ## Building and testing
 
@@ -112,6 +112,8 @@ If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surf
   The seed built the host compiler but neither stage, so what the seed generates cannot decide this gate: it answers for this tree's code generation alone.
 - `symbol_audit` compiles the standard library and `hello` for each of the five targets and fails on any symbol their objects call that neither the system libraries `ens` carries for that target nor its own startup object provide, so a library call code generation adds is caught on every host rather than at a user's link.
   `linux_link` and `windows_link` then link programs for the Linux and Windows targets on every host, read back what they load, and run them on a host of the same system and processor.
+  CI's `cross-platform` job closes the loop: every host builds the fixtures `test.yml` names for all five targets with nothing of the host's reachable, no SDK, no C compiler and no LIB, the bytes have to be the same from every host, and each target's own runner runs them against their headers.
+  A fixture it names pins its run with `@exit`, `@stdout` and `@stderr-contains` alone, and prints no path of the machine it runs on.
 - The `cli_*` jobs (`cli_build`, `cli_runtest`, `cli_overriding`, `cli_dependencies`, `cli_prebuilt`, `cli_toolchain`) all drive `ens`, and each asserts the command's own contract.
   Nothing about another command line is authoritative for them.
 
