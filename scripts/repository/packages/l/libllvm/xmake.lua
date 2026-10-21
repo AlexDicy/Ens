@@ -38,6 +38,10 @@ package("libllvm")
         add_configs("shared", {description = "Build shared library.", default = false, type = "boolean", readonly = true})
         add_configs("runtimes",   {description = "Set vs compiler runtime.", default = "MT", readonly = true})
         add_configs("vs_runtime", {description = "Set vs compiler runtime.", default = "MT", readonly = true})
+        -- LLVM's own build reads ntdll, which no directive in its libraries names, so a program
+        -- linking them links the system libraries ens links on Windows
+        add_syslinks("psapi", "shell32", "ole32", "uuid", "advapi32", "ws2_32", "ntdll", "version",
+            "wsock32", "bcrypt")
     elseif is_plat("windows") then
         -- pre-built
 
