@@ -10,6 +10,7 @@
 #include "lld/Common/Driver.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Config/llvm-config.h"
 #include "llvm/Support/CrashRecoveryContext.h"
 #include "llvm/Support/ManagedStatic.h"
 #include "llvm/Support/raw_ostream.h"
@@ -19,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -112,12 +114,46 @@ char* copied(const std::string& text) {
     return buffer;
 }
 
+// lld names itself in a '.comment' section of every ELF output, and when the LLVM it was built
+// from recorded its repository and revision, as LLVM's own releases do, the name carries those
+// too. The same program linked by two ens binaries over two such builds would then differ, so for
+// the length of an ELF link the name is set to the version alone, through the variable lld reads
+// it from before composing its own. Whatever the variable held before is put back, so a program
+// ens starts afterwards sees the environment it was given.
+class VersionBanner {
+public:
+    VersionBanner() {
+        const char* held = std::getenv("LLD_VERSION");
+        if (held != nullptr) previous = held;
+        set("Linker: LLD " LLVM_VERSION_STRING);
+    }
+
+    ~VersionBanner() { set(previous ? previous->c_str() : nullptr); }
+
+private:
+    static void set(const char* text) {
+#ifdef _WIN32
+        _putenv_s("LLD_VERSION", text == nullptr ? "" : text);
+#else
+        if (text == nullptr) {
+            unsetenv("LLD_VERSION");
+        } else {
+            setenv("LLD_VERSION", text, 1);
+        }
+#endif
+    }
+
+    std::optional<std::string> previous;
+};
+
 bool callDriver(int flavor, llvm::ArrayRef<const char*> arguments, llvm::raw_ostream& outStream,
                 llvm::raw_ostream& errStream) {
     switch (flavor) {
-        case kFlavorElf:
+        case kFlavorElf: {
+            const VersionBanner banner;
             return lld::elf::link(arguments, outStream, errStream, /*exitEarly=*/false,
                                   /*disableOutput=*/false);
+        }
         case kFlavorMachO:
             return lld::macho::link(arguments, outStream, errStream, false, false);
         default:
