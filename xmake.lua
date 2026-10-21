@@ -19,6 +19,9 @@ if is_plat("windows") then
 end
 
 includes("scripts/xmake_**.lua")
+-- package definitions of our own that need more than one file, as libllvm's does; see the header
+-- of each package there for why it is here
+add_repositories("ens-repository scripts/repository")
 
 -- A binary xmake links with the LLVM toolchain on macOS loads that toolchain's libc++, so its folder
 -- is searched at link time and at run time.
@@ -151,13 +154,29 @@ target("ens-llvm")
                 add(file)
             end
         elseif target:is_plat("windows") then
-            local llvm = target:toolchain("llvm")
+            -- the builtins of the target's processor: the toolchain's own when it is of that
+            -- processor, and otherwise the libllvm package's, which LLVM's release archive for
+            -- arm64 ships beside its libraries
             local architecture = target:is_arch("arm64") and "aarch64" or "x86_64"
             local name = "clang_rt.builtins-" .. architecture .. ".lib"
-            local file = llvm and llvm:sdkdir() and os.files(path.join(llvm:sdkdir(), "lib",
-                "clang", "*", "lib", "windows", name))[1]
+            local roots = {}
+            local llvm = target:toolchain("llvm")
+            if llvm and llvm:sdkdir() then
+                table.insert(roots, llvm:sdkdir())
+            end
+            for _, package in ipairs(target:orderpkgs()) do
+                if package:name() == "libllvm" then
+                    table.insert(roots, package:installdir())
+                end
+            end
+            local file = nil
+            for _, root in ipairs(roots) do
+                file = file or os.files(path.join(root, "lib", "clang", "*", "lib", "windows",
+                    name))[1]
+            end
             if not file then
-                raise("the LLVM toolchain has no '%s' to link `ens` with", name)
+                raise("neither the LLVM toolchain nor the libllvm package has '%s' to link `ens` " ..
+                    "with", name)
             end
             add(file)
         elseif target:is_plat("linux") then
