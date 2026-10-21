@@ -1002,8 +1002,9 @@ task("test")
         -- the bootstrap fixpoint: the Ens-written compiler compiles itself, twice, with identical
         -- output. Stage 2 has the compiler under test compile its own sources (stage2/ens plus the
         -- object files it wrote), stage 3 has stage2's ens compile the same sources again. The gate
-        -- holds when the two stages' objects hold the same modules with identical bytes; the
-        -- executables are compared as a note only, because linker output may carry timestamps.
+        -- holds when the two stages' objects hold the same modules with identical bytes and the
+        -- two executables are identical as well: the link writes no time or place into them, so a
+        -- difference there is a link that depends on something other than its inputs.
         --
         -- Neither side of that comparison was produced by the seed, so what the seed generates
         -- cannot decide it: the gate answers for this tree's code generation and nothing else.
@@ -1106,11 +1107,19 @@ task("test")
                             .. "two compilers disagree", name, n, #bytes2, #bytes3)}
                 end
             end
-            local executables = readBytes(boot2) == readBytes(boot3) and "identical"
-                or "differ (not gating: linker output)"
+            local bytes2 = readBytes(boot2)
+            local bytes3 = readBytes(boot3)
+            if bytes2 ~= bytes3 then
+                return {name = name, ok = false,
+                    short = "the stage 2 and stage 3 executables differ",
+                    full = string.format("%s: every module is identical, but the stage 2 "
+                        .. "executable (%d bytes) and the stage 3 executable (%d bytes) differ; "
+                        .. "the link depends on something other than its inputs", name, #bytes2,
+                        #bytes3)}
+            end
             local note = string.format("stages %.0fs/%.0fs; fixpoint over %d modules, "
-                .. "%.1f MB; executables %s", seconds[1] or 0, seconds[2] or 0,
-                #names2, total_bytes / (1024 * 1024), executables)
+                .. "%.1f MB; executables identical", seconds[1] or 0, seconds[2] or 0,
+                #names2, total_bytes / (1024 * 1024))
             return {name = name, ok = true, note = note}
         end
 

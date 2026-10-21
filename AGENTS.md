@@ -108,7 +108,7 @@ If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surf
 - Both arms must keep `selfhost/codegencheck/skiplist.txt` **empty**.
   The list may only shrink: the harness fails if a runnable fixture is neither verified nor listed, and equally if a listed name is no longer a runnable fixture, so the exemption list cannot rot.
 - `bootstrap` is the strongest end-to-end gate: `build/host/ens` compiles `selfhost/driver` into stage 2, stage 2's `ens` compiles the same sources into stage 3, and the two stages' object files must hold the same modules with identical bytes.
-  Executables are compared as a note only, because linker output carries timestamps.
+  The two executables have to be identical as well, since a link writes no time or place into its output.
   The seed built the host compiler but neither stage, so what the seed generates cannot decide this gate: it answers for this tree's code generation alone.
 - `symbol_audit` compiles the standard library and `hello` for each of the five targets and fails on any symbol their objects call that neither the system libraries `ens` carries for that target nor its own startup object provide, so a library call code generation adds is caught on every host rather than at a user's link.
   `linux_link` and `windows_link` then link programs for the Linux and Windows targets on every host, read back what they load, and run them on a host of the same system and processor.
