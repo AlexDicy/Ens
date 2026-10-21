@@ -156,8 +156,15 @@ package("libllvm")
 
     end)
 
-    on_install("windows|x64", "windows|arm64", function (package)
+    on_install("windows|x64", function (package)
         os.cp("*", package:installdir())
+    end)
+
+    -- the headers, the libraries and the builtins beside them; the archive's programs would
+    -- triple the package, and the toolchain package provides them
+    on_install("windows|arm64", function (package)
+        os.cp("include", package:installdir())
+        os.cp("lib", package:installdir())
     end)
 
     on_install("linux", "macosx", "bsd", "android", "iphoneos", "cross", function (package)
