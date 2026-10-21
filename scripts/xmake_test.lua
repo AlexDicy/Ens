@@ -1188,6 +1188,14 @@ task("test")
             if not readobj then
                 return {name = name, ok = false, short = "no llvm-readobj in the LLVM package"}
             end
+            -- the linker names itself in '.comment' by version alone, whatever build of LLVM
+            -- this ens carries, so the output is the same bytes from every host
+            local llvm_version = readobj:match("[/\\]llvm[/\\](%d+%.%d+%.%d+)[/\\]")
+            if not llvm_version then
+                return {name = name, ok = false, short = "the LLVM package folder '" .. readobj
+                    .. "' names no version"}
+            end
+            local banner = "Linker: LLD " .. llvm_version
             local failures = {}
             local targets = {
                 {triple = "x86_64-unknown-linux-gnu", processor = "x86_64",
@@ -1237,6 +1245,16 @@ task("test")
                         if not dump:find("] " .. target.loader, 1, true) then
                             table.insert(failures, string.format("%s does not start through "
                                 .. "'%s'", label, target.loader))
+                        end
+                        execMerged(readobj, {"--string-dump=.comment", exe}, log)
+                        local comments = {}
+                        for line in captured(log):gmatch("[^\r\n]+") do
+                            local text = line:match("^%[%s*%d+%]%s(.*)$")
+                            if text then table.insert(comments, text) end
+                        end
+                        if #comments ~= 1 or comments[1] ~= banner then
+                            table.insert(failures, string.format("%s names its linker as %q, "
+                                .. "expected %q", label, table.concat(comments, " / "), banner))
                         end
                         if is_host("linux") and os.arch() == target.processor then
                             local stdout_file = path.join(root, program.fixture .. ".out")
