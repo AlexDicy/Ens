@@ -1,4 +1,7 @@
-# Runs the suite on every host, on every push and pull request.
+# Runs the suite on every host, on every push and pull request, then proves that any host builds
+# for any other: each host builds the same programs for all five targets with nothing of its own
+# reachable, every target's bytes have to be the same from every host, and each target's own
+# machine runs them.
 #
 # The nightly schedule prevents cache eviction after 7 days without a read, a cold cache
 # on Linux or macOS means building LLVM from source.
@@ -16,17 +19,22 @@ concurrency:
   group: test-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  # the fixtures every host builds for every target, each pinning its exit code, its standard
+  # output and what its standard error has to hold, so the cross-platform job can check a run.
+  CROSS_PLATFORM_PROGRAMS: hello exc_main_unhandled process_spawn_merged_stream fs_round_trip
+
 jobs:
   test:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: windows-2022, host: windows-x64,  plat: windows, arch: x64 }
-          - { os: windows-11-arm, host: windows-arm64, plat: windows, arch: arm64 }
-          - { os: ubuntu-22.04, host: linux-x64,    plat: linux,   arch: x64 }
-          - { os: ubuntu-22.04-arm, host: linux-arm64, plat: linux, arch: arm64 }
-          - { os: macos-15,     host: macos-arm64,  plat: macosx,  arch: arm64 }
+          - { os: windows-2022, host: windows-x64,  plat: windows, arch: x64,   suffix: .exe }
+          - { os: windows-11-arm, host: windows-arm64, plat: windows, arch: arm64, suffix: .exe }
+          - { os: ubuntu-22.04, host: linux-x64,    plat: linux,   arch: x64,   suffix: '' }
+          - { os: ubuntu-22.04-arm, host: linux-arm64, plat: linux, arch: arm64, suffix: '' }
+          - { os: macos-15,     host: macos-arm64,  plat: macosx,  arch: arm64, suffix: '' }
     runs-on: ${{ matrix.os }}
     env:
       XMAKE_VERSION: '3.1.1'
@@ -100,6 +108,59 @@ jobs:
       - name: Test
         run: xmake test
 
+      # The programs the cross-platform job compares and runs, built for all five targets by the
+      # compiler this tree built, with nothing of this machine's reachable: on Linux inside a bare
+      # Debian image that has no C compiler, and on macOS and Windows under an environment emptied
+      # of all but what the system itself needs, so no SDK, no developer folder and no LIB.
+      - name: Build for every target with nothing of this machine's
+        shell: bash
+        run: |
+          compiler="build/bootstrap/stage2/ens${{ matrix.suffix }}"
+          test -f "$compiler" || { echo "no $compiler: did the bootstrap job run?"; exit 1; }
+          out=build/crossplatform
+          mkdir -p "$out" "$RUNNER_TEMP/clean-home"
+          case "${{ runner.os }}" in
+            Linux)
+              docker pull -q debian:stable-slim
+              clean() {
+                docker run --rm -v "$PWD:/work" -w /work -e HOME=/tmp/home -e ENS_CACHE=/tmp/cache \
+                  debian:stable-slim "$@"
+              }
+              ;;
+            macOS)
+              clean() {
+                env -i PATH=/usr/bin:/bin HOME="$RUNNER_TEMP/clean-home" DEVELOPER_DIR=/nonexistent \
+                  ENS_CACHE="$RUNNER_TEMP/clean-cache" "$@"
+              }
+              ;;
+            Windows)
+              system="$(cygpath -u "$SYSTEMROOT")"
+              clean() {
+                env -i SystemRoot="$SYSTEMROOT" PATH="$system/System32:$system" \
+                  TEMP="$RUNNER_TEMP" TMP="$RUNNER_TEMP" USERPROFILE="$RUNNER_TEMP/clean-home" \
+                  ENS_CACHE="$RUNNER_TEMP/clean-cache" "$@"
+              }
+              ;;
+          esac
+          for target in macos-arm64=aarch64-apple-macos linux-x64=x86_64-unknown-linux-gnu \
+              linux-arm64=aarch64-unknown-linux-gnu windows-x64=x86_64-pc-windows-msvc \
+              windows-arm64=aarch64-pc-windows-msvc; do
+            name="${target%%=*}"
+            suffix=''
+            case "$name" in windows-*) suffix=.exe ;; esac
+            for program in $CROSS_PLATFORM_PROGRAMS; do
+              clean "$compiler" build "tests/$program.ens" --target "${target#*=}" \
+                --output "$out/$program-$name$suffix"
+            done
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: programs-${{ matrix.host }}
+          path: build/crossplatform/
+          if-no-files-found: error
+          retention-days: 1
+
       - name: Report a failed package build
         if: failure()
         shell: bash
@@ -146,3 +207,97 @@ jobs:
         with:
           path: ${{ steps.packages.outputs.folder }}
           key: ${{ steps.packages.outputs.key }}
+
+  # One job per target, on that target's own machine: the programs every host built for it have
+  # to be the same bytes, which is what shows a link takes nothing from the host, and each has to
+  # run as its fixture's header pins.
+  cross-platform:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-2022, target: windows-x64, suffix: .exe }
+          - { os: windows-11-arm, target: windows-arm64, suffix: .exe }
+          - { os: ubuntu-22.04, target: linux-x64, suffix: '' }
+          - { os: ubuntu-22.04-arm, target: linux-arm64, suffix: '' }
+          - { os: macos-15, target: macos-arm64, suffix: '' }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: programs-*
+          path: programs
+
+      - name: Compare the bytes every host built
+        shell: bash
+        run: |
+          status=0
+          hosts=(programs/programs-*)
+          for program in $CROSS_PLATFORM_PROGRAMS; do
+            file="$program-${{ matrix.target }}${{ matrix.suffix }}"
+            first="${hosts[0]}/$file"
+            for host in "${hosts[@]}"; do
+              built="$host/$file"
+              if [ ! -f "$built" ]; then
+                echo "$file was not built on ${host#programs/programs-}"
+                status=1
+              elif ! cmp -s "$first" "$built"; then
+                echo "$file differs between ${hosts[0]#programs/programs-} and ${host#programs/programs-}:"
+                cmp "$first" "$built" || true
+                status=1
+              fi
+            done
+          done
+          test $status -eq 0 && echo "every host built the same bytes for ${{ matrix.target }}"
+          exit $status
+
+      # the header of each fixture pins its exit code, its exact standard output and the
+      # fragments its standard error has to hold; a fixture carrying any other directive is
+      # refused here rather than half-checked.
+      - name: Run them
+        shell: bash
+        run: |
+          status=0
+          for program in $CROSS_PLATFORM_PROGRAMS; do
+            source="tests/$program.ens"
+            if unknown="$(grep -E '^// @' "$source" | grep -vE '^// @(exit|stdout|stderr-contains) ')"; then
+              echo "$source carries a directive this job does not check:"
+              echo "$unknown"
+              status=1
+              continue
+            fi
+            expected_exit="$(sed -n 's|^// @exit ||p' "$source")"
+            expected_stdout="$(sed -n 's|^// @stdout ||p' "$source")"
+            for host in programs/programs-*; do
+              exe="$host/$program-${{ matrix.target }}${{ matrix.suffix }}"
+              label="$program built on ${host#programs/programs-}"
+              chmod +x "$exe"
+              set +e
+              "$exe" > stdout.txt 2> stderr.txt
+              code=$?
+              set -e
+              if [ "$code" != "$expected_exit" ]; then
+                echo "$label exited $code, expected $expected_exit:"
+                cat stderr.txt
+                status=1
+              fi
+              if [ "$(tr -d '\r' < stdout.txt)" != "$expected_stdout" ]; then
+                echo "$label printed:"
+                cat stdout.txt
+                echo "expected:"
+                echo "$expected_stdout"
+                status=1
+              fi
+              while IFS= read -r fragment; do
+                if [ -n "$fragment" ] && ! grep -qF -- "$fragment" stderr.txt; then
+                  echo "$label did not report '$fragment':"
+                  cat stderr.txt
+                  status=1
+                fi
+              done <<<"$(sed -n 's|^// @stderr-contains ||p' "$source")"
+            done
+            echo "$program runs on ${{ matrix.target }} as built on every host"
+          done
+          exit $status

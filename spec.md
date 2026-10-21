@@ -968,6 +968,7 @@ Commands use the same three exit codes: `0` when the command did what was asked,
   The program then runs on that version of macOS and later ones, and on macOS 11 and later when no version is written.
   `windows-msvc` may also end in a version, as in `windows-msvc19.40.0`.
   A triple naming any other system, such as `linux-musl` or `windows-gnu`, or naming none, is refused.
+  The executable is the same bytes whichever machine builds it, and one built on Windows for Linux or macOS arrives without the permission to run, which Windows does not record, so give it one there with `chmod +x`.
 - `--stdlib <folder>` names the folder holding `std/` to compile against; `ENS_STDLIB` does the same thing.
   A folder either one names that is not there, or that does not hold the standard library in its `std/` folder, is refused before anything is compiled.
   Without either, the build uses the standard library `ens` itself carries, the one it was built with, so a single `ens` file needs nothing else on the machine.
