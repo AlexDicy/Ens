@@ -567,6 +567,59 @@ task("test")
         -- the ens-llvm archive on the linker's search path: LIBRARY_PATH on Linux and macOS, which
         -- ens turns into -L, and LIB on Windows, where lld-link finds nothing else once LIB is set,
         -- so the MSVC and Windows SDK folders are added to it too.
+        -- the oldest macOS every member of ens-llvm is built for, read from the archive itself, and
+        -- the members that name each version. xmake.lua builds every member for one version, so
+        -- more than one is a build defect, reported by the caller.
+        local function archiveVersions()
+            local objdump = os.files(path.join(global.directory(), "packages", "l", "llvm", "*",
+                "*", "bin", "llvm-objdump"))[1]
+            if not objdump then
+                os.raise("no llvm-objdump in the LLVM package to read ens-llvm's macOS version with")
+            end
+            local archive = path.join(build_dir, "libens-llvm.a")
+            local listing = os.iorunv(objdump, {"--macho", "--private-headers", archive})
+            local versions = {}
+            local member = "?"
+            for line in listing:gmatch("[^\r\n]+") do
+                local named = line:match("^.-%((.-)%):$")
+                if named then
+                    member = named
+                else
+                    local version = line:match("^%s*minos%s+([%d.]+)")
+                    if version then
+                        versions[version] = versions[version] or {}
+                        table.insert(versions[version], member)
+                    end
+                end
+            end
+            return versions
+        end
+
+        -- the target the tree's own programs are built for. On macOS that is the triple naming the
+        -- version every member of ens-llvm is built for, so `ens` and the package tests that link
+        -- it claim no older macOS than their libraries run on; elsewhere it is this machine's own.
+        local tree_target = nil
+        local function treeTargetArguments()
+            if not is_host("macosx") then return {} end
+            if tree_target then return tree_target end
+            local versions = archiveVersions()
+            local found = {}
+            local floor = nil
+            for version, members in pairs(versions) do
+                table.insert(found, string.format("%s (%d members, such as %s)", version,
+                    #members, members[1]))
+                floor = version
+            end
+            if #found ~= 1 then
+                table.sort(found)
+                os.raise("ens-llvm's members are built for %s; xmake.lua builds every one of them "
+                    .. "for one macOS version", #found == 0 and "no macOS version"
+                    or table.concat(found, ", "))
+            end
+            tree_target = {"--target", os.arch() .. "-apple-macosx" .. floor}
+            return tree_target
+        end
+
         local function linkEnvironment()
             local env = os.getenvs()
             if is_host("windows") then
@@ -745,6 +798,8 @@ task("test")
             local env = linkEnvironment()
             os.tryrm(host_dir)
             os.mkdir(host_dir)
+            -- for this machine's default target: the seed links it with the line of the release
+            -- it came from, and only this tree's own compiler links for the floor below
             local rc = execMerged(seed_exe, {"build",
                 path.join(os.projectdir(), "selfhost", "driver"), "--output", host_exe,
                 "--stdlib", path.join(os.projectdir(), "libs"), "--objects", host_dir}, log,
@@ -999,6 +1054,79 @@ task("test")
                 full = string.format("%s:\n%s", name, out)}
         end
 
+        -- where two files differ: how many bytes, the first and last offsets, the section the
+        -- first one is in, and the header lines llvm-readobj reads differently, so a link that
+        -- depends on something other than its inputs says what it read.
+        local function describeDifference(file2, bytes2, file3, bytes3)
+            local count, first, last = 0, nil, nil
+            local chunk = 4096
+            local shorter = math.min(#bytes2, #bytes3)
+            for at = 1, shorter, chunk do
+                local stop = math.min(at + chunk - 1, shorter)
+                if bytes2:sub(at, stop) ~= bytes3:sub(at, stop) then
+                    for i = at, stop do
+                        if bytes2:byte(i) ~= bytes3:byte(i) then
+                            count = count + 1
+                            first = first or i
+                            last = i
+                        end
+                    end
+                end
+            end
+            if #bytes2 ~= #bytes3 then
+                count = count + math.abs(#bytes2 - #bytes3)
+                first = first or shorter + 1
+                last = math.max(#bytes2, #bytes3)
+            end
+            local readobj = os.files(path.join(global.directory(), "packages", "l", "llvm", "*",
+                "*", "bin", "llvm-readobj" .. exe_suffix))[1]
+            if not readobj then
+                return string.format("%d bytes differ, the first at offset %d and the last at %d.",
+                    count, first - 1, last - 1)
+            end
+            local section = "no section"
+            local current = nil
+            for line in os.iorunv(readobj, {"--sections", file2}):gmatch("[^\r\n]+") do
+                local name = line:match("^%s*Name:%s*(%S+)")
+                if name then
+                    current = {name = name}
+                elseif current then
+                    local offset = line:match("^%s*Offset:%s*(%S+)")
+                        or line:match("^%s*PointerToRawData:%s*(%S+)")
+                    local size = line:match("^%s*Size:%s*(%S+)")
+                        or line:match("^%s*RawDataSize:%s*(%S+)")
+                    current.offset = current.offset or (offset and tonumber(offset))
+                    current.size = current.size or (size and tonumber(size))
+                    if current.offset and current.size and first - 1 >= current.offset
+                            and first - 1 < current.offset + current.size then
+                        section = string.format("section %s, %d bytes in", current.name,
+                            first - 1 - current.offset)
+                    end
+                end
+            end
+            local arguments = {"--file-headers"}
+            if is_host("windows") then table.insert(arguments, "--coff-debug-directory") end
+            local function headerLines(file)
+                local lines = {}
+                for line in os.iorunv(readobj, table.join(arguments, {file})):gmatch("[^\r\n]+") do
+                    table.insert(lines, line)
+                end
+                return lines
+            end
+            local lines2, lines3 = headerLines(file2), headerLines(file3)
+            local changed = {}
+            for i = 1, math.max(#lines2, #lines3) do
+                if lines2[i] ~= lines3[i] and #changed < 12
+                        and not (lines2[i] or ""):match("^File:") then
+                    table.insert(changed, string.format("  stage 2: %s\n  stage 3: %s",
+                        (lines2[i] or ""):match("^%s*(.-)%s*$"), (lines3[i] or ""):match("^%s*(.-)%s*$")))
+                end
+            end
+            return string.format("%d bytes differ, the first at offset %d (%s) and the last at "
+                .. "%d.%s", count, first - 1, section, last - 1, #changed == 0 and ""
+                or "\nHeader lines read differently:\n" .. table.concat(changed, "\n"))
+        end
+
         -- the bootstrap fixpoint: the Ens-written compiler compiles itself, twice, with identical
         -- output. Stage 2 has the compiler under test compile its own sources (stage2/ens plus the
         -- object files it wrote), stage 3 has stage2's ens compile the same sources again. The gate
@@ -1038,12 +1166,13 @@ task("test")
                 return nil
             end
 
+            local target = treeTargetArguments()
             local failed = staged("stage 2 (the compiler compiles itself)", host_exe,
-                    {"build", driver_src, "--output", boot2, "--stdlib", libs,
-                     "--objects", stage2_dir}, boot2)
+                    table.join({"build", driver_src, "--output", boot2, "--stdlib", libs,
+                     "--objects", stage2_dir}, target), boot2)
                 or staged("stage 3 (stage 2 compiles the same sources)", boot2,
-                    {"build", driver_src, "--output", boot3, "--stdlib", libs,
-                     "--objects", stage3_dir}, boot3)
+                    table.join({"build", driver_src, "--output", boot3, "--stdlib", libs,
+                     "--objects", stage3_dir}, target), boot3)
             if failed then
                 return {name = name, ok = false, short = failed:match("^[^\n]+"),
                     full = string.format("%s: %s", name, failed)}
@@ -1110,12 +1239,43 @@ task("test")
             local bytes2 = readBytes(boot2)
             local bytes3 = readBytes(boot3)
             if bytes2 ~= bytes3 then
+                -- the same compiler links the same objects once more: a second result equal to
+                -- the first points at the two compilers, one unequal to it at the link itself
+                local again_dir = path.join(boot_dir, "stage3-again")
+                os.mkdir(again_dir)
+                local again = path.join(again_dir, "ens" .. exe_suffix)
+                local relinked = staged("stage 3 again (stage 2 links the same objects once more)",
+                    boot2, table.join({"build", driver_src, "--output", again, "--stdlib", libs,
+                     "--objects", stage3_dir}, target), again)
+                local repeated = relinked and ("the second link by stage 2 " .. relinked)
+                    or readBytes(again) == bytes3 and "A second link of the same objects by stage "
+                        .. "2 is identical to the first, so the two compilers link differently."
+                    or "A second link of the same objects by stage 2 differs from the first as "
+                        .. "well, so one compiler links the same inputs differently each time."
                 return {name = name, ok = false,
                     short = "the stage 2 and stage 3 executables differ",
                     full = string.format("%s: every module is identical, but the stage 2 "
                         .. "executable (%d bytes) and the stage 3 executable (%d bytes) differ; "
-                        .. "the link depends on something other than its inputs", name, #bytes2,
-                        #bytes3)}
+                        .. "the link depends on something other than its inputs. %s %s", name,
+                        #bytes2, #bytes3, describeDifference(boot2, bytes2, boot3, bytes3),
+                        repeated)}
+            end
+            -- on macOS, stage 2 is the compiler a release ships, and it claims to run on the
+            -- version every member of ens-llvm is built for, no older and no newer
+            if is_host("macosx") then
+                local floor = target[2]:match("macosx(.*)$")
+                local objdump = os.files(path.join(global.directory(), "packages", "l", "llvm",
+                    "*", "*", "bin", "llvm-objdump"))[1]
+                local headers = os.iorunv(objdump, {"--macho", "--private-headers", boot2})
+                local claimed = headers:match("\n%s*minos%s+([%d.]+)")
+                if claimed ~= floor then
+                    return {name = name, ok = false,
+                        short = string.format("stage 2 claims macOS %s, its libraries are built "
+                            .. "for %s", tostring(claimed), floor),
+                        full = string.format("%s: '%s' is linked to run on macOS %s, but every "
+                            .. "member of ens-llvm is built for macOS %s", name, boot2,
+                            tostring(claimed), floor)}
+                end
             end
             local note = string.format("stages %.0fs/%.0fs; fixpoint over %d modules, "
                 .. "%.1f MB; executables identical", seconds[1] or 0, seconds[2] or 0,
@@ -3914,6 +4074,7 @@ task("test")
                     table.insert(argv, "--stdlib")
                     table.insert(argv, stdlib_root)
                 end
+                table.join2(argv, treeTargetArguments())
                 for _, a in ipairs(ens_test_args) do
                     table.insert(argv, (a:gsub("{dir}", (job.source:gsub("\\", "/")))))
                 end
