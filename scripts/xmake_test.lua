@@ -1054,6 +1054,79 @@ task("test")
                 full = string.format("%s:\n%s", name, out)}
         end
 
+        -- where two files differ: how many bytes, the first and last offsets, the section the
+        -- first one is in, and the header lines llvm-readobj reads differently, so a link that
+        -- depends on something other than its inputs says what it read.
+        local function describeDifference(file2, bytes2, file3, bytes3)
+            local count, first, last = 0, nil, nil
+            local chunk = 4096
+            local shorter = math.min(#bytes2, #bytes3)
+            for at = 1, shorter, chunk do
+                local stop = math.min(at + chunk - 1, shorter)
+                if bytes2:sub(at, stop) ~= bytes3:sub(at, stop) then
+                    for i = at, stop do
+                        if bytes2:byte(i) ~= bytes3:byte(i) then
+                            count = count + 1
+                            first = first or i
+                            last = i
+                        end
+                    end
+                end
+            end
+            if #bytes2 ~= #bytes3 then
+                count = count + math.abs(#bytes2 - #bytes3)
+                first = first or shorter + 1
+                last = math.max(#bytes2, #bytes3)
+            end
+            local readobj = os.files(path.join(global.directory(), "packages", "l", "llvm", "*",
+                "*", "bin", "llvm-readobj" .. exe_suffix))[1]
+            if not readobj then
+                return string.format("%d bytes differ, the first at offset %d and the last at %d.",
+                    count, first - 1, last - 1)
+            end
+            local section = "no section"
+            local current = nil
+            for line in os.iorunv(readobj, {"--sections", file2}):gmatch("[^\r\n]+") do
+                local name = line:match("^%s*Name:%s*(%S+)")
+                if name then
+                    current = {name = name}
+                elseif current then
+                    local offset = line:match("^%s*Offset:%s*(%S+)")
+                        or line:match("^%s*PointerToRawData:%s*(%S+)")
+                    local size = line:match("^%s*Size:%s*(%S+)")
+                        or line:match("^%s*RawDataSize:%s*(%S+)")
+                    current.offset = current.offset or (offset and tonumber(offset))
+                    current.size = current.size or (size and tonumber(size))
+                    if current.offset and current.size and first - 1 >= current.offset
+                            and first - 1 < current.offset + current.size then
+                        section = string.format("section %s, %d bytes in", current.name,
+                            first - 1 - current.offset)
+                    end
+                end
+            end
+            local arguments = {"--file-headers"}
+            if is_host("windows") then table.insert(arguments, "--coff-debug-directory") end
+            local function headerLines(file)
+                local lines = {}
+                for line in os.iorunv(readobj, table.join(arguments, {file})):gmatch("[^\r\n]+") do
+                    table.insert(lines, line)
+                end
+                return lines
+            end
+            local lines2, lines3 = headerLines(file2), headerLines(file3)
+            local changed = {}
+            for i = 1, math.max(#lines2, #lines3) do
+                if lines2[i] ~= lines3[i] and #changed < 12
+                        and not (lines2[i] or ""):match("^File:") then
+                    table.insert(changed, string.format("  stage 2: %s\n  stage 3: %s",
+                        (lines2[i] or ""):match("^%s*(.-)%s*$"), (lines3[i] or ""):match("^%s*(.-)%s*$")))
+                end
+            end
+            return string.format("%d bytes differ, the first at offset %d (%s) and the last at "
+                .. "%d.%s", count, first - 1, section, last - 1, #changed == 0 and ""
+                or "\nHeader lines read differently:\n" .. table.concat(changed, "\n"))
+        end
+
         -- the bootstrap fixpoint: the Ens-written compiler compiles itself, twice, with identical
         -- output. Stage 2 has the compiler under test compile its own sources (stage2/ens plus the
         -- object files it wrote), stage 3 has stage2's ens compile the same sources again. The gate
@@ -1170,8 +1243,8 @@ task("test")
                     short = "the stage 2 and stage 3 executables differ",
                     full = string.format("%s: every module is identical, but the stage 2 "
                         .. "executable (%d bytes) and the stage 3 executable (%d bytes) differ; "
-                        .. "the link depends on something other than its inputs", name, #bytes2,
-                        #bytes3)}
+                        .. "the link depends on something other than its inputs. %s", name,
+                        #bytes2, #bytes3, describeDifference(boot2, bytes2, boot3, bytes3))}
             end
             -- on macOS, stage 2 is the compiler a release ships, and it claims to run on the
             -- version every member of ens-llvm is built for, no older and no newer
