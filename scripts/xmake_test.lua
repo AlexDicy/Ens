@@ -1239,12 +1239,26 @@ task("test")
             local bytes2 = readBytes(boot2)
             local bytes3 = readBytes(boot3)
             if bytes2 ~= bytes3 then
+                -- the same compiler links the same objects once more: a second result equal to
+                -- the first points at the two compilers, one unequal to it at the link itself
+                local again_dir = path.join(boot_dir, "stage3-again")
+                os.mkdir(again_dir)
+                local again = path.join(again_dir, "ens" .. exe_suffix)
+                local relinked = staged("stage 3 again (stage 2 links the same objects once more)",
+                    boot2, table.join({"build", driver_src, "--output", again, "--stdlib", libs,
+                     "--objects", stage3_dir}, target), again)
+                local repeated = relinked and ("the second link by stage 2 " .. relinked)
+                    or readBytes(again) == bytes3 and "A second link of the same objects by stage "
+                        .. "2 is identical to the first, so the two compilers link differently."
+                    or "A second link of the same objects by stage 2 differs from the first as "
+                        .. "well, so one compiler links the same inputs differently each time."
                 return {name = name, ok = false,
                     short = "the stage 2 and stage 3 executables differ",
                     full = string.format("%s: every module is identical, but the stage 2 "
                         .. "executable (%d bytes) and the stage 3 executable (%d bytes) differ; "
-                        .. "the link depends on something other than its inputs. %s", name,
-                        #bytes2, #bytes3, describeDifference(boot2, bytes2, boot3, bytes3))}
+                        .. "the link depends on something other than its inputs. %s %s", name,
+                        #bytes2, #bytes3, describeDifference(boot2, bytes2, boot3, bytes3),
+                        repeated)}
             end
             -- on macOS, stage 2 is the compiler a release ships, and it claims to run on the
             -- version every member of ens-llvm is built for, no older and no newer
