@@ -16,6 +16,7 @@ move ens-windows-x64.exe "%LOCALAPPDATA%\Microsoft\WindowsApps\ens.exe"
 
 ### macOS
 
+Needs macOS 15 or later.
 A file a browser downloaded is quarantined until the mark is removed.
 
 ```sh

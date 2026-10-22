@@ -567,6 +567,59 @@ task("test")
         -- the ens-llvm archive on the linker's search path: LIBRARY_PATH on Linux and macOS, which
         -- ens turns into -L, and LIB on Windows, where lld-link finds nothing else once LIB is set,
         -- so the MSVC and Windows SDK folders are added to it too.
+        -- the oldest macOS every member of ens-llvm is built for, read from the archive itself, and
+        -- the members that name each version. xmake.lua builds every member for one version, so
+        -- more than one is a build defect, reported by the caller.
+        local function archiveVersions()
+            local objdump = os.files(path.join(global.directory(), "packages", "l", "llvm", "*",
+                "*", "bin", "llvm-objdump"))[1]
+            if not objdump then
+                os.raise("no llvm-objdump in the LLVM package to read ens-llvm's macOS version with")
+            end
+            local archive = path.join(build_dir, "libens-llvm.a")
+            local listing = os.iorunv(objdump, {"--macho", "--private-headers", archive})
+            local versions = {}
+            local member = "?"
+            for line in listing:gmatch("[^\r\n]+") do
+                local named = line:match("^.-%((.-)%):$")
+                if named then
+                    member = named
+                else
+                    local version = line:match("^%s*minos%s+([%d.]+)")
+                    if version then
+                        versions[version] = versions[version] or {}
+                        table.insert(versions[version], member)
+                    end
+                end
+            end
+            return versions
+        end
+
+        -- the target the tree's own programs are built for. On macOS that is the triple naming the
+        -- version every member of ens-llvm is built for, so `ens` and the package tests that link
+        -- it claim no older macOS than their libraries run on; elsewhere it is this machine's own.
+        local tree_target = nil
+        local function treeTargetArguments()
+            if not is_host("macosx") then return {} end
+            if tree_target then return tree_target end
+            local versions = archiveVersions()
+            local found = {}
+            local floor = nil
+            for version, members in pairs(versions) do
+                table.insert(found, string.format("%s (%d members, such as %s)", version,
+                    #members, members[1]))
+                floor = version
+            end
+            if #found ~= 1 then
+                table.sort(found)
+                os.raise("ens-llvm's members are built for %s; xmake.lua builds every one of them "
+                    .. "for one macOS version", #found == 0 and "no macOS version"
+                    or table.concat(found, ", "))
+            end
+            tree_target = {"--target", os.arch() .. "-apple-macosx" .. floor}
+            return tree_target
+        end
+
         local function linkEnvironment()
             local env = os.getenvs()
             if is_host("windows") then
@@ -745,6 +798,8 @@ task("test")
             local env = linkEnvironment()
             os.tryrm(host_dir)
             os.mkdir(host_dir)
+            -- for this machine's default target: the seed links it with the line of the release
+            -- it came from, and only this tree's own compiler links for the floor below
             local rc = execMerged(seed_exe, {"build",
                 path.join(os.projectdir(), "selfhost", "driver"), "--output", host_exe,
                 "--stdlib", path.join(os.projectdir(), "libs"), "--objects", host_dir}, log,
@@ -1038,12 +1093,13 @@ task("test")
                 return nil
             end
 
+            local target = treeTargetArguments()
             local failed = staged("stage 2 (the compiler compiles itself)", host_exe,
-                    {"build", driver_src, "--output", boot2, "--stdlib", libs,
-                     "--objects", stage2_dir}, boot2)
+                    table.join({"build", driver_src, "--output", boot2, "--stdlib", libs,
+                     "--objects", stage2_dir}, target), boot2)
                 or staged("stage 3 (stage 2 compiles the same sources)", boot2,
-                    {"build", driver_src, "--output", boot3, "--stdlib", libs,
-                     "--objects", stage3_dir}, boot3)
+                    table.join({"build", driver_src, "--output", boot3, "--stdlib", libs,
+                     "--objects", stage3_dir}, target), boot3)
             if failed then
                 return {name = name, ok = false, short = failed:match("^[^\n]+"),
                     full = string.format("%s: %s", name, failed)}
@@ -1116,6 +1172,23 @@ task("test")
                         .. "executable (%d bytes) and the stage 3 executable (%d bytes) differ; "
                         .. "the link depends on something other than its inputs", name, #bytes2,
                         #bytes3)}
+            end
+            -- on macOS, stage 2 is the compiler a release ships, and it claims to run on the
+            -- version every member of ens-llvm is built for, no older and no newer
+            if is_host("macosx") then
+                local floor = target[2]:match("macosx(.*)$")
+                local objdump = os.files(path.join(global.directory(), "packages", "l", "llvm",
+                    "*", "*", "bin", "llvm-objdump"))[1]
+                local headers = os.iorunv(objdump, {"--macho", "--private-headers", boot2})
+                local claimed = headers:match("\n%s*minos%s+([%d.]+)")
+                if claimed ~= floor then
+                    return {name = name, ok = false,
+                        short = string.format("stage 2 claims macOS %s, its libraries are built "
+                            .. "for %s", tostring(claimed), floor),
+                        full = string.format("%s: '%s' is linked to run on macOS %s, but every "
+                            .. "member of ens-llvm is built for macOS %s", name, boot2,
+                            tostring(claimed), floor)}
+                end
             end
             local note = string.format("stages %.0fs/%.0fs; fixpoint over %d modules, "
                 .. "%.1f MB; executables identical", seconds[1] or 0, seconds[2] or 0,
@@ -3914,6 +3987,7 @@ task("test")
                     table.insert(argv, "--stdlib")
                     table.insert(argv, stdlib_root)
                 end
+                table.join2(argv, treeTargetArguments())
                 for _, a in ipairs(ens_test_args) do
                     table.insert(argv, (a:gsub("{dir}", (job.source:gsub("\\", "/")))))
                 end

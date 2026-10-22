@@ -1,13 +1,24 @@
 add_rules("mode.debug", "mode.release")
 add_rules("plugin.vsxmake.autoupdate")
 
+-- On macOS, `ens` runs on macOS 15.0 and later, so every library merged into ens-llvm is built for
+-- that version, through a target triple clang follows over whatever deployment version cmake or
+-- xmake adds; the bridge itself gets the version through its toolchain below, and the suite builds
+-- `ens` for the version the archive's members carry. It is written out in every add_requires line
+-- rather than named once, because those lines decide the package cache in CI.
 add_requires("llvm 21.1.0")
-add_requires("libllvm 21.1.0", { configs = { lld = true, clang = false, target_x86 = true, target_aarch64 = true } })
+add_requires("libllvm 21.1.0", { configs = { lld = true, clang = false, target_x86 = true, target_aarch64 = true, cxflags = is_plat("macosx") and "--target=arm64-apple-macos15.0" or nil } })
 -- LLVM finds zlib and zstd wherever the machine keeps them, so ens-llvm links copies built here
 -- instead, and `ens` does not load whichever ones a machine happens to have.
-add_requires("zlib v1.3.2", { system = false, configs = { shared = false, runtimes = "MT" } })
-add_requires("zstd v1.5.7", { system = false, configs = { shared = false, runtimes = "MT" } })
-add_requires("libxml2 v2.14.3", { configs = { runtimes = "MT" } })
+add_requires("zlib v1.3.2", { system = false, configs = { shared = false, runtimes = "MT", cxflags = is_plat("macosx") and "--target=arm64-apple-macos15.0" or nil } })
+add_requires("zstd v1.5.7", { system = false, configs = { shared = false, runtimes = "MT", cxflags = is_plat("macosx") and "--target=arm64-apple-macos15.0" or nil } })
+-- libllvm requires zstd on its own, so its copy is made the one required here, or ens-llvm
+-- would merge two
+add_requireconfs("libllvm.zstd", { system = false, configs = { shared = false, runtimes = "MT", cxflags = is_plat("macosx") and "--target=arm64-apple-macos15.0" or nil } })
+add_requires("libxml2 v2.14.3", { configs = { runtimes = "MT", cxflags = is_plat("macosx") and "--target=arm64-apple-macos15.0" or nil } })
+if is_plat("macosx") then
+    add_requires("libcxx 21.1.0", { configs = { cxflags = "--target=arm64-apple-macos15.0" } })
+end
 add_requires("lsp-framework 1.3.1", { configs = { runtimes = "MT" } })
 
 if is_plat("windows") then
@@ -62,9 +73,12 @@ target("lsp-frontend")
 target("ens-llvm")
     set_kind("static")
     set_languages("cxx17")
-    set_toolchains("@llvm")
+    set_toolchains("@llvm", { target_minver = is_plat("macosx") and "15.0" or nil })
     add_files("runtime/lld/ens_lld.cpp")
     add_packages("libllvm", "libxml2", "zlib", "zstd")
+    if is_plat("macosx") then
+        add_packages("libcxx")
+    end
     -- For a target that names a C runtime, xmake has clang on Windows write a reference to clang's
     -- builtins library into every object, by a path relative to clang's own folders, which `ens`
     -- does not link through. xmake's rules give a target that names none the dynamic runtime while
@@ -143,17 +157,7 @@ target("ens-llvm")
                     entry.link, searched)
             end
         end
-        if target:is_plat("macosx") then
-            local llvm = target:toolchain("llvm")
-            local folder = llvm and llvm:sdkdir() and path.join(llvm:sdkdir(), "lib")
-            for _, name in ipairs({"libc++.a", "libc++abi.a"}) do
-                local file = folder and path.join(folder, name)
-                if not file or not os.isfile(file) then
-                    raise("the LLVM toolchain has no '%s' to link `ens` with", name)
-                end
-                add(file)
-            end
-        elseif target:is_plat("windows") then
+        if target:is_plat("windows") then
             -- the builtins of the target's processor: the toolchain's own when it is of that
             -- processor, and otherwise the libllvm package's, which LLVM's release archive for
             -- arm64 ships beside its libraries

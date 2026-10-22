@@ -56,7 +56,7 @@ If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surf
 - `seed/seed.json` - which published release every host's bootstrap seed is downloaded from, and the sha256 of each; see The bootstrap seed.
 - `scripts/xmake_test.lua` - the test runner; read its header comment for the fixture directives.
 - `scripts/refresh_system_symbols.lua` - rewrites the symbol lists in `selfhost/bundled/symbols/` that this machine's platform provides, printing what was added and removed.
-- `scripts/xmake_packages.lua` - local overrides of xmake-repo package definitions, each one a workaround for an upstream bug and each carrying the condition for deleting it; `scripts/repository/` holds the overrides that need more than one file, as a package repository xmake reads beside xmake-repo.
+- `scripts/xmake_packages.lua` - local overrides of xmake-repo package definitions, each one a workaround for an upstream bug and each carrying the condition for deleting it; `scripts/repository/` is a package repository xmake reads beside xmake-repo, holding the overrides that need more than one file and `libcxx`, the C++ runtime `ens` carries on macOS, built there for the macOS `ens` runs on.
 - `.github/workflows/` - `test.yml` runs the suite on every host and then the `cross-platform` gate (see Test conventions); `release.yml` is dispatch-only and publishes a release plus the pull request that repins the seed; `refresh-system-symbols.yml` is dispatch-only and opens a pull request rewriting the symbol lists on every platform they come from.
 
 ## Building and testing
@@ -148,6 +148,7 @@ A host the pin names no seed for gets its first one from a dispatch with `first_
 The release publishes that host's stage 2, built natively like every other host's.
 
 By hand, the same thing is `ens build selfhost/driver --output ens --stdlib libs`, run on the platform being refreshed.
+On macOS the build also takes `--target arm64-apple-macosx15.0`, the oldest macOS `ens` runs on and the version every library in `ens-llvm` is built for; the suite passes it to every build of the tree's own packages there except the host compiler's, which the seed links with the line of the release it came from.
 `--stdlib libs` is what makes it this tree's standard library rather than the one belonging to whatever `ens` is doing the building.
 That `ens` may be the seed being replaced, a `build/host/ens` from an earlier commit, or an installed toolchain; all that matters is that it compiles these sources.
 
