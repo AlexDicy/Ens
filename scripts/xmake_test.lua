@@ -32,6 +32,8 @@
 -- a folder test's main.ens may use @ens-test (optionally with extra arguments) to run
 -- `ens test <folder> ...` instead of compile+run, asserting on its two streams the same way.
 -- the token {dir} in the extra arguments expands to the folder's absolute path.
+-- the token {language_version} in @expect-error and @expect-note expands to the language version
+-- the tree's compiler implements, as in 0.13, so a pin naming it holds across a release.
 --     // @ens-test --filter needle
 -- @stdlib names a folder holding a std/ package the fixture is compiled against instead of libs/,
 -- which is how a fixture exercises a standard library the tree's own cannot yet contain. The path
@@ -110,6 +112,7 @@ task("test")
         -- it, and the system and processor it runs on.
         local version_source = io.readfile(path.join(os.projectdir(), "selfhost", "language",
             "src", "version.ens")) or ""
+        local language_version = version_source:match('string release = "(%d+%.%d+)') or "?"
         local version_line = string.format("ens %s %s/%s",
             version_source:match('string release = "([^"]*)"') or "?",
             seed_platforms[plat] or plat, seed_architectures[arch] or arch)
@@ -4086,9 +4089,15 @@ task("test")
                     end
                 end
                 local error_str = line:match("^%s*//%s*@expect%-error%s+(.*)$")
-                if error_str then table.insert(expected_errors, error_str) end
+                if error_str then
+                    table.insert(expected_errors, (error_str:gsub("{language_version}",
+                        language_version)))
+                end
                 local note_str = line:match("^%s*//%s*@expect%-note%s+(.*)$")
-                if note_str then table.insert(expected_notes, note_str) end
+                if note_str then
+                    table.insert(expected_notes, (note_str:gsub("{language_version}",
+                        language_version)))
+                end
                 local enstest_str = line:match("^%s*//%s*@ens%-test%s*(.*)$")
                 if enstest_str then
                     ens_test_args = {}
