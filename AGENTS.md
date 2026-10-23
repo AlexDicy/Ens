@@ -33,6 +33,7 @@ If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surf
 - `selfhost/` - the `ens` compiler and build tool, written in Ens, as one workspace of packages:
   - `syntax.grammar` + `syntaxgen/` - the declarative grammar and the generator that emits the syntax-tree sources.
   - `frontend/` - lexer, event parser, red-green syntax tree.
+  - `language/` - the language this compiler implements: the one version Ens has, whose major.minor is the language version a package's `ens` declaration names.
   - `sema/` - the semantic layer: module graph, types, declarations, signatures, layout, generics, expression/statement checking, flow narrowing, checked exceptions.
   - `target/` - a target triple read once into what it names, which code generation, linking and the build carry instead of the text: the processor, the system and the oldest macOS a program runs on, from any of their spellings.
   - `llvm/` - the binding over LLVM-C: contexts, modules, builders, types, values, target machines.
