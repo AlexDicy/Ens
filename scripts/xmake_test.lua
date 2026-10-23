@@ -108,8 +108,8 @@ task("test")
 
         -- what `ens version` prints: the release this tree is, read from the one file that declares
         -- it, and the system and processor it runs on.
-        local version_source = io.readfile(path.join(os.projectdir(), "selfhost", "build", "src",
-            "version.ens")) or ""
+        local version_source = io.readfile(path.join(os.projectdir(), "selfhost", "language",
+            "src", "version.ens")) or ""
         local version_line = string.format("ens %s %s/%s",
             version_source:match('string release = "([^"]*)"') or "?",
             seed_platforms[plat] or plat, seed_architectures[arch] or arch)
@@ -219,6 +219,16 @@ task("test")
             table.insert(jobs, {
                 name = "selfhost_sema",
                 source = path.join(os.projectdir(), "selfhost", "sema"),
+                ens_test_args = {},
+            })
+        end
+
+        -- the language package's tests: the one version Ens has, and the language version read
+        -- out of it.
+        if want("selfhost_language") then
+            table.insert(jobs, {
+                name = "selfhost_language",
+                source = path.join(os.projectdir(), "selfhost", "language"),
                 ens_test_args = {},
             })
         end
@@ -926,7 +936,7 @@ task("test")
                     add_unit("tests/" .. path.basename(sub), path.join(sub, "src"), {"main.ens"})
                 end
             end
-            for _, pkg in ipairs({"corpus", "frontend", "sema", "semacheck", "syntaxgen",
+            for _, pkg in ipairs({"corpus", "frontend", "language", "sema", "semacheck", "syntaxgen",
                               "target", "llvm", "codegen", "codegencheck", "host", "cli",
                               "packages", "bundled", "link", "build", "driver"}) do
                 local src = path.join(os.projectdir(), "selfhost", pkg, "src")

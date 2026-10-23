@@ -10,7 +10,7 @@ function main(version)
         raise("'%s' is not a release version. Write major.minor.patch, optionally followed by "
             .. "a label such as '-beta', as in '0.10.0-beta'", version)
     end
-    local file = path.join(os.scriptdir(), "..", "selfhost", "build", "src", "version.ens")
+    local file = path.join(os.scriptdir(), "..", "selfhost", "language", "src", "version.ens")
     local text = io.readfile(file)
     local pattern = '(export static const string release = ")[^"]*(";)'
     local updated, count = text:gsub(pattern, "%1" .. version .. "%2")
