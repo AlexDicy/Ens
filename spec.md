@@ -983,6 +983,9 @@ Commands use the same three exit codes: `0` when the command did what was asked,
 - `--toolchain <version>` chooses which installed version of Ens does the work.
 
 `ens build` also takes `--output <file>`, naming the executable to write.
+`--strip` leaves the symbol table out of the executable: the names of its functions and variables, which a debugger or a profiler reads and the program itself never does, since a stack trace reads a table of its own.
+On macOS a stripped executable also exports nothing, the way a Linux or Windows executable already exports nothing.
+A Windows executable carries no symbol table to begin with, so `--strip` changes nothing there.
 `ens test` also takes `--filter` and `--tests`, described in the section on tests.
 
 `ens` is also a version multiplexer: a build root's declared `ens` version can send the whole invocation to the toolchain that is that version, and that toolchain's exit code becomes this command's own.
