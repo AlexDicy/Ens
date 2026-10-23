@@ -2292,8 +2292,9 @@ task("test")
                 'main() -> int {\n    return missing();\n}\n')
             for _, command in ipairs({"build", "check"}) do
                 run({command, empty}, nil, 1, "ens.package:1:1: error: This manifest declares "
-                    .. "nothing. Declare the package, as in 'package app { ens \"0.1\"; }', or a "
-                    .. "workspace, as in 'workspace { member \"app\"; }'.",
+                    .. "nothing. Declare the package, as in 'package app { ens \""
+                    .. language_version .. "\"; }', or a workspace, as in "
+                    .. "'workspace { member \"app\"; }'.",
                     "ens: empty: 1 problem in its ens.package", "!missing")
             end
 
@@ -2727,8 +2728,9 @@ task("test")
             })
             for _, command in ipairs({"run", "test"}) do
                 run({command, empty}, nil, 1, "ens.package:1:1: error: This manifest declares "
-                    .. "nothing. Declare the package, as in 'package app { ens \"0.1\"; }', or a "
-                    .. "workspace, as in 'workspace { member \"app\"; }'.",
+                    .. "nothing. Declare the package, as in 'package app { ens \""
+                    .. language_version .. "\"; }', or a workspace, as in "
+                    .. "'workspace { member \"app\"; }'.",
                     "ens: empty: 1 problem in its ens.package", "!the empty program",
                     "!There are no tests")
             end
