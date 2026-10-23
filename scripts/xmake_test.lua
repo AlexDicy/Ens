@@ -90,6 +90,11 @@ task("test")
         -- fresh clone needs it built before anything can reach an executable.
         local native_archive = path.join(build_dir, is_host("windows") and "ens-llvm.lib"
             or "libens-llvm.a")
+        -- a program of the LLVM package, such as llvm-nm, or nil when the package holds none
+        local function llvmTool(name)
+            return os.files(path.join(global.directory(), "packages", "l", "llvm", "*", "*", "bin",
+                name .. exe_suffix))[1]
+        end
 
         -- what `ens version` prints: the release this tree is and the language version it
         -- implements, both read from the one file that declares them.
@@ -563,16 +568,11 @@ task("test")
             return false
         end
 
-        -- the environment a process that links an Ens program needs, which is the folder holding
-        -- the ens-llvm archive on the linker's search path: LIBRARY_PATH on Linux and macOS, which
-        -- ens turns into -L, and LIB on Windows, where lld-link finds nothing else once LIB is set,
-        -- so the MSVC and Windows SDK folders are added to it too.
         -- the oldest macOS every member of ens-llvm is built for, read from the archive itself, and
         -- the members that name each version. xmake.lua builds every member for one version, so
         -- more than one is a build defect, reported by the caller.
         local function archiveVersions()
-            local objdump = os.files(path.join(global.directory(), "packages", "l", "llvm", "*",
-                "*", "bin", "llvm-objdump"))[1]
+            local objdump = llvmTool("llvm-objdump")
             if not objdump then
                 os.raise("no llvm-objdump in the LLVM package to read ens-llvm's macOS version with")
             end
@@ -620,6 +620,10 @@ task("test")
             return tree_target
         end
 
+        -- the environment a process that links an Ens program needs, which is the folder holding
+        -- the ens-llvm archive on the linker's search path: LIBRARY_PATH on Linux and macOS, which
+        -- ens turns into -L, and LIB on Windows, where lld-link finds nothing else once LIB is set,
+        -- so the MSVC and Windows SDK folders are added to it too.
         local function linkEnvironment()
             local env = os.getenvs()
             if is_host("windows") then
@@ -1078,8 +1082,7 @@ task("test")
                 first = first or shorter + 1
                 last = math.max(#bytes2, #bytes3)
             end
-            local readobj = os.files(path.join(global.directory(), "packages", "l", "llvm", "*",
-                "*", "bin", "llvm-readobj" .. exe_suffix))[1]
+            local readobj = llvmTool("llvm-readobj")
             if not readobj then
                 return string.format("%d bytes differ, the first at offset %d and the last at %d.",
                     count, first - 1, last - 1)
@@ -1264,8 +1267,7 @@ task("test")
             -- version every member of ens-llvm is built for, no older and no newer
             if is_host("macosx") then
                 local floor = target[2]:match("macosx(.*)$")
-                local objdump = os.files(path.join(global.directory(), "packages", "l", "llvm",
-                    "*", "*", "bin", "llvm-objdump"))[1]
+                local objdump = llvmTool("llvm-objdump")
                 local headers = os.iorunv(objdump, {"--macho", "--private-headers", boot2})
                 local claimed = headers:match("\n%s*minos%s+([%d.]+)")
                 if claimed ~= floor then
@@ -1286,8 +1288,7 @@ task("test")
         -- the libraries a program loads when it starts, as the LLVM package's llvm-readobj lists
         -- them, or nil and why not.
         local function loadedLibraries(program, log)
-            local readobj = os.files(path.join(global.directory(), "packages", "l", "llvm", "*",
-                "*", "bin", "llvm-readobj" .. exe_suffix))[1]
+            local readobj = llvmTool("llvm-readobj")
             if not readobj then
                 return nil, "no llvm-readobj in the LLVM package"
             end
@@ -1352,8 +1353,7 @@ task("test")
             local root = path.join(os.projectdir(), "build", "linuxlink")
             os.tryrm(root)
             os.mkdir(root)
-            local readobj = os.files(path.join(global.directory(), "packages", "l", "llvm", "*",
-                "*", "bin", "llvm-readobj" .. exe_suffix))[1]
+            local readobj = llvmTool("llvm-readobj")
             if not readobj then
                 return {name = name, ok = false, short = "no llvm-readobj in the LLVM package"}
             end
@@ -1454,8 +1454,7 @@ task("test")
             local root = path.join(os.projectdir(), "build", "windowslink")
             os.tryrm(root)
             os.mkdir(root)
-            local readobj = os.files(path.join(global.directory(), "packages", "l", "llvm", "*",
-                "*", "bin", "llvm-readobj" .. exe_suffix))[1]
+            local readobj = llvmTool("llvm-readobj")
             if not readobj then
                 return {name = name, ok = false, short = "no llvm-readobj in the LLVM package"}
             end
@@ -1551,8 +1550,7 @@ task("test")
             local root = path.join(os.projectdir(), "build", "symbolaudit")
             os.tryrm(root)
             os.mkdir(root)
-            local nm = os.files(path.join(global.directory(), "packages", "l", "llvm", "*", "*",
-                "bin", "llvm-nm" .. exe_suffix))[1]
+            local nm = llvmTool("llvm-nm")
             if not nm then
                 return {name = name, ok = false, short = "no llvm-nm in the LLVM package"}
             end
