@@ -96,14 +96,6 @@ task("test")
                 name .. exe_suffix))[1]
         end
 
-        -- what `ens version` prints: the release this tree is and the language version it
-        -- implements, both read from the one file that declares them.
-        local version_source = io.readfile(path.join(os.projectdir(), "selfhost", "build", "src",
-            "version.ens")) or ""
-        local version_line = string.format("ens %s (language %s)",
-            version_source:match('string release = "([^"]*)"') or "?",
-            version_source:match('string toolchain = "([^"]*)"') or "?")
-
         -- the seed: the published `ens` this tree pins for this host. Its one job is to build the
         -- compiler out of this tree, and nothing else in the suite runs it. Nothing it produces is
         -- ever compared against anything either, so a seed left behind by the tree shows up as a
@@ -113,6 +105,14 @@ task("test")
         local seed_host = (seed_platforms[plat] or plat) .. "-" .. (seed_architectures[arch] or arch)
         local seed_dir = path.join(os.projectdir(), "build", "seed")
         local seed_exe = path.join(seed_dir, "ens" .. exe_suffix)
+
+        -- what `ens version` prints: the release this tree is, read from the one file that declares
+        -- it, and the system and processor it runs on.
+        local version_source = io.readfile(path.join(os.projectdir(), "selfhost", "build", "src",
+            "version.ens")) or ""
+        local version_line = string.format("ens %s %s/%s",
+            version_source:match('string release = "([^"]*)"') or "?",
+            seed_platforms[plat] or plat, seed_architectures[arch] or arch)
 
         -- the compiler under test: `ens` as this tree defines it, and what every job that compiles
         -- Ens drives. It is built below, before the jobs start, because they run in parallel and

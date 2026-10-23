@@ -922,7 +922,8 @@ The toolchain is one command, `ens`, with a subcommand for each thing it does.
   Everything written after `--` is passed to the program exactly as written, and `ens run` exits with the program's exit code.
 - `ens test [path]` builds a target's tests together with its sources and runs them, as described in the section on tests.
 - `ens override add <package> <folder>`, `ens override remove <package>` and `ens override list` maintain the `ens.overrides` file beside the build root's manifest.
-- `ens version` prints which release of Ens it is and the language version it implements, which is the version a package's `ens` declaration names, as in `ens 0.10.0-beta (language 0.1)`.
+- `ens version` prints which release of Ens it is and the system and processor it runs on, as in `ens 0.13.0-beta windows/x64`.
+  A release's major.minor is the language version it implements, which is the version a package's `ens` declaration names, and its patch counts the releases of that language version.
 
 The path is an `.ens` file, a folder of sources, a package folder, or a workspace root.
 With no path, the command works on the nearest package in or above the folder it was run in, found the way `git` finds a repository from a subfolder.
