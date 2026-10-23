@@ -1,6 +1,6 @@
-// `ens` is also a version multiplexer: a build root written for another version of Ens that is
-// installed delegates the whole command to it. A declaration names only what a package is written for,
-// so an unsatisfiable one still builds here, while a command line requesting one is a mistake.
+// `ens` is also a version multiplexer: a build root written for a newer version of Ens than this one
+// delegates the whole command to the newest installed toolchain that is at least that version, and a
+// command line can name the toolchain outright.
 import Path from @std.fs;
 import EntryKind from @std.fs.metadata;
 import FileSystemError from @std.fs.error;
@@ -15,6 +15,8 @@ import platform;
 import Reporter from report;
 import report;
 import Version from version;
+import Version as VersionNumber from @ens.packages.versions;
+import @ens.packages.versions;
 
 // What the command line and the environment named as the toolchain that does the work.
 export final class ToolchainRequest {
@@ -45,7 +47,7 @@ export final class InstalledToolchain {
         return this.toolchainVersion;
     }
 
-    export program() -> Path? {
+    export program() -> Path {
         return this.programFile;
     }
 }
@@ -84,6 +86,23 @@ export final class InstalledToolchains {
             named.push(one.version());
         }
         return named.toArray();
+    }
+
+    // The newest installed toolchain whose version is at least `lowest`, or null when none is. A
+    // folder whose name is not a release version is never chosen this way, and of two folders
+    // naming the same version the first in the order they were found is kept.
+    export newestAtLeast(VersionNumber lowest) -> InstalledToolchain? {
+        InstalledToolchain? newest = null;
+        VersionNumber? newestVersion = null;
+        for (let one in this.found) {
+            let candidate = versions.release(one.version());
+            if (candidate != null && versions.compare(candidate, lowest) >= 0
+                    && (newestVersion == null || versions.compare(candidate, newestVersion) > 0)) {
+                newest = one;
+                newestVersion = candidate;
+            }
+        }
+        return newest;
     }
 
     // The program that is the named version, or empty text when that version is not installed.
@@ -156,9 +175,9 @@ export final class Handoff {
 // exit code. `argv` is what this process was given after its own name, forwarded exactly as it
 // was given so the other toolchain reads the command line this one was given.
 export hand(Environment environment, ToolchainRequest request, string governingVersion,
-            string[] argv, Reporter reporter) -> Handoff {
+            Path buildRoot, string[] argv, Reporter reporter) -> Handoff {
     let installed = discover(root(environment), environment.platform());
-    let decision = select(request, governingVersion, Version.release, installed);
+    let decision = select(request, governingVersion, buildRoot, Version.release, installed);
     if (decision.failure().length > 0) {
         reporter.problem(decision.failure());
         return new Handoff(true, 2);
@@ -176,12 +195,11 @@ export hand(Environment environment, ToolchainRequest request, string governingV
     return new Handoff(true, runToolchain(chosen, decision.version(), argv, reporter));
 }
 
-// Which toolchain does the work. `governing` is the version the build root is written for, `running`
-// is the version this toolchain is, and `installed` is what was found in the toolchains folder.
-//
-// The exact-text comparison of two versions is the whole of the rule for now: a build root written
-// for another version is built by that version when it is here, and by this one when it is not.
-export select(ToolchainRequest request, string governing, string running,
+// Which toolchain does the work. `governing` is the version the build root in `buildRoot` is written
+// for, `running` is the release this toolchain is, and `installed` is what was found in the
+// toolchains folder. A declared version is the oldest one the build root can be built with, so the
+// work leaves this toolchain only when this toolchain is older than the declared version.
+export select(ToolchainRequest request, string governing, Path buildRoot, string running,
               InstalledToolchains installed) -> ToolchainDecision {
     string requested = request.option();
     if (requested.length == 0) {
@@ -198,16 +216,33 @@ export select(ToolchainRequest request, string governing, string running,
     if (requested.length > 0) {
         return honorRequest(request, requested, running, installed);
     }
-    if (governing.length == 0 || governing == running) {
+    let declared = versions.parsed(governing);
+    let current = versions.release(running);
+    if (declared == null || current == null || versions.compare(declared, current) <= 0) {
         return buildHere("");
     }
-    Path? program = installed.programOf(governing);
-    if (program == null) {
-        return buildHere("This build is written for Ens {governing}, which is not installed, so "
-            + "this toolchain, Ens {running}, is building it. " + foundInstead(installed));
+    string needs = "'{buildRoot}' declares 'ens \"{governing}\";', so it needs Ens {governing} or "
+        + "later, and this toolchain is Ens {running}";
+    let newest = installed.newestAtLeast(declared);
+    if (newest == null) {
+        return new ToolchainDecision("", null, needs + ". " + noneNewEnough(installed, governing),
+            "");
     }
-    return new ToolchainDecision(governing, program, "",
-        "This build is written for Ens {governing}, so '{program}' is building it");
+    Path program = newest.program();
+    return new ToolchainDecision(newest.version(), program, "",
+        "{needs}. Ens {newest.version()} at '{program}' is building it");
+}
+
+// Why no installed toolchain can build a build root written for `governing`, and what to do.
+noneNewEnough(InstalledToolchains installed, string governing) -> string {
+    string local = "write '--toolchain local' to build with this toolchain anyway";
+    if (installed.root() == null) {
+        return "There is no toolchains folder to look in: " + noFolderReason(installed) + ". Set "
+            + "'ENS_TOOLCHAINS' to the folder your toolchains are in, or {local}";
+    }
+    return "No installed toolchain is Ens {governing} or later: " + foundInstead(installed)
+        + ". Install Ens {governing} or later in a folder named after its version, such as '"
+        + installedAt(installed, "{governing}.0") + "', or {local}";
 }
 
 // A version the command line or the environment requested by name. Requesting one that is not here
@@ -301,11 +336,8 @@ requestWording(ToolchainRequest request, string requested) -> string {
     return "'ENS_TOOLCHAIN={requested}'";
 }
 
-// What the toolchains folder contains, or why there is no folder to look in.
+// What the toolchains folder contains, once there is one.
 foundInstead(InstalledToolchains installed) -> string {
-    if (installed.root() == null) {
-        return "There is no toolchains folder: " + noFolderReason(installed);
-    }
     string[] versions = installed.versions();
     if (versions.length == 0) {
         return "'{installed.root()}' contains no toolchain";

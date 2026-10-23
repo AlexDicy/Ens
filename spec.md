@@ -823,8 +823,8 @@ A package is named by its `package` declaration, and the name `std` is reserved 
 A package's sources live in its `src/` folder, with its tests in a sibling `tests/` folder.
 A package whose `src/main.ens` defines `main()` is an application and builds to an executable; a package without one is a library.
 Every package declares `ens`, the language version it is written for as major.minor; `version`, the package's own version in dotted numerals, is optional.
-The shape of both is checked, but neither value gates a package's own build: a package declaring a version other than the running toolchain's still builds.
-What does read a declared `ens` version is described with the `ens` command below.
+The shape of both is checked.
+The `ens` version is the oldest language version the package can be built with, and which toolchain builds it is described with the `ens` command below.
 Each `dependency` declares a package this one may import with `@`: the leading segments of an `@` import select the dependency with the longest matching name, and the remaining segments name the module inside it.
 
 A workspace groups packages that are developed together.
@@ -989,8 +989,10 @@ On macOS a stripped executable also exports nothing, the way a Linux or Windows 
 A Windows executable carries no symbol table to begin with, so `--strip` changes nothing there.
 `ens test` also takes `--filter` and `--tests`, described in the section on tests.
 
-`ens` is also a version multiplexer: a build root's declared `ens` version can send the whole invocation to the toolchain that is that version, and that toolchain's exit code becomes this command's own.
-Which declared versions send the work elsewhere is not settled yet; what is settled is where toolchains are found and how one is asked for by name.
+`ens` is also a version multiplexer: a build root's declared `ens` version can send the whole invocation to another installed toolchain, and that toolchain's exit code becomes this command's own.
+A build root declaring the running toolchain's language version or an older one is built by the running toolchain.
+A build root declaring a newer one is handed to the newest installed toolchain whose version is at least the declared one, and when none is installed the command fails, naming the toolchains folder and what it contains.
+Versions compare number by number, so `0.10` is newer than `0.9`, and a label after a release's numbers, such as `-beta`, does not change which version it is, so `0.14.0-beta` and `0.14.0` are the same version.
 Toolchains live one folder per version under `~/.ens/toolchains`, each folder holding the `ens` program that is that version, and `ENS_TOOLCHAINS` names a different root to look in.
 `--toolchain <version>` selects a version by name whatever the build root declares, and `--toolchain local` keeps the work with the running toolchain; `ENS_TOOLCHAIN` is the environment spelling of the same choice, and the option wins when both are given.
 Asking by name for a version that is not installed is an error that names where it was looked for and what would have to be there.

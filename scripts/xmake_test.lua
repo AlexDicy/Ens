@@ -3692,10 +3692,10 @@ task("test")
                 full = string.format("%s:\n%s", name, table.concat(failures, "\n"))}
         end
 
-        -- version delegation: `ens` handing a whole invocation to another toolchain. A copy of the
-        -- built command is installed as toolchain 9.9 in a scratch folder, which is what makes the
-        -- mechanism observable while only one real version exists - the copy answers 'ens 0.1', so
-        -- it would hand the work straight back if the loop guard let it.
+        -- version delegation: `ens` handing a whole invocation to another toolchain. Copies of the
+        -- built command are installed as toolchains 9.9.0 and 9.9.2 in a scratch folder, which is
+        -- what makes the mechanism observable while only one real version exists - each copy is
+        -- the tree's own version, so it would hand the work straight back if the loop guard let it.
         local function run_cli_toolchain(job)
             local name = job.name
             local root = path.join(os.projectdir(), "build", "cli", "enstoolchain")
@@ -3707,10 +3707,13 @@ task("test")
             local env = linkEnvironment()
 
             local toolchains = path.join(root, "toolchains")
-            local installed_dir = path.join(toolchains, "9.9")
+            local installed_dir = path.join(toolchains, "9.9.2")
             local installed_exe = path.join(installed_dir, "ens" .. exe_suffix)
             os.mkdir(installed_dir)
             os.cp(host_exe, installed_exe)
+            local lower_patch_exe = path.join(toolchains, "9.9.0", "ens" .. exe_suffix)
+            os.mkdir(path.directory(lower_patch_exe))
+            os.cp(host_exe, lower_patch_exe)
             local empty = path.join(root, "empty")
             os.mkdir(empty)
 
@@ -3759,8 +3762,9 @@ task("test")
 
             -- the fixtures: a package written for 9.9 in a folder whose name holds a space, so a hop
             -- that mangled the command line could not build it; a library written for 9.9, whose
-            -- refusal of --output is a usage exit code to propagate; and one that does not compile,
-            -- whose failure is the other exit code.
+            -- refusal of --output is a usage exit code to propagate; packages written for an older
+            -- version than this one and for a newer one than any installed; and one that does not
+            -- compile, whose failure is the other exit code.
             local pkg = path.join(root, "spaced pkg")
             os.mkdir(path.join(pkg, "src"))
             io.writefile(path.join(pkg, "ens.package"),
@@ -3773,6 +3777,18 @@ task("test")
                 'package demo.library {\n    ens "9.9";\n}\n')
             io.writefile(path.join(library, "src", "greet.ens"),
                 'export greet() -> string {\n    return "hi";\n}\n')
+            local older = path.join(root, "older")
+            os.mkdir(path.join(older, "src"))
+            io.writefile(path.join(older, "ens.package"),
+                'package demo.older {\n    ens "0.1";\n}\n')
+            io.writefile(path.join(older, "src", "main.ens"),
+                'main() -> int {\n    print("built here");\n    return 0;\n}\n')
+            local newer = path.join(root, "newer")
+            os.mkdir(path.join(newer, "src"))
+            io.writefile(path.join(newer, "ens.package"),
+                'package demo.newer {\n    ens "10.0";\n}\n')
+            io.writefile(path.join(newer, "src", "main.ens"),
+                'main() -> int {\n    return 0;\n}\n')
             local broken = path.join(root, "broken")
             os.mkdir(path.join(broken, "src"))
             io.writefile(path.join(broken, "ens.package"),
@@ -3789,23 +3805,35 @@ task("test")
             -- hop having happened and its absence is the work having stayed here
             local hopped_to = slashed(installed_exe)
             local not_hopped = "!" .. hopped_to
+            local lower_patch = slashed(lower_patch_exe)
+            local declared_newer = "declares 'ens \"9.9\";', so it needs Ens 9.9 or later, and this "
+                .. "toolchain is Ens "
 
-            -- the hop: the package is built by the toolchain installed as the version it is written
-            -- for, and the command line reaches it exactly as it was written here, spaces and all
+            -- the hop: the package is built by the highest installed patch of the version it is
+            -- written for, and the command line reaches it exactly as it was written here, spaces
+            -- and all
             local spaced_out = path.join(root, "spaced out.exe")
             run(host_exe, {"build", pkg, "--output", spaced_out, "-v"}, chains, 0,
-                "written for Ens 9.9", hopped_to, ": Built '")
+                slashed(pkg) .. "' " .. declared_newer, "Ens 9.9.2 at '" .. hopped_to, ": Built '",
+                "!" .. lower_patch)
             run_program(spaced_out, 0, "built by a delegate")
+
+            -- a package written for an older version than this one is built here, and says nothing
+            -- about it even when asked to say everything
+            local older_out = path.join(root, "older.exe")
+            run(host_exe, {"build", older, "--output", older_out, "-v"}, chains, 0, ": Built '",
+                not_hopped, "!" .. lower_patch, "!declares 'ens")
+            run_program(older_out, 0, "built here")
 
             -- a single file and a source folder of the package are written for the package's
             -- version too, so they hop to the same toolchain
             local single_out = path.join(root, "single file.exe")
             run(host_exe, {"build", path.join(pkg, "src", "main.ens"), "--output", single_out, "-v"},
-                chains, 0, "written for Ens 9.9", hopped_to, ": Built '")
+                chains, 0, declared_newer, hopped_to, ": Built '")
             run_program(single_out, 0, "built by a delegate")
             local folder_out = path.join(root, "source folder.exe")
             run(host_exe, {"build", path.join(pkg, "src"), "--output", folder_out, "-v"}, chains, 0,
-                "written for Ens 9.9", hopped_to, ": Built '")
+                declared_newer, hopped_to, ": Built '")
             run_program(folder_out, 0, "built by a delegate")
 
             -- the exit code of the toolchain that did the work is this command's own
@@ -3818,9 +3846,12 @@ task("test")
             -- '--toolchain' asks for one by name, whatever the build root says, and answers for a
             -- name that is not installed instead of ignoring it
             local by_option = path.join(root, "by option.exe")
-            run(host_exe, {"build", hello, "--output", by_option, "--toolchain", "9.9", "-v"},
-                chains, 0, "'--toolchain 9.9'", hopped_to, ": Built '")
+            run(host_exe, {"build", hello, "--output", by_option, "--toolchain", "9.9.2", "-v"},
+                chains, 0, "'--toolchain 9.9.2'", hopped_to, ": Built '")
             run_program(by_option, 0, "Hello, world!")
+            run(host_exe, {"build", pkg, "--output", path.join(root, "by option over declared.exe"),
+                "-v", "--toolchain", "9.9.0"}, chains, 0, "'--toolchain 9.9.0'", lower_patch,
+                ": Built '", not_hopped)
             run(host_exe, {"build", hello, "--toolchain", "9.9"}, nothing_installed, 2,
                 "'--toolchain 9.9' names Ens 9.9, which is not installed: '", "' contains no "
                     .. "toolchain. Install Ens 9.9 as '", "', or write '--toolchain local' to build "
@@ -3835,27 +3866,34 @@ task("test")
 
             -- ENS_TOOLCHAIN is the option's environment spelling, and the option wins over it
             run(host_exe, {"build", hello, "--output", path.join(root, "by variable.exe"), "-v"},
-                {ENS_TOOLCHAINS = toolchains, ENS_TOOLCHAIN = "9.9"}, 0, "ENS_TOOLCHAIN=9.9",
+                {ENS_TOOLCHAINS = toolchains, ENS_TOOLCHAIN = "9.9.2"}, 0, "ENS_TOOLCHAIN=9.9.2",
                 hopped_to, ": Built '")
             run(host_exe, {"build", hello, "--output", path.join(root, "overridden.exe"), "-v",
                 "--toolchain", "local"}, {ENS_TOOLCHAINS = toolchains, ENS_TOOLCHAIN = "9.9"}, 0,
                 ": Built '", not_hopped)
+            run(host_exe, {"build", pkg, "--output", path.join(root, "variable over declared.exe"),
+                "-v"}, {ENS_TOOLCHAINS = toolchains, ENS_TOOLCHAIN = "9.9.0"}, 0,
+                "ENS_TOOLCHAIN=9.9.0", lower_patch, ": Built '", not_hopped)
 
-            -- a version declared but not installed is what a manifest's declaration has always
-            -- been: a statement, not a requirement. It builds here, and says so only when asked.
-            local anyway = path.join(root, "anyway.exe")
-            run(host_exe, {"build", pkg, "--output", anyway, "-v"}, nothing_installed, 0,
-                "This build is written for Ens 9.9, which is not installed, so this toolchain, Ens ",
-                ", is building it. '", "' contains no toolchain",
-                ": Built '")
-            run_program(anyway, 0, "built by a delegate")
-            run(host_exe, {"build", pkg, "--output", path.join(root, "quiet.exe")},
-                nothing_installed, 0, ": Built '", "!9.9")
+            -- a declared version newer than this toolchain and than every installed one is a
+            -- problem, at every verbosity, and '--toolchain local' still builds it here
+            run(host_exe, {"build", pkg}, nothing_installed, 2,
+                slashed(pkg) .. "' " .. declared_newer,
+                ". No installed toolchain is Ens 9.9 or later: '" .. slashed(empty)
+                    .. "' contains no toolchain. Install Ens 9.9 or later in a folder named after "
+                    .. "its version, such as '"
+                    .. slashed(path.join(empty, "9.9.0", "ens" .. exe_suffix))
+                    .. "', or write '--toolchain local' to build with this toolchain anyway",
+                "!: Built '")
+            run(host_exe, {"build", newer}, chains, 2, "declares 'ens \"10.0\";', so it needs Ens "
+                .. "10.0 or later", "' contains only '9.9.0' and '9.9.2'", not_hopped, "!: Built '")
+            run(host_exe, {"build", pkg, "--output", path.join(root, "anyway.exe"),
+                "--toolchain", "local"}, nothing_installed, 0, ": Built '")
 
             -- the loop guard, from the delegate's side: the copy sees the very declaration that
-            -- reached it and asks for 9.9 outright, and still does the work itself
+            -- reached it and asks for 9.9.2 outright, and still does the work itself
             run(installed_exe, {"build", pkg, "--output", path.join(root, "guarded.exe"), "-v",
-                "--toolchain", "9.9"}, {ENS_TOOLCHAINS = toolchains, ENS_TOOLCHAIN = "local"}, 0,
+                "--toolchain", "9.9.2"}, {ENS_TOOLCHAINS = toolchains, ENS_TOOLCHAIN = "local"}, 0,
                 "ENS_TOOLCHAIN=local", ": Built '", not_hopped)
 
             -- and from outside: one hop is all there is, however the chain starts
