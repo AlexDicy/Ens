@@ -992,10 +992,11 @@ A Windows executable carries no symbol table to begin with, so `--strip` changes
 `ens` is also a version multiplexer: a build root's declared `ens` version can send the whole invocation to another installed toolchain, and that toolchain's exit code becomes this command's own.
 A build root declaring the running toolchain's language version or an older one is built by the running toolchain.
 A build root declaring a newer one is handed to the newest installed toolchain whose version is at least the declared one, and when none is installed the command fails, naming the toolchains folder and what it contains.
-Versions compare number by number, so `0.10` is newer than `0.9`, and a label after a release's numbers, such as `-beta`, does not change which version it is, so `0.14.0-beta` and `0.14.0` are the same version.
+In that comparison versions compare number by number, so `0.10` is newer than `0.9`, and a label after a release's numbers, such as `-beta`, does not change which version it is, so `0.14.0-beta` and `0.14.0` are the same version.
 Toolchains live one folder per version under `~/.ens/toolchains`, each folder holding the `ens` program that is that version, and `ENS_TOOLCHAINS` names a different root to look in.
-`--toolchain <version>` selects a version by name whatever the build root declares, and `--toolchain local` keeps the work with the running toolchain; `ENS_TOOLCHAIN` is the environment spelling of the same choice, and the option wins when both are given.
-Asking by name for a version that is not installed is an error that names where it was looked for and what would have to be there.
+`--toolchain <version>` selects a toolchain by name whatever the build root declares, and `--toolchain local` keeps the work with the running toolchain; `ENS_TOOLCHAIN` is the environment spelling of the same choice, and the option wins when both are given.
+A name is matched exactly as written, against the running toolchain's own release and against the folder names under the toolchains folder, so on `ens 0.13.0-beta` the name `0.13.0-beta` keeps the work here while `0.13.0` and `0.13` name folders.
+Asking by name for a toolchain that is not installed is an error that names where it was looked for and what would have to be there.
 Only `build`, `check`, `run` and `test` can hand work over; `version`, `help` and `override` are always handled by the running toolchain.
 The command line reaches the other toolchain exactly as it was written, and a toolchain that was handed the work never hands it on again, so there is at most one hop.
 
