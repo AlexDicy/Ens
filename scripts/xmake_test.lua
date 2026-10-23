@@ -90,6 +90,11 @@ task("test")
         -- fresh clone needs it built before anything can reach an executable.
         local native_archive = path.join(build_dir, is_host("windows") and "ens-llvm.lib"
             or "libens-llvm.a")
+        -- a program of the LLVM package, such as llvm-nm, or nil when the package holds none
+        local function llvmTool(name)
+            return os.files(path.join(global.directory(), "packages", "l", "llvm", "*", "*", "bin",
+                name .. exe_suffix))[1]
+        end
 
         -- what `ens version` prints: the release this tree is and the language version it
         -- implements, both read from the one file that declares them.
@@ -563,16 +568,11 @@ task("test")
             return false
         end
 
-        -- the environment a process that links an Ens program needs, which is the folder holding
-        -- the ens-llvm archive on the linker's search path: LIBRARY_PATH on Linux and macOS, which
-        -- ens turns into -L, and LIB on Windows, where lld-link finds nothing else once LIB is set,
-        -- so the MSVC and Windows SDK folders are added to it too.
         -- the oldest macOS every member of ens-llvm is built for, read from the archive itself, and
         -- the members that name each version. xmake.lua builds every member for one version, so
         -- more than one is a build defect, reported by the caller.
         local function archiveVersions()
-            local objdump = os.files(path.join(global.directory(), "packages", "l", "llvm", "*",
-                "*", "bin", "llvm-objdump"))[1]
+            local objdump = llvmTool("llvm-objdump")
             if not objdump then
                 os.raise("no llvm-objdump in the LLVM package to read ens-llvm's macOS version with")
             end
@@ -620,6 +620,10 @@ task("test")
             return tree_target
         end
 
+        -- the environment a process that links an Ens program needs, which is the folder holding
+        -- the ens-llvm archive on the linker's search path: LIBRARY_PATH on Linux and macOS, which
+        -- ens turns into -L, and LIB on Windows, where lld-link finds nothing else once LIB is set,
+        -- so the MSVC and Windows SDK folders are added to it too.
         local function linkEnvironment()
             local env = os.getenvs()
             if is_host("windows") then
@@ -1078,8 +1082,7 @@ task("test")
                 first = first or shorter + 1
                 last = math.max(#bytes2, #bytes3)
             end
-            local readobj = os.files(path.join(global.directory(), "packages", "l", "llvm", "*",
-                "*", "bin", "llvm-readobj" .. exe_suffix))[1]
+            local readobj = llvmTool("llvm-readobj")
             if not readobj then
                 return string.format("%d bytes differ, the first at offset %d and the last at %d.",
                     count, first - 1, last - 1)
@@ -1132,7 +1135,9 @@ task("test")
         -- object files it wrote), stage 3 has stage2's ens compile the same sources again. The gate
         -- holds when the two stages' objects hold the same modules with identical bytes and the
         -- two executables are identical as well: the link writes no time or place into them, so a
-        -- difference there is a link that depends on something other than its inputs.
+        -- difference there is a link that depends on something other than its inputs. Both stages
+        -- are linked with --strip, as stage 2 is what a release publishes, so the executables
+        -- compared are the ones a release ships.
         --
         -- Neither side of that comparison was produced by the seed, so what the seed generates
         -- cannot decide it: the gate answers for this tree's code generation and nothing else.
@@ -1169,10 +1174,10 @@ task("test")
             local target = treeTargetArguments()
             local failed = staged("stage 2 (the compiler compiles itself)", host_exe,
                     table.join({"build", driver_src, "--output", boot2, "--stdlib", libs,
-                     "--objects", stage2_dir}, target), boot2)
+                     "--objects", stage2_dir, "--strip"}, target), boot2)
                 or staged("stage 3 (stage 2 compiles the same sources)", boot2,
                     table.join({"build", driver_src, "--output", boot3, "--stdlib", libs,
-                     "--objects", stage3_dir}, target), boot3)
+                     "--objects", stage3_dir, "--strip"}, target), boot3)
             if failed then
                 return {name = name, ok = false, short = failed:match("^[^\n]+"),
                     full = string.format("%s: %s", name, failed)}
@@ -1246,7 +1251,7 @@ task("test")
                 local again = path.join(again_dir, "ens" .. exe_suffix)
                 local relinked = staged("stage 3 again (stage 2 links the same objects once more)",
                     boot2, table.join({"build", driver_src, "--output", again, "--stdlib", libs,
-                     "--objects", stage3_dir}, target), again)
+                     "--objects", stage3_dir, "--strip"}, target), again)
                 local repeated = relinked and ("the second link by stage 2 " .. relinked)
                     or readBytes(again) == bytes3 and "A second link of the same objects by stage "
                         .. "2 is identical to the first, so the two compilers link differently."
@@ -1264,8 +1269,7 @@ task("test")
             -- version every member of ens-llvm is built for, no older and no newer
             if is_host("macosx") then
                 local floor = target[2]:match("macosx(.*)$")
-                local objdump = os.files(path.join(global.directory(), "packages", "l", "llvm",
-                    "*", "*", "bin", "llvm-objdump"))[1]
+                local objdump = llvmTool("llvm-objdump")
                 local headers = os.iorunv(objdump, {"--macho", "--private-headers", boot2})
                 local claimed = headers:match("\n%s*minos%s+([%d.]+)")
                 if claimed ~= floor then
@@ -1277,6 +1281,20 @@ task("test")
                             tostring(claimed), floor)}
                 end
             end
+            -- stage 2 ships without a symbol table, so llvm-nm has nothing it defines to list
+            local nm = llvmTool("llvm-nm")
+            if not nm then
+                return {name = name, ok = false, short = "no llvm-nm in the LLVM package"}
+            end
+            execMerged(nm, {"--defined-only", "--just-symbol-name", "--quiet", boot2}, log)
+            local kept = {}
+            for line in captured(log):gmatch("[^\r\n]+") do table.insert(kept, line) end
+            if #kept > 0 then
+                return {name = name, ok = false,
+                    short = string.format("stage 2 carries %d symbols", #kept),
+                    full = string.format("%s: '%s' is linked with --strip, but it defines %d "
+                        .. "symbols llvm-nm lists, the first '%s'", name, boot2, #kept, kept[1])}
+            end
             local note = string.format("stages %.0fs/%.0fs; fixpoint over %d modules, "
                 .. "%.1f MB; executables identical", seconds[1] or 0, seconds[2] or 0,
                 #names2, total_bytes / (1024 * 1024))
@@ -1286,8 +1304,7 @@ task("test")
         -- the libraries a program loads when it starts, as the LLVM package's llvm-readobj lists
         -- them, or nil and why not.
         local function loadedLibraries(program, log)
-            local readobj = os.files(path.join(global.directory(), "packages", "l", "llvm", "*",
-                "*", "bin", "llvm-readobj" .. exe_suffix))[1]
+            local readobj = llvmTool("llvm-readobj")
             if not readobj then
                 return nil, "no llvm-readobj in the LLVM package"
             end
@@ -1352,8 +1369,7 @@ task("test")
             local root = path.join(os.projectdir(), "build", "linuxlink")
             os.tryrm(root)
             os.mkdir(root)
-            local readobj = os.files(path.join(global.directory(), "packages", "l", "llvm", "*",
-                "*", "bin", "llvm-readobj" .. exe_suffix))[1]
+            local readobj = llvmTool("llvm-readobj")
             if not readobj then
                 return {name = name, ok = false, short = "no llvm-readobj in the LLVM package"}
             end
@@ -1454,8 +1470,7 @@ task("test")
             local root = path.join(os.projectdir(), "build", "windowslink")
             os.tryrm(root)
             os.mkdir(root)
-            local readobj = os.files(path.join(global.directory(), "packages", "l", "llvm", "*",
-                "*", "bin", "llvm-readobj" .. exe_suffix))[1]
+            local readobj = llvmTool("llvm-readobj")
             if not readobj then
                 return {name = name, ok = false, short = "no llvm-readobj in the LLVM package"}
             end
@@ -1551,8 +1566,7 @@ task("test")
             local root = path.join(os.projectdir(), "build", "symbolaudit")
             os.tryrm(root)
             os.mkdir(root)
-            local nm = os.files(path.join(global.directory(), "packages", "l", "llvm", "*", "*",
-                "bin", "llvm-nm" .. exe_suffix))[1]
+            local nm = llvmTool("llvm-nm")
             if not nm then
                 return {name = name, ok = false, short = "no llvm-nm in the LLVM package"}
             end
@@ -1753,7 +1767,7 @@ task("test")
             run({"-h"}, nil, 0, "Usage: ens <command>")
             run({"help"}, nil, 0, "Usage: ens <command>", "build", "check", "version",
                 "!cst-dump")
-            run({"help", "build"}, nil, 0, "Usage: ens build", "-o, --output <file>",
+            run({"help", "build"}, nil, 0, "Usage: ens build", "-o, --output <file>", "--strip",
                 "-O, --optimization-level <level>", "!--objects")
             run({"version"}, nil, 0, version_line)
             run({"--version"}, nil, 0, version_line)
@@ -2020,6 +2034,26 @@ task("test")
             run({"build", hello, "--no-link", "--output", path.join(root, "x" .. exe_suffix)}, nil,
                 2, "'--output' names the executable to write, and '--no-link' writes none. Remove "
                 .. "one of the two")
+
+            -- a stripped build writes a program with no symbol table, which runs the same
+            local stripped_exe = path.join(root, "stripped", "hello" .. exe_suffix)
+            run({"build", hello, "--strip", "--output", stripped_exe}, nil, 0, ": Built '")
+            run_program(stripped_exe, 0, "Hello, world!")
+            local nm = llvmTool("llvm-nm")
+            if not nm then
+                table.insert(failures, "no llvm-nm in the LLVM package to read the stripped "
+                    .. "program with")
+            elseif os.isfile(stripped_exe) then
+                execMerged(nm, {"--defined-only", "--just-symbol-name", "--quiet", stripped_exe},
+                    log)
+                if #captured(log) > 0 then
+                    table.insert(failures, "a stripped build left symbols in its program:\n"
+                        .. captured(log))
+                end
+            end
+            run({"build", hello, "--no-link", "--strip"}, nil, 2,
+                "'--strip' leaves the symbol table out of the executable, and '--no-link' writes "
+                .. "none. Remove one of the two")
 
             -- check writes nothing and reports what it found
             run({"check", hello}, nil, 0, "nothing to report")

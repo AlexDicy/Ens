@@ -109,6 +109,7 @@ If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surf
   The list may only shrink: the harness fails if a runnable fixture is neither verified nor listed, and equally if a listed name is no longer a runnable fixture, so the exemption list cannot rot.
 - `bootstrap` is the strongest end-to-end gate: `build/host/ens` compiles `selfhost/driver` into stage 2, stage 2's `ens` compiles the same sources into stage 3, and the two stages' object files must hold the same modules with identical bytes.
   The two executables have to be identical as well, since a link writes no time or place into its output.
+  Both stages are linked with `--strip`, because a release publishes stage 2 and ships no symbol table, so the gate compares the executables a release ships and checks that stage 2 carries no symbol.
   The seed built the host compiler but neither stage, so what the seed generates cannot decide this gate: it answers for this tree's code generation alone.
 - `symbol_audit` compiles the standard library and `hello` for each of the five targets and fails on any symbol their objects call that neither the system libraries `ens` carries for that target nor its own startup object provide, so a library call code generation adds is caught on every host rather than at a user's link.
   `linux_link` and `windows_link` then link programs for the Linux and Windows targets on every host, read back what they load, and run them on a host of the same system and processor.
@@ -147,7 +148,7 @@ Each binary is built on its own platform because seeds are not cross-compiled, a
 A host the pin names no seed for gets its first one from a dispatch with `first_seed_host` set to it: the linux-x64 seed builds this tree's compiler, which emits the driver's objects for that host with `--no-link`, and the host links them into a stage 1 that its suite bootstraps from through `ENS_SEEDS`, with its C compiler on Linux and with its LLVM package's `lld-link` on Windows.
 The release publishes that host's stage 2, built natively like every other host's.
 
-By hand, the same thing is `ens build selfhost/driver --output ens --stdlib libs`, run on the platform being refreshed.
+By hand, the same thing is `ens build selfhost/driver --output ens --stdlib libs --strip`, run on the platform being refreshed.
 On macOS the build also takes `--target arm64-apple-macosx15.0`, the oldest macOS `ens` runs on and the version every library in `ens-llvm` is built for; the suite passes it to every build of the tree's own packages there except the host compiler's, which the seed links with the line of the release it came from.
 `--stdlib libs` is what makes it this tree's standard library rather than the one belonging to whatever `ens` is doing the building.
 That `ens` may be the seed being replaced, a `build/host/ens` from an earlier commit, or an installed toolchain; all that matters is that it compiles these sources.
