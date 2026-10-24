@@ -22,6 +22,18 @@ public final class Win32 {
     public static const long directoryAttribute = 0x10;
     public static const long reparseAttribute = 0x400;
 
+    public static const long readOnlyAttribute = 0x1;
+    public static const long normalAttribute = 0x80;
+
+    // What SetFileAttributesW accepts besides read-only: hidden, system, archive, temporary,
+    // offline and not content indexed.
+    public static const long keptAttributes = 0x3126;
+
+    // r-xr-xr-x, rwxrwxrwx, and the owner's write bit.
+    public static const long readOnlyPermissions = 0x16D;
+    public static const long writablePermissions = 0x1FF;
+    public static const long ownerWritePermission = 0x80;
+
     // The bit marking a reparse tag that names another location rather than describing the file's
     // own storage. A cloud placeholder and a deduplicated file both carry a tag without it.
     public static const long nameSurrogateTag = 0x20000000;
@@ -921,6 +933,94 @@ public windowsRename(Runtime runtime, TypeRef type) -> RuntimeFunction {
 public windowsCopyPermissions(Runtime runtime, TypeRef type) -> RuntimeFunction {
     let definition = runtime.beginDefinition("ens_fs_copy_permissions", type);
     instructions.buildRet(runtime.builder, runtime.int32(0));
+    return runtime.endDefinition(definition);
+}
+
+public windowsPermissions(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let attributesOf = runtime.libc("GetFileAttributesW",
+        runtime.int32Type.functionType([runtime.pointerType]));
+    let widen = widetext.wideFromUtf8(runtime);
+    let release = runtime.free();
+    let definition = runtime.beginDefinition("ens_fs_permissions", type);
+    let builder = runtime.builder;
+    let probeBlock = runtime.block(definition, "permissions.probe");
+    let readBlock = runtime.block(definition, "permissions.read");
+    let unreadableBlock = runtime.block(definition, "permissions.unreadable");
+    let noMemoryBlock = runtime.block(definition, "permissions.no.memory");
+    let wide = runtime.call(widen, [runtime.parameter(definition, 0), runtime.int32(-1)],
+        "path.wide");
+    instructions.buildCondBr(builder, runtime.isNull(wide), noMemoryBlock, probeBlock);
+
+    builder.positionAtEnd(probeBlock);
+    let attributes = instructions.buildZExt(builder,
+        runtime.call(attributesOf, [wide], "attributes"), runtime.int64Type, "");
+    let probeError = runtime.lastError();
+    runtime.call(release, [wide], "");
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, attributes,
+        runtime.int64(0xFFFFFFFF), ""), unreadableBlock, readBlock);
+
+    builder.positionAtEnd(unreadableBlock);
+    instructions.buildRet(builder, probeError);
+
+    builder.positionAtEnd(readBlock);
+    memory.buildStore(builder, instructions.buildSelect(builder,
+        hasBit(runtime, attributes, Win32.readOnlyAttribute),
+        runtime.int32(Win32.readOnlyPermissions), runtime.int32(Win32.writablePermissions),
+        "permissions"), runtime.parameter(definition, 1));
+    instructions.buildRet(builder, runtime.int32(0));
+
+    builder.positionAtEnd(noMemoryBlock);
+    instructions.buildRet(builder, runtime.int32(Win32Error.notEnoughMemory));
+    return runtime.endDefinition(definition);
+}
+
+// Keeps every attribute but read-only.
+public windowsSetPermissions(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let attributesOf = runtime.libc("GetFileAttributesW",
+        runtime.int32Type.functionType([runtime.pointerType]));
+    let setAttributes = runtime.libc("SetFileAttributesW",
+        runtime.int32Type.functionType([runtime.pointerType, runtime.int32Type]));
+    let widen = widetext.wideFromUtf8(runtime);
+    let release = runtime.free();
+    let definition = runtime.beginDefinition("ens_fs_set_permissions", type);
+    let builder = runtime.builder;
+    let probeBlock = runtime.block(definition, "permissions.probe");
+    let changeBlock = runtime.block(definition, "permissions.change");
+    let unreadableBlock = runtime.block(definition, "permissions.unreadable");
+    let noMemoryBlock = runtime.block(definition, "permissions.no.memory");
+    let wide = runtime.call(widen, [runtime.parameter(definition, 0), runtime.int32(-1)],
+        "path.wide");
+    instructions.buildCondBr(builder, runtime.isNull(wide), noMemoryBlock, probeBlock);
+
+    builder.positionAtEnd(probeBlock);
+    let attributes = runtime.call(attributesOf, [wide], "attributes");
+    let probeError = runtime.lastError();
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, attributes,
+        runtime.int32(-1), ""), unreadableBlock, changeBlock);
+
+    builder.positionAtEnd(unreadableBlock);
+    runtime.call(release, [wide], "");
+    instructions.buildRet(builder, probeError);
+
+    builder.positionAtEnd(changeBlock);
+    let kept = instructions.buildAnd(builder, attributes,
+        runtime.int32(Win32.keptAttributes), "kept");
+    let writable = instructions.buildICmpNE(builder, instructions.buildAnd(builder,
+        runtime.parameter(definition, 1), runtime.int32(Win32.ownerWritePermission), ""),
+        runtime.int32(0), "writable");
+    let chosen = instructions.buildSelect(builder, writable, kept,
+        instructions.buildOr(builder, kept, runtime.int32(Win32.readOnlyAttribute), ""),
+        "chosen");
+    let written = instructions.buildSelect(builder,
+        instructions.buildICmpEQ(builder, chosen, runtime.int32(0), ""),
+        runtime.int32(Win32.normalAttribute), chosen, "written");
+    let changed = runtime.call(setAttributes, [wide, written], "changed");
+    let changeError = runtime.lastError();
+    runtime.call(release, [wide], "");
+    storeFlag(runtime, changed, changeError);
+
+    builder.positionAtEnd(noMemoryBlock);
+    instructions.buildRet(builder, runtime.int32(Win32Error.notEnoughMemory));
     return runtime.endDefinition(definition);
 }
 

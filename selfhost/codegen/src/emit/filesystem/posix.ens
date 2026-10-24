@@ -555,8 +555,18 @@ public posixRename(Runtime runtime, TypeRef type, RuntimeFunction metadata) -> R
 }
 
 public linuxCopyPermissions(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    return linuxModeBridge(runtime, type, "ens_fs_copy_permissions", true);
+}
+
+public linuxPermissions(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    return linuxModeBridge(runtime, type, "ens_fs_permissions", false);
+}
+
+// Reads the mode of the path in parameter 0. With `copies` its permission bits are applied to the
+// path in parameter 1, otherwise they are stored through parameter 1.
+linuxModeBridge(Runtime runtime, TypeRef type, string name, bool copies) -> RuntimeFunction {
     long number = nativeshapes.statxSystemCall(runtime.target.architecture());
-    let definition = runtime.beginDefinition("ens_fs_copy_permissions", type);
+    let definition = runtime.beginDefinition(name, type);
     let builder = runtime.builder;
     let claimedBlock = runtime.block(definition, "mode.claimed");
     let copyBlock = runtime.block(definition, "mode.copy");
@@ -576,8 +586,8 @@ public linuxCopyPermissions(Runtime runtime, TypeRef type) -> RuntimeFunction {
         statxClaimed(runtime, result, Statx.permissionsRequest), copyBlock, incompleteBlock);
 
     builder.positionAtEnd(copyBlock);
-    emitModeCopy(runtime, definition, memory.buildLoad(builder, runtime.int16Type,
-        runtime.offsetPointer(result, Statx.modeOffset, ""), "mode"));
+    finishMode(runtime, definition, memory.buildLoad(builder, runtime.int16Type,
+        runtime.offsetPointer(result, Statx.modeOffset, ""), "mode"), copies);
 
     builder.positionAtEnd(incompleteBlock);
     instructions.buildRet(builder, runtime.int32(Statx.incompleteError));
@@ -588,9 +598,18 @@ public linuxCopyPermissions(Runtime runtime, TypeRef type) -> RuntimeFunction {
 }
 
 public darwinCopyPermissions(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    return darwinModeBridge(runtime, type, "ens_fs_copy_permissions", true);
+}
+
+public darwinPermissions(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    return darwinModeBridge(runtime, type, "ens_fs_permissions", false);
+}
+
+// linuxModeBridge through stat.
+darwinModeBridge(Runtime runtime, TypeRef type, string name, bool copies) -> RuntimeFunction {
     let describe = runtime.libc(nativeshapes.entryPointName(runtime.target, "stat"),
         runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType]));
-    let definition = runtime.beginDefinition("ens_fs_copy_permissions", type);
+    let definition = runtime.beginDefinition(name, type);
     let builder = runtime.builder;
     let copyBlock = runtime.block(definition, "mode.copy");
     let failedBlock = runtime.block(definition, "mode.failed");
@@ -602,8 +621,8 @@ public darwinCopyPermissions(Runtime runtime, TypeRef type) -> RuntimeFunction {
         instructions.buildICmpEQ(builder, status, runtime.int32(0), ""), copyBlock, failedBlock);
 
     builder.positionAtEnd(copyBlock);
-    emitModeCopy(runtime, definition, memory.buildLoad(builder, runtime.int16Type,
-        runtime.offsetPointer(result, DarwinStat.modeOffset, ""), "mode"));
+    finishMode(runtime, definition, memory.buildLoad(builder, runtime.int16Type,
+        runtime.offsetPointer(result, DarwinStat.modeOffset, ""), "mode"), copies);
 
     builder.positionAtEnd(failedBlock);
     instructions.buildRet(builder, why);
@@ -731,6 +750,31 @@ refusedRequest(Runtime runtime, Value why) -> Value {
     return refused;
 }
 
+public posixSetPermissions(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let changeMode = runtime.libc("chmod",
+        runtime.int32Type.functionType([runtime.pointerType, runtime.int32Type]));
+    let definition = runtime.beginDefinition("ens_fs_set_permissions", type);
+    let builder = runtime.builder;
+    let permissions = instructions.buildAnd(builder, runtime.parameter(definition, 1),
+        runtime.int32(FilePermissions.permissionBits), "permissions");
+    let status = runtime.call(changeMode, [runtime.parameter(definition, 0), permissions],
+        "status");
+    returnStatus(runtime, status, runtime.lastError());
+    return runtime.endDefinition(definition);
+}
+
+finishMode(Runtime runtime, RuntimeDefinition definition, Value mode, bool copies) {
+    if (copies) {
+        emitModeCopy(runtime, definition, mode);
+        return;
+    }
+    let builder = runtime.builder;
+    memory.buildStore(builder, instructions.buildAnd(builder,
+        instructions.buildZExt(builder, mode, runtime.int32Type, ""),
+        runtime.int32(FilePermissions.permissionBits), "permissions"), runtime.parameter(definition, 1));
+    instructions.buildRet(builder, runtime.int32(0));
+}
+
 // Gives the destination the permission bits the source carries, which is all a copy transfers.
 emitModeCopy(Runtime runtime, RuntimeDefinition definition, Value mode) {
     let builder = runtime.builder;
@@ -738,7 +782,7 @@ emitModeCopy(Runtime runtime, RuntimeDefinition definition, Value mode) {
         runtime.int32Type.functionType([runtime.pointerType, runtime.int32Type]));
     let permissions = instructions.buildAnd(builder,
         instructions.buildZExt(builder, mode, runtime.int32Type, ""),
-        runtime.int32(FilePermissions.copied), "permissions");
+        runtime.int32(FilePermissions.permissionBits), "permissions");
     let status = runtime.call(changeMode, [runtime.parameter(definition, 1), permissions],
         "status");
     returnStatus(runtime, status, runtime.lastError());
