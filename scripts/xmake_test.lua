@@ -75,9 +75,8 @@ task("test")
         -- program links against, goes into a cache of the run's own, never the user's.
         os.setenv("ENS_STDLIB", path.join(os.projectdir(), "libs"))
         os.setenv("ENS_CACHE", path.join(os.projectdir(), "build", "cache"))
-        -- the newest toolchain installed on this machine would run every command the suite starts,
-        -- so every `ens` here looks in a toolchains folder of the run's own that holds none, and
-        -- the cli_toolchain job installs the ones it needs in folders of its own.
+        -- an empty toolchains folder, so no toolchain installed on this machine runs the suite's
+        -- commands; cli_toolchain installs its own
         local no_toolchains = path.join(os.projectdir(), "build", "notoolchains")
         os.tryrm(no_toolchains)
         os.mkdir(no_toolchains)
@@ -3591,9 +3590,8 @@ task("test")
                 chains, 0, "Ens 9.9.2 is installed at '" .. hopped_to .. "', and it is newer than "
                     .. "this toolchain, Ens ", ", so it runs the command", ": Built '")
 
-            -- every other command goes to a newer toolchain too. The one installed here is a
-            -- program that prints what it was handed, since a copy of this one would print the
-            -- same thing whichever of the two ran.
+            -- every other command goes to a newer toolchain too. The stub prints its arguments,
+            -- since a copy of this one could not show which of the two ran.
             local stubs = path.join(root, "stubs")
             local stub_exe = path.join(stubs, "9.9.5", "ens" .. exe_suffix)
             local stub_source = path.join(root, "stub.ens")
@@ -3623,8 +3621,7 @@ main() -> int {
             run(host_exe, {"version"}, {ENS_TOOLCHAINS = stubs, ENS_TOOLCHAIN = "local"}, 0,
                 version_line, "!stub ran")
 
-            -- a command line this toolchain cannot read is handed over as it was written, unless it
-            -- names a toolchain this one could not read out of it
+            -- an unreadable command line is handed over unchanged, unless it holds '--toolchain'
             run(host_exe, {"frobnicate", "--widely", "a b"}, stubbed, 7,
                 "stub ran: frobnicate --widely a b", handed)
             run(host_exe, {"frobnicate", "--toolchain", "9.9.5"}, stubbed, 2, "ens: ",
