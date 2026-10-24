@@ -11,7 +11,7 @@ Download `ens` for your machine from the [releases](https://github.com/AlexDicy/
 The folder below is one Windows puts on `PATH`.
 
 ```cmd
-move ens-windows-x64.exe "%LOCALAPPDATA%\Microsoft\WindowsApps\ens.exe"
+cmd /c move ens-windows-x64.exe "%LOCALAPPDATA%\Microsoft\WindowsApps\ens.exe"
 ```
 
 ### macOS
