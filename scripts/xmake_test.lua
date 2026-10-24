@@ -3661,7 +3661,8 @@ main() -> int {
             run(host_exe, {"toolchain", "list", "--available"},
                 {ENS_TOOLCHAINS = toolchains, ENS_RELEASES = releases_url}, 0,
                 "Available from '" .. releases_url .. "' for " .. host_name
-                    .. ":\n  9.9.2 (installed)\n  9.8.1\n", "!9.10.0", "!9.9.1", "!9.7.0")
+                    .. ":\n  9.9.2 (installed)\n  9.8.1\n", "!9.10.0", "!9.9.1", "!9.7.0",
+                "!Installed in")
             run(host_exe, {"toolchain", "list", "--available"},
                 {ENS_TOOLCHAINS = toolchains, ENS_RELEASES = releases_url .. ".missing"}, 1,
                 "ens: the release list at '" .. releases_url .. ".missing' could not be "

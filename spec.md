@@ -995,8 +995,8 @@ Whenever the newest installed toolchain is newer than the running one, it runs e
 A build root declaring a version newer than the running toolchain and every installed one cannot be built, and the command fails, naming the toolchains folder and what it contains.
 In those comparisons versions compare number by number, so `0.10` is newer than `0.9`, and a label after a release's numbers, such as `-beta`, does not change which version it is, so `0.14.0-beta` and `0.14.0` are the same version.
 Toolchains live one folder per version under `~/.ens/toolchains`, each folder holding the `ens` program that is that version, and `ENS_TOOLCHAINS` names a different root to look in.
-`ens toolchain list` prints the installed toolchains, the newest first, and marks the one running the command.
-`ens toolchain list --available` also prints the newest release of each language version that has a program for this machine, the newest first, written the way its folder is named and marked when it is installed.
+`ens toolchain list` prints the installed toolchains, the newest first, and marks the one running the command, or the one that is the same release when the running `ens` is outside the toolchains folder.
+`ens toolchain list --available` prints instead the newest release of each language version that has a program for this machine, the newest first, written the way its folder is named, and marks the ones that are installed and the one that is the running release.
 Releases are listed from the GitHub releases API of `AlexDicy/Ens`, and `ENS_RELEASES` names a different list, such as a mirror's or a `file://` one.
 A list is a JSON array of releases, each an object with a `tag_name` such as `v0.14.2-beta`, a `draft` flag, and `assets`, each an object with a `name`, a `browser_download_url` and a `digest` written `sha256:` and the hexadecimal digits; drafts and tags that are not release versions are left out.
 A machine's program is the asset named `ens-<system>-<processor>`, as in `ens-linux-x64` or `ens-windows-x64.exe`.
