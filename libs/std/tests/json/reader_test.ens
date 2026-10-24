@@ -1,0 +1,259 @@
+// Reader tests: what is accepted, and each refusal with its full message.
+import List from @std.collections.list;
+import Json from @std.json;
+import JsonError from @std.json;
+import JsonNumber from @std.json;
+import JsonObject from @std.json;
+import @std.testing;
+import TestFailure from @std.testing;
+
+test "the three literals read as what they name" {
+    try testing.assertEqual((try Json.parse("true")).asBool(), true);
+    try testing.assertEqual((try Json.parse("false")).asBool(), false);
+    try testing.assertTrue((try Json.parse("null")).isNull());
+}
+
+test "a number keeps the text it was written with" {
+    try testing.assertEqual(try numberText("0"), "0");
+    try testing.assertEqual(try numberText("-0"), "-0");
+    try testing.assertEqual(try numberText("42"), "42");
+    try testing.assertEqual(try numberText("-1.50"), "-1.50");
+    try testing.assertEqual(try numberText("1e5"), "1e5");
+    try testing.assertEqual(try numberText("1E+5"), "1E+5");
+    try testing.assertEqual(try numberText("0.5e-3"), "0.5e-3");
+    try testing.assertEqual(try numberText("123456789012345678901234567890"),
+        "123456789012345678901234567890");
+}
+
+test "a string resolves every escape and passes other text through" {
+    try testing.assertEqual(try text("\"plain\""), "plain");
+    try testing.assertEqual(try text("\"a\\\"b\\\\c\\/d\""), "a\"b\\c/d");
+    try testing.assertEqual(try text("\"\\b\\f\\n\\r\\t\""), "\b\f\n\r\t");
+    try testing.assertEqual(try text("\"\\u0041\\u00e9\\u00E9\""), "Aéé");
+    try testing.assertEqual(try text("\"\\uD83D\\uDE00\""), "😀");
+    try testing.assertEqual(try text("\"héllo wörld\""), "héllo wörld");
+    try testing.assertEqual(try text("\"\""), "");
+}
+
+test "arrays and objects nest, and whitespace of the four kinds is allowed around every token" {
+    let value = try Json.parse(" \t[\r\n 1 ,\t[ 2 ] , \{ \"k\" : null , \"e\" : \{\} \} ]\n");
+    try testing.assertEqual(value.toString(), "[1, [2], \{\"k\": null, \"e\": \{\}\}]");
+    try testing.assertEqual((try Json.parse("[]")).toString(), "[]");
+    try testing.assertEqual((try Json.parse("\{\}")).toString(), "\{\}");
+    try testing.assertEqual((try Json.parse("[[[]]]")).toString(), "[[[]]]");
+}
+
+test "an object keeps its keys in the order the text has them" {
+    let object = try objectOf("\{\"b\": 1, \"a\": 2, \"c\": 3\}", false);
+    let keys = new List<string>();
+    for (let key in object.keys()) {
+        keys.push(key);
+    }
+    try testing.assertEqual(keys.toArray(), ["b", "a", "c"]);
+}
+
+test "a value stands alone at the top level, and a byte order mark in front is skipped" {
+    try testing.assertEqual((try Json.parse("\"alone\"")).asString(), "alone");
+    try testing.assertEqual((try Json.parse(" 7 ")).asLong(), 7L);
+    try testing.assertEqual((try Json.parse("\uFEFF\{\"a\": 1\}")).toString(), "\{\"a\": 1\}");
+}
+
+test "a duplicate key is kept as the last value when the caller allows it" {
+    let object = try objectOf("\{\"a\": 1, \"b\": 2, \"a\": 3\}", true);
+    try testing.assertEqual(object.length(), 2L);
+    try testing.assertEqual(object.get("a")?.asLong(), 3L);
+    try testing.assertEqual(object.toString(), "\{\"a\": 3, \"b\": 2\}");
+}
+
+test "nesting is read 512 levels deep" {
+    string deep = "[".repeat(512) + "]".repeat(512);
+    try testing.assertEqual((try Json.parse(deep)).toString(), deep);
+}
+
+test "empty text and whitespace alone are refused" {
+    try assertRefused("", "the text is empty, so it holds no JSON value", 0, 1, 1);
+    try assertRefused(" \n\t ", "the text holds only whitespace and no JSON value", 0, 1, 1);
+}
+
+test "text after the one value is refused" {
+    try assertRefused("1 2", "found '2' at line 1, column 3 after the value ended. A JSON text "
+        + "holds exactly one value", 2, 1, 3);
+    try assertRefused("[1]x", "found 'x' at line 1, column 4 after the value ended. A JSON text "
+        + "holds exactly one value", 3, 1, 4);
+    try assertRefused("\"a\" \"b\"", "found '\"' at line 1, column 5 after the value ended. A "
+        + "JSON text holds exactly one value", 4, 1, 5);
+}
+
+test "a value that is not JSON is named with what JSON allows in its place" {
+    string allowed = "A value is an object, an array, a string in double quotes, a number, true, "
+        + "false or null";
+    try assertRefused("True", "found 'True' at line 1, column 1 where a value was expected. "
+        + allowed, 0, 1, 1);
+    try assertRefused("tru", "found 'tru' at line 1, column 1 where a value was expected. "
+        + allowed, 0, 1, 1);
+    try assertRefused("nulls", "found 'nulls' at line 1, column 1 where a value was expected. "
+        + allowed, 0, 1, 1);
+    try assertRefused("// note", "found '/' at line 1, column 1 where a value was expected. "
+        + allowed, 0, 1, 1);
+    try assertRefused("é", "found 'é' at line 1, column 1 where a value was expected. "
+        + allowed, 0, 1, 1);
+    try assertRefused("[1, \u0001]", "found a control character at line 1, column 5 where a "
+        + "value was expected. " + allowed, 4, 1, 5);
+}
+
+test "the spellings other languages allow for a value are refused with the JSON one" {
+    try assertRefused("'a'", "found a single quote at line 1, column 1 where a value was "
+        + "expected. JSON writes strings in double quotes, as in \"text\"", 0, 1, 1);
+    try assertRefused(".5", "found '.' at line 1, column 1 where a value was expected. A number "
+        + "starts with a digit, as in '0.5'", 0, 1, 1);
+    try assertRefused("+1", "found '+' at line 1, column 1 where a value was expected. A number "
+        + "is written without a '+' in front", 0, 1, 1);
+    try assertRefused("NaN", "found 'NaN' at line 1, column 1 where a value was expected. JSON "
+        + "has no spelling for a NaN or an infinity", 0, 1, 1);
+    try assertRefused("Infinity", "found 'Infinity' at line 1, column 1 where a value was "
+        + "expected. JSON has no spelling for a NaN or an infinity", 0, 1, 1);
+    try assertRefused("-Infinity", "found '-Infinity' at line 1, column 1 where a value was "
+        + "expected. JSON has no spelling for a NaN or an infinity", 0, 1, 1);
+}
+
+test "a number that is not written the JSON way is refused at its start" {
+    try assertRefused("01", "the number at line 1, column 1 starts with '0' followed by a digit, "
+        + "which JSON does not allow. Remove the leading zero", 0, 1, 1);
+    try assertRefused("1.", "the number at line 1, column 1 has a '.' with no digit after it. "
+        + "Write a digit after the point, as in '1.0'", 0, 1, 1);
+    try assertRefused("1.e5", "the number at line 1, column 1 has a '.' with no digit after it. "
+        + "Write a digit after the point, as in '1.0'", 0, 1, 1);
+    try assertRefused("1e", "the number at line 1, column 1 has an 'e' with no digit after it. "
+        + "Write the exponent's digits, as in '1e5'", 0, 1, 1);
+    try assertRefused("1e+", "the number at line 1, column 1 has an 'e' with no digit after it. "
+        + "Write the exponent's digits, as in '1e5'", 0, 1, 1);
+    try assertRefused("-", "found '-' at line 1, column 1 with no digit after it. A negative "
+        + "number is '-' followed by its digits, as in '-5'", 0, 1, 1);
+    try assertRefused("[-x]", "found '-' at line 1, column 2 with no digit after it. A negative "
+        + "number is '-' followed by its digits, as in '-5'", 1, 1, 2);
+}
+
+test "a string that ends early or holds a control character is refused" {
+    try assertRefused("\"abc", "the text ends inside the string that began at line 1, column 1. "
+        + "Close it with '\"'", 4, 1, 5);
+    try assertRefused("\"abc\\", "the text ends inside the string that began at line 1, column "
+        + "1. Close it with '\"'", 5, 1, 6);
+    try assertRefused("\"a\nb\"", "the string that began at line 1, column 1 holds a control "
+        + "character at line 1, column 3, which JSON writes as an escape such as '\\n' or "
+        + "'\\u001f'", 2, 1, 3);
+}
+
+test "an escape that is not one of JSON's is refused" {
+    try assertRefused("\"\\x\"", "found '\\x' at line 1, column 2, which is not a JSON escape. "
+        + "The escapes are \\\" \\\\ \\/ \\b \\f \\n \\r \\t and \\uXXXX with four hex digits",
+        1, 1, 2);
+    try assertRefused("\"\\u12\"", "the escape '\\u' at line 1, column 2 is not followed by four "
+        + "hex digits, as in '\\u00e9'", 1, 1, 2);
+    try assertRefused("\"\\u12g4\"", "the escape '\\u' at line 1, column 2 is not followed by "
+        + "four hex digits, as in '\\u00e9'", 1, 1, 2);
+}
+
+test "half of a surrogate pair is refused, since it is no character on its own" {
+    string advice = " is one half of a surrogate pair, which is no character on its own. Write "
+        + "both halves, as in '\\uD83D\\uDE00', or the character itself";
+    try assertRefused("\"\\uD83D\"", "the escape '\\uD83D' at line 1, column 2" + advice,
+        1, 1, 2);
+    try assertRefused("\"\\uD83D\\u0041\"", "the escape '\\uD83D' at line 1, column 2" + advice,
+        1, 1, 2);
+    try assertRefused("\"\\uD83Dx\"", "the escape '\\uD83D' at line 1, column 2" + advice,
+        1, 1, 2);
+    try assertRefused("\"\\uDE00\"", "the escape '\\uDE00' at line 1, column 2" + advice,
+        1, 1, 2);
+    try assertRefused("\"\\uD83D\\uZZZZ\"", "the escape '\\u' at line 1, column 8 is not followed "
+        + "by four hex digits, as in '\\u00e9'", 7, 1, 8);
+}
+
+test "an array that ends early, misses a comma, or ends in a comma is refused" {
+    try assertRefused("[", "the text ends inside the array that began at line 1, column 1. Close "
+        + "it with ']'", 1, 1, 2);
+    try assertRefused("[1", "the text ends inside the array that began at line 1, column 1. "
+        + "Close it with ']'", 2, 1, 3);
+    try assertRefused("[1,", "the text ends inside the array that began at line 1, column 1. "
+        + "Close it with ']'", 3, 1, 4);
+    try assertRefused("[1 2]", "found '2' at line 1, column 4 after an array element. Write ',' "
+        + "before the next element or ']' to end the array", 3, 1, 4);
+    try assertRefused("[1}", "found '\}' at line 1, column 3 after an array element. Write ',' "
+        + "before the next element or ']' to end the array", 2, 1, 3);
+    try assertRefused("[1,]", "found ']' at line 1, column 4 where a value was expected, because "
+        + "the ',' before it has to be followed by one. Remove the ','", 3, 1, 4);
+}
+
+test "an object that ends early or is written without the keys, colons and commas is refused" {
+    try assertRefused("\{", "the text ends inside the object that began at line 1, column 1. "
+        + "Close it with '\}'", 1, 1, 2);
+    try assertRefused("\{\"a\"", "the text ends inside the object that began at line 1, column "
+        + "1. Close it with '\}'", 4, 1, 5);
+    try assertRefused("\{\"a\":", "the text ends inside the object that began at line 1, column "
+        + "1. Close it with '\}'", 5, 1, 6);
+    try assertRefused("\{\"a\": 1", "the text ends inside the object that began at line 1, "
+        + "column 1. Close it with '\}'", 7, 1, 8);
+    try assertRefused("\{\"a\": 1,", "the text ends inside the object that began at line 1, "
+        + "column 1. Close it with '\}'", 8, 1, 9);
+    try assertRefused("\{a: 1\}", "found 'a' at line 1, column 2 where a key was expected. A key "
+        + "is a string in double quotes, as in \"name\"", 1, 1, 2);
+    try assertRefused("\{\"a\" 1\}", "found '1' at line 1, column 6 after the key 'a'. Write ':' "
+        + "between a key and its value", 5, 1, 6);
+    try assertRefused("\{\"a\": 1 \"b\": 2\}", "found '\"' at line 1, column 9 after the value "
+        + "of 'a'. Write ',' before the next key or '\}' to end the object", 8, 1, 9);
+    try assertRefused("\{\"a\": 1,\}", "found '\}' at line 1, column 9 where a key was expected, "
+        + "because the ',' before it has to be followed by one. Remove the ','", 8, 1, 9);
+}
+
+test "a key written twice in one object is refused, naming both places" {
+    try assertRefused("\{\"a\": 1, \"a\": 2\}", "the key 'a' appears twice in the same object, "
+        + "at line 1, column 2 and line 1, column 10. Remove one of them, or pass "
+        + "allowDuplicateKeys to keep the last", 9, 1, 10);
+    let nested = try Json.parse("\{\"a\": \{\"a\": 1\}\}");
+    try testing.assertEqual(nested.toString(), "\{\"a\": \{\"a\": 1\}\}");
+}
+
+test "a problem on a later line is placed on it" {
+    try assertRefused("[\n  1,\n  x\n]", "found 'x' at line 3, column 3 where a value was "
+        + "expected. A value is an object, an array, a string in double quotes, a number, true, "
+        + "false or null", 9, 3, 3);
+    try assertRefused("\{\n  \"a\": 1,\n  \"a\": 2\n\}", "the key 'a' appears twice in the same "
+        + "object, at line 2, column 3 and line 3, column 3. Remove one of them, or pass "
+        + "allowDuplicateKeys to keep the last", 14, 3, 3);
+}
+
+test "nesting past 512 levels is refused" {
+    string deep = "[".repeat(600);
+    try assertRefused(deep, "the value at line 1, column 514 is nested more than 512 levels "
+        + "deep, which this reader does not read", 513, 1, 514);
+}
+
+numberText(string text) -> string throws JsonError {
+    let value = try Json.parse(text);
+    if (value is JsonNumber) {
+        return value.text;
+    }
+    return "not a number";
+}
+
+objectOf(string json, bool allowDuplicateKeys) -> JsonObject throws JsonError, TestFailure {
+    let object = (try Json.parse(json, allowDuplicateKeys)).asObject();
+    if (object == null) {
+        try testing.fail("'{json}' did not read as an object");
+    }
+    return object;
+}
+
+text(string json) -> string throws JsonError {
+    return (try Json.parse(json)).asString() ?? "not a string";
+}
+
+assertRefused(string text, string message, long offset, long line, long column)
+        throws TestFailure {
+    let failure = try testing.assertThrows<JsonError>(() -> {
+        let ignored = try Json.parse(text);
+    });
+    try testing.assertEqual(failure.message, message);
+    try testing.assertEqual(failure.offset, offset);
+    try testing.assertEqual(failure.line, line);
+    try testing.assertEqual(failure.column, column);
+}

@@ -2357,6 +2357,39 @@ relay(string url) -> int throws ProcessError, IoError {
 
 ---
 
+`@std.json` reads JSON text into a tree of values and writes a tree back as text.
+Every value is a `Json`, a sealed class whose six final subclasses are the kinds JSON has: `JsonNull`, `JsonBool`, `JsonNumber`, `JsonString`, `JsonArray` and `JsonObject`.
+A program that walks a value it knows nothing about switches over it with an `is` arm per kind, which the compiler checks is exhaustive, and a program that knows the shape it expects probes with `isNull()`, `asBool()`, `asLong()`, `asDouble()`, `asString()`, `asArray()` and `asObject()`, each returning the content when the value is of that kind and `null` otherwise, so `release.get("tag_name")?.asString()` is the tag as a `string?` whether or not the member is there.
+`Json.parse(text)` returns the value the text holds, which has to be JSON as RFC 8259 defines it: no comments, no trailing commas, no single quotes, no leading zeros, no `NaN` or infinity, whitespace allowed around every token, and a byte order mark allowed in front.
+Anything else raises a `JsonError`, whose `offset`, `line` and `column` say where the text stops being JSON, the column counted in bytes from the start of its line, and whose message says what was found there and what JSON allows in its place.
+An object that names the same key twice is refused, naming both places; `Json.parse(text, true)` keeps the last value instead.
+Nesting deeper than 512 levels is refused.
+
+A `JsonNumber` keeps the text the number was written with, so nothing is rounded between reading a number and writing it again and a number longer than any numeric type is carried through untouched.
+`asLong()` returns the number only when it is written as a whole number a `long` holds, so `1.0` and `1e2` return `null`, and `asDouble()` returns the nearest `double`, or `null` outside the range a `double` holds.
+`JsonNumber.of(value)` makes one from a `long` or a `double`, written as the value prints, and stops the program for a `NaN` or an infinity, which JSON has no spelling for.
+A `JsonArray` holds values in order, with `get`, `set`, `push`, `removeAt`, `clear`, `length` and `isEmpty`, and is walked with `for (let element in array)`.
+A `JsonObject` holds members by key in the order they were added, which is the order they are written in and walked in as `Entry<string, Json>` values; `set` on a key already there replaces its value and keeps its place, `get(key)` returns `null` for a key that is not there, and `keys()` returns the keys in order.
+Two values are equal, and hash alike, when they are the same kind with equal content, an object's key order left aside, so a parsed value compares with one built by hand.
+
+`toString()` writes a value as JSON on one line in the form a struct prints as, `", "` between elements and members and `": "` after a key, with `"`, `\` and control characters escaped the same way, so a `JsonObject` and a struct holding the same fields print the same text.
+`toString(indent)` writes it over several lines, every element and member on a line of its own and indented by one `indent` per level of nesting, with an empty array or object as `[]` or `{}`.
+
+```ens
+import Json from @std.json;
+import JsonError from @std.json;
+
+newestTag(string releases) -> string? throws JsonError {
+    let list = (try Json.parse(releases)).asArray();
+    if (list == null || list.isEmpty()) {
+        return null;
+    }
+    return list.get(0).asObject()?.get("tag_name")?.asString();
+}
+```
+
+---
+
 `@std.thread` holds one call: `Thread.sleep(millis)` blocks the thread it is called on until the monotonic clock has advanced by that many milliseconds.
 The count is a floor and never a ceiling, so nothing bounds how long a loaded machine leaves the thread waiting, and a count of zero or less returns without waiting at all.
 

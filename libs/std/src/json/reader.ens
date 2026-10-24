@@ -1,0 +1,518 @@
+// Parsing JSON text (RFC 8259) into `Json` values. A byte order mark in front is skipped. Every
+// error says what was found, where, and what JSON allows there.
+import Map from @std.collections.map;
+import Json from @std.json;
+import JsonArray from @std.json;
+import JsonBool from @std.json;
+import JsonError from @std.json;
+import JsonNull from @std.json;
+import JsonNumber from @std.json;
+import JsonObject from @std.json;
+import JsonString from @std.json;
+import StringBuilder from @std.text.stringbuilder;
+
+public parse(string text, bool allowDuplicateKeys) -> Json throws JsonError {
+    let cursor = new Cursor(text, allowDuplicateKeys);
+    cursor.skipByteOrderMark();
+    cursor.skipWhitespace();
+    if (cursor.atEnd()) {
+        if (text.length == 0) {
+            throw cursor.failure("the text is empty, so it holds no JSON value", 0);
+        }
+        throw cursor.failure("the text holds only whitespace and no JSON value", 0);
+    }
+    let value = try cursor.value(0);
+    cursor.skipWhitespace();
+    if (!cursor.atEnd()) {
+        throw cursor.failure("found {cursor.describe()} at {cursor.where()} after the value "
+            + "ended. A JSON text holds exactly one value", cursor.at);
+    }
+    return value;
+}
+
+final class Limits {
+    // Each nesting level is a recursive call, so this keeps a deeply nested text from overflowing
+    // the stack.
+    protected static const long depth = 512;
+}
+
+// The read position in the text, and the parsing of each kind of value from it.
+final class Cursor {
+    const string text;
+    const bool allowDuplicateKeys;
+    long at;
+
+    protected constructor(this.text, this.allowDuplicateKeys) {
+        this.at = 0;
+    }
+
+    atEnd() -> bool {
+        return this.at >= this.text.length;
+    }
+
+    skipByteOrderMark() {
+        if (this.text.length >= 3 && this.text.byteAt(0) == 0xEF && this.text.byteAt(1) == 0xBB
+            && this.text.byteAt(2) == 0xBF) {
+            this.at = 3;
+        }
+    }
+
+    skipWhitespace() {
+        while (!this.atEnd()) {
+            byte current = this.text.byteAt(this.at);
+            if (current != ' ' && current != '\t' && current != '\n' && current != '\r') {
+                return;
+            }
+            this.at = this.at + 1;
+        }
+    }
+
+    // Parses the value at the read position, `depth` levels inside the outermost one.
+    value(long depth) -> Json throws JsonError {
+        if (depth > Limits.depth) {
+            throw this.failure("the value at {this.where()} is nested more than {Limits.depth} "
+                + "levels deep, which this reader does not read", this.at);
+        }
+        byte current = this.text.byteAt(this.at);
+        if (current == '{') {
+            return try this.object(depth);
+        }
+        if (current == '[') {
+            return try this.array(depth);
+        }
+        if (current == '"') {
+            return new JsonString(try this.quoted());
+        }
+        if (current == 't') {
+            return try this.literal("true", new JsonBool(true));
+        }
+        if (current == 'f') {
+            return try this.literal("false", new JsonBool(false));
+        }
+        if (current == 'n') {
+            return try this.literal("null", new JsonNull());
+        }
+        if (current == '-' || isDigit(current)) {
+            return try this.number();
+        }
+        throw this.unexpectedValue();
+    }
+
+    // The error for a byte that cannot start a value, with advice matching what the byte is.
+    unexpectedValue() -> JsonError {
+        byte current = this.text.byteAt(this.at);
+        string found = this.describe();
+        string start = "found {found} at {this.where()} where a value was expected";
+        if (current == '\'') {
+            return this.failure("{start}. JSON writes strings in double quotes, as in \"text\"",
+                this.at);
+        }
+        if (current == '.') {
+            return this.failure("{start}. A number starts with a digit, as in '0.5'", this.at);
+        }
+        if (current == '+') {
+            return this.failure("{start}. A number is written without a '+' in front", this.at);
+        }
+        string word = this.word();
+        if (word == "NaN" || word == "Infinity") {
+            return this.failure("{start}. JSON has no spelling for a NaN or an infinity", this.at);
+        }
+        return this.failure("{start}. A value is an object, an array, a string in double quotes, "
+            + "a number, true, false or null", this.at);
+    }
+
+    // Reads the word `expected` as `value`; any other word is an error.
+    literal(string expected, Json value) -> Json throws JsonError {
+        if (this.word() != expected) {
+            throw this.unexpectedValue();
+        }
+        this.at = this.at + expected.length;
+        return value;
+    }
+
+    number() -> Json throws JsonError {
+        long start = this.at;
+        if (this.text.byteAt(this.at) == '-') {
+            this.at = this.at + 1;
+            if (this.atEnd() || !isDigit(this.text.byteAt(this.at))) {
+                if (!this.atEnd() && this.word() == "Infinity") {
+                    throw this.failure("found '-Infinity' at {this.where(start)} where a value "
+                        + "was expected. JSON has no spelling for a NaN or an infinity", start);
+                }
+                throw this.failure("found '-' at {this.where(start)} with no digit after it. A "
+                    + "negative number is '-' followed by its digits, as in '-5'", start);
+            }
+        }
+        if (this.text.byteAt(this.at) == '0') {
+            this.at = this.at + 1;
+            if (!this.atEnd() && isDigit(this.text.byteAt(this.at))) {
+                throw this.failure("the number at {this.where(start)} starts with '0' followed "
+                    + "by a digit, which JSON does not allow. Remove the leading zero", start);
+            }
+        } else {
+            this.skipDigits();
+        }
+        if (!this.atEnd() && this.text.byteAt(this.at) == '.') {
+            this.at = this.at + 1;
+            if (this.atEnd() || !isDigit(this.text.byteAt(this.at))) {
+                throw this.failure("the number at {this.where(start)} has a '.' with no digit "
+                    + "after it. Write a digit after the point, as in '1.0'", start);
+            }
+            this.skipDigits();
+        }
+        if (!this.atEnd() && isExponentMark(this.text.byteAt(this.at))) {
+            this.at = this.at + 1;
+            if (!this.atEnd() && isSign(this.text.byteAt(this.at))) {
+                this.at = this.at + 1;
+            }
+            if (this.atEnd() || !isDigit(this.text.byteAt(this.at))) {
+                throw this.failure("the number at {this.where(start)} has an 'e' with no digit "
+                    + "after it. Write the exponent's digits, as in '1e5'", start);
+            }
+            this.skipDigits();
+        }
+        return new JsonNumber(this.text.substring(start, this.at));
+    }
+
+    skipDigits() {
+        while (!this.atEnd() && isDigit(this.text.byteAt(this.at))) {
+            this.at = this.at + 1;
+        }
+    }
+
+    // Parses the string whose opening quote is at the read position, resolving its escapes.
+    quoted() -> string throws JsonError {
+        long start = this.at;
+        this.at = this.at + 1;
+        let out = new StringBuilder();
+        long runStart = this.at;
+        while (true) {
+            if (this.atEnd()) {
+                throw this.unclosedString(start);
+            }
+            byte current = this.text.byteAt(this.at);
+            if (current == '"') {
+                out.append(this.text.substring(runStart, this.at));
+                this.at = this.at + 1;
+                return out.toString();
+            }
+            if (current == '\\') {
+                out.append(this.text.substring(runStart, this.at));
+                try this.escape(out, start);
+                runStart = this.at;
+                continue;
+            }
+            if (current < 0x20) {
+                throw this.failure("the string that began at {this.where(start)} holds a "
+                    + "control character at {this.where()}, which JSON writes as an escape such "
+                    + "as '\\n' or '\\u001f'", this.at);
+            }
+            this.at = this.at + 1;
+        }
+    }
+
+    unclosedString(long start) -> JsonError {
+        return this.failure("the text ends inside the string that began at {this.where(start)}. "
+            + "Close it with '\"'", this.at);
+    }
+
+    // Appends the character of the escape at the read position, which is its '\', to `out`.
+    escape(StringBuilder out, long stringStart) throws JsonError {
+        long start = this.at;
+        this.at = this.at + 1;
+        if (this.atEnd()) {
+            throw this.unclosedString(stringStart);
+        }
+        byte letter = this.text.byteAt(this.at);
+        this.at = this.at + 1;
+        if (letter == '"' || letter == '\\' || letter == '/') {
+            out.append(this.text.substring(start + 1, start + 2));
+            return;
+        }
+        if (letter == 'b') {
+            out.append("\b");
+            return;
+        }
+        if (letter == 'f') {
+            out.append("\f");
+            return;
+        }
+        if (letter == 'n') {
+            out.append("\n");
+            return;
+        }
+        if (letter == 'r') {
+            out.append("\r");
+            return;
+        }
+        if (letter == 't') {
+            out.append("\t");
+            return;
+        }
+        if (letter == 'u') {
+            long code = try this.hexEscape(start);
+            if (code >= 0xD800 && code <= 0xDBFF) {
+                code = try this.lowSurrogate(start, code);
+            } else if (code >= 0xDC00 && code <= 0xDFFF) {
+                throw this.loneSurrogate(start);
+            }
+            let character = code as? char;
+            if (character != null) {
+                out.append(character);
+            }
+            return;
+        }
+        throw this.failure("found '{this.text.substring(start, this.at)}' at {this.where(start)}, "
+            + "which is not a JSON escape. The escapes are \\\" \\\\ \\/ \\b \\f \\n \\r \\t and "
+            + "\\uXXXX with four hex digits", start);
+    }
+
+    // The value of the four hex digits after '\u'; `start` is the '\'.
+    hexEscape(long start) -> long throws JsonError {
+        long code = 0;
+        for (long i = 0; i < 4; i++) {
+            long digit = -1;
+            if (!this.atEnd()) {
+                digit = hexValue(this.text.byteAt(this.at));
+            }
+            if (digit < 0) {
+                throw this.failure("the escape '\\u' at {this.where(start)} is not followed by "
+                    + "four hex digits, as in '\\u00e9'", start);
+            }
+            code = code * 16 + digit;
+            this.at = this.at + 1;
+        }
+        return code;
+    }
+
+    // Combines `high` with the low surrogate escaped right after it; `start` is the '\' of the
+    // first escape.
+    lowSurrogate(long start, long high) -> long throws JsonError {
+        long second = this.at;
+        if (this.at + 1 < this.text.length && this.text.byteAt(this.at) == '\\'
+            && this.text.byteAt(this.at + 1) == 'u') {
+            this.at = this.at + 2;
+            long low = try this.hexEscape(second);
+            if (low >= 0xDC00 && low <= 0xDFFF) {
+                return 0x10000 + (high - 0xD800) * 0x400 + (low - 0xDC00);
+            }
+        }
+        throw this.loneSurrogate(start);
+    }
+
+    loneSurrogate(long start) -> JsonError {
+        return this.failure("the escape '{this.text.substring(start, start + 6)}' at "
+            + "{this.where(start)} is one half of a surrogate pair, which is no character on its "
+            + "own. Write both halves, as in '\\uD83D\\uDE00', or the character itself", start);
+    }
+
+    array(long depth) -> Json throws JsonError {
+        long start = this.at;
+        this.at = this.at + 1;
+        let array = new JsonArray();
+        this.skipWhitespace();
+        if (!this.atEnd() && this.text.byteAt(this.at) == ']') {
+            this.at = this.at + 1;
+            return array;
+        }
+        while (true) {
+            if (this.atEnd()) {
+                throw this.unclosed("array", start, "]");
+            }
+            array.push(try this.value(depth + 1));
+            this.skipWhitespace();
+            if (this.atEnd()) {
+                throw this.unclosed("array", start, "]");
+            }
+            byte current = this.text.byteAt(this.at);
+            if (current == ']') {
+                this.at = this.at + 1;
+                return array;
+            }
+            if (current != ',') {
+                throw this.failure("found {this.describe()} at {this.where()} after an array "
+                    + "element. Write ',' before the next element or ']' to end the array",
+                    this.at);
+            }
+            this.at = this.at + 1;
+            this.skipWhitespace();
+            if (!this.atEnd() && this.text.byteAt(this.at) == ']') {
+                throw this.trailingComma("a value");
+            }
+        }
+    }
+
+    object(long depth) -> Json throws JsonError {
+        long start = this.at;
+        this.at = this.at + 1;
+        let object = new JsonObject();
+        let firstSeen = new Map<string, long>();
+        this.skipWhitespace();
+        if (!this.atEnd() && this.text.byteAt(this.at) == '}') {
+            this.at = this.at + 1;
+            return object;
+        }
+        while (true) {
+            if (this.atEnd()) {
+                throw this.unclosed("object", start, "\}");
+            }
+            if (this.text.byteAt(this.at) != '"') {
+                throw this.failure("found {this.describe()} at {this.where()} where a key was "
+                    + "expected. A key is a string in double quotes, as in \"name\"", this.at);
+            }
+            long keyStart = this.at;
+            string key = try this.quoted();
+            this.skipWhitespace();
+            if (this.atEnd()) {
+                throw this.unclosed("object", start, "\}");
+            }
+            if (this.text.byteAt(this.at) != ':') {
+                throw this.failure("found {this.describe()} at {this.where()} after the key "
+                    + "'{key}'. Write ':' between a key and its value", this.at);
+            }
+            this.at = this.at + 1;
+            this.skipWhitespace();
+            if (this.atEnd()) {
+                throw this.unclosed("object", start, "\}");
+            }
+            let value = try this.value(depth + 1);
+            if (!this.allowDuplicateKeys) {
+                let earlier = firstSeen.get(key);
+                if (earlier != null) {
+                    throw this.failure("the key '{key}' appears twice in the same object, at "
+                        + "{this.where(earlier)} and {this.where(keyStart)}. Remove one of them, "
+                        + "or pass allowDuplicateKeys to keep the last", keyStart);
+                }
+                firstSeen.set(key, keyStart);
+            }
+            object.set(key, value);
+            this.skipWhitespace();
+            if (this.atEnd()) {
+                throw this.unclosed("object", start, "\}");
+            }
+            byte current = this.text.byteAt(this.at);
+            if (current == '}') {
+                this.at = this.at + 1;
+                return object;
+            }
+            if (current != ',') {
+                throw this.failure("found {this.describe()} at {this.where()} after the value of "
+                    + "'{key}'. Write ',' before the next key or '\}' to end the object", this.at);
+            }
+            this.at = this.at + 1;
+            this.skipWhitespace();
+            if (!this.atEnd() && this.text.byteAt(this.at) == '}') {
+                throw this.trailingComma("a key");
+            }
+        }
+    }
+
+    unclosed(string kind, long start, string closer) -> JsonError {
+        return this.failure("the text ends inside the {kind} that began at {this.where(start)}. "
+            + "Close it with '{closer}'", this.at);
+    }
+
+    // The error for a closing bracket right after a ','.
+    trailingComma(string expected) -> JsonError {
+        return this.failure("found {this.describe()} at {this.where()} where {expected} was "
+            + "expected, because the ',' before it has to be followed by one. Remove the ','",
+            this.at);
+    }
+
+    // The ASCII letters and digits at the read position, possibly none.
+    word() -> string {
+        long end = this.at;
+        while (end < this.text.length && isWordByte(this.text.byteAt(end))) {
+            end = end + 1;
+        }
+        return this.text.substring(this.at, end);
+    }
+
+    // The byte at the read position as a message names it: a word or a character in single
+    // quotes, or a description when it cannot be shown.
+    describe() -> string {
+        byte current = this.text.byteAt(this.at);
+        if (current == '\'') {
+            return "a single quote";
+        }
+        if (isWordByte(current)) {
+            return "'" + this.word() + "'";
+        }
+        if (current < 0x20 || current == 0x7F) {
+            return "a control character";
+        }
+        if (current < 0x80) {
+            return "'" + this.text.substring(this.at, this.at + 1) + "'";
+        }
+        long length = 2;
+        if (current >= 0xF0) {
+            length = 4;
+        } else if (current >= 0xE0) {
+            length = 3;
+        }
+        return "'" + this.text.substring(this.at, this.at + length) + "'";
+    }
+
+    where() -> string {
+        return this.where(this.at);
+    }
+
+    // "line L, column C" for a byte offset, both 1-based, the column in bytes.
+    where(long offset) -> string {
+        let position = this.position(offset);
+        return "line {position.line}, column {position.column}";
+    }
+
+    position(long offset) -> Position {
+        long line = 1;
+        long lineStart = 0;
+        for (long i = 0; i < offset; i++) {
+            if (this.text.byteAt(i) == '\n') {
+                line = line + 1;
+                lineStart = i + 1;
+            }
+        }
+        Position found = {line: line, column: offset - lineStart + 1};
+        return found;
+    }
+
+    failure(string message, long offset) -> JsonError {
+        let position = this.position(offset);
+        return new JsonError(message, offset, position.line, position.column);
+    }
+}
+
+struct Position {
+    long line;
+    long column;
+}
+
+isDigit(byte value) -> bool {
+    return value >= '0' && value <= '9';
+}
+
+isExponentMark(byte value) -> bool {
+    return value == 'e' || value == 'E';
+}
+
+isSign(byte value) -> bool {
+    return value == '+' || value == '-';
+}
+
+isWordByte(byte value) -> bool {
+    return isDigit(value) || (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z');
+}
+
+// The value of a hex digit, or -1.
+hexValue(byte value) -> long {
+    if (isDigit(value)) {
+        return value - '0';
+    }
+    if (value >= 'a' && value <= 'f') {
+        return value - 'a' + 10;
+    }
+    if (value >= 'A' && value <= 'F') {
+        return value - 'A' + 10;
+    }
+    return -1;
+}
