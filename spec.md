@@ -992,7 +992,7 @@ A Windows executable carries no symbol table to begin with, so `--strip` changes
 
 `ens` is also a version multiplexer: a command can be handed to another installed toolchain, and that toolchain's exit code becomes this command's own.
 Whenever the newest installed toolchain is newer than the running one, it runs every command except `ens toolchain remove`, so the `ens` a machine runs is always the newest one it has.
-A build root declaring a version newer than the running toolchain and every installed one cannot be built, and the command fails, naming the toolchains folder and what it contains.
+A build root declaring a version newer than the running toolchain and every installed one has the newest release of that language version downloaded and installed, and that release runs the command; `--offline` refuses the download instead.
 In those comparisons versions compare number by number, so `0.10` is newer than `0.9`, and a label after a release's numbers, such as `-beta`, does not change which version it is, so `0.14.0-beta` and `0.14.0` are the same version.
 Toolchains live one folder per version under `~/.ens/toolchains`, each folder holding the `ens` program that is that version, and `ENS_TOOLCHAINS` names a different root to look in.
 `ens toolchain list` prints the installed toolchains, the newest first, and marks the one running the command, or the one that is the same release when the running `ens` is outside the toolchains folder.
@@ -1001,11 +1001,15 @@ Releases are listed from the GitHub releases API of `AlexDicy/Ens`, and `ENS_REL
 A list is a JSON array of releases, each an object with a `tag_name` such as `v0.14.2-beta`, a `draft` flag, and `assets`, each an object with a `name`, a `browser_download_url` and a `digest` written `sha256:` and the hexadecimal digits; drafts and tags that are not release versions are left out.
 A machine's program is the asset named `ens-<system>-<processor>`, as in `ens-linux-x64` or `ens-windows-x64.exe`.
 `GITHUB_TOKEN`, when it is set, is sent to `https://api.github.com` to raise its limit on requests, and to no other address unless `ENS_RELEASES_TOKEN` is `always`.
+`ens toolchain install <version>` installs a release such as `0.14.2`, the newest release of a language version such as `0.14`, or with `latest` the newest release of all, and leaves a release that is already installed as it is; `--force` downloads it again and replaces the installed copy.
+A release is downloaded into a staging folder under the toolchains folder, checked against the sha256 its release list reports, marked executable on Linux and macOS, and moved into its folder in one step, so a download that is refused or stops part-way installs nothing, and two installs of one release at once both succeed.
+A download whose sha256 does not match, or that the list reports no sha256 for, is refused.
 `ens toolchain remove <version>` removes the toolchain installed under that name, and it is always run by the `ens` that was started, which never removes itself.
 A removal takes the version's folder out of the toolchains folder in one step before deleting its files, so a removal that stops part-way never leaves a toolchain that looks installed, and a toolchain that is running while it is removed keeps running.
 Every command except `ens toolchain remove` takes `--toolchain <version>`, which selects a toolchain by name whatever is installed and whatever the build root declares, and `--toolchain local` keeps the work with the running toolchain; `ENS_TOOLCHAIN` is the environment spelling of the same choice, and the option wins when both are given.
 A name is matched exactly as written, against the running toolchain's own release and against the folder names under the toolchains folder, so on `ens 0.13.0-beta` the name `0.13.0-beta` keeps the work here while `0.13.0` and `0.13` name folders.
-Asking by name for a toolchain that is not installed is an error that names where it was looked for and what would have to be there.
+A whole release asked for by name, such as `0.14.2`, is downloaded and installed when it is not installed, and asking for anything else that is not installed, such as `0.14`, is an error.
+A download prints where it comes from on the error stream, unless `--quiet` is given.
 A command line the running toolchain cannot read, such as a command added in a later version, is handed to the newest installed toolchain to be read there, unless it is written with `--toolchain`, which the running toolchain could not read out of it.
 The command line reaches the other toolchain exactly as it was written, and a toolchain that was handed the work never hands it on again, so there is at most one hop.
 

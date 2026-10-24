@@ -82,6 +82,9 @@ task("test")
         os.mkdir(no_toolchains)
         os.setenv("ENS_TOOLCHAINS", no_toolchains)
         os.setenv("ENS_TOOLCHAIN", "")
+        -- a release list that is not there, so no `ens` here downloads from the network
+        os.setenv("ENS_RELEASES", "file:///" .. (path.join(no_toolchains, "no-releases.json")
+            :gsub("\\", "/"):gsub("^/", "")))
         local exe_suffix = is_host("windows") and ".exe" or ""
         -- what `ens` names the artifacts it is not told the name of: it follows the target's object
         -- format, and every assertion about a default-named file has to as well.
@@ -3548,16 +3551,11 @@ task("test")
                 {ENS_TOOLCHAINS = toolchains, ENS_TOOLCHAIN = "9.9.2"}, 0, "ENS_TOOLCHAIN=9.9.2",
                 hopped_to, ": Built '")
 
-            -- a declared version newer than this toolchain and than every installed one is a
-            -- problem, at every verbosity
-            run(host_exe, {"build", pkg}, nothing_installed, 2,
-                slashed(pkg) .. "' " .. declared_newer,
-                ". No installed toolchain is Ens 9.9 or later: '" .. slashed(empty)
-                    .. "' contains no toolchain. Install Ens 9.9 or later in a folder named after "
-                    .. "its version, such as '"
-                    .. slashed(path.join(empty, "9.9.0", "ens" .. exe_suffix))
-                    .. "', or write '--toolchain local' to build with this toolchain anyway",
-                "!: Built '")
+            -- a declared version newer than this toolchain and than every installed one is
+            -- downloaded, and a source that cannot be reached fails the command
+            run(host_exe, {"build", pkg}, nothing_installed, 1,
+                "'" .. slashed(pkg) .. "' declares 'ens \"9.9\";'.",
+                "The release list at '", "' could not be downloaded: curl: ", "!: Built '")
 
             -- one hop is all there is, however the chain starts
             local _, chained = run(installed_exe, {"build", pkg, "--output",
@@ -3582,8 +3580,9 @@ task("test")
             run(host_exe, {"run", pkg, "-v"}, chains, 0, hopped_to, "built by a delegate")
             run(host_exe, {"test", pkg, "-v"}, chains, 0, hopped_to, "There are no tests in")
             run(host_exe, {"run", hello, "--toolchain", "9.9"}, nothing_installed, 2,
-                "'--toolchain 9.9' names Ens 9.9, which is not installed: '", "' contains no "
-                    .. "toolchain")
+                "ens: Ens 9.9 is not installed: '", "' contains no toolchain. Write a whole "
+                    .. "release, as in '--toolchain 9.9.0', which is downloaded when it is not "
+                    .. "installed")
 
             -- a build root that declares nothing newer still goes to a newer installed toolchain
             run(host_exe, {"build", hello, "--output", path.join(root, "undeclared.exe"), "-v"},
@@ -3693,8 +3692,88 @@ main() -> int {
 
             -- a toolchain the environment names is required by every command
             run(host_exe, {"version"}, {ENS_TOOLCHAINS = toolchains, ENS_TOOLCHAIN = "9.9"}, 2,
-                "'ENS_TOOLCHAIN=9.9' names Ens 9.9, which is not installed: '",
+                "ens: Ens 9.9 is not installed: '", "as in 'ENS_TOOLCHAIN=9.9.0'",
                 "or write '--toolchain local' to use this toolchain, Ens ")
+
+            -- downloading: a release list naming the stub as this machine's build of 9.9.5, and
+            -- 9.8.0 published with a digest its file does not have
+            local published = path.join(root, "published")
+            local published_exe = path.join(published, host_asset)
+            os.mkdir(published)
+            os.cp(stub_exe, published_exe)
+            local published_url = file_url(published_exe)
+            local download_list = path.join(root, "downloads.json")
+            io.writefile(download_list, string.format('[{"tag_name": "v9.9.5-beta", "assets": '
+                .. '[{"name": "%s", "browser_download_url": "%s", "digest": "sha256:%s"}]}, '
+                .. '{"tag_name": "v9.8.0-beta", "assets": [{"name": "%s", '
+                .. '"browser_download_url": "%s", "digest": "sha256:%s"}]}]', host_asset,
+                published_url, hash.sha256(published_exe), host_asset, published_url,
+                string.rep("0", 64)))
+            local download_url = file_url(download_list)
+            local function fresh(name)
+                local folder = path.join(root, name)
+                os.tryrm(folder)
+                os.mkdir(folder)
+                return folder
+            end
+            local downloading = "Downloading Ens 9.9.5 from '" .. published_url .. "'"
+
+            -- a declared version newer than every installed one downloads its newest release,
+            -- which then does the work, and is not downloaded again
+            local automatic = fresh("automatic")
+            local automatic_vars = {ENS_TOOLCHAINS = automatic, ENS_RELEASES = download_url}
+            run(host_exe, {"check", pkg}, automatic_vars, 7,
+                "'" .. slashed(pkg) .. "' declares 'ens \"9.9\";'. " .. downloading,
+                "stub ran: check " .. pkg, handed)
+            run(host_exe, {"check", pkg}, automatic_vars, 7, "stub ran: check", "!Downloading")
+            if not os.isfile(path.join(automatic, "9.9.5", "ens" .. exe_suffix)) then
+                table.insert(failures, "the automatic download did not install 9.9.5")
+            end
+
+            -- '--offline' refuses the download, and a handed-over toolchain never downloads
+            local offline = fresh("offline")
+            local offline_vars = {ENS_TOOLCHAINS = offline, ENS_RELEASES = download_url}
+            run(host_exe, {"check", pkg, "--offline"}, offline_vars, 1,
+                "ens: '" .. slashed(pkg) .. "' needs Ens 9.9 or later. '--offline' does not allow "
+                    .. "downloading it. Run 'ens toolchain install 9.9', or run without "
+                    .. "'--offline'", "!Downloading", "!stub ran")
+            run(host_exe, {"check", pkg}, {ENS_TOOLCHAINS = offline, ENS_RELEASES = download_url,
+                ENS_TOOLCHAIN = "local"}, 0, "!Downloading", "!stub ran")
+            if #os.dirs(path.join(offline, "*")) ~= 0 then
+                table.insert(failures, "a run that may not download left something in "
+                    .. slashed(offline))
+            end
+
+            -- '--toolchain' with a whole release that is not installed downloads exactly that one
+            local requested = fresh("requested")
+            run(host_exe, {"version", "--toolchain", "9.9.5"},
+                {ENS_TOOLCHAINS = requested, ENS_RELEASES = download_url}, 7,
+                "Ens 9.9.5 is not installed. " .. downloading, "stub ran: version --toolchain 9.9.5")
+
+            -- 'toolchain install' installs once, again only with '--force', and refuses a file
+            -- whose sha256 is not the published one
+            local explicit = fresh("explicit")
+            local explicit_vars = {ENS_TOOLCHAINS = explicit, ENS_RELEASES = download_url}
+            local explicit_folder = slashed(path.join(explicit, "9.9.5"))
+            run(host_exe, {"toolchain", "install", "9.9", "--toolchain", "local"}, explicit_vars, 0,
+                downloading, "Installed Ens 9.9.5 in '" .. explicit_folder .. "'")
+            run(host_exe, {"toolchain", "install", "9.9.5", "--toolchain", "local"}, explicit_vars,
+                0, "Ens 9.9.5 is already installed in '" .. explicit_folder .. "'", "!Downloading")
+            run(host_exe, {"toolchain", "install", "9.9.5", "--force", "--toolchain", "local"},
+                explicit_vars, 0, downloading, "Reinstalled Ens 9.9.5 in '" .. explicit_folder .. "'")
+            run(host_exe, {"toolchain", "install", "9.8.0", "--toolchain", "local"}, explicit_vars,
+                1, "ens: Ens 9.8.0 was not installed: the file downloaded from '" .. published_url
+                    .. "' does not match the sha256 the release source reports, so it is not the "
+                    .. "published file")
+            if os.isdir(path.join(explicit, "9.8.0")) then
+                table.insert(failures, "a download whose sha256 did not match was installed")
+            end
+            run(host_exe, {"toolchain", "install", "0.x", "--toolchain", "local"}, explicit_vars, 2,
+                "ens: '0.x' is not a version. Write a release such as '0.14.2', a language version "
+                    .. "such as '0.14', or 'latest'")
+            run(host_exe, {"toolchain", "install", "9.7", "--toolchain", "local"}, explicit_vars, 1,
+                "ens: No release of Ens 9.7 at '" .. download_url .. "' has a build for "
+                    .. host_name)
 
             if #failures == 0 then
                 return {name = name, ok = true}

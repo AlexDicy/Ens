@@ -12,6 +12,7 @@ import @ens.host.childexit;
 import platform;
 import Reporter from report;
 import report;
+import toolchaininstall;
 import Version from @ens.language.version;
 import Version as VersionNumber from @ens.packages.versions;
 import @ens.packages.versions;
@@ -154,8 +155,12 @@ export final class ToolchainDecision {
     Path? chosenProgram;
     string problem;
     string reason;
+    string wanted;
+    string why;
+    string offlineProblem;
 
-    protected constructor(this.chosenVersion, this.chosenProgram, this.problem, this.reason);
+    protected constructor(this.chosenVersion, this.chosenProgram, this.problem, this.reason,
+                          this.wanted = "", this.why = "", this.offlineProblem = "");
 
     // Whether another toolchain does the work, which is exactly when there is a program to run.
     export delegates() -> bool {
@@ -182,6 +187,21 @@ export final class ToolchainDecision {
     export explanation() -> string {
         return this.reason;
     }
+
+    // The release or language version to download and run, or empty when nothing is downloaded.
+    export download() -> string {
+        return this.wanted;
+    }
+
+    // The sentence the download notice starts with.
+    export context() -> string {
+        return this.why;
+    }
+
+    // What is reported instead of downloading under '--offline'.
+    export offline() -> string {
+        return this.offlineProblem;
+    }
 }
 
 // Whether another toolchain ran the command, and with what.
@@ -207,12 +227,30 @@ export final class Handoff {
 // exit code. `declaration` is null for a command that compiles nothing. `argv` is forwarded
 // unchanged.
 export hand(Environment environment, ToolchainRequest request, Declaration? declaration,
-            string[] argv, Reporter reporter) -> Handoff {
+            string[] argv, bool offline, Reporter reporter) -> Handoff {
     let installed = discover(root(environment), environment.platform());
     let decision = select(request, declaration, Version.release, installed);
     if (decision.failure().length > 0) {
         reporter.problem(decision.failure());
         return new Handoff(true, 2);
+    }
+    Path? folder = installed.root();
+    if (decision.download().length > 0 && folder != null) {
+        if (offline) {
+            reporter.problem(decision.offline());
+            return new Handoff(true, 1);
+        }
+        let obtained = toolchaininstall.obtain(environment, folder, decision.download(), false,
+            decision.context(), reporter);
+        if (obtained.leftovers().length > 0) {
+            reporter.note(obtained.leftovers());
+        }
+        Path? downloaded = obtained.program();
+        if (downloaded == null) {
+            reporter.problem(afterContext(decision.context(), obtained.failure()));
+            return new Handoff(true, 1);
+        }
+        return new Handoff(true, runToolchain(downloaded, decision.download(), argv, reporter));
     }
     if (decision.explanation().length > 0) {
         reporter.step(decision.explanation());
@@ -265,8 +303,7 @@ export select(ToolchainRequest request, Declaration? declaration, string running
     if (declaration != null && declared != null && versions.compare(declared, current) > 0) {
         string needs = needsNewer(declaration, running);
         if (newest == null || !atLeast(newest, declared)) {
-            return new ToolchainDecision("", null,
-                needs + ". " + noneNewEnough(installed, declaration.version()), "");
+            return newerDownloaded(declaration, needs, installed);
         }
         Path program = newest.program();
         return new ToolchainDecision(newest.version(), program, "",
@@ -305,37 +342,76 @@ newerThan(InstalledToolchain toolchain, VersionNumber other) -> bool {
     return version != null && versions.compare(version, other) > 0;
 }
 
-// Why no installed toolchain can build a build root written for `governing`, and what to do.
-noneNewEnough(InstalledToolchains installed, string governing) -> string {
-    string local = "write '--toolchain local' to build with this toolchain anyway";
+// The newest release of the declared language version is downloaded, unless there is no toolchains
+// folder to put it in.
+newerDownloaded(Declaration declaration, string needs,
+                InstalledToolchains installed) -> ToolchainDecision {
+    string governing = declaration.version();
     if (installed.root() == null) {
-        return "There is no toolchains folder to look in: " + noFolderReason(installed) + ". Set "
-            + "'ENS_TOOLCHAINS' to the folder your toolchains are in, or {local}";
+        return new ToolchainDecision("", null, "{needs}. There is no toolchains folder to "
+            + "install Ens {governing} in: " + noFolderReason(installed) + ". Set "
+            + "'ENS_TOOLCHAINS' to the folder your toolchains are in, or write '--toolchain local' "
+            + "to build with this toolchain anyway", "");
     }
-    return "No installed toolchain is Ens {governing} or later: " + foundInstead(installed)
-        + ". Install Ens {governing} or later in a folder named after its version, such as '"
-        + installedAt(installed, "{governing}.0") + "', or {local}";
+    return new ToolchainDecision("", null, "", "", governing,
+        "'{declaration.root()}' declares 'ens \"{governing}\";'.",
+        "'{declaration.root()}' needs Ens {governing} or later. '--offline' does not allow "
+        + "downloading it. Run 'ens toolchain install {governing}', or run without '--offline'");
 }
 
-// A version the command line or the environment requested by name. Requesting one that is not here
-// is a usage problem: it names a toolchain, and there is no toolchain to name.
+// A whole release that is not installed is downloaded. Anything else names a folder, which has to
+// be there.
 honorRequest(ToolchainRequest request, string requested, string running,
              InstalledToolchains installed) -> ToolchainDecision {
     string named = requestWording(request, requested);
     Path? program = installed.programOf(requested);
     if (program != null) {
         return new ToolchainDecision(requested, program, "",
-            "{named} names Ens {requested}, so '{program}' runs the command");
+            "Ens {requested} at '{program}' runs the command, as {named} requests");
     }
     string local = "write '--toolchain local' to use this toolchain, Ens {running}";
     if (installed.root() == null) {
-        return new ToolchainDecision("", null, "{named} names Ens {requested}, and there is no "
-            + "toolchains folder to look in: " + noFolderReason(installed) + ". Set "
+        return new ToolchainDecision("", null, "Ens {requested} is not installed, and there is "
+            + "no toolchains folder to install it in: " + noFolderReason(installed) + ". Set "
             + "'ENS_TOOLCHAINS' to the folder your toolchains are in, or {local}", "");
     }
-    return new ToolchainDecision("", null, "{named} names Ens {requested}, which is not "
-        + "installed: " + foundInstead(installed) + ". Install Ens {requested} as '"
-        + installedAt(installed, requested) + "', or {local}", "");
+    if (isWholeRelease(requested)) {
+        return new ToolchainDecision("", null, "", "", requested,
+            "Ens {requested} is not installed.",
+            "Ens {requested} is not installed. '--offline' does not allow downloading it. Run "
+            + "'ens toolchain install {requested}', or run without '--offline'");
+    }
+    string example = requestWording(request, wholeReleaseLike(requested, running));
+    return new ToolchainDecision("", null, "Ens {requested} is not installed: "
+        + foundInstead(installed) + ". Write a whole release, as in {example}, which is "
+        + "downloaded when it is not installed, or {local}", "");
+}
+
+// Three numbers and no label, as in '0.14.2', which is also the folder it is installed in.
+isWholeRelease(string requested) -> bool {
+    let version = versions.parsed(requested);
+    return version != null && version.components().length == 3;
+}
+
+// '0.14.0' for '0.14', '0.14.2' for '0.14.2-beta', and this toolchain's release otherwise.
+wholeReleaseLike(string requested, string running) -> string {
+    let version = versions.release(requested);
+    if (version == null) {
+        version = versions.release(running);
+    }
+    if (version == null) {
+        return running;
+    }
+    long[] parts = version.components();
+    string written = "{parts[0]}";
+    for (long i = 1; i < 3; i++) {
+        long part = 0;
+        if (i < parts.length) {
+            part = parts[i];
+        }
+        written = written + ".{part}";
+    }
+    return written;
 }
 
 // The toolchains folder: the folder ENS_TOOLCHAINS names, else '.ens/toolchains' under this user's
@@ -405,6 +481,27 @@ export namesToolchain(string[] argv) -> bool {
     return false;
 }
 
+// The problem as a sentence after `context`, with a capital first letter.
+export afterContext(string context, string problem) -> string {
+    if (problem.length == 0) {
+        return context;
+    }
+    return context + " " + problem.substring(0, 1).toUpperAscii() + problem.substring(1);
+}
+
+// Whether `argv` contains '--offline' before any '--'.
+export forbidsDownloads(string[] argv) -> bool {
+    for (let argument in argv) {
+        if (argument == "--") {
+            return false;
+        }
+        if (argument == "--offline") {
+            return true;
+        }
+    }
+    return false;
+}
+
 final class ToolchainVersions {
     // The version that means "this one", whatever this one is.
     protected static const string local = "local";
@@ -433,14 +530,4 @@ export foundInstead(InstalledToolchains installed) -> string {
 
 export noFolderReason(InstalledToolchains installed) -> string {
     return "neither 'ENS_TOOLCHAINS' nor '{installed.userVariable()}' is set";
-}
-
-// Where a requested version's program would be under the toolchains folder. Only a message
-// calls this, and only after the folder is resolved, so a caller that has none never reaches here.
-installedAt(InstalledToolchains installed, string requested) -> string {
-    Path? root = installed.root();
-    if (root == null) {
-        return installed.programName();
-    }
-    return root.join(requested).join(installed.programName()).toString();
 }

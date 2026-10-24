@@ -1,0 +1,167 @@
+import Path from @std.fs;
+import @std.testing;
+import @std.environment;
+import Platform from @std.platform;
+import Access from @std.fs.permissions;
+import Permissions from @std.fs.permissions;
+import @ens.packages.hashing;
+import Release from releases;
+import ReleaseAsset from releases;
+import RequestKind from toolchaininstall;
+import toolchaininstall;
+import Reporter from report;
+import Verbosity from options;
+import platform;
+import support;
+
+test "a request is a release, a language version or 'latest'" {
+    try testing.assertEqual(toolchaininstall.kindOf("0.14.2"), RequestKind.Release);
+    try testing.assertEqual(toolchaininstall.kindOf("0.14.2-beta"), RequestKind.Release);
+    try testing.assertEqual(toolchaininstall.kindOf("0.14"), RequestKind.LanguageVersion);
+    try testing.assertEqual(toolchaininstall.kindOf("latest"), RequestKind.Latest);
+    try testing.assertEqual(toolchaininstall.kindOf("0.x"), RequestKind.Unrecognized);
+    try testing.assertEqual(toolchaininstall.kindOf("1.2.3.4"), RequestKind.Unrecognized);
+    try testing.assertEqual(toolchaininstall.unrecognized("0.x"), "'0.x' is not a version. "
+        + "Write a release such as '0.14.2', a language version such as '0.14', or 'latest'");
+}
+
+test "the newest release a request covers is chosen, among those with a build here" {
+    Release[] listed = [release("0.14.1-beta", "ens"), release("0.14.2-beta", "ens"),
+        release("0.15.0-beta", "other"), release("0.13.3-beta", "ens")];
+    try testing.assertEqual(chosenVersion(listed, "0.14"), "0.14.2-beta");
+    try testing.assertEqual(chosenVersion(listed, "0.14.1"), "0.14.1-beta");
+    try testing.assertEqual(chosenVersion(listed, "0.14.1-beta"), "0.14.1-beta");
+    try testing.assertEqual(chosenVersion(listed, "latest"), "0.14.2-beta");
+    try testing.assertEqual(chosenVersion(listed, "0.15"), "");
+    try testing.assertEqual(chosenVersion(listed, "0.14.9"), "");
+}
+
+test "a request nothing covers says which release there is instead" {
+    Release[] listed = [release("0.14.2-beta", "ens"), release("0.15.0-beta", "other")];
+    string url = "https://example.com/releases";
+    try testing.assertEqual(toolchaininstall.nothingChosen(listed, "0.14.9", url, "windows/x64"),
+        "Ens 0.14.9 is not a release at 'https://example.com/releases'. The newest release of "
+        + "Ens 0.14 is 0.14.2");
+    try testing.assertEqual(toolchaininstall.nothingChosen(listed, "0.16.0", url, "windows/x64"),
+        "Ens 0.16.0 is not a release at 'https://example.com/releases'");
+    try testing.assertEqual(toolchaininstall.nothingChosen(listed, "0.15", url, "windows/x64"),
+        "No release of Ens 0.15 at 'https://example.com/releases' has a build for windows/x64");
+    try testing.assertEqual(toolchaininstall.nothingChosen(listed, "0.15.0", url, "windows/x64"),
+        "No release of Ens 0.15.0 at 'https://example.com/releases' has a build for windows/x64");
+    Release[] none = [];
+    try testing.assertEqual(toolchaininstall.nothingChosen(none, "latest", url, "windows/x64"),
+        "No release at 'https://example.com/releases' has a build for windows/x64");
+}
+
+test "a release is installed once, and again only when forced" {
+    let scratchFolder = try support.scratch("install-toolchain");
+    Path scratch = scratchFolder.path();
+    Path published = scratch.join("published");
+    try support.writeFile(published, "ens-build", "not really a compiler");
+    Path root = scratch.join("toolchains");
+    Platform host = environment.platform();
+    let asset = new ReleaseAsset("ens-build", fileUrl(published.join("ens-build")),
+        hashing.digits(try hashing.ofFile(published.join("ens-build"))));
+    ReleaseAsset[] assets = [asset];
+    let chosen = new Release("v9.9.2-beta", "9.9.2-beta", assets);
+    let quiet = new Reporter(Verbosity.Quiet);
+
+    let first = toolchaininstall.install(root, chosen, asset, host, false, "", quiet);
+    try testing.assertEqual(first.failure(), "");
+    try testing.assertTrue(first.wasDownloaded(), "the first install downloads");
+    try testing.assertFalse(first.replaced(), "nothing was there to replace");
+    Path program = root.join("9.9.2").join(platform.executableNamed("ens", host));
+    try testing.assertEqual(first.program(), program);
+    try testing.assertEqual(try program.readText(), "not really a compiler");
+    if (host != Platform.Windows) {
+        Access everything = {read: true, write: true, execute: true};
+        Access readAndRun = {read: true, write: false, execute: true};
+        Permissions runnable = {owner: everything, group: readAndRun, others: readAndRun};
+        try testing.assertEqual(try program.permissions(), runnable);
+    }
+
+    let second = toolchaininstall.install(root, chosen, asset, host, false, "", quiet);
+    try testing.assertEqual(second.failure(), "");
+    try testing.assertFalse(second.wasDownloaded(), "an installed release is not downloaded again");
+
+    let forced = toolchaininstall.install(root, chosen, asset, host, true, "", quiet);
+    try testing.assertEqual(forced.failure(), "");
+    try testing.assertTrue(forced.replaced(), "a forced install replaces the installed copy");
+    try testing.assertEqual(try program.readText(), "not really a compiler");
+    try assertNothingStaged(root);
+}
+
+test "a release another run installed first is kept, and one forced over it replaces it" {
+    let scratchFolder = try support.scratch("install-race");
+    Path scratch = scratchFolder.path();
+    try support.writeFile(scratch, "staged/9.9.2/ens", "ours");
+    try support.writeFile(scratch, "toolchains/9.9.2/ens", "theirs");
+    Path folder = scratch.join("toolchains/9.9.2");
+    Path program = folder.join("ens");
+
+    try testing.assertEqual(try toolchaininstall.claimed(scratch.join("staged/9.9.2"), folder,
+        program, scratch.join("aside"), false, "9.9.2"), "");
+    try testing.assertEqual(try program.readText(), "theirs");
+
+    try testing.assertEqual(try toolchaininstall.claimed(scratch.join("staged/9.9.2"), folder,
+        program, scratch.join("aside"), true, "9.9.2"), "");
+    try testing.assertEqual(try program.readText(), "ours");
+    try testing.assertEqual(try scratch.join("aside/ens").readText(), "theirs");
+}
+
+test "a download that does not match its sha256 is not installed" {
+    let scratchFolder = try support.scratch("install-mismatch");
+    Path scratch = scratchFolder.path();
+    try support.writeFile(scratch, "published/ens-build", "not the published bytes");
+    Path root = scratch.join("toolchains");
+    string url = fileUrl(scratch.join("published/ens-build"));
+    let asset = new ReleaseAsset("ens-build", url, "00");
+    ReleaseAsset[] assets = [asset];
+    let chosen = new Release("v9.9.2-beta", "9.9.2-beta", assets);
+
+    let refused = toolchaininstall.install(root, chosen, asset, environment.platform(), false,
+        "", new Reporter(Verbosity.Quiet));
+    try testing.assertEqual(refused.failure(), "Ens 9.9.2 was not installed: the file downloaded "
+        + "from '{url}' does not match the sha256 the release source reports, so it is not the "
+        + "published file");
+    try testing.assertTrue(refused.program() == null, "nothing is installed");
+    try testing.assertFalse(root.join("9.9.2").exists(), "no version folder is left");
+    try assertNothingStaged(root);
+
+    let unchecked = new ReleaseAsset("ens-build", url, "");
+    try testing.assertEqual(toolchaininstall.install(root, chosen, unchecked,
+        environment.platform(), false, "", new Reporter(Verbosity.Quiet)).failure(),
+        "Ens 9.9.2 was not installed: the release source reports no sha256 for 'ens-build', so "
+        + "the download cannot be checked");
+}
+
+release(string version, string assetName) -> Release {
+    ReleaseAsset[] assets = [new ReleaseAsset(assetName, "https://example.com/{version}", "00")];
+    return new Release("v" + version, version, assets);
+}
+
+chosenVersion(Release[] listed, string request) -> string {
+    Release? chosen = toolchaininstall.choose(listed, request, "ens");
+    if (chosen == null) {
+        return "";
+    }
+    return chosen.version();
+}
+
+fileUrl(Path file) -> string {
+    string written = file.toString();
+    if (written.startsWith("/")) {
+        return "file://" + written;
+    }
+    return "file:///" + written;
+}
+
+assertNothingStaged(Path root) throws {
+    Path staging = root.join(".staging");
+    if (!staging.isDirectory()) {
+        return;
+    }
+    for (let left in try staging.entries()) {
+        try testing.fail("the install left '{left.path}' behind");
+    }
+}

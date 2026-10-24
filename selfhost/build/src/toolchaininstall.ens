@@ -1,0 +1,308 @@
+// Installing a release of Ens into the toolchains folder. A release is downloaded and checked in a
+// staging folder and moved into place in one step, so a toolchain folder never holds a partial
+// download.
+import Path from @std.fs;
+import FileSystemError from @std.fs.error;
+import Environment from @std.environment;
+import Access from @std.fs.permissions;
+import Permissions from @std.fs.permissions;
+import Platform from @std.platform;
+import @ens.host.scratch;
+import @ens.packages.artifacts;
+import @ens.packages.hashing;
+import @ens.packages.tools;
+import @ens.packages.versions;
+import Release from releases;
+import ReleaseAsset from releases;
+import releasesource;
+import platform;
+import Reporter from report;
+
+export enum RequestKind {
+    Release,
+    LanguageVersion,
+    Latest,
+    Unrecognized,
+}
+
+// A release such as '0.14.2' or '0.14.2-beta', a language version such as '0.14', or 'latest'.
+export kindOf(string request) -> RequestKind {
+    if (request == "latest") {
+        return RequestKind.Latest;
+    }
+    let version = versions.release(request);
+    if (version == null) {
+        return RequestKind.Unrecognized;
+    }
+    return switch (version.components().length) {
+        3 -> RequestKind.Release,
+        2 -> RequestKind.LanguageVersion,
+        default -> RequestKind.Unrecognized,
+    };
+}
+
+export unrecognized(string request) -> string {
+    return "'{request}' is not a version. Write a release such as '0.14.2', a language version "
+        + "such as '0.14', or 'latest'";
+}
+
+// The newest release the request covers that has `assetName`, or null when none does.
+export choose(Release[] releases, string request, string assetName) -> Release? {
+    Release? chosen = null;
+    for (let release in releases) {
+        if (release.asset(assetName) != null && covers(request, release)
+                && (chosen == null || newer(release, chosen))) {
+            chosen = release;
+        }
+    }
+    return chosen;
+}
+
+// Why `choose` found nothing.
+export nothingChosen(Release[] releases, string request, string url, string host) -> string {
+    if (kindOf(request) == RequestKind.Latest) {
+        return "No release at '{url}' has a build for {host}";
+    }
+    if (kindOf(request) == RequestKind.LanguageVersion) {
+        return "No release of Ens {request} at '{url}' has a build for {host}";
+    }
+    for (let release in releases) {
+        if (covers(request, release)) {
+            return "No release of Ens {request} at '{url}' has a build for {host}";
+        }
+    }
+    string language = languageOf(request);
+    Release? newestOfLanguage = null;
+    for (let release in releases) {
+        if (covers(language, release) && (newestOfLanguage == null
+                || newer(release, newestOfLanguage))) {
+            newestOfLanguage = release;
+        }
+    }
+    string missing = "Ens {request} is not a release at '{url}'";
+    if (newestOfLanguage == null) {
+        return missing;
+    }
+    return missing + ". The newest release of Ens {language} is {newestOfLanguage.folderName()}";
+}
+
+export final class Installation {
+    Path? installed;
+    bool downloaded;
+    bool replacedOne;
+    string problem;
+    string leftBehind;
+
+    protected constructor(this.installed, this.downloaded, this.replacedOne, this.problem,
+                          this.leftBehind);
+
+    export program() -> Path? {
+        return this.installed;
+    }
+
+    // False when the release was already installed.
+    export wasDownloaded() -> bool {
+        return this.downloaded;
+    }
+
+    // Whether the download replaced an installed copy.
+    export replaced() -> bool {
+        return this.replacedOne;
+    }
+
+    export failure() -> string {
+        return this.problem;
+    }
+
+    // Why a staging folder could not be removed, or empty.
+    export leftovers() -> string {
+        return this.leftBehind;
+    }
+}
+
+// Installs the newest release `request` covers, announcing the download after `context`, which
+// is empty or a sentence that says why it is needed.
+export obtain(Environment environment, Path root, string request, bool force, string context,
+              Reporter reporter) -> Installation {
+    let source = releasesource.sourceFor(environment);
+    if (source.failure().length > 0) {
+        return refused(source.failure());
+    }
+    let staging = scratch.createMarkedUnder(root.join(".staging"), "list");
+    if (staging.failure().length > 0) {
+        return refused("the releases at '{source.url()}' could not be listed: "
+            + staging.failure());
+    }
+    let fetched = releasesource.fetch(source, staging.folder(), reporter);
+    string leftBehind = staging.remove();
+    if (fetched.failure().length > 0) {
+        return new Installation(null, false, false, fetched.failure(), leftBehind);
+    }
+    string assetName = platform.hostAssetName();
+    Release? release = choose(fetched.releases(), request, assetName);
+    if (release == null) {
+        return new Installation(null, false, false, nothingChosen(fetched.releases(), request,
+            source.url(), platform.hostName()), leftBehind);
+    }
+    ReleaseAsset? asset = release.asset(assetName);
+    if (asset == null) {
+        return refused("Internal: the chosen release '{release.tag()}' has no '{assetName}'");
+    }
+    return install(root, release, asset, environment.platform(), force, context, reporter);
+}
+
+// With `force`, an installed release is downloaded again and replaces the installed one.
+export install(Path root, Release release, ReleaseAsset asset, Platform host, bool force,
+               string context, Reporter reporter) -> Installation {
+    string version = release.folderName();
+    Path folder = root.join(version);
+    Path program = folder.join(platform.executableNamed("ens", host));
+    if (program.isFile() && !force) {
+        return new Installation(program, false, false, "", "");
+    }
+    if (asset.digest().length == 0) {
+        return refused("Ens {version} was not installed: the release source reports no sha256 "
+            + "for '{asset.name()}', so the download cannot be checked");
+    }
+    try root.createDirectories();
+    let staging = scratch.createMarkedUnder(root.join(".staging"), "install");
+    if (staging.failure().length > 0) {
+        return refused("Ens {version} was not installed: {staging.failure()}");
+    }
+    bool replacing = force && program.isFile();
+    string problem = placed(staging.folder(), folder, program, release, asset, host, force,
+        context, reporter);
+    string leftBehind = staging.remove();
+    if (problem.length > 0) {
+        return new Installation(null, false, false, problem, leftBehind);
+    }
+    return new Installation(program, true, replacing, "", leftBehind);
+} catch (FileSystemError stopped) {
+    return refused("Ens {release.folderName()} was not installed: {stopped.message}");
+}
+
+// Downloads into `staging`, checks the file and moves it into `folder`. Returns why it did not, or
+// empty. A release another run moved into place first is taken as installed.
+placed(Path staging, Path folder, Path program, Release release, ReleaseAsset asset,
+       Platform host, bool force, string context, Reporter reporter) -> string {
+    string version = release.folderName();
+    Path staged = staging.join(version);
+    try staged.createDirectories();
+    Path target = staged.join(program.fileName());
+    string announced = "Downloading Ens {version} from '{asset.url()}'";
+    if (context.length > 0) {
+        announced = context + " " + announced;
+    }
+    reporter.announce(announced);
+    let download = tools.read("curl", artifacts.curlArguments(asset.url(), target), noOverrides());
+    if (!download.started()) {
+        return "downloading Ens {version} needs 'curl', which could not be started. Install curl "
+            + "and add its folder to 'PATH'";
+    }
+    if (!download.succeeded()) {
+        return "Ens {version} was not installed: '{asset.url()}' could not be downloaded: "
+            + download.report();
+    }
+    if (hashing.digits(try hashing.ofFile(target)) != asset.digest()) {
+        return "Ens {version} was not installed: the file downloaded from '{asset.url()}' does "
+            + "not match the sha256 the release source reports, so it is not the published file";
+    }
+    if (host != Platform.Windows) {
+        try target.setPermissions(runnable());
+    }
+    return try claimed(staged, folder, program, staging.join("replaced"), force, version);
+} catch (FileSystemError stopped) {
+    return "Ens {release.folderName()} was not installed: {stopped.message}";
+}
+
+// Moves `staged` into `folder`. Without `force`, a release another run installed first is kept
+// as it is; with it, the installed copy is moved to `aside` first, and back when the move fails.
+// Returns why `folder` does not hold the program, or empty.
+export claimed(Path staged, Path folder, Path program, Path aside, bool force,
+               string version) -> string throws FileSystemError {
+    if (program.isFile() && !force) {
+        return "";
+    }
+    bool replacing = folder.exists();
+    if (replacing) {
+        let moved = try folder.moveTo(aside);
+    }
+    FileSystemError? refusal = movedInto(staged, folder);
+    if (program.isFile()) {
+        return "";
+    }
+    if (replacing) {
+        let back = try aside.moveTo(folder);
+    }
+    string reason = "something else is already there";
+    if (refusal != null) {
+        reason = refusal.reason;
+    }
+    return "Ens {version} was not installed: '{folder}' could not be written: {reason}";
+}
+
+// rwxr-xr-x.
+runnable() -> Permissions {
+    Access everything = {read: true, write: true, execute: true};
+    Access readAndRun = {read: true, write: false, execute: true};
+    Permissions permissions = {owner: everything, group: readAndRun, others: readAndRun};
+    return permissions;
+}
+
+movedInto(Path staged, Path folder) -> FileSystemError? {
+    let moved = try staged.moveTo(folder);
+    return null;
+} catch (FileSystemError refused) {
+    return refused;
+}
+
+covers(string request, Release release) -> bool {
+    let version = versions.release(release.version());
+    if (version == null) {
+        return false;
+    }
+    if (request == "latest") {
+        return true;
+    }
+    let wanted = versions.release(request);
+    if (wanted == null) {
+        return false;
+    }
+    long[] have = version.components();
+    long[] want = wanted.components();
+    if (have.length < want.length) {
+        return false;
+    }
+    for (long i = 0; i < want.length; i++) {
+        if (have[i] != want[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+newer(Release left, Release right) -> bool {
+    let leftVersion = versions.release(left.version());
+    let rightVersion = versions.release(right.version());
+    return leftVersion != null && rightVersion != null
+        && versions.compare(leftVersion, rightVersion) > 0;
+}
+
+// '0.14' for '0.14.2'.
+languageOf(string request) -> string {
+    long minor = request.indexOf(".") + 1;
+    long patch = request.indexOf(".", minor);
+    if (minor == 0 || patch < 0) {
+        return request;
+    }
+    return request.substring(0, patch);
+}
+
+refused(string problem) -> Installation {
+    return new Installation(null, false, false, problem, "");
+}
+
+noOverrides() -> string[] {
+    string[] none = [];
+    return none;
+}
