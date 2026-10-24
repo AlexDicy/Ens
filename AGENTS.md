@@ -67,7 +67,7 @@ If the spec, `ens`, and the `tests/` fixtures disagree, that is a bug worth surf
   `xmake test` includes an `ens_lsp` job that builds it; when the binary is held open by a running editor the job reports a skip instead of failing, so a green suite has not necessarily checked it.
   Any change that touches `lsp/`, and any repository-wide rename or move that its sources could be reading, is gated by closing a running `ens-lsp.exe` and running `xmake build ens-lsp` by hand.
 - Run everything: `xmake test` (subset: `xmake test <name>...`).
-  The full suite must be green before every commit, with no exceptions.
+  The full suite must be green before every commit that changes anything it builds or runs.
   `xmake test` builds `ens-llvm` itself before any job starts, so it is the one command that always works from a clean checkout, and an edit to the bridge is gated by the run that follows it rather than by the run after that.
 - `xmake test` starts by building the compiler it then tests: the **seed** for this host compiles `selfhost/driver` into `build/host/ens`, and every job that compiles Ens drives that.
   Everything Ens-related is therefore built by the Ens compiler as this tree defines it, so nothing frozen into the seed can shape what the suite measures.
