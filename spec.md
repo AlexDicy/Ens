@@ -922,6 +922,7 @@ The toolchain is one command, `ens`, with a subcommand for each thing it does.
   Everything written after `--` is passed to the program exactly as written, and `ens run` exits with the program's exit code.
 - `ens test [path]` builds a target's tests together with its sources and runs them, as described in the section on tests.
 - `ens override add <package> <folder>`, `ens override remove <package>` and `ens override list` maintain the `ens.overrides` file beside the build root's manifest.
+- `ens toolchain list` and `ens toolchain remove <version>` manage the installed toolchains, as described below.
 - `ens version` prints which release of Ens it is and the system and processor it runs on, as in `ens 0.13.0-beta windows/x64`.
   A release's major.minor is the language version it implements, which is the version a package's `ens` declaration names, and its patch counts the releases of that language version.
 
@@ -990,11 +991,14 @@ A Windows executable carries no symbol table to begin with, so `--strip` changes
 `ens test` also takes `--filter` and `--tests`, described in the section on tests.
 
 `ens` is also a version multiplexer: a command can be handed to another installed toolchain, and that toolchain's exit code becomes this command's own.
-Whenever the newest installed toolchain is newer than the running one, it runs every command, so the `ens` a machine runs is always the newest one it has.
+Whenever the newest installed toolchain is newer than the running one, it runs every command except `ens toolchain remove`, so the `ens` a machine runs is always the newest one it has.
 A build root declaring a version newer than the running toolchain and every installed one cannot be built, and the command fails, naming the toolchains folder and what it contains.
 In those comparisons versions compare number by number, so `0.10` is newer than `0.9`, and a label after a release's numbers, such as `-beta`, does not change which version it is, so `0.14.0-beta` and `0.14.0` are the same version.
 Toolchains live one folder per version under `~/.ens/toolchains`, each folder holding the `ens` program that is that version, and `ENS_TOOLCHAINS` names a different root to look in.
-Every command takes `--toolchain <version>`, which selects a toolchain by name whatever is installed and whatever the build root declares, and `--toolchain local` keeps the work with the running toolchain; `ENS_TOOLCHAIN` is the environment spelling of the same choice, and the option wins when both are given.
+`ens toolchain list` prints the installed toolchains, the newest first, and marks the one running the command.
+`ens toolchain remove <version>` removes the toolchain installed under that name, and it is always run by the `ens` that was started, which never removes itself.
+A removal takes the version's folder out of the toolchains folder in one step before deleting its files, so a removal that stops part-way never leaves a toolchain that looks installed, and a toolchain that is running while it is removed keeps running.
+Every command except `ens toolchain remove` takes `--toolchain <version>`, which selects a toolchain by name whatever is installed and whatever the build root declares, and `--toolchain local` keeps the work with the running toolchain; `ENS_TOOLCHAIN` is the environment spelling of the same choice, and the option wins when both are given.
 A name is matched exactly as written, against the running toolchain's own release and against the folder names under the toolchains folder, so on `ens 0.13.0-beta` the name `0.13.0-beta` keeps the work here while `0.13.0` and `0.13` name folders.
 Asking by name for a toolchain that is not installed is an error that names where it was looked for and what would have to be there.
 A command line the running toolchain cannot read, such as a command added in a later version, is handed to the newest installed toolchain to be read there, unless it is written with `--toolchain`, which the running toolchain could not read out of it.

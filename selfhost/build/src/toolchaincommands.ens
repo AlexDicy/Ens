@@ -1,0 +1,167 @@
+// `ens toolchain`: listing the toolchains installed in the toolchains folder and removing one. A
+// removal moves the version's folder out of the toolchains folder in one step before deleting it,
+// so a removal that stops part-way never leaves a toolchain that looks installed and is not whole.
+import Path from @std.fs;
+import FileSystemError from @std.fs.error;
+import Environment from @std.environment;
+import @std.environment;
+import List from @std.collections.list;
+import @ens.host.scratch;
+import Version from @ens.language.version;
+import InstalledToolchain from toolchain;
+import InstalledToolchains from toolchain;
+import toolchain;
+import Reporter from report;
+
+// Prints the installed toolchains, the newest first, marking the one running this command.
+export list(Environment environment, Reporter reporter) -> int {
+    let installed = toolchain.discover(toolchain.root(environment), environment.platform());
+    if (installed.root() == null) {
+        reporter.problem("there is no toolchains folder to list: "
+            + toolchain.noFolderReason(installed) + ". Set 'ENS_TOOLCHAINS' to the folder your "
+            + "toolchains are in");
+        return 1;
+    }
+    Path? running = runningProgram();
+    for (let line in listing(installed, runningName(installed, running), Version.release,
+            running)) {
+        reporter.note(line);
+    }
+    return 0;
+}
+
+// What 'ens toolchain list' prints. `runningName` is the installed toolchain running the command,
+// or null when the program running it is not in the toolchains folder, in which case `running` is
+// that program and `runningVersion` the release it is.
+export listing(InstalledToolchains installed, string? runningName, string runningVersion,
+               Path? running) -> string[] {
+    let lines = new List<string>();
+    InstalledToolchain[] ordered = installed.byNewest();
+    if (ordered.length == 0) {
+        lines.push(toolchain.foundInstead(installed));
+    } else {
+        lines.push("Installed in '{installed.root()}':");
+        for (let one in ordered) {
+            if (runningName != null && one.version() == runningName) {
+                lines.push("  {one.version()} (this toolchain)");
+            } else {
+                lines.push("  {one.version()}");
+            }
+        }
+    }
+    if (runningName == null && running != null) {
+        lines.push("This toolchain is Ens {runningVersion}, at '{running}'");
+    }
+    return lines.toArray();
+}
+
+// Removes the named toolchain from the toolchains folder. The toolchain running this command is
+// never removed, so whoever started it keeps the program they started.
+export remove(Environment environment, string version, Reporter reporter) -> int {
+    let installed = toolchain.discover(toolchain.root(environment), environment.platform());
+    Path? root = installed.root();
+    if (root == null) {
+        reporter.problem("there is no toolchains folder to remove Ens {version} from: "
+            + toolchain.noFolderReason(installed) + ". Set 'ENS_TOOLCHAINS' to the folder your "
+            + "toolchains are in");
+        return 1;
+    }
+    string refused = removalProblem(installed, version, runningName(installed, runningProgram()));
+    if (refused.length > 0) {
+        reporter.problem(refused);
+        return 2;
+    }
+    Path? program = installed.programOf(version);
+    Path? folder = null;
+    if (program != null) {
+        folder = program.parent();
+    }
+    if (folder == null) {
+        reporter.problem("Internal: the installed toolchain '{version}' has no folder");
+        return 1;
+    }
+
+    let staging = scratch.createMarkedUnder(root.join(".staging"), "remove");
+    if (staging.failure().length > 0) {
+        reporter.problem("Ens {version} was not removed: {staging.failure()}");
+        return 1;
+    }
+    FileSystemError? stopped = movedAside(folder, staging.folder().join(version));
+    string leftBehind = staging.remove();
+    if (stopped != null) {
+        reporter.problem("Ens {version} was not removed: '{folder}' could not be moved out of "
+            + "'{root}': {stopped.reason}");
+        return 1;
+    }
+    reporter.note("Removed Ens {version} from '{folder}'");
+    if (leftBehind.length > 0) {
+        reporter.note("Some of its files are still on disk: {leftBehind}. The next "
+            + "'ens toolchain remove' deletes them");
+    }
+    return 0;
+}
+
+// Why the named toolchain cannot be removed, or empty text when it can. `runningName` is the
+// installed toolchain running this command, or null when that program is not in the toolchains
+// folder.
+export removalProblem(InstalledToolchains installed, string version,
+                      string? runningName) -> string {
+    Path? program = installed.programOf(version);
+    if (program == null) {
+        return "Ens {version} is not installed: " + toolchain.foundInstead(installed);
+    }
+    if (runningName == null || runningName != version) {
+        return "";
+    }
+    string cannot = "Ens {version} is the toolchain running this command, from '{program}', so "
+        + "it cannot remove itself";
+    for (let other in installed.byNewest()) {
+        if (other.version() != version) {
+            return cannot + ". Run the 'ens' of another version to remove it, as in "
+                + "'{other.program()} toolchain remove {version}'";
+        }
+    }
+    Path? folder = program.parent();
+    if (folder == null) {
+        return cannot;
+    }
+    return cannot + ". Delete the folder '{folder}' to remove it";
+}
+
+// The installed toolchain whose program is `running`, or null when none is.
+runningName(InstalledToolchains installed, Path? running) -> string? {
+    if (running == null) {
+        return null;
+    }
+    for (let one in installed.byNewest()) {
+        if (samePlace(one.program(), running)) {
+            return one.version();
+        }
+    }
+    return null;
+}
+
+// The program running this command, as the operating system resolves it, or null when the system
+// does not report it.
+runningProgram() -> Path? {
+    Path? reported = environment.executablePath();
+    if (reported == null) {
+        return null;
+    }
+    return try reported.realPath();
+} catch (FileSystemError unresolved) {
+    return environment.executablePath();
+}
+
+samePlace(Path program, Path running) -> bool {
+    return try program.realPath() == running;
+} catch (FileSystemError unresolved) {
+    return false;
+}
+
+movedAside(Path folder, Path destination) -> FileSystemError? {
+    let moved = try folder.moveTo(destination);
+    return null;
+} catch (FileSystemError refused) {
+    return refused;
+}

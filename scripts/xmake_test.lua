@@ -3631,6 +3631,31 @@ main() -> int {
                 "!stub ran")
             run(host_exe, {"frobnicate"}, nothing_installed, 2, "ens: ", "!stub ran")
 
+            -- 'toolchain list' goes to the newest toolchain like any other command, and marks it
+            run(host_exe, {"toolchain", "list"}, chains, 0,
+                "Installed in '" .. slashed(toolchains) .. "':\n  9.9.2 (this toolchain)\n  9.9.0")
+            run(host_exe, {"toolchain", "list", "--toolchain", "local"}, chains, 0, "  9.9.2\n",
+                "This toolchain is Ens ", ", at '", "!(this toolchain)")
+
+            -- 'toolchain remove' never goes to another toolchain, and never removes the one running
+            local removable = path.join(root, "removable")
+            local removable_exe = path.join(removable, "9.9.7", "ens" .. exe_suffix)
+            os.mkdir(path.directory(removable_exe))
+            os.cp(stub_exe, removable_exe)
+            run(host_exe, {"toolchain", "remove", "9.9.7"}, {ENS_TOOLCHAINS = removable}, 0,
+                "Removed Ens 9.9.7 from '" .. slashed(path.directory(removable_exe)) .. "'",
+                "!stub ran")
+            if os.isdir(path.directory(removable_exe)) then
+                table.insert(failures, "'toolchain remove 9.9.7' left its folder in place")
+            end
+            run(host_exe, {"toolchain", "remove", "9.9.7"}, {ENS_TOOLCHAINS = removable}, 2,
+                "ens: Ens 9.9.7 is not installed: '" .. slashed(removable)
+                    .. "' contains no toolchain")
+            run(installed_exe, {"toolchain", "remove", "9.9.2"}, chains, 2,
+                "ens: Ens 9.9.2 is the toolchain running this command, from '" .. hopped_to
+                    .. "', so it cannot remove itself. Run the 'ens' of another version to remove "
+                    .. "it, as in '" .. lower_patch .. " toolchain remove 9.9.2'")
+
             -- a toolchain the environment names is required by every command
             run(host_exe, {"version"}, {ENS_TOOLCHAINS = toolchains, ENS_TOOLCHAIN = "9.9"}, 2,
                 "'ENS_TOOLCHAIN=9.9' names Ens 9.9, which is not installed: '",
