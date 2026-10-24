@@ -1,6 +1,6 @@
-// `ens` is also a version multiplexer: a build root written for a newer version of Ens than this one
-// delegates the whole command to the newest installed toolchain that is at least that version, and a
-// command line can name the toolchain outright.
+// `ens` is also a version multiplexer: a command goes to the newest installed toolchain whenever that
+// one is newer than this one, a build root written for a newer version of Ens than every installed
+// one cannot be built, and a command line can name the toolchain outright.
 import Path from @std.fs;
 import EntryKind from @std.fs.metadata;
 import FileSystemError from @std.fs.error;
@@ -52,6 +52,24 @@ export final class InstalledToolchain {
     }
 }
 
+// The Ens version the build root of a compiling command declares, and where that build root is, which
+// a command that compiles nothing has neither of.
+export final class Declaration {
+    string declaredVersion;
+    Path buildRoot;
+
+    export constructor(this.declaredVersion, this.buildRoot);
+
+    // The version the build root declares, or empty text when it declares none.
+    export version() -> string {
+        return this.declaredVersion;
+    }
+
+    export root() -> Path {
+        return this.buildRoot;
+    }
+}
+
 // Every toolchain installed in the toolchains folder, with the folder they were looked for in and the
 // name one of their programs carries, so a run that requested a missing one can report where it searched and
 // what it would have taken to be there.
@@ -88,15 +106,15 @@ export final class InstalledToolchains {
         return named.toArray();
     }
 
-    // The newest installed toolchain whose version is at least `lowest`, or null when none is. A
-    // folder whose name is not a release version is never chosen this way, and of two folders
-    // naming the same version the first in the order they were found is kept.
-    export newestAtLeast(VersionNumber lowest) -> InstalledToolchain? {
+    // The newest installed toolchain, or null when none is. A folder whose name is not a release
+    // version is never chosen this way, and of two folders naming the same version the first in
+    // the order they were found is kept.
+    export newest() -> InstalledToolchain? {
         InstalledToolchain? newest = null;
         VersionNumber? newestVersion = null;
         for (let one in this.found) {
             let candidate = versions.release(one.version());
-            if (candidate != null && versions.compare(candidate, lowest) >= 0
+            if (candidate != null
                     && (newestVersion == null || versions.compare(candidate, newestVersion) > 0)) {
                 newest = one;
                 newestVersion = candidate;
@@ -172,12 +190,14 @@ export final class Handoff {
 }
 
 // Selects the toolchain that does the work and, when it is another one, runs it and returns its
-// exit code. `argv` is what this process was given after its own name, forwarded exactly as it
-// was given so the other toolchain reads the command line this one was given.
-export hand(Environment environment, ToolchainRequest request, string governingVersion,
-            Path buildRoot, string[] argv, Reporter reporter) -> Handoff {
+// exit code. `declaration` is what the build root of a compiling command declares, and null for a
+// command that compiles nothing. `argv` is what this process was given after its own name,
+// forwarded exactly as it was given so the other toolchain reads the command line this one was
+// given.
+export hand(Environment environment, ToolchainRequest request, Declaration? declaration,
+            string[] argv, Reporter reporter) -> Handoff {
     let installed = discover(root(environment), environment.platform());
-    let decision = select(request, governingVersion, buildRoot, Version.release, installed);
+    let decision = select(request, declaration, Version.release, installed);
     if (decision.failure().length > 0) {
         reporter.problem(decision.failure());
         return new Handoff(true, 2);
@@ -195,11 +215,12 @@ export hand(Environment environment, ToolchainRequest request, string governingV
     return new Handoff(true, runToolchain(chosen, decision.version(), argv, reporter));
 }
 
-// Which toolchain does the work. `governing` is the version the build root in `buildRoot` is written
-// for, `running` is the release this toolchain is, and `installed` is what was found in the
-// toolchains folder. A declared version is the oldest one the build root can be built with, so the
-// work leaves this toolchain only when this toolchain is older than the declared version.
-export select(ToolchainRequest request, string governing, Path buildRoot, string running,
+// Which toolchain does the work. `declaration` is what the build root of a compiling command
+// declares, `running` is the release this toolchain is, and `installed` is what was found in the
+// toolchains folder. The newest installed toolchain does the work whenever it is newer than this
+// one. A declared version is the oldest one the build root can be built with, so a build root
+// declaring a version newer than every toolchain here cannot be built.
+export select(ToolchainRequest request, Declaration? declaration, string running,
               InstalledToolchains installed) -> ToolchainDecision {
     string requested = request.option();
     if (requested.length == 0) {
@@ -210,27 +231,60 @@ export select(ToolchainRequest request, string governing, Path buildRoot, string
     }
     if (request.environmentValue() == ToolchainVersions.local) {
         string named = requestWording(request, requested);
-        return buildHere("Building with this toolchain: 'ENS_TOOLCHAIN=local' is set, so {named} "
-            + "is not used");
+        return buildHere("Using this toolchain: 'ENS_TOOLCHAIN=local' is set, so {named} is not "
+            + "used");
     }
     if (requested.length > 0) {
         return honorRequest(request, requested, running, installed);
     }
-    let declared = versions.parsed(governing);
     let current = versions.release(running);
-    if (declared == null || current == null || versions.compare(declared, current) <= 0) {
+    if (current == null) {
         return buildHere("");
     }
-    string needs = "'{buildRoot}' declares 'ens \"{governing}\";', so it needs Ens {governing} or "
-        + "later, and this toolchain is Ens {running}";
-    let newest = installed.newestAtLeast(declared);
-    if (newest == null) {
-        return new ToolchainDecision("", null, needs + ". " + noneNewEnough(installed, governing),
-            "");
+    let newest = installed.newest();
+    let declared = declaredVersion(declaration);
+    if (declaration != null && declared != null && versions.compare(declared, current) > 0) {
+        string needs = needsNewer(declaration, running);
+        if (newest == null || !atLeast(newest, declared)) {
+            return new ToolchainDecision("", null,
+                needs + ". " + noneNewEnough(installed, declaration.version()), "");
+        }
+        Path program = newest.program();
+        return new ToolchainDecision(newest.version(), program, "",
+            "{needs}. Ens {newest.version()} at '{program}' runs the command");
+    }
+    if (newest == null || !newerThan(newest, current)) {
+        return buildHere("");
     }
     Path program = newest.program();
     return new ToolchainDecision(newest.version(), program, "",
-        "{needs}. Ens {newest.version()} at '{program}' is building it");
+        "Ens {newest.version()} is installed at '{program}', and it is newer than this "
+        + "toolchain, Ens {running}, so it runs the command");
+}
+
+// The version a build root declares, or null when there is no build root or it declares none.
+declaredVersion(Declaration? declaration) -> VersionNumber? {
+    if (declaration == null) {
+        return null;
+    }
+    return versions.parsed(declaration.version());
+}
+
+// Why a build root cannot be built by this toolchain.
+needsNewer(Declaration declaration, string running) -> string {
+    string governing = declaration.version();
+    return "'{declaration.root()}' declares 'ens \"{governing}\";', so it needs Ens {governing} "
+        + "or later, and this toolchain is Ens {running}";
+}
+
+atLeast(InstalledToolchain toolchain, VersionNumber lowest) -> bool {
+    let version = versions.release(toolchain.version());
+    return version != null && versions.compare(version, lowest) >= 0;
+}
+
+newerThan(InstalledToolchain toolchain, VersionNumber other) -> bool {
+    let version = versions.release(toolchain.version());
+    return version != null && versions.compare(version, other) > 0;
 }
 
 // Why no installed toolchain can build a build root written for `governing`, and what to do.
@@ -253,9 +307,9 @@ honorRequest(ToolchainRequest request, string requested, string running,
     Path? program = installed.programOf(requested);
     if (program != null) {
         return new ToolchainDecision(requested, program, "",
-            "{named} names Ens {requested}, so '{program}' is building it");
+            "{named} names Ens {requested}, so '{program}' runs the command");
     }
-    string local = "write '--toolchain local' to build with this toolchain, Ens {running}";
+    string local = "write '--toolchain local' to use this toolchain, Ens {running}";
     if (installed.root() == null) {
         return new ToolchainDecision("", null, "{named} names Ens {requested}, and there is no "
             + "toolchains folder to look in: " + noFolderReason(installed) + ". Set "
@@ -317,6 +371,20 @@ runToolchain(Path program, string version, string[] argv, Reporter reporter) -> 
 } catch (ProcessError refused) {
     reporter.problem("the Ens {version} toolchain is installed, but {refused.message}");
     return 1;
+}
+
+// Whether a command line that could not be read names a toolchain anyway, by '--toolchain' before
+// any '--' that ends the options. Handing such a line over would drop the toolchain it names.
+export namesToolchain(string[] argv) -> bool {
+    for (let argument in argv) {
+        if (argument == "--") {
+            return false;
+        }
+        if (argument == "--toolchain" || argument.startsWith("--toolchain=")) {
+            return true;
+        }
+    }
+    return false;
 }
 
 final class ToolchainVersions {

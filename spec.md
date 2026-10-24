@@ -981,7 +981,7 @@ Commands use the same three exit codes: `0` when the command did what was asked,
   The account is not about an optimization, so it reports at every level, and `ens check` prints nothing because it stops before code generation.
 - `--offline` and `--locked` govern package fetching and `ens.lock`, as described above.
 - `--quiet` reports problems and nothing else, and `--verbose` reports each step as it runs; asking for both is an error.
-- `--toolchain <version>` chooses which installed version of Ens does the work.
+- `--toolchain <version>` chooses which installed version of Ens does the work, as described below.
 
 `ens build` also takes `--output <file>`, naming the executable to write.
 `--strip` leaves the symbol table out of the executable: the names of its functions and variables, which a debugger or a profiler reads and the program itself never does, since a stack trace reads a table of its own.
@@ -989,15 +989,15 @@ On macOS a stripped executable also exports nothing, the way a Linux or Windows 
 A Windows executable carries no symbol table to begin with, so `--strip` changes nothing there.
 `ens test` also takes `--filter` and `--tests`, described in the section on tests.
 
-`ens` is also a version multiplexer: a build root's declared `ens` version can send the whole invocation to another installed toolchain, and that toolchain's exit code becomes this command's own.
-A build root declaring the running toolchain's language version or an older one is built by the running toolchain.
-A build root declaring a newer one is handed to the newest installed toolchain whose version is at least the declared one, and when none is installed the command fails, naming the toolchains folder and what it contains.
-In that comparison versions compare number by number, so `0.10` is newer than `0.9`, and a label after a release's numbers, such as `-beta`, does not change which version it is, so `0.14.0-beta` and `0.14.0` are the same version.
+`ens` is also a version multiplexer: a command can be handed to another installed toolchain, and that toolchain's exit code becomes this command's own.
+Whenever the newest installed toolchain is newer than the running one, it runs every command, so the `ens` a machine runs is always the newest one it has.
+A build root declaring a version newer than the running toolchain and every installed one cannot be built, and the command fails, naming the toolchains folder and what it contains.
+In those comparisons versions compare number by number, so `0.10` is newer than `0.9`, and a label after a release's numbers, such as `-beta`, does not change which version it is, so `0.14.0-beta` and `0.14.0` are the same version.
 Toolchains live one folder per version under `~/.ens/toolchains`, each folder holding the `ens` program that is that version, and `ENS_TOOLCHAINS` names a different root to look in.
-`--toolchain <version>` selects a toolchain by name whatever the build root declares, and `--toolchain local` keeps the work with the running toolchain; `ENS_TOOLCHAIN` is the environment spelling of the same choice, and the option wins when both are given.
+Every command takes `--toolchain <version>`, which selects a toolchain by name whatever is installed and whatever the build root declares, and `--toolchain local` keeps the work with the running toolchain; `ENS_TOOLCHAIN` is the environment spelling of the same choice, and the option wins when both are given.
 A name is matched exactly as written, against the running toolchain's own release and against the folder names under the toolchains folder, so on `ens 0.13.0-beta` the name `0.13.0-beta` keeps the work here while `0.13.0` and `0.13` name folders.
 Asking by name for a toolchain that is not installed is an error that names where it was looked for and what would have to be there.
-Only `build`, `check`, `run` and `test` can hand work over; `version`, `help` and `override` are always handled by the running toolchain.
+A command line the running toolchain cannot read, such as a command added in a later version, is handed to the newest installed toolchain to be read there, unless it is written with `--toolchain`, which the running toolchain could not read out of it.
 The command line reaches the other toolchain exactly as it was written, and a toolchain that was handed the work never hands it on again, so there is at most one hop.
 
 ---

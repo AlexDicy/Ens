@@ -75,6 +75,14 @@ task("test")
         -- program links against, goes into a cache of the run's own, never the user's.
         os.setenv("ENS_STDLIB", path.join(os.projectdir(), "libs"))
         os.setenv("ENS_CACHE", path.join(os.projectdir(), "build", "cache"))
+        -- the newest toolchain installed on this machine would run every command the suite starts,
+        -- so every `ens` here looks in a toolchains folder of the run's own that holds none, and
+        -- the cli_toolchain job installs the ones it needs in folders of its own.
+        local no_toolchains = path.join(os.projectdir(), "build", "notoolchains")
+        os.tryrm(no_toolchains)
+        os.mkdir(no_toolchains)
+        os.setenv("ENS_TOOLCHAINS", no_toolchains)
+        os.setenv("ENS_TOOLCHAIN", "")
         local exe_suffix = is_host("windows") and ".exe" or ""
         -- what `ens` names the artifacts it is not told the name of: it follows the target's object
         -- format, and every assertion about a default-named file has to as well.
@@ -3578,9 +3586,55 @@ task("test")
                 "'--toolchain 9.9' names Ens 9.9, which is not installed: '", "' contains no "
                     .. "toolchain")
 
-            -- a command that never delegates, however the environment is set
-            run(host_exe, {"version"}, {ENS_TOOLCHAINS = toolchains, ENS_TOOLCHAIN = "9.9"}, 0,
-                version_line)
+            -- a build root that declares nothing newer still goes to a newer installed toolchain
+            run(host_exe, {"build", hello, "--output", path.join(root, "undeclared.exe"), "-v"},
+                chains, 0, "Ens 9.9.2 is installed at '" .. hopped_to .. "', and it is newer than "
+                    .. "this toolchain, Ens ", ", so it runs the command", ": Built '")
+
+            -- every other command goes to a newer toolchain too. The one installed here is a
+            -- program that prints what it was handed, since a copy of this one would print the
+            -- same thing whichever of the two ran.
+            local stubs = path.join(root, "stubs")
+            local stub_exe = path.join(stubs, "9.9.5", "ens" .. exe_suffix)
+            local stub_source = path.join(root, "stub.ens")
+            io.writefile(stub_source, [[
+import Environment from @std.environment;
+import @std.environment;
+
+main() -> int {
+    string line = "stub ran:";
+    for (let argument in environment.arguments()) {
+        line = line + " " + argument;
+    }
+    print(line);
+    print("ENS_TOOLCHAIN=" + (Environment.current().get("ENS_TOOLCHAIN") ?? ""));
+    return 7;
+}
+]])
+            os.mkdir(path.directory(stub_exe))
+            run(host_exe, {"build", stub_source, "--output", stub_exe}, nothing_installed, 0)
+            local stubbed = {ENS_TOOLCHAINS = stubs}
+            local handed = "ENS_TOOLCHAIN=local"
+            run(host_exe, {"version"}, stubbed, 7, "stub ran: version", handed)
+            run(host_exe, {"--version"}, stubbed, 7, "stub ran: --version")
+            run(host_exe, {"help", "build"}, stubbed, 7, "stub ran: help build")
+            run(host_exe, {"override", "list"}, stubbed, 7, "stub ran: override list")
+            run(host_exe, {"version", "--toolchain", "local"}, stubbed, 0, version_line, "!stub ran")
+            run(host_exe, {"version"}, {ENS_TOOLCHAINS = stubs, ENS_TOOLCHAIN = "local"}, 0,
+                version_line, "!stub ran")
+
+            -- a command line this toolchain cannot read is handed over as it was written, unless it
+            -- names a toolchain this one could not read out of it
+            run(host_exe, {"frobnicate", "--widely", "a b"}, stubbed, 7,
+                "stub ran: frobnicate --widely a b", handed)
+            run(host_exe, {"frobnicate", "--toolchain", "9.9.5"}, stubbed, 2, "ens: ",
+                "!stub ran")
+            run(host_exe, {"frobnicate"}, nothing_installed, 2, "ens: ", "!stub ran")
+
+            -- a toolchain the environment names is required by every command
+            run(host_exe, {"version"}, {ENS_TOOLCHAINS = toolchains, ENS_TOOLCHAIN = "9.9"}, 2,
+                "'ENS_TOOLCHAIN=9.9' names Ens 9.9, which is not installed: '",
+                "or write '--toolchain local' to use this toolchain, Ens ")
 
             if #failures == 0 then
                 return {name = name, ok = true}
