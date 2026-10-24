@@ -82,7 +82,7 @@ public noreturn fail(string message) throws {
 }
 ```
 
-Structs automatically implement `copy()` and are `(de)serializable` by default, which also allows printing them as JSON strings. Private and protected fields are included in the serialization.
+Structs automatically implement `copy()` and are `serializable` by default, which also allows printing them as JSON strings. Private and protected fields are included in the serialization.
 
 ```ens
 struct Rectangle {
