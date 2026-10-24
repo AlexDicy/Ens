@@ -1,0 +1,218 @@
+// The releases of Ens a release source lists, read from a page of the GitHub releases API.
+import Json from @std.json;
+import JsonArray from @std.json;
+import JsonError from @std.json;
+import JsonObject from @std.json;
+import List from @std.collections.list;
+import Version as VersionNumber from @ens.packages.versions;
+import @ens.packages.versions;
+
+export final class ReleaseAsset {
+    string fileName;
+    string address;
+    string reportedDigest;
+
+    export constructor(this.fileName, this.address, this.reportedDigest);
+
+    export name() -> string {
+        return this.fileName;
+    }
+
+    export url() -> string {
+        return this.address;
+    }
+
+    // The sha256 in hexadecimal, or empty when the source reports none.
+    export digest() -> string {
+        return this.reportedDigest;
+    }
+}
+
+export final class Release {
+    string tagName;
+    string releaseVersion;
+    ReleaseAsset[] files;
+
+    export constructor(this.tagName, this.releaseVersion, this.files);
+
+    export tag() -> string {
+        return this.tagName;
+    }
+
+    // As in '0.14.2-beta'.
+    export version() -> string {
+        return this.releaseVersion;
+    }
+
+    // The version without its label, as in '0.14.2'.
+    export folderName() -> string {
+        long label = this.releaseVersion.indexOf("-");
+        if (label < 0) {
+            return this.releaseVersion;
+        }
+        return this.releaseVersion.substring(0, label);
+    }
+
+    export asset(string name) -> ReleaseAsset? {
+        for (let one in this.files) {
+            if (one.name() == name) {
+                return one;
+            }
+        }
+        return null;
+    }
+}
+
+export final class ReleasePage {
+    Release[] found;
+    long entryCount;
+    string problem;
+
+    protected constructor(this.found, this.entryCount, this.problem);
+
+    export releases() -> Release[] {
+        return this.found;
+    }
+
+    // Every entry the page held, including the ones left out of 'releases'.
+    export entries() -> long {
+        return this.entryCount;
+    }
+
+    export failure() -> string {
+        return this.problem;
+    }
+}
+
+// Drafts and tags that are not release versions are left out.
+export readPage(string text, string url) -> ReleasePage {
+    let parsed = try Json.parse(text);
+    JsonArray? entries = parsed.asArray();
+    if (entries == null) {
+        return unreadable("the release list at '{url}' is not a list of releases: it is JSON, "
+            + "but not a JSON array");
+    }
+    let found = new List<Release>();
+    for (let entry in entries) {
+        Release? release = releaseOf(entry);
+        if (release != null) {
+            found.push(release);
+        }
+    }
+    return new ReleasePage(found.toArray(), entries.length(), "");
+} catch (JsonError broken) {
+    return unreadable("the release list at '{url}' is not JSON: {broken.message}");
+}
+
+// The newest release of each language version that carries `assetName`, newest first.
+export newestPerLanguage(Release[] releases, string assetName) -> Release[] {
+    let kept = new List<Release>();
+    for (let release in releases) {
+        if (release.asset(assetName) == null) {
+            continue;
+        }
+        bool placed = false;
+        for (long i = 0; i < kept.length(); i++) {
+            if (sameLanguage(kept.get(i), release)) {
+                if (newer(release, kept.get(i))) {
+                    kept.set(i, release);
+                }
+                placed = true;
+                break;
+            }
+        }
+        if (!placed) {
+            kept.push(release);
+        }
+    }
+    kept.sort((left, right) -> newer(left, right) ? -1 : (newer(right, left) ? 1 : 0));
+    return kept.toArray();
+}
+
+releaseOf(Json entry) -> Release? {
+    JsonObject? fields = entry.asObject();
+    if (fields == null || boolField(fields, "draft")) {
+        return null;
+    }
+    string tag = stringField(fields, "tag_name");
+    string version = tag;
+    if (version.startsWith("v")) {
+        version = version.substring(1);
+    }
+    if (versions.release(version) == null) {
+        return null;
+    }
+    let assets = new List<ReleaseAsset>();
+    Json? listed = fields.get("assets");
+    if (listed != null) {
+        JsonArray? files = listed.asArray();
+        if (files != null) {
+            for (let file in files) {
+                ReleaseAsset? asset = assetOf(file);
+                if (asset != null) {
+                    assets.push(asset);
+                }
+            }
+        }
+    }
+    return new Release(tag, version, assets.toArray());
+}
+
+// A digest other than 'sha256:' and hexadecimal digits counts as none.
+assetOf(Json entry) -> ReleaseAsset? {
+    JsonObject? fields = entry.asObject();
+    if (fields == null) {
+        return null;
+    }
+    string name = stringField(fields, "name");
+    string url = stringField(fields, "browser_download_url");
+    if (name.length == 0 || url.length == 0) {
+        return null;
+    }
+    string digest = stringField(fields, "digest");
+    if (digest.startsWith("sha256:")) {
+        digest = digest.substring(7).toLowerAscii();
+    } else {
+        digest = "";
+    }
+    return new ReleaseAsset(name, url, digest);
+}
+
+sameLanguage(Release left, Release right) -> bool {
+    let leftVersion = versions.release(left.version());
+    let rightVersion = versions.release(right.version());
+    if (leftVersion == null || rightVersion == null) {
+        return false;
+    }
+    long[] a = leftVersion.components();
+    long[] b = rightVersion.components();
+    return a.length >= 2 && b.length >= 2 && a[0] == b[0] && a[1] == b[1];
+}
+
+newer(Release left, Release right) -> bool {
+    let leftVersion = versions.release(left.version());
+    let rightVersion = versions.release(right.version());
+    return leftVersion != null && rightVersion != null
+        && versions.compare(leftVersion, rightVersion) > 0;
+}
+
+stringField(JsonObject fields, string key) -> string {
+    Json? value = fields.get(key);
+    if (value == null) {
+        return "";
+    }
+    return value.asString() ?? "";
+}
+
+boolField(JsonObject fields, string key) -> bool {
+    Json? value = fields.get(key);
+    if (value == null) {
+        return false;
+    }
+    return value.asBool() ?? false;
+}
+
+unreadable(string problem) -> ReleasePage {
+    Release[] none = [];
+    return new ReleasePage(none, 0, problem);
+}

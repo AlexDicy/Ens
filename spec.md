@@ -996,6 +996,11 @@ A build root declaring a version newer than the running toolchain and every inst
 In those comparisons versions compare number by number, so `0.10` is newer than `0.9`, and a label after a release's numbers, such as `-beta`, does not change which version it is, so `0.14.0-beta` and `0.14.0` are the same version.
 Toolchains live one folder per version under `~/.ens/toolchains`, each folder holding the `ens` program that is that version, and `ENS_TOOLCHAINS` names a different root to look in.
 `ens toolchain list` prints the installed toolchains, the newest first, and marks the one running the command.
+`ens toolchain list --available` also prints the newest release of each language version that has a program for this machine, the newest first, written the way its folder is named and marked when it is installed.
+Releases are listed from the GitHub releases API of `AlexDicy/Ens`, and `ENS_RELEASES` names a different list, such as a mirror's or a `file://` one.
+A list is a JSON array of releases, each an object with a `tag_name` such as `v0.14.2-beta`, a `draft` flag, and `assets`, each an object with a `name`, a `browser_download_url` and a `digest` written `sha256:` and the hexadecimal digits; drafts and tags that are not release versions are left out.
+A machine's program is the asset named `ens-<system>-<processor>`, as in `ens-linux-x64` or `ens-windows-x64.exe`.
+`GITHUB_TOKEN`, when it is set, is sent to `https://api.github.com` to raise its limit on requests, and to no other address unless `ENS_RELEASES_TOKEN` is `always`.
 `ens toolchain remove <version>` removes the toolchain installed under that name, and it is always run by the `ens` that was started, which never removes itself.
 A removal takes the version's folder out of the toolchains folder in one step before deleting its files, so a removal that stops part-way never leaves a toolchain that looks installed, and a toolchain that is running while it is removed keeps running.
 Every command except `ens toolchain remove` takes `--toolchain <version>`, which selects a toolchain by name whatever is installed and whatever the build root declares, and `--toolchain local` keeps the work with the running toolchain; `ENS_TOOLCHAIN` is the environment spelling of the same choice, and the option wins when both are given.

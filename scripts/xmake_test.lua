@@ -3634,6 +3634,43 @@ main() -> int {
             run(host_exe, {"toolchain", "list", "--toolchain", "local"}, chains, 0, "  9.9.2\n",
                 "This toolchain is Ens ", ", at '", "!(this toolchain)")
 
+            -- 'toolchain list --available' reads the list ENS_RELEASES names and shows the newest
+            -- release of each language version that has a program for this machine
+            local function file_url(p)
+                local written = slashed(p)
+                if written:sub(1, 1) == "/" then
+                    return "file://" .. written
+                end
+                return "file:///" .. written
+            end
+            local host_name = (seed_platforms[plat] or plat) .. "/" .. (seed_architectures[arch] or arch)
+            local host_asset = "ens-" .. host_name:gsub("/", "-") .. exe_suffix
+            local function listed_release(tag, draft, asset)
+                return string.format('{"tag_name": "%s", "draft": %s, "assets": [{"name": "%s", '
+                    .. '"browser_download_url": "file:///nowhere/%s", "digest": null}]}', tag,
+                    draft, asset, asset)
+            end
+            local releases_file = path.join(root, "releases.json")
+            io.writefile(releases_file, "[" .. table.concat({
+                listed_release("v9.9.2-beta", "false", host_asset),
+                listed_release("v9.9.1-beta", "false", host_asset),
+                listed_release("v9.8.1-beta", "false", host_asset),
+                listed_release("v9.10.0-beta", "true", host_asset),
+                listed_release("v9.7.0-beta", "false", "ens-elsewhere")}, ", ") .. "]")
+            local releases_url = file_url(releases_file)
+            run(host_exe, {"toolchain", "list", "--available"},
+                {ENS_TOOLCHAINS = toolchains, ENS_RELEASES = releases_url}, 0,
+                "Available from '" .. releases_url .. "' for " .. host_name
+                    .. ":\n  9.9.2 (installed)\n  9.8.1\n", "!9.10.0", "!9.9.1", "!9.7.0")
+            run(host_exe, {"toolchain", "list", "--available"},
+                {ENS_TOOLCHAINS = toolchains, ENS_RELEASES = releases_url .. ".missing"}, 1,
+                "ens: the release list at '" .. releases_url .. ".missing' could not be "
+                    .. "downloaded: ")
+            run(host_exe, {"toolchain", "list", "--available"},
+                {ENS_TOOLCHAINS = toolchains, ENS_RELEASES = releases_url,
+                 ENS_RELEASES_TOKEN = "yes"}, 2,
+                "ens: 'ENS_RELEASES_TOKEN' is set to 'yes', which is not recognized. ")
+
             -- 'toolchain remove' never goes to another toolchain, and never removes the one running
             local removable = path.join(root, "removable")
             local removable_exe = path.join(removable, "9.9.7", "ens" .. exe_suffix)
