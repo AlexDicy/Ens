@@ -2100,6 +2100,7 @@ Which thread a task runs on is the runtime's business, so a program never names 
 
 What one task may hand to another is decided by one rule: a value crosses to another task only when nothing can write it, or when every write to it is synchronized.
 Such a value is called shareable, and the keyword for it is `shared`.
+`shared` is a keyword only where it marks a declaration, a function type or a type parameter, so a variable, a method, a type or a folder may still be named `shared`.
 Primitives, enums, `string` and `bytes` are shareable.
 A struct is shareable when every field of it is, judged over its fields as `==` and its text form already are.
 An array, a `List`, a `Map`, a `Set` and every other container is not shareable, because it can be written through any reference to it; a frozen copy of one is, as the collections describe.
