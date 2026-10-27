@@ -402,10 +402,11 @@ A cycle between static const initializers is an error, and so are function calls
 A static const's type is therefore a primitive, `char`, `bool`, or `string`, and on a generic type neither it nor its initializer can mention the type's parameters, so every instantiation shares one value.
 Reads go through the type name, as in `Path.separator`, and each read compiles to the constant's value; assigning to a static const, or applying `++` or `--` to one, is an error.
 
-A `lazy const` field is a type-level value with a written type and a mandatory initializer: `export lazy const BufferedReader input = makeInput();`.
+A `lazy const` field is a type-level value with a written type and a mandatory initializer: `export lazy const FrozenMap<string, string> defaults = loadDefaults();`.
 The initializer runs on the first read and the value is kept for the rest of the program, so unlike a static const's it may call functions, allocate, and build aggregates.
 It may not throw, which is what keeps a read from needing `try`.
-A lazy const is read through the type name, as in `Streams.input`, and it is type-level already, so writing `static` beside `lazy` is an error.
+A lazy const is read through the type name, as in `Settings.defaults`, and it is type-level already, so writing `static` beside `lazy` is an error.
+Every task in a program can read a lazy const by name, so its type must be shareable, as the section on tasks defines; `lazy const List<string> names` is refused naming the type, and a `FrozenList<string>` is what to write there.
 The value's destructor never runs, because the program holds the value to the end.
 On a generic type a lazy const's type and its initializer cannot mention the type's parameters, so every instantiation shares one value.
 Assigning to a lazy const, or applying `++` or `--` to one, is an error.
@@ -524,8 +525,10 @@ It also looks through the interfaces a class implements and the classes it exten
 The first argument that mentions a type parameter binds it, and a later argument that disagrees is an error naming that binding and the argument it came from.
 An argument with no type of its own, such as an array literal or a `?:` holding a lambda, binds a type parameter through those of its values that have a type of their own: passing `[twice, (x) -> x + 1]` for a `T[]` parameter binds `T` to the type of `twice`, and the lambda then takes that type.
 Explicit type arguments always win over what the call would infer.
+A lambda binds the type parameters its target's return type and throws list mention, once its parameter types are known from the target or from an earlier argument: `attempt(() -> compute())` binds `V` to what the body returns and `E` to what it throws, so a type parameter only a lambda's result mentions needs no explicit argument.
 A type argument no argument mentions, such as one that appears only in the return type, must be passed explicitly.
-`void` means no value, so it is never a type argument: writing one, as in `List<void>`, is an error, and so is a call that would infer one, such as a `() -> void` passed for a `() -> T` parameter.
+`void` means no value, and it is a type argument wherever the generic can do without one: a `() -> void` passed for a `() -> T` parameter binds `T` to `void`, a field of that type takes no storage, a statement that would only store or copy such a value does nothing, and a function returning `T` returns nothing, so `Task<() -> void>` carries no value and `Channel<void>` carries only that something was sent.
+A generic that needs a value of `T` on its own, as `List<T>` does for its `T[]` storage, refuses `void` at the instantiation under the rule for judgments deferred to type arguments, naming the line that needs the value; `List<void>` is therefore an error, and so is `void[]` anywhere.
 
 ```ens
 firstOf<T>(List<T> items) -> T {
@@ -641,6 +644,7 @@ A parameter's type may also be written, as in `(int a, int b) -> a - b`, and the
 
 A lambda copies the values it reads from around it, and only those.
 Reading a local, a parameter, or `this` inside the body captures it: the closure keeps its own copy from the moment it is created, and a class reference it captured stays alive for as long as the closure does.
+A lambda written against a `shared` function type captures only shareable values, as the section on tasks defines, and in such a lambda a read of a `const` field of `this` whose type is shareable captures that field's value rather than `this`, so a lambda inside any class may read the object's `const` fields and still be `shared`.
 A local a lambda captures must already be assigned where the lambda is created.
 A narrowing that holds where a lambda is created holds inside its body for what the lambda captures, because a capture is a copy that nothing can write.
 So `check(string? held) -> () -> bool { if (held == null) { return () -> false; } return () -> take(held); }` compiles, and `held` is a `string` inside the second lambda.
@@ -1022,8 +1026,11 @@ For most methods the set of throwable types is computed by the compiler and show
 Any function or method may also declare its thrown types explicitly, as in `read() -> bytes throws IOError` or `read() -> bytes throws IOError, ParseError`.
 The list is an upper bound: the body may raise those types or their subclasses and nothing else, and callers see the list rather than what the body happens to raise today, so widening it is a deliberate edit.
 A list is required on an abstract method, which has no body to infer one from, and where a method can be overridden the list binds every override to the same bound.
-A generic may list one of its type parameters, as in `run<E: Error>((() -> void throws E) body) throws E`, provided the parameter has a class bound under `Error`; each caller's contract then names the type that caller supplied.
-The same bound lets a `catch (E caught)` clause catch the parameter, selecting on the concrete type each instantiation names.
+A generic may list one of its type parameters, as in `run<E: Error>((() -> void throws E) body) throws E`, provided the parameter has a class bound under `Error`.
+Such a parameter stands for a whole throws list rather than for one type: a body throwing `ParseError` and `IoError` binds `E` to both, a body throwing nothing binds it to the empty list, and each caller's contract names exactly what that caller's body throws.
+Inside the generic, a call that throws `E` is written with `try` whatever the list turns out to be, so an instantiation whose list is empty does not report that `try` as unneeded.
+`catch (E caught)` catches every type in the list, and `caught` has the nearest class every one of them extends, which is `Error` for two unrelated kinds.
+Outside, an instantiation whose list is empty throws nothing, so a call of it is written without `try`, as any call that cannot throw is.
 
 If any exception is not handled and the method is not marked as `throws`, this should result in a compilation error explaining which exceptions were not handled and how to handle them (either with a `catch` block or via the `throws` keyword).
 
@@ -1944,7 +1951,7 @@ let greeting = "Hello, " + name + "!";
 let n = greeting.length;            // long, the byte count
 if (name == "world") { /* ... */ }
 let label = count.toString();       // "0", "42", "-7"
-let raw = greeting.toBytes();       // byte[], from the library's member
+let raw = greeting.toBytes();       // bytes, from the library's member
 let at = greeting.indexOf("llo");   // 2, likewise
 if (name.compareTo("world") < 0) { /* name sorts first */ }
 ```
@@ -1968,21 +1975,30 @@ A hole or `.toString()` call whose type has no text form for any type argument, 
 
 ---
 
-`embed "path"` is an expression of type `byte[]` holding the contents of the file at `path`, read when the program is compiled.
+`bytes` is immutable binary data, to a `byte[]` what a `string` is to text: a reference type whose contents never change, so a variable binds a reference, copying it copies the reference, and every operation that "changes" one returns a new one.
+It is what whole contents are handed around as, where a `byte[]` is what a stream fills: `readAll()`, `readBytes()`, `toBytes()` and `embed` return `bytes`, `read(buffer)` takes a `byte[]`, and `write` and `writeBytes` accept either.
+`length` counts the bytes, `byteAt(index)` reads one, with an index outside the data aborting the program, and `slice(start, end)` and `slice(start)` return a half-open range as new data sharing the storage.
+`isEmpty()`, `contains(needle)`, `indexOf(needle)`, `indexOf(needle, from)`, `lastIndexOf(needle)`, `startsWith(prefix)` and `endsWith(suffix)` search exact bytes under the same rules as the string members of the same names.
+`toArray()` returns the bytes as a new `byte[]`, `bytes.of(array)` returns `bytes` holding an array's contents, moving the storage when nothing else refers to the array and copying it otherwise, and `string.fromBytes(data)` decodes it as UTF-8.
+Two `bytes` compare and hash by content, and a `bytes` can be a key, a field of a shareable struct, and a value sent to another task, because nothing can write it.
+A literal of type `bytes` is written as an array literal where `bytes` is the target, as in `const bytes signature = [0x89, 'P', 'N', 'G'];`.
+
+---
+
+`embed "path"` is an expression of type `bytes` holding the contents of the file at `path`, read when the program is compiled.
 `embed folder "path"` is an expression of type `EmbeddedFile[]` with one element for every file under the folder, at any depth.
-`EmbeddedFile` is a struct from `@std.embed` with the file's `path` inside the folder, written with `/` between folders, and its `contents`.
+`EmbeddedFile` is a struct from `@std.embed` with the file's `path` inside the folder, written with `/` between folders, and its `contents` as `bytes`.
 The elements are sorted by `path`, and a file or folder whose name starts with `.`, such as `.git`, is left out.
 The path is a string literal relative to the folder of the source file that writes it, with `/` between folders on every system.
 An empty path, an absolute one, or one written with `\` is an error, and so is a path that names nothing, or a folder where `embed` expects a file, or a file where `embed folder` expects a folder.
-The bytes are part of the program, and each evaluation copies them into a new array, because an array can be written to.
-A `lazy const` keeps one copy for the whole program, as in `lazy const byte[] logo = embed "logo.png";`.
+The bytes are part of the program, and every evaluation returns the same `bytes` value without copying, because nothing can write it.
 An `embed` is not a compile-time constant, so a `static const` cannot be initialized with one.
 
 ```ens
 import EmbeddedFile from @std.embed;
 
 final class Assets {
-    lazy const byte[] logo = embed "logo.png";
+    lazy const bytes logo = embed "logo.png";
     lazy const EmbeddedFile[] icons = embed folder "icons";
 }
 ```
@@ -2067,7 +2083,53 @@ The compiler performs **escape analysis** to elide retain/release pairs and larg
 `--explain-arc` reports that work.
 A function appears in the account when there is something to report about it: which of its incoming references may outlive the call or have their storage written, and one line for each optimization pass that removed reference-counting operations from it, with the number removed.
 A last line gives the total for the whole program.
+It also names each `frozen()` call that copied its container rather than moving its storage, because a freeze that copies has a second reference behind it worth finding.
 The account describes an optimization that ran, so `-O0` prints nothing, the optimizer being off there, and `ens check` prints nothing, since it stops before code generation.
+
+---
+
+A program runs its work on tasks.
+A task runs an ordinary function from its start to its end, waiting wherever the function waits, and there is no second kind of function for it: nothing on a signature says that a function may wait, and nothing is written at a call to let it.
+Which thread a task runs on is the runtime's business, so a program never names a thread; `@std.tasks` starts tasks, waits for them and stops them, and `@std.parallel` runs one body over many pieces of data at once, both described with the library.
+
+What one task may hand to another is decided by one rule: a value crosses to another task only when nothing can write it, or when every write to it is synchronized.
+Such a value is called shareable, and the keyword for it is `shared`.
+Primitives, enums, `string` and `bytes` are shareable.
+A struct is shareable when every field of it is, judged over its fields as `==` and its text form already are.
+An array, a `List`, a `Map`, a `Set` and every other container is not shareable, because it can be written through any reference to it; a frozen copy of one is, as the collections describe.
+A class is shareable only when it is declared `shared`: it is then `final`, or `sealed` with every subclass declared `shared`, every field of it is `const`, and every field's type is shareable, and a declaration that breaks one of those is refused naming the field.
+A class the library synchronizes inside, such as `Mutex`, `Atomic`, `Channel`, `Sender`, `Task` and `TaskScope`, is declared `shared` by the library and is shareable although what it holds changes.
+An interface is shareable when it is declared `shared interface`, which only `shared` classes may implement, so a value typed by it can cross.
+An `external` handle is shareable only when its declaration says `shared`, because the library behind it is what decides whether two threads may use it at once.
+A function value is shareable when its type is written with `shared` before the parameter list, as in `shared (Request) -> Response`, and a lambda written against such a type may capture only shareable values: a local or a parameter of a shareable type, a `const` field of `this` whose type is shareable, which it copies, and `this` itself only when its class is `shared`.
+A type parameter is shareable when it is declared `<shared T>`, every argument for it must then be shareable, and the body may treat a `T` value as shareable, so `Channel<shared T>` carries shareable values and nothing else.
+A `shared` generic class declares `shared` every type parameter a field's type mentions, since the field could not be shareable otherwise.
+Function types stay exactly assignable, so `shared (int) -> bool` and `(int) -> bool` are two types, and a value of the second is not accepted where the first is expected.
+
+```ens
+shared class Config {
+    const string host;
+    const int port;
+    const FrozenList<Route> routes;
+}
+
+shared interface Handler {
+    handle(Request request) -> Response throws IoError;
+}
+
+serve(Config config, shared (Request) -> Response handler) { /* ... */ }
+```
+
+The rule is checked in three places: at a lambda a task runs, at a value sent through a channel or kept in a `Mutex` or an `Atomic`, and at a `lazy const`, which every task can read by name.
+A capture, a send, a store or a `lazy const` of a type that is not shareable is an error naming the value and its type and saying what to write: `frozen()` for a container, a `Mutex` around a value that has to change, or the values the task should return instead.
+
+What a task returns is not held to the rule: the task has finished when its value is taken, so the value belongs to whoever takes it, whatever its type, and a task may build a syntax tree, a list or a map and hand it back.
+A frozen copy, a `Mutex`, an `Atomic` and a task's result are therefore the ways writable data moves between tasks, and the two things the rule refuses are these: a writable object is never captured by a task that is already running, and nothing a task started outlives the scope it was started in.
+A task may also lend what it owns for exactly as long as it waits: the loops of `@std.parallel` park the calling task until every piece of work is done, so an array only that task could write is handed to the pieces in disjoint parts to write, or whole to read, with no copy and no further rule.
+
+Reference counts are already shared between threads, so a shareable object may be held by any number of tasks at once, and a destructor runs on the task that released the last reference, which is the only task that could still reach the object.
+The initializer of a `lazy const` runs once however many tasks read it first at the same moment, and the others wait for its value.
+A value a `lazy const` holds is kept to the end of the program, so it is not reference counted at all, and neither is anything reached only through it.
 
 ---
 
@@ -2095,7 +2157,7 @@ A family's own name is a module too where one type stands at its head, which is 
 `@std.io` moves bytes, and two contracts from `@std.io.streams` describe every stream in it.
 `Reader` declares `read(byte[] buffer) -> long throws IoError`, which fills as much of the buffer as it has ready and returns how many bytes it wrote.
 That count is `0` only once the stream has ended, so a count shorter than the buffer is a reason to call `read` again, not a sign that the bytes have run out.
-`Writer` declares `write(byte[] data) throws IoError`, which takes all of `data` and keeps nothing, and `flush() throws IoError`, which hands over everything accepted but not yet passed on.
+`Writer` declares `write(data) throws IoError`, where `data` is a `byte[]` or a `bytes`, which takes all of it and keeps nothing, and `flush() throws IoError`, which hands over everything accepted but not yet passed on.
 `streams.copy(source, target)` moves everything the source has left into the target and returns how many bytes moved, flushing and closing neither, so flushing and closing the target is up to the caller.
 
 `@std.io` itself provides the streams a program starts with: `io.out()` is standard output as a `Writer`, `io.err()` is standard error, and `io.in()` is standard input as a `BufferedReader`.
@@ -2120,7 +2182,7 @@ A condition that only a call on a path can report, such as a file system with no
 `BufferedReader` and `BufferedWriter` from `@std.io.buffered` turn many small reads and writes into few large ones, each wrapping one stream and taking a capacity that defaults to 8192 bytes, where a capacity below one byte is raised to one.
 `BufferedReader` adds the reads a raw source cannot offer.
 `readLine()` returns the next line without its ending, and `null` once the stream has ended; a carriage return before the newline belongs to the ending, and a last line that ends in no newline is a line of its own.
-`readAll()` returns everything left as bytes, and `readAllText()` returns it as text, raising an `IoError` for bytes that spell no character, since text in Ens is always valid UTF-8.
+`readAll()` returns everything left as `bytes`, and `readAllText()` returns it as text, raising an `IoError` for bytes that spell no character, since text in Ens is always valid UTF-8.
 That refusal is an `IoError` of kind `Other` naming the offset where the bytes stop spelling text, and it carries the `EncodingError` underneath as its cause.
 `BufferedWriter` passes what it holds on when it fills, when `flush` is called, and when the wrapper is dropped, and the flush a drop does discards any failure, so a program that must confirm the bytes arrived calls `flush` itself.
 
@@ -2129,8 +2191,8 @@ Each call reaches the target once, so a line written through it arrives whole ra
 It is not a `Writer` itself, because it is not a destination for bytes.
 
 `BytesReader` and `BytesWriter` from `@std.io.memory` are streams over bytes already in memory, which is what drives anything written against `Reader` or `Writer` with no operating system taking part.
-A `BytesReader` hands out the array it was given, in order, sharing that array rather than copying it, and returns `0` for ever once the last of it is gone.
-A `BytesWriter` collects everything written into one growing array, which `toBytes()` returns as a copy, `length()` measures, and `clear()` empties.
+A `BytesReader` hands out the `bytes` or the array it was given, in order, sharing that storage rather than copying it, and returns `0` for ever once the last of it is gone.
+A `BytesWriter` collects everything written into one growing array, which `toBytes()` returns as `bytes`, a copy so that the writer can go on, `length()` measures, and `clear()` empties.
 Neither of them can fail, so a call on either needs no `try`.
 
 ```ens
@@ -2185,8 +2247,8 @@ On Windows it may still return a result for a path whose middle part is missing,
 `linkTarget()` returns the path a symbolic link stores, so a relative target stays relative to the link's directory; it returns `null` for a path that names something other than a link, and raises a `FileSystemError` for a path where nothing is there.
 On Windows a junction counts as a link too, and the target is the link's display form, the path as it was written when the link was made.
 
-`readBytes()` and `readText()` return everything the file at the path holds, and `readText` raises a `FileSystemError` for bytes that spell no character.
-`writeBytes(content)` and `writeText(content)` write that content as everything the file holds, creating the file when nothing is there and replacing what was there when something is.
+`readBytes()` and `readText()` return everything the file at the path holds, the first as `bytes`, and `readText` raises a `FileSystemError` for bytes that spell no character.
+`writeBytes(content)` and `writeText(content)` write that content, a `byte[]` or a `bytes` for the first, as everything the file holds, creating the file when nothing is there and replacing what was there when something is.
 `writeBytesAtomic(content)` and `writeTextAtomic(content)` write to a file beside the path and move that file over the path in one step, so a reader sees the old content or the new and never a half-written file.
 `open()` returns the file open for reading, `create()` returns it open for writing and holding nothing, and `append()` returns it open for writing at its end; the last two create the file when nothing is there yet, and a directory is refused when the file is opened rather than at the first read.
 
@@ -2402,8 +2464,77 @@ newestTag(string releases) -> string? throws JsonError {
 
 ---
 
-`@std.thread` holds one call: `Thread.sleep(millis)` blocks the thread it is called on until the monotonic clock has advanced by that many milliseconds.
-The count is a floor and never a ceiling, so nothing bounds how long a loaded machine leaves the thread waiting, and a count of zero or less returns without waiting at all.
+`@std.tasks` starts tasks, waits for them and stops them, and every task belongs to a scope.
+`tasks.scope(body)` makes a `TaskScope`, runs `body` with it on the calling task, and returns what the body returns once the body has returned and every task started in the scope has finished, so no task outlives the block that started it.
+`scope.start(body)` starts `body` on another task at once and returns a `Task` without waiting, so two calls in a row run two tasks at the same time.
+The type is `Task<F>` where `F` is the function type the task runs: a body returning a `Module` and throwing `ParseError` or `IoError` gives a `Task<(() -> Module throws ParseError, IoError)>`, a body returning a value and throwing nothing a `Task<() -> Module>`, and a body returning nothing a `Task<() -> void>`; a local holding one is written with `let`, and the type is inferred.
+`task.await()` waits for the task and returns what its body returned, or throws what its body threw, so a call of it is written with `try` exactly when the body can throw.
+A `Task` is shareable, so a task may await one of its siblings, and a value that is not shareable is taken once, a second `await()` aborting the program, while a shareable value is returned to every awaiter.
+`scope.launch(body)` starts a body that returns nothing and cannot throw, and returns nothing: it is the form for work nobody waits for, such as serving one connection, and a body that could throw is refused with the advice the lambda rules give, to move the work into a function with a `catch` clause of its own.
+A task started with `start` is meant to be awaited, so one that threw and was never awaited aborts the program when its scope ends, naming the line that started it, because an error nobody handled is unhandled.
+`scope.startDedicated(priority, body)` is `start` on an operating-system thread of the task's own, for a loop that must not share one, such as audio or rendering, under the same rules for what the body may capture.
+A `TaskScope` is also made with `new TaskScope()` and kept in a field, for tasks that live as long as an object does; its destructor cancels every task in it and waits for them all, and since no task can hold a reference to a writable object such as its owner, the wait is never for itself.
+Starting a task in a scope that has ended aborts the program.
+
+```ens
+import @std.tasks;
+
+loadBoth(Path first, Path second) -> Module[] throws ParseError, IoError {
+    return try tasks.scope((scope) -> {
+        let parsing = scope.start(() -> try parse(first));
+        let other = scope.start(() -> try parse(second));
+        return [try parsing.await(), try other.await()];
+    });
+}
+```
+
+A task stops when it is asked to and when it chooses to: cancellation is cooperative.
+`scope.cancel()` marks every task in the scope cancelled, `task.cancel()` marks one task and everything it started, and `scope.cancelAfter(millis)` marks the scope after that many milliseconds, which is how a deadline is written.
+The first task in a scope to throw marks the scope cancelled as well, so the others stop wasting work, while the scope still waits for every one of them before the error reaches whoever awaits it.
+A task reads `tasks.isCancelled()` to learn that it was asked to stop, and `tasks.checkCancelled()` throws `Cancelled` when it was, so a loop writes `try tasks.checkCancelled();` once per iteration, and its body's throws list, and so its task's type, then say that the task can be cut short.
+A call that waits, on a stream, a channel, a lock or a task, ends early in a cancelled task by throwing the error it declares anyway, an `IoError` for a read, with a `Cancelled` as its cause.
+A task whose body never checks runs to its end, and its type shows that it cannot be cut short.
+Two tasks that await each other, and a task that locks a `Mutex` it already holds, could wait for ever, so each aborts the program naming the lines that started the tasks instead.
+`tasks.sleep(millis)` blocks the calling task until the monotonic clock has advanced by that many milliseconds; the count is a floor and never a ceiling, so nothing bounds how long a loaded machine leaves the task waiting, and a count of zero or less returns without waiting at all.
+
+`Channel<T>` from `@std.tasks` carries shareable values from the tasks that send to the tasks that receive.
+`new Channel<T>(capacity)` is the receiving end: `receive()` waits for the next value and returns it, or `null` once the channel is closed and empty, `receive(timeoutMillis)` returns `null` after that many milliseconds as well, with `isClosed()` telling the two apart, and a `for` loop walks a channel one value at a time until it is closed and empty, so two loops on two tasks share the work between them.
+`channel.sender()` returns a `Sender<T>`, whose `send(value)` puts a value in and waits while the channel already holds `capacity` values; a capacity of zero makes every send wait for a receive.
+The channel closes when the last `Sender` is released, so a producer closes nothing and a loop over the channel ends exactly when every producer has finished; a sender kept in a field keeps the channel open for as long as the field does.
+A send on a channel whose receiving end has been released throws `ChannelClosed`, since the value would never arrive.
+There is no way to wait on two channels at once; two sources merge by sending into one channel, each through a sender of its own, and a wait with a time limit is `receive(timeoutMillis)`.
+
+```ens
+const lines = new Channel<Line>(64);
+for (let path in paths) {
+    scope.launch(() -> read(path, lines.sender()));   // read(Path, Sender<Line>) holds one sender
+}
+for (let line in lines) {                             // ends when the last producer has finished
+    consume(line);
+}
+```
+
+`Mutex<T>` from `@std.tasks` holds one value that several tasks change in turn.
+`new Mutex(value)` takes the value in, and `mutex.lock(body)` runs `body` with the value while no other task has it, waiting for its turn, and returns what the body returns.
+The body is a `shared` function and its result must be shareable, so the value inside cannot leave the lock through a capture or a return, while a shareable part of it, such as an entry of a map of `shared` objects, can.
+`Atomic<T>` from `@std.tasks` holds one shareable value that tasks read and replace without a lock: `read()`, `write(value)`, `compareAndSet(expected, replacement) -> bool`, and for numbers `increment()`, `decrement()` and `add(amount)`, each returning the value after the change.
+An `Atomic` of a `shared` class replaces a whole table under its readers, which see the old value or the new and never a mix of the two.
+
+`@std.parallel` runs one body over many pieces of data at once and returns when every piece is done, on the task that called it, which it parks for the whole call.
+`parallel.map(items, body)` runs the body once per item and returns an array of the results in the items' order, however the pieces finished; `parallel.each(items, body)` is the same for a body that returns nothing; `parallel.range(start, end, body)` runs the body once per index of a half-open range.
+A body that can throw makes the call throw the same types, the first failure cancels the pieces still running, and the call throws once every piece has ended.
+Each body is a `shared` function, so it captures shareable values only, and the items are handed to other tasks, so their type must be shareable, as the `Path` values of a file walk are, while what a body returns may be anything, being a result.
+`parallel.split(array, parts, body)` cuts an array into `parts` disjoint `Slice<T>` views, runs the body once per slice on another task, and gives the array back whole once every body has returned; a slice is read and written through `get(index)` and `set(index, value)`, with `length()` and `start`, the index of its first element in the array.
+Only the calling task could write the array, and it is parked inside the call, so a body writes its slice with no copy and no lock, and the slice is a parameter that is not shareable, so no body can keep it past the call.
+`parallel.split(array, parts, reading(other), body)` lends every body a whole read-only view of a second array beside its slice, for data each piece reads while writing its own part; naming the array being written as a read view aborts the program, since a piece would read what another writes.
+An element type that is a writable class is refused by the bound, because two slices could reach one object through two elements; an array of structs, or of `shared` objects, is what `split` is for.
+
+```ens
+import @std.parallel;
+
+let modules = try parallel.map(files, (file) -> try parse(file));
+parallel.split(pixels, tiles, reading(depth), (tile, depthView) -> shade(tile, depthView, scene));
+```
 
 ---
 
@@ -2430,6 +2561,8 @@ All three are read-only, so what changes a container is declared on the containe
 `List`, `Set`, `Deque` and `PriorityQueue` are `Collection<T>`s, while `Map` and `SortedMap` are `Iterable<Entry<K, V>>`s.
 Every container is a reference type, as a class is, and each has a `copy()` that returns a second container holding the same values, which leaves the values themselves shared between the two.
 A container aborts the program rather than returning a value it does not have, so an index outside the container, and `pop`, `popFront`, `popBack`, `first`, `last`, `peek`, `firstKey` or `lastKey` on an empty one, are mistakes in the caller rather than conditions to recover from.
+`frozen()` on a list, a map, a set or an array returns a `FrozenList<T>`, a `FrozenMap<K, V>` or a `FrozenSet<T>` holding the same values, which nothing can write afterwards, so it is shareable when its values are and may cross to another task.
+When nothing else refers to the container, its storage moves into the frozen one and nothing is copied, which is the case for a container built in a local and frozen at its last use; otherwise the values are copied, and `--explain-arc` names each freeze that copied.
 
 - `List<T>` from `@std.collections.list` is a growable sequence holding its values in the order they were put in: `push(value)`, `pushAll(values)`, `pop()` taking the last value off and returning it, `get(index)`, `set(index, value)`, `first()`, `last()`, `insert(index, value)`, `removeAt(index)`, `remove(value)` removing the first value equal to it, `clear()`, `reserve(capacity)`, `copy()`, and `toArray()` returning a fresh right-sized `T[]` holding the current contents.
   `indexOf(value)` and `indexWhere(test)` return where the first match sits, or `-1` when there is none, and `removeWhere(test)` removes every value a test accepts in one pass and returns how many went.
@@ -2458,6 +2591,9 @@ A container aborts the program rather than returning a value it does not have, s
 - `SortedMap<K, V>` from `@std.collections.sortedmap` has the operations of `Map` apart from `withCapacity`, plus `firstKey()` and `lastKey()`, and walks its entries and its views in key order.
   That order is the natural order of the key type, under the same rule as a priority queue's, or the comparison given to the constructor.
   Adding or removing entries while a sorted map or one of its views is being walked aborts the program, as it does for a `Map`.
+- `FrozenList<T>`, `FrozenMap<K, V>` and `FrozenSet<T>` from `@std.collections.frozen` hold what they were frozen with and offer the reads of their counterparts, `get`, `length()`, `isEmpty()`, `contains`, `indexOf`, `first()`, `last()`, `keys()`, `values()` and iteration in the same order, and none of `set`, `push`, `remove` or `clear`.
+  `toList()`, `toMap()`, `toSet()` and `toArray()` return a writable copy, and `FrozenList.of(values)` freezes an array or a list in one step.
+  A frozen collection compares and hashes by content, and it can be a key, since its content cannot change while it sits in the table.
 
 ```ens
 import Map from @std.collections.map;
@@ -2480,7 +2616,7 @@ A map or set keyed by a base class or an interface therefore finds the entry a d
 Struct keys are supported and match by content: their fields compare with `==` and hash by content, so a key rebuilt from equal field values finds the entry stored under the original.
 A struct key that declares its own `equals` and `hash` is matched and bucketed by that pair instead, so a field the pair ignores does not change which entry a key finds.
 An array cannot be a key: it compares and hashes by content, and its content can change while it sits in the table, so the entry would silently become unfindable.
-A collection cannot be a key for the same reason, nor can a struct whose fields, at any depth, hold an array or a collection; the error names the field.
+A writable collection cannot be a key for the same reason, nor can a struct whose fields, at any depth, hold an array or a writable collection; the error names the field, while a frozen collection can be a key, since its content cannot change.
 A struct holding one is still accepted as a key when it declares its own `equals` and `hash`, because that pair is what determines which entry a key finds, and a field it ignores cannot move one.
 A `SortedMap` accepts a struct whose fields hold one whether or not it declares that pair, since the `compareTo` it declares is what puts its keys in order.
 An external handle or a function value cannot be a key either, because neither has a hash to bucket by.
@@ -2500,8 +2636,8 @@ What text can do is declared on `string` itself, so every member below is called
 `lines()` splits on `\n` and drops a carriage return before it, so text written with either line ending gives the same lines; text ending in a newline has a last, empty line.
 `toLowerAscii()`, `toUpperAscii()` and `equalsIgnoreCaseAscii(other)` convert or compare the ASCII letters only and keep every other byte as it is; the names include `Ascii` because the full Unicode rules are a different operation.
 `compareTo(other)` orders text by its bytes, which is code point order.
-`toBytes()` returns the UTF-8 bytes as a copy, while `chars()` and `bytes()` walk the characters or the bytes without copying; text does not iterate on its own, so a walk always names which view it reads.
-`string.fromBytes(bytes)` builds text from UTF-8 bytes and throws `EncodingError` at the offset where the bytes spell no character, `string.fromBytesLossy(bytes)` writes U+FFFD in place of each such sequence instead, and `string.joined(parts, separator)` puts the separator between neighboring parts and nothing before the first or after the last.
+`toBytes()` returns the UTF-8 bytes as `bytes` sharing the text's storage, while `chars()` and `bytes()` walk the characters or the bytes without copying; text does not iterate on its own, so a walk always names which view it reads.
+`string.fromBytes(data)` builds text from UTF-8 bytes, given as `bytes` or as a `byte[]`, and throws `EncodingError` at the offset where the bytes spell no character, `string.fromBytesLossy(data)` writes U+FFFD in place of each such sequence instead, and `string.joined(parts, separator)` puts the separator between neighboring parts and nothing before the first or after the last.
 
 ```ens
 string[] fields = "name,age,city".split(",");
