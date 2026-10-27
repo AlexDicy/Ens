@@ -527,8 +527,14 @@ An argument with no type of its own, such as an array literal or a `?:` holding 
 Explicit type arguments always win over what the call would infer.
 A lambda binds the type parameters its target's return type and throws list mention, once its parameter types are known from the target or from an earlier argument: `attempt(() -> compute())` binds `V` to what the body returns and `E` to what it throws, so a type parameter only a lambda's result mentions needs no explicit argument.
 A type argument no argument mentions, such as one that appears only in the return type, must be passed explicitly.
-`void` means no value, and it is a type argument wherever the generic can do without one: a `() -> void` passed for a `() -> T` parameter binds `T` to `void`, a field of that type takes no storage, a statement that would only store or copy such a value does nothing, and a function returning `T` returns nothing, so `Task<() -> void>` carries no value and `Channel<void>` carries only that something was sent.
-A generic that needs a value of `T` on its own, as `List<T>` does for its `T[]` storage, refuses `void` at the instantiation under the rule for judgments deferred to type arguments, naming the line that needs the value; `List<void>` is therefore an error, and so is `void[]` anywhere.
+`void` means no value, and it is a type argument like any other, written as in `Holder<void>` or bound by a call.
+A function or a lambda that returns nothing, passed for a `() -> T` parameter, binds `T` to `void` unless another argument gives `T` a type, which then decides it, so `after(callback, 1)` against `after<T>(() -> T first, T second)` binds `T` to `int` and refuses `callback`.
+An argument that is itself no value, such as a call to a function that returns nothing, is still refused wherever a value is passed.
+A value of type `void` takes no storage: a local, a field, a parameter or a capture of that type holds nothing, a struct literal leaves such a field out, and a function returning `T` returns nothing, so `Task<() -> void>` carries no value and `Channel<void>` carries only that something was sent.
+A `T?` over `void` is present or absent and holds nothing else.
+A field of type `void` takes no part in a struct's `==`, its hash, or its JSON form, while a value of type `void` has no text form, so writing one in an interpolation is refused.
+A parameter that a `void` type argument makes `void` takes no argument, so `same<void>(1)` is refused.
+An array of `void` would have nothing to hold, so a generic that makes one, as `List<T>` and `Map<K, V>` do for their storage, refuses `void` at the instantiation under the rule for judgments deferred to type arguments, naming the line that makes the array; `List<void>` is therefore an error, and so is `void[]` anywhere.
 
 ```ens
 firstOf<T>(List<T> items) -> T {

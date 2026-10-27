@@ -16,6 +16,7 @@ import FunctionType from model.types;
 import TypeParamType from model.types;
 import InstantiationType from model.types;
 import TypeStore from model.types;
+import PrimitiveKind from model.types;
 import model.types;
 import List from @std.collections.list;
 
@@ -28,6 +29,7 @@ public class TypeArgumentInference {
     List<Type?> slotBindings;
     List<long> slotSources;
     List<long> voidSources;
+    List<long> voidResults;
 
     public constructor(TypeStore store, GreenNode owner, long arity) {
         this.store = store;
@@ -35,18 +37,27 @@ public class TypeArgumentInference {
         this.slotBindings = new List<Type?>();
         this.slotSources = new List<long>();
         this.voidSources = new List<long>();
+        this.voidResults = new List<long>();
         for (long i = 0; i < arity; i++) {
             this.slotBindings.push(null);
             this.slotSources.push(TypeArgumentInference.unbound);
             this.voidSources.push(TypeArgumentInference.unbound);
+            this.voidResults.push(TypeArgumentInference.unbound);
         }
     }
 
     // Binds each open type parameter the parameter type mentions, matching the argument
     // structurally and through what it conforms to. A mismatch binds nothing; the argument check
-    // reports it. 'void' is never a type argument, so a slot it would fill stays open and keeps
-    // the first argument that offered it.
+    // reports it. An argument that is itself no value leaves the slot it would fill open and keeps
+    // the first argument that offered it, since a call refuses that argument. A 'void' inside the
+    // argument's type, such as the result of a function that returns nothing, binds the slot only
+    // when no other argument gives it a type, so a mismatch is reported against the argument whose
+    // type is a value.
     public unifyArgument(long argumentIndex, Type parameterType, Type argumentType) {
+        this.unifyAt(argumentIndex, parameterType, argumentType, true);
+    }
+
+    unifyAt(long argumentIndex, Type parameterType, Type argumentType, bool whole) {
         switch (parameterType) {
             is TypeParamType parameter -> {
                 if (parameter.owner() != this.owner
@@ -56,8 +67,9 @@ public class TypeArgumentInference {
                     return;
                 }
                 if (types.isVoidType(argumentType)) {
-                    if (this.voidSources.get(parameter.index()) == TypeArgumentInference.unbound) {
-                        this.voidSources.set(parameter.index(), argumentIndex);
+                    let sources = whole ? this.voidSources : this.voidResults;
+                    if (sources.get(parameter.index()) == TypeArgumentInference.unbound) {
+                        sources.set(parameter.index(), argumentIndex);
                     }
                     return;
                 }
@@ -69,12 +81,12 @@ public class TypeArgumentInference {
                 if (inner is OptionalType) {
                     inner = inner.inner();
                 }
-                this.unifyArgument(argumentIndex, optional.inner(), inner);
+                this.unifyAt(argumentIndex, optional.inner(), inner, whole);
             },
             is ArrayType array -> {
                 let core = convert.coreOf(argumentType);
                 if (core is ArrayType) {
-                    this.unifyArgument(argumentIndex, array.element(), core.element());
+                    this.unifyAt(argumentIndex, array.element(), core.element(), false);
                 }
             },
             is FunctionType functionType -> {
@@ -82,8 +94,7 @@ public class TypeArgumentInference {
                 if (core is FunctionType) {
                     this.unifyEach(argumentIndex, functionType.parameterTypes(),
                         core.parameterTypes());
-                    this.unifyArgument(argumentIndex, functionType.returnType(),
-                        core.returnType());
+                    this.unifyAt(argumentIndex, functionType.returnType(), core.returnType(), false);
                     this.unifyEach(argumentIndex, functionType.thrownTypes(),
                         core.thrownTypes());
                 }
@@ -102,7 +113,7 @@ public class TypeArgumentInference {
 
     unifyEach(long argumentIndex, Type[] parameterTypes, Type[] argumentTypes) {
         for (long i = 0; i < parameterTypes.length && i < argumentTypes.length; i++) {
-            this.unifyArgument(argumentIndex, parameterTypes[i], argumentTypes[i]);
+            this.unifyAt(argumentIndex, parameterTypes[i], argumentTypes[i], false);
         }
     }
 
@@ -118,9 +129,12 @@ public class TypeArgumentInference {
     // its parameter declares, to the type both it and what the slot holds fit, as the branches of '?:'
     // join. False where no type fits both.
     public joinResult(long argumentIndex, TypeParamType parameter, Type given) -> bool {
-        let bound = this.slotBindings.get(parameter.index());
-        if (bound == null || given is NullType || given is ErrorType || types.isVoidType(given)) {
-            this.unifyArgument(argumentIndex, parameter, given);
+        let bound = this.binding(parameter.index());
+        if (bound != null && (types.isVoidType(given) || types.isVoidType(bound))) {
+            return types.isVoidType(given) && types.isVoidType(bound);
+        }
+        if (bound == null || given is NullType || given is ErrorType) {
+            this.unifyAt(argumentIndex, parameter, given, false);
             return true;
         }
         let joined = convert.unifyValueTypes(bound, given, this.store);
@@ -136,15 +150,21 @@ public class TypeArgumentInference {
         return this.owner;
     }
 
+    // What the slot 'index' holds: the type an argument or the context gave it, else 'void' where only
+    // the result of a function that returns nothing offered one, else null.
     public binding(long index) -> Type? {
-        return this.slotBindings.get(index);
+        let bound = this.slotBindings.get(index);
+        if (bound != null || this.voidResults.get(index) == TypeArgumentInference.unbound) {
+            return bound;
+        }
+        return this.store.primitive(PrimitiveKind.Void);
     }
 
     // The index of the first argument that would have made the open slot 'index' 'void', or null
     // when the slot is bound or no argument offered 'void' for it.
     public voidArgument(long index) -> long? {
         long source = this.voidSources.get(index);
-        if (this.slotBindings.get(index) != null || source == TypeArgumentInference.unbound) {
+        if (this.binding(index) != null || source == TypeArgumentInference.unbound) {
             return null;
         }
         return source;
@@ -157,8 +177,8 @@ public class TypeArgumentInference {
             return null;
         }
         let arguments = new List<Type>();
-        for (let binding in this.slotBindings) {
-            arguments.push(binding ?? this.store.errorType());
+        for (long i = 0; i < this.slotBindings.length(); i++) {
+            arguments.push(this.binding(i) ?? this.store.errorType());
         }
         return this.store.substitute(templateType, this.owner, arguments.toArray());
     }
@@ -168,7 +188,7 @@ public class TypeArgumentInference {
             is TypeParamType parameter -> {
                 return parameter.owner() == this.owner
                     && parameter.index() < this.slotBindings.length()
-                    && this.slotBindings.get(parameter.index()) == null;
+                    && this.binding(parameter.index()) == null;
             },
             is OptionalType optional -> {
                 return this.mentionsOpenSlot(optional.inner());
@@ -203,7 +223,7 @@ public class TypeArgumentInference {
     public bindings() -> Type[]? {
         let resolved = new List<Type>();
         for (long i = 0; i < this.slotBindings.length(); i++) {
-            let bound = this.slotBindings.get(i);
+            let bound = this.binding(i);
             if (bound == null) {
                 return null;
             }
