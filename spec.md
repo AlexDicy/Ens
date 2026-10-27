@@ -1983,7 +1983,8 @@ A hole or `.toString()` call whose type has no text form for any type argument, 
 
 `bytes` is immutable binary data, to a `byte[]` what a `string` is to text: a reference type whose contents never change, so a variable binds a reference, copying it copies the reference, and every operation that "changes" one returns a new one.
 It is what whole contents are handed around as, where a `byte[]` is what a stream fills: `readAll()`, `readBytes()`, `toBytes()` and `embed` return `bytes`, `read(buffer)` takes a `byte[]`, and `write` and `writeBytes` accept either.
-`length` counts the bytes, `byteAt(index)` reads one, with an index outside the data aborting the program, and `slice(start, end)` and `slice(start)` return a half-open range as new data sharing the storage.
+`length` counts the bytes and `data[index]` reads one, with an index outside the data aborting the program, while writing one is refused when the program is compiled, as is passing a `bytes` where a `byte[]` is expected or the other way round.
+`slice(start, end)` and `slice(start)` return a half-open range as new data, copied from the original.
 `isEmpty()`, `contains(needle)`, `indexOf(needle)`, `indexOf(needle, from)`, `lastIndexOf(needle)`, `startsWith(prefix)` and `endsWith(suffix)` search exact bytes under the same rules as the string members of the same names.
 `toArray()` returns the bytes as a new `byte[]`, `bytes.of(array)` returns `bytes` holding an array's contents, moving the storage when nothing else refers to the array and copying it otherwise, and `string.fromBytes(data)` decodes it as UTF-8.
 Two `bytes` compare and hash by content, and a `bytes` can be a key, a field of a shareable struct, and a value sent to another task, because nothing can write it.
