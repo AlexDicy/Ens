@@ -1,0 +1,399 @@
+// Operating-system threads and the lock tasks wait on. A thread runs one function value and
+// releases it when the function returns. A lock carries the one condition its waiters sleep on, so
+// a holder that changes what they wait for wakes them all and each looks again.
+import TypeRef from @ens.llvm.types;
+import Value from @ens.llvm.values;
+import @ens.llvm.instructions;
+import @ens.llvm.memory;
+import Timespec from emit.nativeshapes;
+import Runtime from emit.runtime;
+import RuntimeFunction from emit.runtime;
+
+// The stack every thread a task runs on is given, as large as the one a program starts with on
+// Linux, since a task may recurse as deeply as 'main' does.
+final class ThreadStack {
+    protected static const long bytes = 8388608;
+    // Win32 reserves the size passed rather than committing it when this flag is given.
+    protected static const long windowsReservation = 0x10000;
+    // Room for a POSIX pthread_attr_t on every target, which is at most 64 bytes.
+    protected static const long posixAttributes = 128;
+}
+
+// Where a lock keeps its mutex and its condition. POSIX gives each at most 64 bytes on every
+// target; Win32 gives each one pointer, and memory set to zero holds both already initialized.
+final class LockLayout {
+    protected static const long posixCondition = 64;
+    protected static const long posixBytes = 128;
+    protected static const long windowsCondition = 8;
+    protected static const long windowsBytes = 16;
+}
+
+final class Windows {
+    protected static const long infinite = 0xFFFFFFFF;
+    // The longest wait one Win32 call is given, short of the value that means a wait without end.
+    protected static const long widestWait = 0xFFFFFFFE;
+}
+
+// ptr ens_thread_start(ptr body, ptr error): starts a thread that calls the '() -> void' function
+// value 'body' and releases it once the call returns, and returns the thread's handle, or null with
+// the system's error number written to 'error' when no thread could be started.
+public startRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.pointerType.functionType([runtime.pointerType, runtime.pointerType]);
+    let known = runtime.existing("ens_thread_start", type);
+    if (known != null) {
+        return known;
+    }
+    let entry = entryRuntime(runtime);
+    if (runtime.onWindows()) {
+        return windowsStart(runtime, type, entry);
+    }
+    return posixStart(runtime, type, entry);
+}
+
+// What a new thread runs: the function value's code with the value itself as its first argument,
+// then the release of the reference the starting thread retained for it.
+entryRuntime(Runtime runtime) -> RuntimeFunction {
+    TypeRef result = runtime.pointerType;
+    if (runtime.onWindows()) {
+        result = runtime.int32Type;
+    }
+    let type = result.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_thread_entry", type);
+    if (known != null) {
+        return known;
+    }
+    let release = runtime.release();
+    let definition = runtime.beginDefinition("ens_thread_entry", type);
+    let builder = runtime.builder;
+    let body = runtime.parameter(definition, 0);
+    let code = memory.buildLoad(builder, runtime.pointerType, body, "code");
+    instructions.buildCall(builder, runtime.voidType.functionType([runtime.pointerType]), code,
+        [body], "");
+    runtime.call(release, [body], "");
+    if (runtime.onWindows()) {
+        instructions.buildRet(builder, runtime.int32(0));
+    } else {
+        instructions.buildRet(builder, runtime.nullPointer());
+    }
+    return runtime.endDefinition(definition);
+}
+
+// The handle is a cell holding the pthread_t, since its width and its kind differ between targets;
+// joining frees the cell.
+posixStart(Runtime runtime, TypeRef type, RuntimeFunction entry) -> RuntimeFunction {
+    let initialize = runtime.libc("pthread_attr_init",
+        runtime.int32Type.functionType([runtime.pointerType]));
+    let setStack = runtime.libc("pthread_attr_setstacksize",
+        runtime.int32Type.functionType([runtime.pointerType, runtime.int64Type]));
+    let destroy = runtime.libc("pthread_attr_destroy",
+        runtime.int32Type.functionType([runtime.pointerType]));
+    let create = runtime.libc("pthread_create", runtime.int32Type.functionType([runtime.pointerType,
+        runtime.pointerType, runtime.pointerType, runtime.pointerType]));
+    let allocate = runtime.malloc();
+    let deallocate = runtime.free();
+    let retain = runtime.retain();
+    let release = runtime.release();
+    let definition = runtime.beginDefinition("ens_thread_start", type);
+    let builder = runtime.builder;
+    let body = runtime.parameter(definition, 0);
+    let error = runtime.parameter(definition, 1);
+    let started = runtime.block(definition, "start.started");
+    let failed = runtime.block(definition, "start.failed");
+    let noCell = runtime.block(definition, "start.no.cell");
+    let haveCell = runtime.block(definition, "start.have.cell");
+
+    let cell = runtime.call(allocate, [runtime.int64(8)], "cell");
+    instructions.buildCondBr(builder, runtime.isNull(cell), noCell, haveCell);
+
+    builder.positionAtEnd(noCell);
+    memory.buildStore(builder, runtime.int32(12), error);
+    instructions.buildRet(builder, runtime.nullPointer());
+
+    builder.positionAtEnd(haveCell);
+    let attributes = memory.buildAlloca(builder,
+        runtime.int8Type.arrayType(ThreadStack.posixAttributes as ulong), "attributes");
+    runtime.call(initialize, [attributes], "");
+    runtime.call(setStack, [attributes, runtime.int64(ThreadStack.bytes)], "");
+    runtime.call(retain, [body], "");
+    let code = runtime.call(create, [cell, attributes, entry.function, body], "code");
+    runtime.call(destroy, [attributes], "");
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, code, runtime.int32(0),
+        "ok"), started, failed);
+
+    builder.positionAtEnd(failed);
+    runtime.call(release, [body], "");
+    runtime.call(deallocate, [cell], "");
+    memory.buildStore(builder, code, error);
+    instructions.buildRet(builder, runtime.nullPointer());
+
+    builder.positionAtEnd(started);
+    memory.buildStore(builder, runtime.int32(0), error);
+    instructions.buildRet(builder, cell);
+    return runtime.endDefinition(definition);
+}
+
+windowsStart(Runtime runtime, TypeRef type, RuntimeFunction entry) -> RuntimeFunction {
+    let create = runtime.libc("CreateThread", runtime.pointerType.functionType([runtime.pointerType,
+        runtime.int64Type, runtime.pointerType, runtime.pointerType, runtime.int32Type,
+        runtime.pointerType]));
+    let lastError = runtime.libc("GetLastError", runtime.int32Type.functionType([]));
+    let retain = runtime.retain();
+    let release = runtime.release();
+    let definition = runtime.beginDefinition("ens_thread_start", type);
+    let builder = runtime.builder;
+    let body = runtime.parameter(definition, 0);
+    let error = runtime.parameter(definition, 1);
+    let started = runtime.block(definition, "start.started");
+    let failed = runtime.block(definition, "start.failed");
+    runtime.call(retain, [body], "");
+    let handle = runtime.call(create, [runtime.nullPointer(), runtime.int64(ThreadStack.bytes),
+        entry.function, body, runtime.int32(ThreadStack.windowsReservation),
+        runtime.nullPointer()], "handle");
+    instructions.buildCondBr(builder, runtime.isNull(handle), failed, started);
+
+    builder.positionAtEnd(failed);
+    let code = runtime.call(lastError, [], "code");
+    runtime.call(release, [body], "");
+    memory.buildStore(builder, code, error);
+    instructions.buildRet(builder, runtime.nullPointer());
+
+    builder.positionAtEnd(started);
+    memory.buildStore(builder, runtime.int32(0), error);
+    instructions.buildRet(builder, handle);
+    return runtime.endDefinition(definition);
+}
+
+// void ens_thread_join(ptr thread): waits until the thread has returned, then frees its handle.
+public joinRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.voidType.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_thread_join", type);
+    if (known != null) {
+        return known;
+    }
+    if (runtime.onWindows()) {
+        let wait = runtime.libc("WaitForSingleObject",
+            runtime.int32Type.functionType([runtime.pointerType, runtime.int32Type]));
+        let close = runtime.libc("CloseHandle",
+            runtime.int32Type.functionType([runtime.pointerType]));
+        let definition = runtime.beginDefinition("ens_thread_join", type);
+        let thread = runtime.parameter(definition, 0);
+        runtime.call(wait, [thread, runtime.int32(Windows.infinite)], "");
+        runtime.call(close, [thread], "");
+        instructions.buildRetVoid(runtime.builder);
+        return runtime.endDefinition(definition);
+    }
+    let join = runtime.libc("pthread_join",
+        runtime.int32Type.functionType([runtime.int64Type, runtime.pointerType]));
+    let deallocate = runtime.free();
+    let definition = runtime.beginDefinition("ens_thread_join", type);
+    let builder = runtime.builder;
+    let cell = runtime.parameter(definition, 0);
+    let thread = memory.buildLoad(builder, runtime.int64Type, cell, "thread");
+    runtime.call(join, [thread, runtime.nullPointer()], "");
+    runtime.call(deallocate, [cell], "");
+    instructions.buildRetVoid(builder);
+    return runtime.endDefinition(definition);
+}
+
+// ptr ens_lock_create(): a lock no thread holds, or null when there is no memory for one.
+public createLockRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.pointerType.functionType([]);
+    let known = runtime.existing("ens_lock_create", type);
+    if (known != null) {
+        return known;
+    }
+    if (runtime.onWindows()) {
+        let allocate = runtime.calloc();
+        let definition = runtime.beginDefinition("ens_lock_create", type);
+        let lock = runtime.call(allocate,
+            [runtime.int64(1), runtime.int64(LockLayout.windowsBytes)], "lock");
+        instructions.buildRet(runtime.builder, lock);
+        return runtime.endDefinition(definition);
+    }
+    let initializeMutex = runtime.libc("pthread_mutex_init",
+        runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType]));
+    let initializeCondition = runtime.libc("pthread_cond_init",
+        runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType]));
+    let allocate = runtime.malloc();
+    let definition = runtime.beginDefinition("ens_lock_create", type);
+    let builder = runtime.builder;
+    let ready = runtime.block(definition, "lock.ready");
+    let missing = runtime.block(definition, "lock.missing");
+    let lock = runtime.call(allocate, [runtime.int64(LockLayout.posixBytes)], "lock");
+    instructions.buildCondBr(builder, runtime.isNull(lock), missing, ready);
+
+    builder.positionAtEnd(missing);
+    instructions.buildRet(builder, runtime.nullPointer());
+
+    builder.positionAtEnd(ready);
+    runtime.call(initializeMutex, [lock, runtime.nullPointer()], "");
+    runtime.call(initializeCondition, [runtime.offsetPointer(lock, LockLayout.posixCondition, ""),
+        runtime.nullPointer()], "");
+    instructions.buildRet(builder, lock);
+    return runtime.endDefinition(definition);
+}
+
+// void ens_lock_destroy(ptr lock): frees a lock no thread holds or waits on.
+public destroyLockRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.voidType.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_lock_destroy", type);
+    if (known != null) {
+        return known;
+    }
+    let deallocate = runtime.free();
+    if (runtime.onWindows()) {
+        let definition = runtime.beginDefinition("ens_lock_destroy", type);
+        runtime.call(deallocate, [runtime.parameter(definition, 0)], "");
+        instructions.buildRetVoid(runtime.builder);
+        return runtime.endDefinition(definition);
+    }
+    let destroyMutex = runtime.libc("pthread_mutex_destroy",
+        runtime.int32Type.functionType([runtime.pointerType]));
+    let destroyCondition = runtime.libc("pthread_cond_destroy",
+        runtime.int32Type.functionType([runtime.pointerType]));
+    let definition = runtime.beginDefinition("ens_lock_destroy", type);
+    let lock = runtime.parameter(definition, 0);
+    runtime.call(destroyCondition,
+        [runtime.offsetPointer(lock, LockLayout.posixCondition, "")], "");
+    runtime.call(destroyMutex, [lock], "");
+    runtime.call(deallocate, [lock], "");
+    instructions.buildRetVoid(runtime.builder);
+    return runtime.endDefinition(definition);
+}
+
+// void ens_lock_acquire(ptr lock): waits until no other thread holds the lock, then holds it.
+public acquireRuntime(Runtime runtime) -> RuntimeFunction {
+    return lockCall(runtime, "ens_lock_acquire", "AcquireSRWLockExclusive", "pthread_mutex_lock");
+}
+
+// void ens_lock_release(ptr lock): gives up a lock this thread holds.
+public releaseRuntime(Runtime runtime) -> RuntimeFunction {
+    return lockCall(runtime, "ens_lock_release", "ReleaseSRWLockExclusive",
+        "pthread_mutex_unlock");
+}
+
+// void ens_lock_notify_all(ptr lock): wakes every thread waiting on the lock's condition.
+public notifyAllRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.voidType.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_lock_notify_all", type);
+    if (known != null) {
+        return known;
+    }
+    string native = "pthread_cond_broadcast";
+    long offset = LockLayout.posixCondition;
+    TypeRef result = runtime.int32Type;
+    if (runtime.onWindows()) {
+        native = "WakeAllConditionVariable";
+        offset = LockLayout.windowsCondition;
+        result = runtime.voidType;
+    }
+    let wake = runtime.libc(native, result.functionType([runtime.pointerType]));
+    let definition = runtime.beginDefinition("ens_lock_notify_all", type);
+    runtime.call(wake, [runtime.offsetPointer(runtime.parameter(definition, 0), offset, "")], "");
+    instructions.buildRetVoid(runtime.builder);
+    return runtime.endDefinition(definition);
+}
+
+// The bridges that pass the lock straight to one native call, which returns an error number on
+// POSIX and nothing on Win32.
+lockCall(Runtime runtime, string name, string windows, string posix) -> RuntimeFunction {
+    let type = runtime.voidType.functionType([runtime.pointerType]);
+    let known = runtime.existing(name, type);
+    if (known != null) {
+        return known;
+    }
+    string native = posix;
+    TypeRef result = runtime.int32Type;
+    if (runtime.onWindows()) {
+        native = windows;
+        result = runtime.voidType;
+    }
+    let call = runtime.libc(native, result.functionType([runtime.pointerType]));
+    let definition = runtime.beginDefinition(name, type);
+    runtime.call(call, [runtime.parameter(definition, 0)], "");
+    instructions.buildRetVoid(runtime.builder);
+    return runtime.endDefinition(definition);
+}
+
+// void ens_lock_wait(ptr lock, i64 millis): gives up the lock this thread holds, sleeps until
+// another thread notifies the lock or until about 'millis' milliseconds have passed, and holds the
+// lock again before it returns. A count below zero waits for a notification alone. A wait may also
+// end with neither, so a waiter looks again at what it waits for and at its own clock.
+public waitRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.voidType.functionType([runtime.pointerType, runtime.int64Type]);
+    let known = runtime.existing("ens_lock_wait", type);
+    if (known != null) {
+        return known;
+    }
+    if (runtime.onWindows()) {
+        return windowsWait(runtime, type);
+    }
+    return posixWait(runtime, type);
+}
+
+windowsWait(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let sleep = runtime.libc("SleepConditionVariableSRW", runtime.int32Type.functionType([
+        runtime.pointerType, runtime.pointerType, runtime.int32Type, runtime.int32Type]));
+    let definition = runtime.beginDefinition("ens_lock_wait", type);
+    let builder = runtime.builder;
+    let lock = runtime.parameter(definition, 0);
+    let millis = runtime.parameter(definition, 1);
+    let endless = instructions.buildICmpSLT(builder, millis, runtime.int64(0), "endless");
+    let capped = instructions.buildSelect(builder, instructions.buildICmpSGT(builder, millis,
+        runtime.int64(Windows.widestWait), "wide"), runtime.int64(Windows.widestWait), millis,
+        "capped");
+    let count = instructions.buildSelect(builder, endless, runtime.int64(Windows.infinite), capped,
+        "count");
+    runtime.call(sleep, [runtime.offsetPointer(lock, LockLayout.windowsCondition, ""), lock,
+        instructions.buildTrunc(builder, count, runtime.int32Type, ""), runtime.int32(0)], "");
+    instructions.buildRetVoid(builder);
+    return runtime.endDefinition(definition);
+}
+
+// A timed wait takes a deadline on the clock that can be set, which is why a waiter's own clock is
+// the one that decides whether its wait is over.
+posixWait(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let wait = runtime.libc("pthread_cond_wait",
+        runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType]));
+    let timedWait = runtime.libc("pthread_cond_timedwait", runtime.int32Type.functionType([
+        runtime.pointerType, runtime.pointerType, runtime.pointerType]));
+    let readClock = runtime.libc("clock_gettime",
+        runtime.int32Type.functionType([runtime.int32Type, runtime.pointerType]));
+    let definition = runtime.beginDefinition("ens_lock_wait", type);
+    let builder = runtime.builder;
+    let lock = runtime.parameter(definition, 0);
+    let millis = runtime.parameter(definition, 1);
+    let condition = runtime.offsetPointer(lock, LockLayout.posixCondition, "condition");
+    let endless = runtime.block(definition, "wait.endless");
+    let timed = runtime.block(definition, "wait.timed");
+    instructions.buildCondBr(builder, instructions.buildICmpSLT(builder, millis, runtime.int64(0),
+        "endless"), endless, timed);
+
+    builder.positionAtEnd(endless);
+    runtime.call(wait, [condition, lock], "");
+    instructions.buildRetVoid(builder);
+
+    builder.positionAtEnd(timed);
+    let deadline = memory.buildAlloca(builder,
+        runtime.int8Type.arrayType(Timespec.structBytes as ulong), "deadline");
+    let secondsSlot = runtime.offsetPointer(deadline, Timespec.seconds, "");
+    let nanosecondsSlot = runtime.offsetPointer(deadline, Timespec.nanoseconds, "");
+    memory.buildStore(builder, runtime.int64(0), secondsSlot);
+    memory.buildStore(builder, runtime.int64(0), nanosecondsSlot);
+    runtime.call(readClock, [runtime.int32(0), deadline], "");
+    let nanoseconds = instructions.buildAdd(builder,
+        memory.buildLoad(builder, runtime.int64Type, nanosecondsSlot, "now.nanoseconds"),
+        instructions.buildMul(builder, instructions.buildSRem(builder, millis,
+            runtime.int64(1000), ""), runtime.int64(1000000), ""), "nanoseconds");
+    let seconds = instructions.buildAdd(builder,
+        memory.buildLoad(builder, runtime.int64Type, secondsSlot, "now.seconds"),
+        instructions.buildAdd(builder, instructions.buildSDiv(builder, millis, runtime.int64(1000),
+            ""), instructions.buildSDiv(builder, nanoseconds, runtime.int64(1000000000), ""), ""),
+        "seconds");
+    memory.buildStore(builder, seconds, secondsSlot);
+    memory.buildStore(builder, instructions.buildSRem(builder, nanoseconds,
+        runtime.int64(1000000000), ""), nanosecondsSlot);
+    runtime.call(timedWait, [condition, lock, deadline], "");
+    instructions.buildRetVoid(builder);
+    return runtime.endDefinition(definition);
+}
