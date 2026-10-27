@@ -1,0 +1,153 @@
+// The guard in front of a lazy const, which tasks may read first at the same moment. Its state is
+// one 64-bit word: zero while nothing has begun, the ready mark once the value is there, and the
+// token of the thread building it in between, so a read on that same thread is a cycle and a read on
+// any other waits for the value.
+import Value from @ens.llvm.values;
+import @ens.llvm.instructions;
+import @ens.llvm.memory;
+import AtomicOrdering from @ens.llvm.memory;
+import Runtime from emit.runtime;
+import RuntimeFunction from emit.runtime;
+import emit.clock;
+
+// What 'ens_lazy_enter' answers, and the word the state holds once the value is there.
+final class LazyGuard {
+    protected static const long ready = -1;
+    protected static const long wait = 0;
+    protected static const long build = 1;
+    protected static const long cycle = 2;
+    // How long a thread waiting for another thread's initializer sleeps between looks.
+    protected static const long pauseMillis = 1;
+}
+
+// i1 ens_lazy_ready(ptr state): whether the value is there, read so that everything the building
+// thread wrote before marking it ready is visible to the reader.
+public readyRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int1Type.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_lazy_ready", type);
+    if (known != null) {
+        return known;
+    }
+    let definition = runtime.beginDefinition("ens_lazy_ready", type);
+    let builder = runtime.builder;
+    let state = runtime.loadCount(runtime.parameter(definition, 0), AtomicOrdering.acquire);
+    instructions.buildRet(builder, instructions.buildICmpEQ(builder, state,
+        runtime.int64(LazyGuard.ready), "ready"));
+    return runtime.endDefinition(definition);
+}
+
+// i32 ens_lazy_enter(ptr state): 1 when the calling thread is now the one to build the value, 0
+// once another thread has built it, waiting while it does, and 2 when the calling thread is already
+// building it, which is a cycle.
+public enterRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int32Type.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_lazy_enter", type);
+    if (known != null) {
+        return known;
+    }
+    let sleep = clock.sleepMillisRuntime(runtime);
+    let definition = runtime.beginDefinition("ens_lazy_enter", type);
+    let builder = runtime.builder;
+    let state = runtime.parameter(definition, 0);
+    let me = threadToken(runtime);
+    let look = runtime.block(definition, "lazy.look");
+    let taken = runtime.block(definition, "lazy.taken");
+    let other = runtime.block(definition, "lazy.other");
+    let done = runtime.block(definition, "lazy.done");
+    let notReady = runtime.block(definition, "lazy.not.ready");
+    let looped = runtime.block(definition, "lazy.cycle");
+    let pause = runtime.block(definition, "lazy.pause");
+    instructions.buildBr(builder, look);
+
+    builder.positionAtEnd(look);
+    let exchanged = memory.buildAtomicCompareExchange(builder, state, runtime.int64(0), me,
+        AtomicOrdering.acquireRelease, AtomicOrdering.acquire);
+    let previous = instructions.buildExtractValue(builder, exchanged, 0, "previous");
+    let won = instructions.buildExtractValue(builder, exchanged, 1, "won");
+    instructions.buildCondBr(builder, won, taken, other);
+
+    builder.positionAtEnd(taken);
+    instructions.buildRet(builder, runtime.int32(LazyGuard.build));
+
+    builder.positionAtEnd(other);
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, previous,
+        runtime.int64(LazyGuard.ready), "is.ready"), done, notReady);
+
+    builder.positionAtEnd(done);
+    instructions.buildRet(builder, runtime.int32(LazyGuard.wait));
+
+    builder.positionAtEnd(notReady);
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, previous, me, "mine"),
+        looped, pause);
+
+    builder.positionAtEnd(looped);
+    instructions.buildRet(builder, runtime.int32(LazyGuard.cycle));
+
+    builder.positionAtEnd(pause);
+    runtime.call(sleep, [runtime.int64(LazyGuard.pauseMillis)], "");
+    instructions.buildBr(builder, look);
+    return runtime.endDefinition(definition);
+}
+
+// void ens_lazy_leave(ptr state): marks the value ready, after everything the building thread
+// wrote into it.
+public leaveRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.voidType.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_lazy_leave", type);
+    if (known != null) {
+        return known;
+    }
+    let definition = runtime.beginDefinition("ens_lazy_leave", type);
+    let store = memory.buildStore(runtime.builder, runtime.int64(LazyGuard.ready),
+        runtime.parameter(definition, 0));
+    memory.setOrdering(store, AtomicOrdering.release);
+    memory.setAlignment(store, 8);
+    instructions.buildRetVoid(runtime.builder);
+    return runtime.endDefinition(definition);
+}
+
+// void ens_lazy_keep(ptr slot): makes the object the storage of a lazy const holds immortal, so the
+// reads of every task leave its count alone and nothing ever frees it. A null reference and an
+// object that is immortal already, such as a string literal in read-only memory, are left as they
+// are.
+public keepRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.voidType.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_lazy_keep", type);
+    if (known != null) {
+        return known;
+    }
+    let definition = runtime.beginDefinition("ens_lazy_keep", type);
+    let builder = runtime.builder;
+    let object = memory.buildLoad(builder, runtime.pointerType, runtime.parameter(definition, 0),
+        "object");
+    let present = runtime.block(definition, "keep.present");
+    let mortal = runtime.block(definition, "keep.mortal");
+    let absent = runtime.block(definition, "keep.absent");
+    instructions.buildCondBr(builder, runtime.isNull(object), absent, present);
+
+    builder.positionAtEnd(present);
+    let count = runtime.loadCount(runtime.countSlot(object), AtomicOrdering.monotonic);
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, count,
+        runtime.immortalCountValue(), "immortal"), absent, mortal);
+
+    builder.positionAtEnd(mortal);
+    let store = memory.buildStore(builder, runtime.immortalCountValue(), runtime.countSlot(object));
+    memory.setOrdering(store, AtomicOrdering.monotonic);
+    memory.setAlignment(store, 8);
+    instructions.buildRetVoid(builder);
+
+    builder.positionAtEnd(absent);
+    instructions.buildRetVoid(builder);
+    return runtime.endDefinition(definition);
+}
+
+// A number no two running threads share and that is never zero or the ready mark.
+threadToken(Runtime runtime) -> Value {
+    if (runtime.onWindows()) {
+        let current = runtime.libc("GetCurrentThreadId", runtime.int32Type.functionType([]));
+        return instructions.buildZExt(runtime.builder, runtime.call(current, [], "thread"),
+            runtime.int64Type, "token");
+    }
+    let current = runtime.libc("pthread_self", runtime.int64Type.functionType([]));
+    return runtime.call(current, [], "token");
+}

@@ -93,9 +93,26 @@ bool Parser::nextIsAdjacent() const {
 }
 
 bool Parser::atArrowAfterParentheses() const {
-    if (!at(SyntaxKind::LParen)) return false;
+    return at(SyntaxKind::LParen) && arrowAfterParenthesesAt(current);
+}
+
+// The raw index of the n-th token ahead that is not trivia.
+size_t Parser::rawIndexOf(size_t n) const {
+    size_t idx = current;
+    while (idx < tokens.size()) {
+        if (!isTrivia(tokens[idx].kind)) {
+            if (n == 0) return idx;
+            n--;
+        }
+        idx++;
+    }
+    return tokens.size();
+}
+
+// True when the parentheses opening at the raw index `start` are followed by '->'.
+bool Parser::arrowAfterParenthesesAt(size_t start) const {
     int depth = 0;
-    for (size_t idx = current; idx < tokens.size(); ++idx) {
+    for (size_t idx = start; idx < tokens.size(); ++idx) {
         SyntaxKind k = tokens[idx].kind;
         if (isTrivia(k)) continue;
         if (k == SyntaxKind::EndOfFile) break;
@@ -216,6 +233,63 @@ bool Parser::peekIsContextualType(size_t n) const {
         }
         idx++;
     }
+}
+
+// `shared` is a contextual keyword: an ordinary identifier everywhere except before a declaration it
+// marks, before a function type, and before a type parameter's name.
+bool Parser::atContextualShared() const {
+    return peekIsContextualShared(0);
+}
+
+bool Parser::peekIsContextualShared(size_t n) const {
+    size_t idx = rawIndexOf(n);
+    return idx < tokens.size() && tokens[idx].kind == SyntaxKind::Identifier && tokens[idx].text == u"shared";
+}
+
+// A `shared` n tokens ahead marks a declaration when a keyword follows it, or a name that is not
+// itself followed by ';' or '=', which would make `shared` the name of a type.
+bool Parser::atSharedModifier(size_t n) const {
+    if (!peekIsContextualShared(n)) return false;
+    SyntaxKind next = peekKind(n + 1);
+    if (isKeyword(next)) return true;
+    SyntaxKind after = peekKind(n + 2);
+    return next == SyntaxKind::Identifier && after != SyntaxKind::Semi && after != SyntaxKind::Eq;
+}
+
+// `shared (int) -> bool`.
+bool Parser::atSharedFunctionType() const {
+    return atContextualShared() && peekKind(1) == SyntaxKind::LParen && arrowAfterParenthesesAt(rawIndexOf(1));
+}
+
+// A shared function type that a name follows declares a field, as in `shared (int) -> bool test;`,
+// where `shared(int amount) -> int { ... }` is a method named `shared`: a parameter list names its
+// parameters, and a field ends at ';' or '=' after its name.
+bool Parser::atSharedFunctionTypedField() const {
+    if (!atSharedFunctionType()) return false;
+    int depth = 0;
+    size_t idx = rawIndexOf(1);
+    SyntaxKind previous = SyntaxKind::LParen;
+    for (; idx < tokens.size(); ++idx) {
+        SyntaxKind k = tokens[idx].kind;
+        if (isTrivia(k)) continue;
+        if (k == SyntaxKind::LParen) depth++;
+        else if (k == SyntaxKind::RParen && --depth == 0) break;
+        else if (depth == 1 && k == SyntaxKind::Identifier &&
+                 (previous == SyntaxKind::Identifier || isPrimitiveTypeKw(previous) ||
+                  previous == SyntaxKind::Gt || previous == SyntaxKind::RBracket ||
+                  previous == SyntaxKind::Question)) {
+            return false;
+        }
+        previous = k;
+    }
+    for (++idx; idx < tokens.size(); ++idx) {
+        SyntaxKind k = tokens[idx].kind;
+        if (isTrivia(k)) continue;
+        if (k == SyntaxKind::LBrace || k == SyntaxKind::EndOfFile) return false;
+        if (k == SyntaxKind::Semi || k == SyntaxKind::Eq) return previous == SyntaxKind::Identifier;
+        previous = k;
+    }
+    return false;
 }
 
 // `primitive` is a contextual keyword: an ordinary identifier everywhere except at the top level,
@@ -368,9 +442,10 @@ void Parser::parseTopLevel() {
 
     bool hasVisibility = atAny({SyntaxKind::KwPrivate, SyntaxKind::KwProtected, SyntaxKind::KwPublic,
                                 SyntaxKind::KwExport});
+    int beforeExternal = hasVisibility ? 1 : 0;
+    if (atSharedModifier(beforeExternal)) beforeExternal++;
 
-    if (at(SyntaxKind::KwExternal) ||
-        peekKind(hasVisibility ? 1 : 0) == SyntaxKind::KwExternal) {
+    if (at(SyntaxKind::KwExternal) || peekKind(beforeExternal) == SyntaxKind::KwExternal) {
         parseExternalDecl();
         return;
     }
@@ -381,7 +456,7 @@ void Parser::parseTopLevel() {
         if (k == SyntaxKind::KwPrivate || k == SyntaxKind::KwProtected || k == SyntaxKind::KwPublic ||
             k == SyntaxKind::KwExport ||
             k == SyntaxKind::KwAbstract || k == SyntaxKind::KwFinal || k == SyntaxKind::KwSealed ||
-            k == SyntaxKind::KwNoreturn) {
+            k == SyntaxKind::KwNoreturn || atSharedModifier(declMods)) {
             declMods++;
             continue;
         }
@@ -529,7 +604,8 @@ void Parser::parseImportPath() {
 void Parser::parseExternalDecl() {
     // Lookahead: 'external' 'type' IDENT ';'     -> ExternalTypeDecl
     //            'external' 'from' STRING { ... } -> ExternalBlock
-    size_t externalIdx = (kindAt() == SyntaxKind::KwExternal) ? 0 : 1;
+    size_t externalIdx = 0;
+    while (peekKind(externalIdx) != SyntaxKind::KwExternal && !atEnd() && externalIdx < 2) externalIdx++;
     if (peekIsContextualType(externalIdx + 1)) {
         parseExternalTypeDecl();
     } else {
@@ -540,6 +616,7 @@ void Parser::parseExternalDecl() {
 void Parser::parseExternalTypeDecl() {
     builder.startNode(SyntaxKind::ExternalTypeDecl);
     parseVisibilityModifier();
+    if (atSharedModifier(0)) bumpAs(SyntaxKind::KwShared);
     expect(SyntaxKind::KwExternal, "'external'");
     if (atContextualType()) {
         bumpAs(SyntaxKind::KwType);
@@ -811,9 +888,11 @@ void Parser::parseStructOrClassDecl(SyntaxKind nodeKind, SyntaxKind keywordKind)
     bool isClass = (keywordKind == SyntaxKind::KwClass);
     builder.startNode(nodeKind);
     parseVisibilityModifier();
-    while (at(SyntaxKind::KwAbstract) || at(SyntaxKind::KwFinal) || at(SyntaxKind::KwSealed)) {
-        if (!isClass) reportAtCurrent("'abstract', 'final', and 'sealed' are only allowed on classes");
-        bump();
+    while (at(SyntaxKind::KwAbstract) || at(SyntaxKind::KwFinal) || at(SyntaxKind::KwSealed) ||
+           atSharedModifier(0)) {
+        if (!isClass) reportAtCurrent("'abstract', 'final', 'sealed', and 'shared' are only allowed on classes");
+        if (atContextualShared()) bumpAs(SyntaxKind::KwShared);
+        else bump();
     }
     expect(keywordKind, keywordKind == SyntaxKind::KwStruct ? "'struct'" : "'class'");
     expect(SyntaxKind::Identifier, "name");
@@ -881,6 +960,7 @@ void Parser::parseImplementsClause() {
 void Parser::parseInterfaceDecl() {
     builder.startNode(SyntaxKind::InterfaceDecl);
     parseVisibilityModifier();
+    if (atSharedModifier(0)) bumpAs(SyntaxKind::KwShared);
     while (at(SyntaxKind::KwAbstract) || at(SyntaxKind::KwFinal) || at(SyntaxKind::KwSealed)) {
         reportAtCurrent("'abstract', 'final', and 'sealed' are not allowed on an interface");
         bump();
@@ -918,7 +998,8 @@ void Parser::parseInterfaceDecl() {
 }
 
 void Parser::parseStructOrClassMember() {
-    if (looksLikeFuncDecl(/*allowShorthand=*/true) || looksLikeKeywordNamedMethod()) {
+    if (!atSharedFunctionTypedField() &&
+        (looksLikeFuncDecl(/*allowShorthand=*/true) || looksLikeKeywordNamedMethod())) {
         parseFuncDecl();
     } else {
         parseFieldDecl();
@@ -1033,6 +1114,10 @@ bool Parser::isTypeOrGroupStart(SyntaxKind k) const {
 }
 
 void Parser::parseType(bool leaveCoalesceToExpression) {
+    if (atSharedFunctionType()) {
+        parseFunctionType();
+        return;
+    }
     if (at(SyntaxKind::LParen)) {
         if (atArrowAfterParentheses()) parseFunctionType();
         else parseParenthesizedType(leaveCoalesceToExpression);
@@ -1061,6 +1146,7 @@ void Parser::parseNamedType(bool leaveCoalesceToExpression) {
 // is why the return type is parsed as a whole type and this node takes no suffixes.
 void Parser::parseFunctionType() {
     builder.startNode(SyntaxKind::FuncType);
+    if (atContextualShared()) bumpAs(SyntaxKind::KwShared);
     expect(SyntaxKind::LParen, "'('");
     if (!at(SyntaxKind::RParen) && !atEnd()) {
         parseType();
@@ -1158,6 +1244,7 @@ void Parser::parseTypeParamList() {
 
 void Parser::parseTypeParam() {
     builder.startNode(SyntaxKind::TypeParam);
+    if (atContextualShared() && peekKind(1) == SyntaxKind::Identifier) bumpAs(SyntaxKind::KwShared);
     expect(SyntaxKind::Identifier, "type parameter name");
     if (eat(SyntaxKind::Colon)) {
         // One or more bounds separated by '+': `T: Base + Comparable`.
@@ -1257,6 +1344,11 @@ size_t Parser::scanType(size_t cursor, int depth) const {
             return c;
         }
     };
+    // `shared (int) -> bool`: the parentheses after a contextual `shared` must open a function type.
+    if (peekIsContextualShared(cursor) && peekKind(cursor + 1) == SyntaxKind::LParen &&
+        arrowAfterParenthesesAt(rawIndexOf(cursor + 1))) {
+        return scanType(cursor + 1, depth + 1);
+    }
     SyntaxKind k0 = peekKind(cursor);
     if (k0 == SyntaxKind::LParen) {
         // The two readings of a leading '(' share their opening: a comma-separated list of

@@ -1,0 +1,261 @@
+// The rules a 'shared' declaration keeps, so that another task may hold its values: a shared class
+// cannot be extended by a class that is not shared, its fields never change and hold only values
+// another task may hold too, and a type that implements a shared interface keeps the same rules.
+import Span from @ens.frontend.support.source;
+import Reporter from support.diagnostics;
+import model.hierarchy;
+import model.sharing;
+import Unshareable from model.sharing;
+import UnshareableKind from model.sharing;
+import model.typemembers;
+import Field from model.typemembers;
+import model.typenames;
+import TypeNames from model.typenames;
+import model.types;
+import Type from model.types;
+import DeclaredType from model.types;
+import ClassType from model.types;
+import InterfaceType from model.types;
+import ExternalType from model.types;
+import StructType from model.types;
+import TypeParamType from model.types;
+import InstantiationType from model.types;
+import ErrorType from model.types;
+
+// Checks the class 'classType', named at 'nameSpan': a shared one against every rule, and any other
+// one against the shared types it extends or implements.
+public checkClass(Reporter reporter, TypeNames names, ClassType classType, Span nameSpan) {
+    string quoted = names.quotedName(classType);
+    if (!classType.isShared()) {
+        checkUnmarkedClass(reporter, names, classType, nameSpan);
+        return;
+    }
+    if (!classType.isFinal() && !classType.isSealed()) {
+        string fix = "Mark it 'final', as in 'shared final class {classType.name()}'";
+        if (classType.isAbstract()) {
+            fix = "Mark it 'sealed', as in 'shared sealed abstract class {classType.name()}', so "
+                + "only this module can extend it";
+        }
+        reporter.report("Class {quoted} is 'shared', but a subclass could add a field that changes "
+            + "while another task holds {held(classType, names)}. {fix}.", nameSpan);
+    }
+    let base = classType.base();
+    if (base != null) {
+        let baseClass = types.authorityOf(base);
+        if (baseClass != null && !baseClass.isShared()) {
+            string quotedBase = names.quoted(base);
+            reporter.report("Class {quoted} is 'shared', but its base class {quotedBase} is not, "
+                + "so a field {quotedBase} declares could change while another task holds "
+                + held(classType, names) + "." + markFix(baseClass), nameSpan);
+        }
+    }
+    let fields = classType.fields();
+    for (long i = classType.baseFieldCount(); i < fields.length(); i++) {
+        checkField(reporter, names, "the 'shared' class {quoted}", quoted, fields.get(i), true);
+    }
+}
+
+// A class that is not marked may still be one another task holds: as a subclass of a shared class,
+// or as an implementation of a shared interface.
+checkUnmarkedClass(Reporter reporter, TypeNames names, ClassType classType, Span nameSpan) {
+    string quoted = names.quotedName(classType);
+    string fix = " Write 'shared' before 'class {classType.name()}'.";
+    let base = classType.base();
+    if (base != null) {
+        let baseClass = types.authorityOf(base);
+        if (baseClass != null && baseClass.isShared()) {
+            string quotedBase = names.quoted(base);
+            reporter.report("Class {quoted} extends the 'shared' class {quotedBase}, so it must be "
+                + "'shared' too, because another task may hold {held(base, names)} that is "
+                + held(classType, names) + "." + fix, nameSpan);
+            return;
+        }
+    }
+    let shared = sharedInterfaceOf(classType);
+    if (shared != null) {
+        string quotedInterface = names.quoted(shared);
+        reporter.report("Class {quoted} implements the 'shared' interface {quotedInterface}, so it "
+            + "must be 'shared' too, because another task may hold {held(shared, names)} that is "
+            + held(classType, names) + "." + fix, nameSpan);
+    }
+}
+
+// A struct is shareable when every field is, so it is checked only where it implements a shared
+// interface, which promises that another task may hold it.
+public checkStruct(Reporter reporter, TypeNames names, StructType structType) {
+    let shared = sharedInterfaceOf(structType);
+    if (shared == null) {
+        return;
+    }
+    string quoted = names.quotedName(structType);
+    string subject = "the struct {quoted}, which implements the 'shared' interface "
+        + names.quoted(shared) + ",";
+    for (let field in structType.fields()) {
+        checkField(reporter, names, subject, quoted, field, false);
+    }
+}
+
+// The first shared interface 'type' implements, directly or through the interfaces those extend.
+sharedInterfaceOf(Type type) -> Type? {
+    for (let implemented in hierarchy.interfacesOf(type)) {
+        for (let level in hierarchy.interfaceLadderOf(implemented)) {
+            let declared = types.authorityOf(level);
+            if (declared != null && declared.isShared()) {
+                return level;
+            }
+        }
+    }
+    return null;
+}
+
+// Checks one field of 'subject', which another task may hold as a 'holder': a class's field must
+// not change, and every field's type must be one another task may hold.
+checkField(Reporter reporter, TypeNames names, string subject, string holder, Field field,
+           bool mustBeConst) {
+    if (field.type() is ErrorType) {
+        return;
+    }
+    string opening = "Field '{field.name()}' of {subject}";
+    if (mustBeConst && !field.isConst() && !field.isStatic()) {
+        string example = names.quotedCode(["const ", " {field.name()};"], [field.type()]);
+        reporter.report("{opening} is not 'const', so it could change while another task holds the "
+            + "same {holder}. Mark it 'const', as in {example}.", field.nameSpan());
+        return;
+    }
+    let reason = sharing.whyUnshareable(field.type());
+    if (reason == null) {
+        return;
+    }
+    reporter.report("{opening} has type {described(reason, names)}, so the field could change "
+        + "while another task holds the same {holder}." + fixFor(reason.innermost(), names),
+        field.nameSpan());
+}
+
+// The type a reason is about, quoted, followed by what keeps another task from holding it, as in
+// "'int[]', which can be changed through any reference to it".
+public described(Unshareable reason, TypeNames names) -> string {
+    string quoted = names.quoted(reason.type());
+    switch (reason.kind()) {
+        Changeable -> {
+            return "{quoted}, which can be changed through any reference to it";
+        },
+        Unmarked -> {
+            return "{quoted}, {article(reason.type())} that is not 'shared'";
+        },
+        OpenParameter -> {
+            return "{quoted}, a type parameter whose type argument may be a type that changes";
+        },
+        FunctionValue -> {
+            return "{quoted}, a function that may keep a value that changes";
+        },
+        StructField -> {
+            let inner = reason.inner();
+            if (inner == null) {
+                return quoted;
+            }
+            return "{quoted}, a struct whose field '{reason.field()}' has type "
+                + described(inner, names);
+        },
+    }
+}
+
+// What keeps another task from holding a value of the type a reason is about, as a sentence without
+// its full stop: "'int[]' can be changed through any reference to it".
+public stated(Unshareable reason, TypeNames names) -> string {
+    string quoted = names.quoted(reason.type());
+    switch (reason.kind()) {
+        Changeable -> {
+            return "{quoted} can be changed through any reference to it";
+        },
+        Unmarked -> {
+            return "{quoted} is {article(reason.type())} that is not 'shared'";
+        },
+        OpenParameter -> {
+            return "{quoted} is a type parameter whose type argument may be a type that changes";
+        },
+        FunctionValue -> {
+            return "{quoted} is a function that may keep a value that changes";
+        },
+        StructField -> {
+            let inner = reason.inner();
+            if (inner == null) {
+                return "{quoted} is a struct with a field that changes";
+            }
+            return "{quoted} is a struct whose field '{reason.field()}' has type "
+                + described(inner, names);
+        },
+    }
+}
+
+// The fix for the innermost reason, opening with a space, or empty where no edit makes the type one
+// another task may hold.
+public fixFor(Unshareable reason, TypeNames names) -> string {
+    switch (reason.kind()) {
+        Unmarked -> {
+            let declared = types.authorityOf(reason.type());
+            if (declared == null) {
+                return "";
+            }
+            return markFix(declared);
+        },
+        FunctionValue -> {
+            string spelled = names.of(reason.type());
+            return " Write 'shared' before the function type, as in 'shared {spelled}'.";
+        },
+        OpenParameter -> {
+            let parameter = reason.type();
+            if (parameter is TypeParamType) {
+                string name = parameter.name();
+                string owner = parameter.ownerName();
+                if (owner.length == 0) {
+                    return " Declare it as '<shared {name}>'.";
+                }
+                return " Declare it as '<shared {name}>' in the type parameters of '{owner}'.";
+            }
+            return "";
+        },
+        default -> {
+            return "";
+        },
+    }
+}
+
+// The fix that marks the declaration of 'declared', opening with a space, or empty where the
+// declaration belongs to a package the program cannot edit.
+markFix(DeclaredType declared) -> string {
+    if (!declared.isEditable()) {
+        return "";
+    }
+    switch (declared) {
+        is ClassType ignored -> {
+            return " Write 'shared' before 'class {declared.name()}'.";
+        },
+        is InterfaceType ignored -> {
+            return " Write 'shared' before 'interface {declared.name()}'.";
+        },
+        is ExternalType ignored -> {
+            return " Write 'shared' before 'external type {declared.name()}' if the library behind "
+                + "it allows two tasks to use one at once.";
+        },
+        default -> {
+            return "";
+        },
+    }
+}
+
+// A value of 'type' as a sentence names it, with its article: "an 'Open'".
+held(Type type, TypeNames names) -> string {
+    return "{typenames.typeArticle(names.of(type))} {names.quoted(type)}";
+}
+
+// What kind of declaration an unmarked type is, with its article.
+article(Type type) -> string {
+    let declared = types.authorityOf(type);
+    if (declared is InterfaceType) {
+        return "an interface";
+    }
+    if (declared is ExternalType) {
+        return "an external type";
+    }
+    return "a class";
+}

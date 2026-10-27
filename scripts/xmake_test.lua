@@ -1962,7 +1962,7 @@ task("test")
                 table.insert(failures, string.format("ens build -q said %q", quiet_out))
             end
             run({"build", hello, "--output", path.join(root, "loud.exe"), "-v"}, nil, 0,
-                "Emitted 2 object files from 9 modules")
+                "Emitted 2 object files from 10 modules")
 
             -- an application package is named after its package; a library keeps no artifact and
             -- refuses an output, while keeping its object files the way a program keeps its own.
@@ -1972,7 +1972,7 @@ task("test")
             run_program(path.join(work, "main" .. exe_suffix), 0, "Hello, Ada! [acme.tools]")
             local library_root = path.join(tests_dir, "pkg_import_dep")
             os.tryrm(path.join(library_root, ".ens"))
-            run({"build", library_root}, in_work, 0, "Compiled 12 modules as a library")
+            run({"build", library_root}, in_work, 0, "Compiled 13 modules as a library")
             if os.isfile(path.join(work, "tools" .. exe_suffix)) then
                 table.insert(failures, "building a library left an executable behind")
             end
@@ -1991,7 +1991,7 @@ task("test")
             local unlinked = path.join(root, "unlinked")
             os.tryrm(path.join(work, "hello" .. exe_suffix))
             run({"build", hello, "--no-link", "--objects", unlinked}, in_work, 0,
-                "hello: Emitted 2 object files from 9 modules into '", "', and linked nothing")
+                "hello: Emitted 2 object files from 10 modules into '", "', and linked nothing")
             if #os.files(path.join(unlinked, "*" .. obj_suffix)) ~= 2 then
                 table.insert(failures, string.format("a build that links nothing left %d object "
                     .. "files", #os.files(path.join(unlinked, "*" .. obj_suffix))))
@@ -2130,7 +2130,7 @@ task("test")
             -- a workspace root builds every member, the library before the application that
             -- depends on it even though the manifest lists the application first
             local workspace = path.join(tests_dir, "cli_workspace")
-            run({"build", workspace}, in_work, 0, "[1/2] demo.lib: Compiled 9 modules as a "
+            run({"build", workspace}, in_work, 0, "[1/2] demo.lib: Compiled 10 modules as a "
                 .. "library", "[2/2] demo.app: Built '")
             run({"build", workspace, "--output", path.join(root, "x.exe")}, nil, 2,
                 "ens: '--output' names one executable, but '", "' is a workspace that builds one "
@@ -2634,7 +2634,7 @@ task("test")
 
             -- both members take the package from the same override, and the build says so once
             local _, said = run({"build"}, in_ws, 0, "demo.app: Built '",
-                "demo.tool: Compiled 10 modules as a library")
+                "demo.tool: Compiled 11 modules as a library")
             local times = 0
             for _ in said:gmatch("Using the override for package 'acme%.json'") do
                 times = times + 1

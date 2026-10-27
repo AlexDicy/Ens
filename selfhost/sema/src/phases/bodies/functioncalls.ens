@@ -1376,6 +1376,23 @@ analyzeGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry e
     return result;
 }
 
+// Whether the lambdas of a call bound every type argument the call left open, filling those slots of
+// 'typeArguments' when they did.
+boundByLambdas(TypeArgumentInference inference, List<Type?> typeArguments) -> bool {
+    for (long i = 0; i < typeArguments.length(); i++) {
+        let bound = inference.binding(i);
+        if (typeArguments.get(i) == null && bound == null) {
+            return false;
+        }
+    }
+    for (long i = 0; i < typeArguments.length(); i++) {
+        if (typeArguments.get(i) == null) {
+            typeArguments.set(i, inference.binding(i));
+        }
+    }
+    return true;
+}
+
 checkGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry entry, string name,
                  Type? expected, PendingArguments pending) -> Type {
     let signature = entry.signature();
@@ -1419,8 +1436,7 @@ checkGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry ent
             return checker.store().errorType();
         }
         for (long i = 0; i < arity; i++) {
-            typeArguments.set(i, checker.resolver().resolveTypeArgument(explicitList.arguments(i),
-                typeParameters[i].name(), name));
+            typeArguments.set(i, checker.resolver().resolveType(explicitList.arguments(i)));
         }
     }
 
@@ -1456,34 +1472,46 @@ checkGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry ent
         if (argument == null && refusedArgument) {
             return checker.store().errorType();
         }
-        if (argument == null) {
+        if (argument == null && explicitList == null) {
             bool untyped = voidtypearguments.inferFromLambdas(checker, arguments, parameters, inference);
-            pending.checkLambdasWith(parameters, inference);
-            pending.settle(checker);
-            bool refusedVoid = voidtypearguments.reportVoidTypeArgument(checker, arguments, parameters,
-                argumentTypes, inference, typeParameters, "'{name}'");
-            if (refusedVoid) {
+            if (!untyped && boundByLambdas(inference, typeArguments)) {
+                argument = typeArguments.get(i);
+            } else {
+                pending.checkLambdasWith(parameters, inference);
+                long reportedBeforeLambdas = checker.reporter().reportedCount();
+                pending.settle(checker);
+                if (untyped && checker.reporter().reportedCount() > reportedBeforeLambdas) {
+                    return checker.store().errorType();
+                }
+                bool refusedVoid = voidtypearguments.reportVoidTypeArgument(checker, arguments, parameters,
+                    argumentTypes, inference, typeParameters, "'{name}'");
+                if (refusedVoid) {
+                    return checker.store().errorType();
+                }
+                string unshown = "'{name}' is generic, and this call does not show what its type "
+                    + "argument '{typeParameters[i].name()}' is.";
+                if (untyped) {
+                    checker.reporter().report(unshown, node.span());
+                    return checker.store().errorType();
+                }
+                let listed = staticmembers.writtenTypeArguments(checker, inference,
+                    contextInference(checker, owner, arity, signature.returnType(), expected), arity,
+                    node.arguments(), parameters, typeParameters);
+                if (listed == null) {
+                    checker.reporter().report(unshown, node.span());
+                    return checker.store().errorType();
+                }
+                string write = "Write it";
+                if (arity > 1) {
+                    write = "Write its type arguments";
+                }
+                string spelled = exampleArguments(checker, node.arguments(), reportedBefore);
+                checker.reporter().report("{unshown} {write}, as in '{name}<{listed}>{spelled}'.",
+                    node.span());
                 return checker.store().errorType();
             }
-            string unshown = "'{name}' is generic, and this call does not show what its type "
-                + "argument '{typeParameters[i].name()}' is.";
-            if (untyped) {
-                checker.reporter().report(unshown, node.span());
-                return checker.store().errorType();
-            }
-            let listed = staticmembers.writtenTypeArguments(checker, inference,
-                contextInference(checker, owner, arity, signature.returnType(), expected), arity,
-                node.arguments(), parameters);
-            if (listed == null) {
-                checker.reporter().report(unshown, node.span());
-                return checker.store().errorType();
-            }
-            string write = "Write it";
-            if (arity > 1) {
-                write = "Write its type arguments";
-            }
-            string spelled = exampleArguments(checker, node.arguments(), reportedBefore);
-            checker.reporter().report("{unshown} {write}, as in '{name}<{listed}>{spelled}'.", node.span());
+        }
+        if (argument == null) {
             return checker.store().errorType();
         }
         resolved.push(argument);
@@ -1537,7 +1565,7 @@ checkGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry ent
             } else if (!(parameterType is ErrorType) && !(actual is ErrorType)
                     && !convert.isAssignableStrict(parameterType, actual)) {
                 string provenance = "";
-                if (explicitList == null) {
+                if (explicitList == null && !convert.bytesForByteArray(parameterType, actual)) {
                     provenance = inference.provenance(parameters[i].type(), name, "(...)", checker.names());
                 }
                 string hint = nullguidance.valueAssignabilityHint(checker, parameterType, actual, argument);
@@ -2029,6 +2057,22 @@ public argumentMismatch(string label, string callee, string parameter, Type expe
     if (parameter.length == 0) {
         string wanted = names.of(expected);
         return "{given}, but {callee} takes {typenames.typeArticle(wanted)} {names.quoted(expected)} there.";
+    }
+    if (types.isVoidType(expected)) {
+        return "{given}, but parameter '{parameter}' has type 'void', which means no value, so no "
+            + "argument fits it. Replace 'void' with {names.quoted(actual)} in the type arguments.";
+    }
+    if (convert.sharedFunctionWidens(expected, actual)) {
+        return "{given}, but parameter '{parameter}' has type {names.quoted(expected)}. A function "
+            + "value whose type is not written 'shared' may keep a value another task could change. "
+            + "Give the value the type {names.quoted(expected)} where it is made, so its lambda is "
+            + "checked for that.";
+    }
+    if (convert.bytesForByteArray(expected, actual)) {
+        return "{given}, but parameter '{parameter}' has type {names.quoted(expected)}, whose "
+            + "elements can be changed. Nothing can change the elements of a 'bytes', so it cannot "
+            + "be passed as a 'byte[]'. Call 'toArray()' on it to pass a copy whose elements can be "
+            + "changed.";
     }
     return "{given}, but parameter '{parameter}' has type {names.quoted(expected)}.";
 }

@@ -1,0 +1,175 @@
+// Whether another task may be given a value of a type: a value nothing can change, or one whose
+// changes are synchronized. The judgment is one function, so every place that refuses a value for
+// another task gives the same reason for it.
+import model.typemembers;
+import model.types;
+import Type from model.types;
+import PrimitiveType from model.types;
+import StringType from model.types;
+import NullType from model.types;
+import ErrorType from model.types;
+import OptionalType from model.types;
+import ArrayType from model.types;
+import FunctionType from model.types;
+import ClassType from model.types;
+import InterfaceType from model.types;
+import StructType from model.types;
+import EnumType from model.types;
+import ExternalType from model.types;
+import TypeParamType from model.types;
+import InstantiationType from model.types;
+import DeclaredType from model.types;
+import Set from @std.collections.set;
+
+// What keeps a type from being one another task may be given.
+export enum UnshareableKind {
+    // An array or a value that can be changed through any reference to it.
+    Changeable,
+    // A class, an interface or an external type whose declaration is not marked 'shared'.
+    Unmarked,
+    // A type parameter not declared '<shared T>', whose argument may be a type that changes.
+    OpenParameter,
+    // A function value whose type is not written 'shared', which may keep values another task could
+    // change.
+    FunctionValue,
+    // A struct with a field whose own type is one of the above.
+    StructField,
+}
+
+// Why a type is not shareable: the kind, the type it is about, and for a struct the field whose
+// type is the cause, with that type's own reason.
+export final class Unshareable {
+    const UnshareableKind unshareableKind;
+    const Type unshareableType;
+    const string fieldName;
+    const Unshareable? fieldReason;
+
+    public constructor(this.unshareableKind, this.unshareableType, this.fieldName,
+                       this.fieldReason);
+
+    export kind() -> UnshareableKind {
+        return this.unshareableKind;
+    }
+
+    export type() -> Type {
+        return this.unshareableType;
+    }
+
+    // The field of a struct that holds the cause, for a reason of kind 'StructField'.
+    export field() -> string {
+        return this.fieldName;
+    }
+
+    export inner() -> Unshareable? {
+        return this.fieldReason;
+    }
+
+    // The reason at the bottom of a chain of struct fields.
+    export innermost() -> Unshareable {
+        let inner = this.fieldReason;
+        if (inner == null) {
+            return this;
+        }
+        return inner.innermost();
+    }
+}
+
+// Whether another task may be given a value of 'type'.
+export isShareable(Type type) -> bool {
+    return whyUnshareable(type) == null;
+}
+
+// Why another task may not be given a value of 'type', or null when it may. Primitives, enums,
+// strings and 'void' are shareable; an optional is when its payload is; a struct is when every
+// field is; a class, an interface and an external type are when their declarations are marked
+// 'shared'; a type parameter is when it is declared '<shared T>'; a function type is when it is
+// written 'shared', and 'bytes' is. Any other array is not, because it can be changed through any
+// reference to it.
+export whyUnshareable(Type type) -> Unshareable? {
+    return reasonGuarded(type, new Set<Type>());
+}
+
+reasonGuarded(Type type, Set<Type> visiting) -> Unshareable? {
+    switch (type) {
+        is PrimitiveType ignored -> {
+            return null;
+        },
+        is StringType ignored -> {
+            return null;
+        },
+        is NullType ignored -> {
+            return null;
+        },
+        is ErrorType ignored -> {
+            return null;
+        },
+        is EnumType ignored -> {
+            return null;
+        },
+        is OptionalType optional -> {
+            return reasonGuarded(optional.inner(), visiting);
+        },
+        is ArrayType array -> {
+            if (array.isBytes()) {
+                return null;
+            }
+            return new Unshareable(UnshareableKind.Changeable, type, "", null);
+        },
+        is FunctionType function -> {
+            if (function.isShared()) {
+                return null;
+            }
+            return new Unshareable(UnshareableKind.FunctionValue, type, "", null);
+        },
+        is TypeParamType parameter -> {
+            if (parameter.isShared()) {
+                return null;
+            }
+            return new Unshareable(UnshareableKind.OpenParameter, type, "", null);
+        },
+        is StructType ignored -> {
+            return structReason(type, visiting);
+        },
+        is InstantiationType instantiation -> {
+            if (types.isStructLike(type)) {
+                return structReason(type, visiting);
+            }
+            return markedReason(type, instantiation.template());
+        },
+        is DeclaredType declared -> {
+            return markedReason(type, declared);
+        },
+        default -> {
+            return null;
+        },
+    }
+}
+
+// A class, an interface or an external type is shareable when its declaration is marked 'shared'.
+markedReason(Type type, DeclaredType declared) -> Unshareable? {
+    if (declared.isShared()) {
+        return null;
+    }
+    if (declared is ClassType || declared is InterfaceType || declared is ExternalType) {
+        return new Unshareable(UnshareableKind.Unmarked, type, "", null);
+    }
+    return null;
+}
+
+// A struct revisited while it is judged was reached through its own fields, which a struct cannot
+// hold by value, so the second visit adds nothing.
+structReason(Type type, Set<Type> visiting) -> Unshareable? {
+    let fields = typemembers.fieldsOf(type);
+    if (fields == null || !visiting.add(type)) {
+        return null;
+    }
+    for (let field in fields) {
+        let reason = reasonGuarded(field.type(), visiting);
+        if (reason != null) {
+            visiting.remove(type);
+            return new Unshareable(UnshareableKind.StructField, type, field.name(), reason);
+        }
+    }
+    visiting.remove(type);
+    return null;
+}
