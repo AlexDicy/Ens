@@ -2136,7 +2136,7 @@ A task may also lend what it owns for exactly as long as it waits: the loops of 
 
 Reference counts are already shared between threads, so a shareable object may be held by any number of tasks at once, and a destructor runs on the task that released the last reference, which is the only task that could still reach the object.
 The initializer of a `lazy const` runs once however many tasks read it first at the same moment, and the others wait for its value.
-A value a `lazy const` holds is kept to the end of the program, so it is not reference counted at all, and neither is anything reached only through it.
+An object a `lazy const` holds is kept to the end of the program, so its reference count is never changed again once it is built, and reading it costs no task a write to it.
 
 ---
 

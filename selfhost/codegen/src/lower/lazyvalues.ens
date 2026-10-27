@@ -1,10 +1,13 @@
 // The two globals one lazy const keeps its value and its state in, the function that builds the
-// value, and the guard a read is fronted by. The storage keeps its reference for the whole
-// program, so a read returns a borrowed one and the cycle refusal stays off the hot path.
+// value, and the guard a read is fronted by. The value is built once however many tasks read it
+// first, by the first of them while the others wait, and a reference it holds is made immortal, so a
+// read returns a borrowed one that no task's count changes and the cycle refusal stays off the hot
+// path.
 import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
 import Field from @ens.sema.model.typemembers;
 import PrimitiveKind from @ens.sema.model.types;
 import Type from @ens.sema.model.types;
+import @ens.sema.model.types;
 import EirBinary from eir.model;
 import EirBinaryOp from eir.model;
 import EirBranch from eir.model;
@@ -15,7 +18,7 @@ import EirGlobalAddress from eir.model;
 import EirJump from eir.model;
 import EirPanic from eir.model;
 import EirReturn from eir.model;
-import EirStorePtr from eir.model;
+import EirForeignCall from eir.model;
 import EirUnreachable from eir.model;
 import LazyValueInfo from lower.index;
 import LoweringContext from lower.context;
@@ -24,12 +27,14 @@ import lower.ownership;
 import lower.places;
 import lower.stores;
 import lower.strings;
+import support.primitives;
 
-// The two states anything names. Nothing names the pending state, which is the zero the storage
-// starts at.
-final class LazyState {
-    protected static const long building = 1;
-    protected static const long ready = 2;
+// What the guard's entry answers: another thread built the value, this one is to build it, or this
+// one is building it already.
+final class LazyEntry {
+    protected static const long built = 0;
+    protected static const long build = 1;
+    protected static const long cycle = 2;
 }
 
 // Reads one lazy const, taking the initializer call only on the cold edge. Returns the address
@@ -42,8 +47,7 @@ public lowerReadAddress(LoweringContext lowering, MemberExpressionNode member, F
         return -1;
     }
     let builder = lowering.builder();
-    long state = loadState(lowering, lazyValue);
-    long ready = stateTest(lowering, state, LazyState.ready);
+    long ready = guardCall(lowering, booleanType(lowering), "ens_lazy_ready", lazyValue);
     let readyBlock = builder.newBlock("lazy.ready");
     let buildBlock = builder.newBlock("lazy.build");
     builder.terminate(new EirBranch(ready, readyBlock, buildBlock));
@@ -59,18 +63,24 @@ public lowerReadAddress(LoweringContext lowering, MemberExpressionNode member, F
 // building has begun and that the value is there.
 public lowerInitializer(LoweringContext lowering, LazyValueInfo lazyValue) -> bool {
     let builder = lowering.builder();
-    long state = loadState(lowering, lazyValue);
-    long building = stateTest(lowering, state, LazyState.building);
+    long entry = guardCall(lowering, entryType(lowering), "ens_lazy_enter", lazyValue);
+    let checkBlock = builder.newBlock("lazy.check");
+    let builtBlock = builder.newBlock("lazy.built");
     let cycleBlock = builder.newBlock("lazy.cycle");
     let buildBlock = builder.newBlock("lazy.build");
-    builder.terminate(new EirBranch(building, cycleBlock, buildBlock));
+    builder.terminate(new EirBranch(entryTest(lowering, entry, LazyEntry.built), builtBlock,
+        checkBlock));
+    builder.moveTo(builtBlock);
+    builder.terminate(new EirReturn(-1));
+    builder.moveTo(checkBlock);
+    builder.terminate(new EirBranch(entryTest(lowering, entry, LazyEntry.cycle), cycleBlock,
+        buildBlock));
     builder.moveTo(cycleBlock);
     long message = strings.literalText(lowering, "'{lazyValue.display()}' was read while it "
         + "was still being initialized");
     builder.append(new EirPanic(message, lowering.lineAt(lazyValue.initializer().span())));
     builder.terminate(new EirUnreachable());
     builder.moveTo(buildBlock);
-    storeState(lowering, lazyValue, LazyState.building);
     Type valueType = lowering.substituted(lazyValue.field().type());
     lowering.pushScope();
     let outer = lowering.enterOwnedReads(ownedreads.ofExpression(lowering,
@@ -86,33 +96,40 @@ public lowerInitializer(LoweringContext lowering, LazyValueInfo lazyValue) -> bo
             + "a value with no storage to retain", lazyValue.initializer().span());
         return false;
     }
-    storeState(lowering, lazyValue, LazyState.ready);
+    if (primitives.isReferenceType(valueType)) {
+        builder.append(new EirForeignCall(-1, voidType(lowering), "ens_lazy_keep",
+            [valueAddress(lowering, lazyValue)], [valueType], [true]));
+    }
+    guardCall(lowering, voidType(lowering), "ens_lazy_leave", lazyValue);
     ownership.releaseAllScopes(lowering);
     builder.terminate(new EirReturn(-1));
     lowering.popScope();
     return true;
 }
 
-// Tests the state byte against one state, which is the one compare a read costs.
-stateTest(LoweringContext lowering, long state, long against) -> long {
+// Calls one of the guard's bridges over the state word, which it is handed by address, and returns
+// the temp holding what it answers, or -1 for a bridge that answers nothing.
+guardCall(LoweringContext lowering, Type type, string symbol, LazyValueInfo lazyValue) -> long {
     let builder = lowering.builder();
-    long expectedState = builder.newTemp(stateType(lowering));
-    builder.append(new EirConstInt(expectedState, stateType(lowering), against));
-    long result = builder.newTemp(booleanType(lowering));
-    builder.append(new EirBinary(result, booleanType(lowering), EirBinaryOp.CmpEq, state,
-        expectedState));
+    long address = stateAddress(lowering, lazyValue);
+    long result = -1;
+    if (!types.isVoidType(type)) {
+        result = builder.newTemp(type);
+    }
+    builder.append(new EirForeignCall(result, type, symbol, [address], [stateType(lowering)],
+        [true]));
     return result;
 }
 
-loadState(LoweringContext lowering, LazyValueInfo lazyValue) -> long {
-    return places.loadFrom(lowering, stateAddress(lowering, lazyValue), stateType(lowering));
-}
-
-storeState(LoweringContext lowering, LazyValueInfo lazyValue, long state) {
+// Tests what the guard's entry answered against one answer.
+entryTest(LoweringContext lowering, long entry, long against) -> long {
     let builder = lowering.builder();
-    long value = builder.newTemp(stateType(lowering));
-    builder.append(new EirConstInt(value, stateType(lowering), state));
-    builder.append(new EirStorePtr(stateAddress(lowering, lazyValue), value));
+    long expected = builder.newTemp(entryType(lowering));
+    builder.append(new EirConstInt(expected, entryType(lowering), against));
+    long result = builder.newTemp(booleanType(lowering));
+    builder.append(new EirBinary(result, booleanType(lowering), EirBinaryOp.CmpEq, entry,
+        expected));
+    return result;
 }
 
 stateAddress(LoweringContext lowering, LazyValueInfo lazyValue) -> long {
@@ -143,7 +160,11 @@ initializerCallee(LoweringContext lowering, LazyValueInfo lazyValue) -> EirCalle
 }
 
 stateType(LoweringContext lowering) -> Type {
-    return lowering.store().primitive(PrimitiveKind.Byte);
+    return lowering.store().primitive(PrimitiveKind.Long);
+}
+
+entryType(LoweringContext lowering) -> Type {
+    return lowering.store().primitive(PrimitiveKind.Int);
 }
 
 booleanType(LoweringContext lowering) -> Type {
