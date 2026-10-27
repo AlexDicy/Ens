@@ -2111,7 +2111,7 @@ An `external` handle is shareable only when its declaration says `shared`, becau
 A function value is shareable when its type is written with `shared` before the parameter list, as in `shared (Request) -> Response`, and a lambda written against such a type may capture only shareable values: a local or a parameter of a shareable type, a `const` field of `this` whose type is shareable, which it copies, and `this` itself only when its class is `shared`.
 A type parameter is shareable when it is declared `<shared T>`, every argument for it must then be shareable, and the body may treat a `T` value as shareable, so `Channel<shared T>` carries shareable values and nothing else.
 A `shared` generic class declares `shared` every type parameter a field's type mentions, since the field could not be shareable otherwise.
-Function types stay exactly assignable, so `shared (int) -> bool` and `(int) -> bool` are two types, and a value of the second is not accepted where the first is expected.
+`shared (int) -> bool` and `(int) -> bool` are two types: a value of the first is accepted where the second is expected, since a function another task may run is also one this task may run, and a value of the second is not accepted where the first is expected.
 
 ```ens
 shared class Config {
