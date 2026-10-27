@@ -66,6 +66,13 @@ private:
     // True when positioned on the contextual `type` keyword (a `type` identifier).
     bool atContextualType() const;
     bool peekIsContextualType(size_t n) const;
+    bool atContextualShared() const;
+    bool peekIsContextualShared(size_t n) const;
+    bool atSharedModifier(size_t n) const;
+    bool atSharedFunctionType() const;
+    bool atSharedFunctionTypedField() const;
+    bool arrowAfterParenthesesAt(size_t start) const;
+    size_t rawIndexOf(size_t n) const;
     // True when positioned on the contextual `primitive` keyword (a `primitive` identifier).
     bool atContextualPrimitive() const;
     bool peekIsContextualPrimitive(size_t n) const;

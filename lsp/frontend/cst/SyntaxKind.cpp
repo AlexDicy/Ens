@@ -184,6 +184,7 @@ static constexpr std::pair<SyntaxKind, std::string_view> KIND_NAMES[] = {
     {SyntaxKind::KwRethrow,         "KwRethrow"},
     {SyntaxKind::KwReturn,          "KwReturn"},
     {SyntaxKind::KwSealed,          "KwSealed"},
+    {SyntaxKind::KwShared,          "KwShared"},
     {SyntaxKind::KwStatic,          "KwStatic"},
     {SyntaxKind::KwStruct,          "KwStruct"},
     {SyntaxKind::KwSuper,           "KwSuper"},
