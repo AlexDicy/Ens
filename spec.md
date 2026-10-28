@@ -773,7 +773,7 @@ The implicitly imported modules described below are the one exception: no import
 Two modules may import each other: circular imports are allowed, and declarations resolve across the cycle like any other import.
 
 A short list of standard-library modules is imported implicitly: `@std.core` and `@std.io.print`.
-Every exported name of such a module is in scope in every module with no import written: `@std.core`'s types `Error`, `StackFrame`, `Comparable`, and `Copyable` are used by name, and both modules' exported functions are called unqualified.
+Every exported name of such a module is in scope in every module with no import written: `@std.core`'s types `Error`, `StackFrame`, `Comparable`, `Number`, and `Copyable` are used by name, and both modules' exported functions are called unqualified.
 So `print(message)` and `eprint(message)`, which write a line to standard output and to standard error, come from the standard library rather than from the language, and no program imports anything to print a line.
 A declaration of your own with one of those names takes precedence inside the module that declares it.
 That precedence goes by name and not by signature: a `describe(int)` of your own hides every implicitly imported `describe`, so a call that does not fit yours is an error rather than a call to theirs, and the hidden one is reached by importing its module and qualifying the call.
@@ -2530,6 +2530,9 @@ for (let line in lines) {                             // ends when the last prod
 `new Mutex(value)` takes the value in, and `mutex.lock(body)` runs `body` with the value while no other task has it, waiting for its turn, and returns what the body returns.
 The body is a `shared` function and its result must be shareable, so the value inside cannot leave the lock through a capture or a return, while a shareable part of it, such as an entry of a map of `shared` objects, can.
 `Atomic<T>` from `@std.tasks` holds one shareable value that tasks read and replace without a lock: `read()`, `write(value)`, `compareAndSet(expected, replacement) -> bool`, and for numbers `increment()`, `decrement()` and `add(amount)`, each returning the value after the change.
+The arithmetic members are conditional on `T: Number<T>`, the interface every number type implements with `plus`, `minus`, `incremented` and `decremented`, so they exist on an `Atomic<long>` or an `Atomic<double>` and on no `Atomic<string>`.
+`compareAndSet` compares a reference by identity and every other value bit for bit, which is what the processor compares.
+An `Atomic` holds a number, a `bool`, a `char`, an enum or a reference, possibly null, which the processor replaces in a single step; a struct, or a nullable value that is not a reference, is refused where the type is written, with `Mutex` as the fix.
 An `Atomic` of a `shared` class replaces a whole table under its readers, which see the old value or the new and never a mix of the two.
 
 `@std.parallel` runs one body over many pieces of data at once and returns when every piece is done, on the task that called it, which it parks for the whole call.

@@ -1,0 +1,181 @@
+// The Atomic<T> intercept. Its reading and writing members lower to atomic instructions over the
+// one field the class holds, so no other task ever sees the value half written, and an integer's
+// arithmetic lowers to a single atomic add rather than the loop its Ens body spells.
+import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
+import Expression from @ens.frontend.syntax.generated.nodes;
+import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import NamedArgumentNode from @ens.frontend.syntax.generated.nodes;
+import Span from @ens.frontend.support.source;
+import Method from @ens.sema.model.typemembers;
+import @ens.sema.model.typemembers;
+import DeclaredType from @ens.sema.model.types;
+import InstantiationType from @ens.sema.model.types;
+import PrimitiveKind from @ens.sema.model.types;
+import Type from @ens.sema.model.types;
+import EirAtomicAdd from eir.model;
+import EirAtomicCompareSet from eir.model;
+import EirAtomicLoad from eir.model;
+import EirAtomicStore from eir.model;
+import EirConstInt from eir.model;
+import EirObjectFieldAddress from eir.model;
+import LoweringContext from lower.context;
+import lower.classes;
+import lower.expressions;
+import lower.ownership;
+import lower.places;
+import support.primitives;
+import List from @std.collections.list;
+
+final class Modules {
+    protected static const string tasks = "std.tasks";
+}
+
+// The value type of an Atomic receiver, or null for anything else.
+public valueOf(Type receiverType) -> Type? {
+    let core = receiverType;
+    if (!(core is InstantiationType)) {
+        return null;
+    }
+    let template = core.template();
+    if (template.name() != "Atomic" || template.modulePath() != Modules.tasks) {
+        return null;
+    }
+    let arguments = core.arguments();
+    if (arguments.length != 1) {
+        return null;
+    }
+    return arguments[0];
+}
+
+// True for a call this module lowers: one of Atomic's own reading and writing members, and the
+// arithmetic of an Atomic over an integer.
+public isIntercepted(Type receiverType, Method method) -> bool {
+    let value = valueOf(receiverType);
+    if (value == null) {
+        return false;
+    }
+    return switch (method.name()) {
+        "read", "write", "compareAndSet" -> true,
+        "add", "increment", "decrement" -> primitives.isIntegerType(value),
+        default -> false,
+    };
+}
+
+public lowerCall(LoweringContext lowering, CallExpressionNode call, MemberExpressionNode member,
+                 Method method) -> long {
+    let receiverType = lowering.typeOf(member.object());
+    if (receiverType == null) {
+        return -1;
+    }
+    let value = valueOf(receiverType);
+    if (value == null) {
+        return -1;
+    }
+    let held = new List<long>();
+    long receiver = receiverOf(lowering, member, receiverType, held);
+    if (receiver < 0) {
+        return -1;
+    }
+    long index = typemembers.inheritedOrOwnFieldIndex(receiverType, "value");
+    if (index < 0) {
+        lowering.internalError("'{method.name()}' of an Atomic found no 'value' field",
+            call.span());
+        return -1;
+    }
+    let builder = lowering.builder();
+    long address = builder.newTemp(value);
+    builder.append(new EirObjectFieldAddress(address, value, receiver, index));
+    let arguments = argumentsOf(lowering, call);
+    if (arguments == null) {
+        return -1;
+    }
+    long result = -1;
+    switch (method.name()) {
+        "read" -> {
+            result = builder.newTemp(value);
+            builder.append(new EirAtomicLoad(result, value, address));
+        },
+        "write" -> {
+            long written = operand(lowering, arguments, 0, value, held, call.span());
+            if (written < 0) {
+                return -1;
+            }
+            builder.append(new EirAtomicStore(address, written, value));
+        },
+        "compareAndSet" -> {
+            long expected = operand(lowering, arguments, 0, value, held, call.span());
+            long replacement = operand(lowering, arguments, 1, value, held, call.span());
+            if (expected < 0 || replacement < 0) {
+                return -1;
+            }
+            let boolType = lowering.store().primitive(PrimitiveKind.Bool);
+            result = builder.newTemp(boolType);
+            builder.append(new EirAtomicCompareSet(result, address, expected, replacement, value));
+        },
+        default -> {
+            long amount = -1;
+            if (method.name() == "add") {
+                amount = operand(lowering, arguments, 0, value, held, call.span());
+            } else {
+                amount = builder.newTemp(value);
+                long step = method.name() == "increment" ? 1 : -1;
+                builder.append(new EirConstInt(amount, value, step));
+            }
+            if (amount < 0) {
+                return -1;
+            }
+            result = builder.newTemp(value);
+            builder.append(new EirAtomicAdd(result, value, address, amount));
+        },
+    }
+    classes.releaseHeld(lowering, held);
+    return result;
+}
+
+// The object the call runs over, retained for the call where the arguments could replace where it
+// was read from, and kept alive until the call is done when the expression produced it.
+receiverOf(LoweringContext lowering, MemberExpressionNode member, Type receiverType,
+           List<long> held) -> long {
+    if (!places.retainsRead(lowering, member.object())) {
+        return classes.callOperand(lowering, member.object(), receiverType, held);
+    }
+    long object = expressions.lowerConverted(lowering, member.object(), receiverType);
+    if (object >= 0) {
+        ownership.retainValue(lowering, object);
+        lowering.protectValue(object);
+        held.push(object);
+    }
+    return object;
+}
+
+// The argument at 'position' as a value of the Atomic's type, borrowed for the instruction, which
+// retains a reference it keeps.
+operand(LoweringContext lowering, List<Expression> arguments, long position, Type value,
+        List<long> held, Span span) -> long {
+    if (position >= arguments.length()) {
+        lowering.internalError("an Atomic member reached lowering with {arguments.length()} "
+            + "argument(s)", span);
+        return -1;
+    }
+    return classes.callOperand(lowering, arguments.get(position), value, held);
+}
+
+argumentsOf(LoweringContext lowering, CallExpressionNode call) -> List<Expression>? {
+    let collected = new List<Expression>();
+    let arguments = call.arguments();
+    for (long i = 0; i < arguments.argumentsCount(); i++) {
+        switch (arguments.arguments(i)) {
+            is NamedArgumentNode named -> {
+                collected.push(named.value());
+            },
+            is Expression plain -> {
+                collected.push(plain);
+            },
+            default -> {
+                lowering.internalError("an Atomic member takes no 'out' argument", call.span());
+                return null;
+            },
+        }
+    }
+    return collected;
+}
