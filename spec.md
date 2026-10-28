@@ -2554,7 +2554,7 @@ parallel.split(pixels, tiles, reading(depth), (tile, depthView) -> shade(tile, d
 
 ---
 
-Every value has a `hash()` method returning a `long`. Value types (primitives, enums, strings, structs) and arrays hash by their contents, so equal values hash equally; classes hash by identity, matching how `==` compares them.
+Every value but an external handle, a function value, and a floating-point number has a `hash()` method returning a `long`. Value types (primitives, enums, strings, structs) and arrays hash by their contents, so equal values hash equally; classes hash by identity, matching how `==` compares them.
 An optional hashes as its payload does while it is present and as one fixed value once it is absent, so every absent value hashes equally whatever its type.
 A class or a struct can declare its own `hash() -> long` to control its hashing, paired with `equals(T other) -> bool`, a method taking a single parameter of the declaring type `T` itself, to control equality.
 A method named `hash` must have exactly that signature, and neither `hash` nor `equals` can be `throws`, because the language takes a value's hash and compares two values where there is no room for a `try`; `equals` must return `bool`.
