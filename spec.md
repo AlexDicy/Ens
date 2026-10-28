@@ -200,7 +200,8 @@ When neither overload is more specific, the call is a compile error that lists t
 Overloads that are not visible from the call site lose to visible ones; visibility is only an error when no visible overload matches.
 Named arguments participate in selection: an overload is only considered when every named argument names one of its parameters.
 A subclass may add a new overload of an inherited method name; `override` still requires the exact signature of the method it replaces.
-External functions and generic functions cannot be overloaded.
+External functions cannot be overloaded, and neither can generic methods.
+A generic function shares its name only with declarations that take a different number of arguments, counting the arguments a default leaves out, so the number of arguments a call passes picks it before any argument's type is read.
 
 ```ens
 calculateArea(Rectangle rectangle) -> uint {
@@ -788,7 +789,7 @@ A module may also declare a function with the same name and parameter types as o
 Every call to that name in the module that writes the declaration goes to it, and every other module keeps the function the language provides.
 Such a declaration is an ordinary function and takes nothing from the one it stands in for: a `panic` of your own never returns only if you write `noreturn` on it.
 A declaration whose parameter types differ is an ordinary overload alongside the provided function, exactly as two declarations of your own overload each other.
-A generic declaration of that name is rejected either way, because a generic function cannot be overloaded and replacing the provided function needs its parameter list.
+A generic declaration of that name is rejected when it can take as many arguments as the provided function, because a generic function shares its name only with declarations that take a different number of arguments.
 
 A program's entry point is the top-level function `main` in its **main module**: `src/main.ens` for a package or a folder of sources, or the compiled file itself for a single-file program.
 No other module may define a top-level `main`; the compiler rejects one wherever it is loaded from, including through an import of another package's main module.
