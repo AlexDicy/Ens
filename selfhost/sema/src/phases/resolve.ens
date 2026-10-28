@@ -31,7 +31,6 @@ import KeyTypeObligation from phases.obligations;
 import AtomicValueObligation from phases.obligations;
 import Origin from phases.obligations;
 import phases.obligations;
-import phases.declare;
 import phases.bodies.wording;
 import program.implicit;
 import SemaResult from result;
@@ -49,7 +48,6 @@ import Type from model.types;
 import ErrorType from model.types;
 import TypeStore from model.types;
 import DeclaredType from model.types;
-import FunctionType from model.types;
 import ClassType from model.types;
 import StructType from model.types;
 import InstantiationType from model.types;
@@ -181,7 +179,7 @@ public class TypeResolver {
         return this.semaResult;
     }
 
-    public report(string message, Span span) {
+    report(string message, Span span) {
         if (this.openTrials > 0) {
             return;
         }
@@ -483,9 +481,6 @@ public class TypeResolver {
     // established that `base` is generic and `argumentList` is present.
     public instantiateGeneric(DeclaredType base, string name, TypeArgumentListNode argumentList,
             Span nameSpan) -> Type {
-        if (base.isWrittenAsFunction()) {
-            return this.instantiateFromFunction(base, name, argumentList, nameSpan);
-        }
         string[] parameterNames = base.typeParameters();
         long arity = parameterNames.length;
         long given = argumentList.argumentsCount();
@@ -518,58 +513,13 @@ public class TypeResolver {
         if (failed) {
             return this.store.errorType();
         }
-        let spans = new List<Span>();
-        for (long i = 0; i < given; i++) {
-            spans.push(argumentList.arguments(i).span());
-        }
-        return this.instantiateChecked(base, arguments.toArray(), spans.toArray(),
-            writtenSpan(nameSpan, argumentList.span()));
-    }
-
-    // A type whose list matches a function type, written with the one function type its two type
-    // parameters are read from: 'Task<() -> Module throws ParseError>' is 'Task' at 'Module' and the
-    // throws list of 'ParseError'.
-    instantiateFromFunction(DeclaredType base, string name, TypeArgumentListNode argumentList,
-            Span nameSpan) -> Type {
-        string example = "'{name}<() -> int>'";
-        if (argumentList.argumentsCount() != 1) {
-            this.report("Generic type '{name}' is written with the one function type it runs, as in "
-                + "{example}, but {argumentList.argumentsCount()} type arguments are written here.",
-                nameSpan);
-            return this.store.errorType();
-        }
-        Type written = this.resolveType(argumentList.arguments(0));
-        if (written is ErrorType) {
-            return written;
-        }
-        Type core = written;
-        if (!(core is FunctionType) || core.parameterTypes().length > 0) {
-            this.report("Generic type '{name}' is written with the function type it runs, which takes "
-                + "no parameters, as in {example}, but {this.names().quoted(written)} is written here.",
-                argumentList.arguments(0).span());
-            return this.store.errorType();
-        }
-        Type fallback = this.store.errorType();
-        let errorClass = this.implicitBinding("Error");
-        if (errorClass != null) {
-            fallback = errorClass;
-        }
-        Type[] arguments = [core.returnType(),
-            convert.thrownListBinding(this.store, core.thrownTypes(), fallback)];
-        Span at = argumentList.arguments(0).span();
-        return this.instantiateChecked(base, arguments, [at, at],
-            writtenSpan(nameSpan, argumentList.span()));
-    }
-
-    // The instantiation at these resolved type arguments, once their bounds and what the template
-    // requires of them hold. 'spans' says where each argument is written.
-    instantiateChecked(DeclaredType base, Type[] argumentTypes, Span[] spans, Span writtenAt) -> Type {
-        long given = argumentTypes.length;
+        Type[] argumentTypes = arguments.toArray();
         if (this.checkBoundsImmediately) {
             TypeParamType[] parameters = base.typeParameterTypes();
             bool bounded = true;
             for (long i = 0; i < parameters.length && i < given; i++) {
-                if (!this.checkArgumentBounds(parameters[i], argumentTypes, spans[i])) {
+                if (!this.checkArgumentBounds(parameters[i], argumentTypes,
+                        argumentList.arguments(i).span())) {
                     bounded = false;
                 }
             }
@@ -578,19 +528,25 @@ public class TypeResolver {
             }
             let keyed = capabilities.keyedContainerOf(base);
             if (keyed != null && !this.acceptsKeyType(base, argumentTypes,
-                    spans[keyed.keyIndex()])) {
+                    argumentList.arguments(keyed.keyIndex()).span())) {
                 return this.store.errorType();
             }
             if (capabilities.isAtomicCell(base) && given > 0
-                    && !this.acceptsAtomicValue(base, argumentTypes[0], spans[0])) {
+                    && !this.acceptsAtomicValue(base, argumentTypes[0],
+                        argumentList.arguments(0).span())) {
                 return this.store.errorType();
             }
         } else if (this.openTrials == 0) {
+            let spans = new List<Span>();
+            for (long i = 0; i < given; i++) {
+                spans.push(argumentList.arguments(i).span());
+            }
             this.deferredBoundChecks.push(new DeferredBoundCheck(base, argumentTypes,
-                spans, this.constraintScopeOwner, this.constraintScope));
+                spans.toArray(), this.constraintScopeOwner, this.constraintScope));
         }
         let instantiation = this.store.instantiationOf(base, argumentTypes);
-        this.recordInstantiationMention(instantiation, writtenAt);
+        this.recordInstantiationMention(instantiation,
+            writtenSpan(nameSpan, argumentList.span()));
         return instantiation;
     }
 
@@ -1063,10 +1019,6 @@ public class TypeResolver {
         if (list == null) {
             return [];
         }
-        let pattern = list.pattern();
-        if (pattern != null) {
-            return this.resolvePatternParameters(owner, ownerName, pattern);
-        }
         let interned = new List<TypeParamType>();
         for (long i = 0; i < list.parametersCount(); i++) {
             let parameter = this.store.typeParameter(owner, i, list.parameters(i).name().text());
@@ -1085,25 +1037,6 @@ public class TypeResolver {
             }
         }
         this.popTypeParameters(parameters.length);
-        return parameters;
-    }
-
-    // The type parameters a function-type pattern names: the result and the throws list, the second
-    // bounded by 'Error' as every type parameter a throws list names is.
-    resolvePatternParameters(GreenNode owner, string ownerName, FunctionTypeNode pattern)
-            -> TypeParamType[] {
-        string[] names = declare.patternNames(pattern);
-        let interned = new List<TypeParamType>();
-        for (long i = 0; i < names.length; i++) {
-            let parameter = this.store.typeParameter(owner, i, names[i]);
-            parameter.setOwnerName(ownerName);
-            interned.push(parameter);
-        }
-        TypeParamType[] parameters = interned.toArray();
-        let errorClass = this.implicitBinding("Error");
-        if (parameters.length == 2 && errorClass != null) {
-            parameters[1].setBounds([errorClass]);
-        }
         return parameters;
     }
 
