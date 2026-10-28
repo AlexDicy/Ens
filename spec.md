@@ -2513,6 +2513,7 @@ Two tasks that await each other, and a task that locks a `Mutex` it already hold
 `new Channel<T>(capacity)` is the receiving end: `receive()` waits for the next value and returns it, or `null` once the channel is closed and empty, `receive(timeoutMillis)` returns `null` after that many milliseconds as well, with `isClosed()` telling the two apart, and a `for` loop walks a channel one value at a time until it is closed and empty, so two loops on two tasks share the work between them.
 `channel.sender()` returns a `Sender<T>`, whose `send(value)` puts a value in and waits while the channel already holds `capacity` values; a capacity of zero makes every send wait for a receive.
 The channel closes when the last `Sender` is released, so a producer closes nothing and a loop over the channel ends exactly when every producer has finished; a sender kept in a field keeps the channel open for as long as the field does.
+A channel no `Sender` has been taken from yet is open, so a receive on it waits for the first one.
 A send on a channel whose receiving end has been released throws `ChannelClosed`, since the value would never arrive.
 There is no way to wait on two channels at once; two sources merge by sending into one channel, each through a sender of its own, and a wait with a time limit is `receive(timeoutMillis)`.
 
