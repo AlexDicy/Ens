@@ -28,6 +28,7 @@ import InstantiationMention from phases.obligations;
 import FunctionThrowsMention from phases.obligations;
 import ObligationRegistry from phases.obligations;
 import KeyTypeObligation from phases.obligations;
+import AtomicValueObligation from phases.obligations;
 import Origin from phases.obligations;
 import phases.obligations;
 import phases.bodies.wording;
@@ -51,6 +52,8 @@ import ClassType from model.types;
 import StructType from model.types;
 import InstantiationType from model.types;
 import TypeParamType from model.types;
+import ThrownListType from model.types;
+import PendingThrowsType from model.types;
 import PrimitiveKind from model.types;
 import List from @std.collections.list;
 import Map from @std.collections.map;
@@ -266,13 +269,22 @@ public class TypeResolver {
             this.constraintScope);
     }
 
-    // The type parameter in scope under this name, innermost first, or null when none is.
+    // The type parameter in scope under this name, innermost first, or null when none is. A list
+    // that declares the name twice is refused, and the name stays the first of the two.
     public typeParameterNamed(string name) -> TypeParamType? {
         for (long i = this.parameterScope.length() - 1; i >= 0; i--) {
             let parameter = this.parameterScope.get(i);
-            if (parameter.name() == name) {
-                return parameter;
+            if (parameter.name() != name) {
+                continue;
             }
+            TypeParamType found = parameter;
+            for (long j = i - 1; j >= 0; j--) {
+                let earlier = this.parameterScope.get(j);
+                if (earlier.owner() == found.owner() && earlier.name() == name) {
+                    found = earlier;
+                }
+            }
+            return found;
         }
         return null;
     }
@@ -519,6 +531,11 @@ public class TypeResolver {
                     argumentList.arguments(keyed.keyIndex()).span())) {
                 return this.store.errorType();
             }
+            if (capabilities.isAtomicCell(base) && given > 0
+                    && !this.acceptsAtomicValue(base, argumentTypes[0],
+                        argumentList.arguments(0).span())) {
+                return this.store.errorType();
+            }
         } else if (this.openTrials == 0) {
             let spans = new List<Span>();
             for (long i = 0; i < given; i++) {
@@ -588,6 +605,31 @@ public class TypeResolver {
         return false;
     }
 
+    // Whether 'value' is a type an 'Atomic' can hold, reporting why not at 'valueSpan'. A value that
+    // still names a type parameter is judged once per instantiation instead.
+    public acceptsAtomicValue(DeclaredType template, Type value, Span valueSpan) -> bool {
+        if (convert.containsTypeParam(value)) {
+            if (this.openTrials == 0) {
+                let owners = new Set<GreenNode>();
+                obligations.collectOwners(value, owners);
+                for (let owner in owners) {
+                    let obligation = new AtomicValueObligation(template, value, valueSpan);
+                    if (owner == this.constraintScopeOwner) {
+                        obligation.setGuards(this.constraintScope);
+                    }
+                    this.deferredObligations.recordObligation(owner, this.resolverFilePath, obligation);
+                }
+            }
+            return true;
+        }
+        let issue = capabilities.atomicValueIssue("", template, value, this.names());
+        if (issue == null) {
+            return true;
+        }
+        this.report(issue, valueSpan);
+        return false;
+    }
+
     // Records the judgment against every generic owner the key names, guarded by the active
     // member constraints where they speak about that owner, as a body records its own.
     recordKeyTypeObligation(DeclaredType template, Type key, Span keySpan) {
@@ -639,11 +681,9 @@ public class TypeResolver {
         if (primitive != null) {
             return primitive;
         }
-        for (long i = this.parameterScope.length() - 1; i >= 0; i--) {
-            let parameter = this.parameterScope.get(i);
-            if (parameter.name() == name) {
-                return parameter;
-            }
+        let parameter = this.typeParameterNamed(name);
+        if (parameter != null) {
+            return parameter;
         }
         let declared = this.store.findDeclared(this.resolverModulePath, name);
         if (declared != null) {
@@ -682,10 +722,28 @@ public class TypeResolver {
 
     // A bound naming a parameter of the same list is judged with the arguments substituted in,
     // so '<T: Comparable<T>>' requires 'Comparable<Item>' of 'Item'.
-    public checkArgumentBounds(TypeParamType parameter, Type[] arguments, Span span) -> bool {
+    // Whether the type argument for 'parameter' meets its bounds and its 'shared' marker, reporting
+    // each one it fails. A generic method's bounds may also name the type parameters of the type
+    // that declares it, which 'receiver', the instantiation it is called on, gives.
+    public checkArgumentBounds(TypeParamType parameter, Type[] arguments, Span span,
+                               Type? receiver = null) -> bool {
         Type argument = arguments[parameter.index()];
+        if (argument is PendingThrowsType) {
+            return true;
+        }
+        if (argument is ThrownListType) {
+            bool everyMember = true;
+            for (let member in argument.members()) {
+                Type[] single = arguments.slice(0, arguments.length);
+                single[parameter.index()] = member;
+                if (!this.checkArgumentBounds(parameter, single, span, receiver)) {
+                    everyMember = false;
+                }
+            }
+            return everyMember;
+        }
         bool satisfied = true;
-        for (let bound in this.substitutedBounds(parameter, arguments)) {
+        for (let bound in this.substitutedBounds(parameter, arguments, receiver)) {
             if (hierarchy.satisfiesBound(argument, bound, this.extraBoundsOf(argument))) {
                 continue;
             }
@@ -810,10 +868,15 @@ public class TypeResolver {
         return true;
     }
 
-    substitutedBounds(TypeParamType parameter, Type[] arguments) -> Type[] {
+    substitutedBounds(TypeParamType parameter, Type[] arguments, Type? receiver = null) -> Type[] {
         let substituted = new List<Type>();
         for (let bound in parameter.bounds()) {
-            substituted.push(this.store.substitute(bound, parameter.owner(), arguments));
+            Type concrete = this.store.substitute(bound, parameter.owner(), arguments);
+            if (receiver is InstantiationType) {
+                concrete = this.store.substitute(concrete, receiver.template().declaration(),
+                    receiver.arguments());
+            }
+            substituted.push(concrete);
         }
         return substituted.toArray();
     }
@@ -848,6 +911,10 @@ public class TypeResolver {
             let keyed = capabilities.keyedContainerOf(check.template());
             if (bounded && keyed != null && keyed.keyIndex() < spans.length) {
                 this.acceptsKeyType(check.template(), arguments, spans[keyed.keyIndex()]);
+            }
+            if (bounded && capabilities.isAtomicCell(check.template()) && arguments.length > 0
+                    && spans.length > 0) {
+                this.acceptsAtomicValue(check.template(), arguments[0], spans[0]);
             }
             if (recordedOwner != null) {
                 this.popMemberConstraints();

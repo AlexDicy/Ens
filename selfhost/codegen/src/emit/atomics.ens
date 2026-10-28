@@ -1,0 +1,247 @@
+// The atomic instructions an Atomic<T> lowers to. A value that fits one machine word is read and
+// written with the processor's atomic operations. A reference also needs its count kept: a reader
+// sets the lowest bit of the pointer, which an object's alignment keeps clear, while it retains the
+// object, so a writer that would release the object waits for the reader to finish.
+import EirAtomicAdd from eir.model;
+import EirAtomicCompareSet from eir.model;
+import EirAtomicLoad from eir.model;
+import EirAtomicStore from eir.model;
+import Type from @ens.sema.model.types;
+import TypeRef from @ens.llvm.types;
+import Value from @ens.llvm.values;
+import @ens.llvm.instructions;
+import @ens.llvm.memory;
+import AtomicOrdering from @ens.llvm.memory;
+import ModuleEmitter from emit.context;
+import EmissionFrame from emit.context;
+import Runtime from emit.runtime;
+import RuntimeFunction from emit.runtime;
+import support.primitives;
+
+public emitAtomicLoad(ModuleEmitter emitter, EmissionFrame frame, EirAtomicLoad load) {
+    let address = frame.value(load.address);
+    if (primitives.isReferenceType(load.type)) {
+        frame.define(load.result, emitter.runtime.call(referenceRead(emitter.runtime), [address],
+            "atomic.read"));
+        return;
+    }
+    let stored = storedType(emitter, load.type);
+    let loaded = memory.buildLoad(emitter.builder, stored, address, "atomic.load");
+    memory.setOrdering(loaded, AtomicOrdering.sequentiallyConsistent);
+    memory.setAlignment(loaded, alignmentOf(emitter, stored));
+    frame.define(load.result, fromStored(emitter, loaded, load.type));
+}
+
+public emitAtomicStore(ModuleEmitter emitter, EmissionFrame frame, EirAtomicStore store) {
+    let address = frame.value(store.address);
+    let value = frame.value(store.value);
+    if (primitives.isReferenceType(store.type)) {
+        emitter.runtime.call(referenceWrite(emitter.runtime), [address, value], "");
+        return;
+    }
+    let stored = storedType(emitter, store.type);
+    let written = memory.buildStore(emitter.builder, toStored(emitter, value, store.type), address);
+    memory.setOrdering(written, AtomicOrdering.sequentiallyConsistent);
+    memory.setAlignment(written, alignmentOf(emitter, stored));
+}
+
+public emitAtomicCompareSet(ModuleEmitter emitter, EmissionFrame frame, EirAtomicCompareSet set) {
+    let address = frame.value(set.address);
+    let expected = frame.value(set.expected);
+    let replacement = frame.value(set.replacement);
+    if (primitives.isReferenceType(set.type)) {
+        frame.define(set.result, emitter.runtime.call(referenceCompareSet(emitter.runtime),
+            [address, expected, replacement], "atomic.cas"));
+        return;
+    }
+    let exchanged = memory.buildAtomicCompareExchange(emitter.builder, address,
+        toStored(emitter, expected, set.type), toStored(emitter, replacement, set.type),
+        AtomicOrdering.sequentiallyConsistent, AtomicOrdering.sequentiallyConsistent);
+    frame.define(set.result, instructions.buildExtractValue(emitter.builder, exchanged, 1,
+        "atomic.cas.done"));
+}
+
+// The integer after the addition, since the processor returns the one before it.
+public emitAtomicAdd(ModuleEmitter emitter, EmissionFrame frame, EirAtomicAdd add) {
+    let amount = frame.value(add.amount);
+    let before = memory.buildAtomicAdd(emitter.builder, frame.value(add.address), amount,
+        AtomicOrdering.sequentiallyConsistent);
+    frame.define(add.result, instructions.buildAdd(emitter.builder, before, amount, "atomic.sum"));
+}
+
+// The integer a value is kept as for the atomic operations, which take no floating-point number for
+// a compare and nothing narrower than a byte.
+storedType(ModuleEmitter emitter, Type type) -> TypeRef {
+    if (primitives.isBoolType(type)) {
+        return emitter.context.int8Type();
+    }
+    if (primitives.isFloatType(type)) {
+        let mapped = emitter.mapType(type);
+        long bytes = emitter.dataLayout().abiSizeOfType(mapped) as long;
+        return bytes == 4 ? emitter.context.int32Type() : emitter.context.int64Type();
+    }
+    return emitter.mapType(type);
+}
+
+toStored(ModuleEmitter emitter, Value value, Type type) -> Value {
+    if (primitives.isBoolType(type)) {
+        return instructions.buildZExt(emitter.builder, value, emitter.context.int8Type(), "");
+    }
+    if (primitives.isFloatType(type)) {
+        return instructions.buildBitCast(emitter.builder, value, storedType(emitter, type), "");
+    }
+    return value;
+}
+
+fromStored(ModuleEmitter emitter, Value stored, Type type) -> Value {
+    if (primitives.isBoolType(type)) {
+        return instructions.buildTrunc(emitter.builder, stored, emitter.context.int1Type(), "");
+    }
+    if (primitives.isFloatType(type)) {
+        return instructions.buildBitCast(emitter.builder, stored, emitter.mapType(type), "");
+    }
+    return stored;
+}
+
+alignmentOf(ModuleEmitter emitter, TypeRef stored) -> uint {
+    return emitter.dataLayout().abiSizeOfType(stored) as uint;
+}
+
+// ptr ens_atomic_read(ptr cell): the reference the cell holds, with one more owner. The lowest bit
+// of the cell is set while the reference is retained, so no writer can release it in between.
+referenceRead(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.pointerType.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_atomic_read", type);
+    if (known != null) {
+        return known;
+    }
+    let retain = runtime.retain();
+    let definition = runtime.beginDefinition("ens_atomic_read", type);
+    let cell = runtime.parameter(definition, 0);
+    let spin = runtime.block(definition, "read.spin");
+    let take = runtime.block(definition, "read.take");
+    let held = runtime.block(definition, "read.held");
+    instructions.buildBr(runtime.builder, spin);
+
+    runtime.builder.positionAtEnd(spin);
+    let current = loadCell(runtime, cell);
+    instructions.buildCondBr(runtime.builder, isMarked(runtime, current), spin, take);
+
+    runtime.builder.positionAtEnd(take);
+    let exchanged = memory.buildAtomicCompareExchange(runtime.builder, cell, current,
+        runtime.offsetPointer(current, 1, "marked"), AtomicOrdering.sequentiallyConsistent,
+        AtomicOrdering.sequentiallyConsistent);
+    instructions.buildCondBr(runtime.builder,
+        instructions.buildExtractValue(runtime.builder, exchanged, 1, ""), held, spin);
+
+    runtime.builder.positionAtEnd(held);
+    runtime.call(retain, [current], "");
+    storeCell(runtime, cell, current);
+    instructions.buildRet(runtime.builder, current);
+    return runtime.endDefinition(definition);
+}
+
+// void ens_atomic_write(ptr cell, ptr value): the cell holds 'value', retained, and the reference it
+// held before is released, once no reader is retaining it.
+referenceWrite(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.voidType.functionType([runtime.pointerType, runtime.pointerType]);
+    let known = runtime.existing("ens_atomic_write", type);
+    if (known != null) {
+        return known;
+    }
+    let retain = runtime.retain();
+    let release = runtime.release();
+    let definition = runtime.beginDefinition("ens_atomic_write", type);
+    let cell = runtime.parameter(definition, 0);
+    let value = runtime.parameter(definition, 1);
+    let spin = runtime.block(definition, "write.spin");
+    let swap = runtime.block(definition, "write.swap");
+    let done = runtime.block(definition, "write.done");
+    runtime.call(retain, [value], "");
+    instructions.buildBr(runtime.builder, spin);
+
+    runtime.builder.positionAtEnd(spin);
+    let current = loadCell(runtime, cell);
+    instructions.buildCondBr(runtime.builder, isMarked(runtime, current), spin, swap);
+
+    runtime.builder.positionAtEnd(swap);
+    let exchanged = memory.buildAtomicCompareExchange(runtime.builder, cell, current, value,
+        AtomicOrdering.sequentiallyConsistent, AtomicOrdering.sequentiallyConsistent);
+    instructions.buildCondBr(runtime.builder,
+        instructions.buildExtractValue(runtime.builder, exchanged, 1, ""), done, spin);
+
+    runtime.builder.positionAtEnd(done);
+    runtime.call(release, [current], "");
+    instructions.buildRetVoid(runtime.builder);
+    return runtime.endDefinition(definition);
+}
+
+// i1 ens_atomic_compare_set(ptr cell, ptr expected, ptr replacement): whether the cell held
+// 'expected', by identity, and now holds 'replacement'. The replacement is retained before it is
+// published, and that retain is given back when the cell held something else.
+referenceCompareSet(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int1Type.functionType([runtime.pointerType, runtime.pointerType,
+        runtime.pointerType]);
+    let known = runtime.existing("ens_atomic_compare_set", type);
+    if (known != null) {
+        return known;
+    }
+    let retain = runtime.retain();
+    let release = runtime.release();
+    let definition = runtime.beginDefinition("ens_atomic_compare_set", type);
+    let cell = runtime.parameter(definition, 0);
+    let expected = runtime.parameter(definition, 1);
+    let replacement = runtime.parameter(definition, 2);
+    let spin = runtime.block(definition, "cas.spin");
+    let compare = runtime.block(definition, "cas.compare");
+    let swap = runtime.block(definition, "cas.swap");
+    let swapped = runtime.block(definition, "cas.swapped");
+    let refused = runtime.block(definition, "cas.refused");
+    runtime.call(retain, [replacement], "");
+    instructions.buildBr(runtime.builder, spin);
+
+    runtime.builder.positionAtEnd(spin);
+    let current = loadCell(runtime, cell);
+    instructions.buildCondBr(runtime.builder, isMarked(runtime, current), spin, compare);
+
+    runtime.builder.positionAtEnd(compare);
+    let same = instructions.buildICmpEQ(runtime.builder,
+        instructions.buildPtrToInt(runtime.builder, current, runtime.int64Type, ""),
+        instructions.buildPtrToInt(runtime.builder, expected, runtime.int64Type, ""), "");
+    instructions.buildCondBr(runtime.builder, same, swap, refused);
+
+    runtime.builder.positionAtEnd(swap);
+    let exchanged = memory.buildAtomicCompareExchange(runtime.builder, cell, current, replacement,
+        AtomicOrdering.sequentiallyConsistent, AtomicOrdering.sequentiallyConsistent);
+    instructions.buildCondBr(runtime.builder,
+        instructions.buildExtractValue(runtime.builder, exchanged, 1, ""), swapped, spin);
+
+    runtime.builder.positionAtEnd(swapped);
+    runtime.call(release, [current], "");
+    instructions.buildRet(runtime.builder, runtime.int1Type.constInt(1, false));
+
+    runtime.builder.positionAtEnd(refused);
+    runtime.call(release, [replacement], "");
+    instructions.buildRet(runtime.builder, runtime.int1Type.constInt(0, false));
+    return runtime.endDefinition(definition);
+}
+
+loadCell(Runtime runtime, Value cell) -> Value {
+    let loaded = memory.buildLoad(runtime.builder, runtime.pointerType, cell, "cell");
+    memory.setOrdering(loaded, AtomicOrdering.sequentiallyConsistent);
+    memory.setAlignment(loaded, 8);
+    return loaded;
+}
+
+storeCell(Runtime runtime, Value cell, Value value) {
+    let stored = memory.buildStore(runtime.builder, value, cell);
+    memory.setOrdering(stored, AtomicOrdering.sequentiallyConsistent);
+    memory.setAlignment(stored, 8);
+}
+
+// True while a reader holds the cell, which it marks by setting the pointer's lowest bit.
+isMarked(Runtime runtime, Value pointer) -> Value {
+    let bits = instructions.buildPtrToInt(runtime.builder, pointer, runtime.int64Type, "");
+    let marked = instructions.buildAnd(runtime.builder, bits, runtime.int64(1), "");
+    return instructions.buildICmpNE(runtime.builder, marked, runtime.int64(0), "");
+}

@@ -69,6 +69,9 @@ import PrimitiveKind from model.types;
 import ExternalType from model.types;
 import InstantiationType from model.types;
 import Visibility from model.types;
+import ThrownListType from model.types;
+import TypeParamType from model.types;
+import PendingThrowsType from model.types;
 import List from @std.collections.list;
 import Map from @std.collections.map;
 import model.narrow;
@@ -1233,6 +1236,9 @@ analyzeFunctionCall(BodyChecker checker, CallExpressionNode node, IdentifierExpr
 dispatchFunctionCall(BodyChecker checker, CallExpressionNode node, IdentifierExpressionNode identifier,
                      string name, List<FunctionEntry> entries, Type? expected) -> Type {
     let first = entries.get(0);
+    if (!first.signature().isGeneric()) {
+        refuseUnusedTypeArguments(checker, node, "'{name}' is not generic");
+    }
     if (first.isExternal()) {
         checker.result().setCallable(identifier.green(), first.signature());
         return analyzeExternalCall(checker, node, first, name);
@@ -1276,6 +1282,9 @@ public analyzeNamespaceFunctionCall(BodyChecker checker, CallExpressionNode node
     }
     string targetPackagePrefix = target.module().packagePrefix();
     checker.result().setCallableFile(member.green(), target.module().filePath());
+    if (!entries.get(0).signature().isGeneric()) {
+        refuseUnusedTypeArguments(checker, node, "'{memberName}' is not generic");
+    }
     if (entries.length() > 1 || usesNamedArguments(node.arguments())) {
         let candidates = new List<CallCandidate>();
         for (long i = 0; i < entries.length(); i++) {
@@ -1367,17 +1376,110 @@ checkFromCStringCall(BodyChecker checker, ArgumentListNode arguments, Span callS
     return result;
 }
 
+// Refuses the type arguments written on a call to a callee that declares no type parameters, which
+// 'reason' says, as in "'plain' is not generic".
+public refuseUnusedTypeArguments(BodyChecker checker, CallExpressionNode node, string reason) {
+    let written = node.typeArguments();
+    if (written == null) {
+        return;
+    }
+    checker.reporter().report("{reason}, so its call takes no type arguments. Remove "
+        + "'{wording.greenSpelling(written.green())}'.", written.span());
+}
+
 // A call to a generic function, whose pending arguments are settled once whatever path the call takes.
 analyzeGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry entry, string name,
                    Type? expected) -> Type {
+    return analyzeGenericCallTo(checker, node, entry.signature(),
+        new GenericCallee(name, "function", name, null), expected);
+}
+
+// A call to a generic function or method, whose pending arguments are settled once whatever path
+// the call takes.
+public analyzeGenericCallTo(BodyChecker checker, CallExpressionNode node, Signature signature,
+                            GenericCallee callee, Type? expected) -> Type {
     let pending = new PendingArguments(node.arguments());
-    Type result = checkGenericCall(checker, node, entry, name, expected, pending);
+    Type result = checkGenericCall(checker, node, signature, callee, expected, pending);
     pending.settle(checker);
     return result;
 }
 
+// How a generic call names its callee: its name, whether it is a function or a method, and what an
+// example writes before the '<...>' list, as 'box.map'. A generic method also carries the type that
+// declares it, whose type arguments its bounds and its body read as well.
+public final class GenericCallee {
+    protected string name;
+    protected string kindWord;
+    protected string spelled;
+    protected Type? receiver;
+
+    public constructor(this.name, this.kindWord, this.spelled, this.receiver);
+
+    protected kindSubject() -> string {
+        if (this.kindWord == "method") {
+            return "Method '{this.name}'";
+        }
+        return "Function '{this.name}'";
+    }
+}
+
 // Whether the lambdas of a call bound every type argument the call left open, filling those slots of
 // 'typeArguments' when they did.
+// The refusal of a call whose type argument stands for a throws list of none or several types,
+// where 'callee' also uses that type parameter as the type of a value, which has to be one type.
+// Null when no type argument is such a list or the callee uses none of them that way.
+public thrownListAsValue(BodyChecker checker, Signature signature, GreenNode owner,
+                         Type[] arguments, TypeParamType[] typeParameters, string callee,
+                         TypeArgumentInference? inference) -> string? {
+    for (long i = 0; i < arguments.length && i < typeParameters.length; i++) {
+        let listed = arguments[i];
+        if (!(listed is ThrownListType) || !usesAsValue(signature, owner, i)) {
+            continue;
+        }
+        string parameter = typeParameters[i].name();
+        string source = "the argument it is taken from";
+        if (inference != null && inference.sourceOf(i) >= 0) {
+            source = "argument {inference.sourceOf(i) + 1}";
+        }
+        string opening = "{callee} uses its type parameter '{parameter}' as the type of a value, so "
+            + "'{parameter}' has to be one type";
+        if (listed.members().length == 0) {
+            return "{opening}, but here it stands for an empty throws list, because {source} "
+                + "throws nothing.";
+        }
+        let spelled = new List<string>();
+        for (let member in listed.members()) {
+            spelled.push(checker.names().quoted(member));
+        }
+        return "{opening}, but here it stands for the throws list of {source}, which is "
+            + "{diagnostics.andJoined(spelled.toArray())}.";
+    }
+    return null;
+}
+
+usesAsValue(Signature signature, GreenNode owner, long index) -> bool {
+    if (convert.mentionsAsValue(signature.returnType(), owner, index)) {
+        return true;
+    }
+    for (let parameter in signature.parameters()) {
+        if (convert.mentionsAsValue(parameter.type(), owner, index)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// True when a type argument stands for what a lambda argument throws, which the exceptions phase
+// settles.
+public awaitsThrows(Type[] arguments) -> bool {
+    for (let argument in arguments) {
+        if (argument is PendingThrowsType) {
+            return true;
+        }
+    }
+    return false;
+}
+
 boundByLambdas(TypeArgumentInference inference, List<Type?> typeArguments) -> bool {
     for (long i = 0; i < typeArguments.length(); i++) {
         let bound = inference.binding(i);
@@ -1393,9 +1495,9 @@ boundByLambdas(TypeArgumentInference inference, List<Type?> typeArguments) -> bo
     return true;
 }
 
-checkGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry entry, string name,
-                 Type? expected, PendingArguments pending) -> Type {
-    let signature = entry.signature();
+checkGenericCall(BodyChecker checker, CallExpressionNode node, Signature signature,
+                 GenericCallee callee, Type? expected, PendingArguments pending) -> Type {
+    string name = callee.name;
     let arguments = node.arguments();
     Parameter[] declared = signature.parameters();
     bool genericResult = convert.containsTypeParam(signature.returnType());
@@ -1406,9 +1508,9 @@ checkGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry ent
         }
     }
     if (usesNamedArguments(arguments)) {
-        checker.reporter().report("'{name}' is generic, and a call to a generic function cannot name its "
-            + "arguments. Pass them in order, as in '{name}{positionalSpelling(arguments)}'.",
-            node.span());
+        checker.reporter().report("'{name}' is generic, and a call to a generic {callee.kindWord} cannot "
+            + "name its arguments. Pass them in order, as in "
+            + "'{callee.spelled}{positionalSpelling(arguments)}'.", node.span());
         analyzeArgumentsOnly(checker, arguments);
         return checker.store().errorType();
     }
@@ -1430,8 +1532,8 @@ checkGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry ent
             for (let parameter in typeParameters) {
                 names.push(parameter.name());
             }
-            checker.reporter().report(calls.countRefusal("Generic function '{name}' takes", arity, arity,
-                given, "type argument", names.toArray()), node.span());
+            checker.reporter().report(calls.countRefusal("Generic {callee.kindWord} '{name}' takes",
+                arity, arity, given, "type argument", names.toArray()), node.span());
             analyzeArgumentsOnly(checker, arguments);
             return checker.store().errorType();
         }
@@ -1465,7 +1567,7 @@ checkGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry ent
         // may be what gives the type argument its type, and an extra one has no parameter to bind. The count
         // does not depend on the type of any argument, so it is refused even where one is.
         if (argument == null && !calls.acceptsArgumentCount(signature, arguments.argumentsCount())) {
-            checker.reporter().report(calls.arityRefusal("Function '{name}'", signature,
+            checker.reporter().report(calls.arityRefusal(callee.kindSubject(), signature,
                 arguments.argumentsCount()), node.span());
             return checker.store().errorType();
         }
@@ -1473,7 +1575,8 @@ checkGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry ent
             return checker.store().errorType();
         }
         if (argument == null && explicitList == null) {
-            bool untyped = voidtypearguments.inferFromLambdas(checker, arguments, parameters, inference);
+            bool untyped = voidtypearguments.inferFromLambdas(checker, arguments, parameters,
+                signature.returnType(), inference);
             if (!untyped && boundByLambdas(inference, typeArguments)) {
                 argument = typeArguments.get(i);
             } else {
@@ -1506,8 +1609,8 @@ checkGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry ent
                     write = "Write its type arguments";
                 }
                 string spelled = exampleArguments(checker, node.arguments(), reportedBefore);
-                checker.reporter().report("{unshown} {write}, as in '{name}<{listed}>{spelled}'.",
-                    node.span());
+                checker.reporter().report("{unshown} {write}, as in "
+                    + "'{callee.spelled}<{listed}>{spelled}'.", node.span());
                 return checker.store().errorType();
             }
         }
@@ -1517,6 +1620,15 @@ checkGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry ent
         resolved.push(argument);
     }
     Type[] resolvedArguments = resolved.toArray();
+    let listedAsValue = thrownListAsValue(checker, signature, owner, resolvedArguments,
+        typeParameters, "'{name}'", explicitList == null ? inference : null);
+    if (listedAsValue != null) {
+        checker.reporter().report(listedAsValue, node.span());
+        return checker.store().errorType();
+    }
+    if (awaitsThrows(resolvedArguments)) {
+        checker.result().notePendingThrows(node.green());
+    }
 
     bool bounded = true;
     for (long i = 0; i < arity; i++) {
@@ -1524,7 +1636,8 @@ checkGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry ent
         if (explicitList != null && i < explicitList.argumentsCount()) {
             at = explicitList.arguments(i).span();
         }
-        if (!checker.resolver().checkArgumentBounds(typeParameters[i], resolvedArguments, at)) {
+        if (!checker.resolver().checkArgumentBounds(typeParameters[i], resolvedArguments, at,
+                callee.receiver)) {
             bounded = false;
         }
     }
@@ -1532,7 +1645,7 @@ checkGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry ent
     long count = arguments.argumentsCount();
     long required = calls.requiredArgumentCount(signature);
     if (count < required || count > parameters.length) {
-        checker.reporter().report(calls.arityRefusal("Function '{name}'", signature, count), node.span());
+        checker.reporter().report(calls.arityRefusal(callee.kindSubject(), signature, count), node.span());
         return checker.store().substitute(signature.returnType(), owner, resolvedArguments);
     }
     for (long i = 0; i < count && i < parameters.length; i++) {
@@ -1565,7 +1678,8 @@ checkGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry ent
             } else if (!(parameterType is ErrorType) && !(actual is ErrorType)
                     && !convert.isAssignableStrict(parameterType, actual)) {
                 string provenance = "";
-                if (explicitList == null && !convert.bytesForByteArray(parameterType, actual)) {
+                if (explicitList == null && !convert.bytesForByteArray(parameterType, actual)
+                        && !convert.byteArrayForBytes(parameterType, actual)) {
                     provenance = inference.provenance(parameters[i].type(), name, "(...)", checker.names());
                 }
                 string hint = nullguidance.valueAssignabilityHint(checker, parameterType, actual, argument);
@@ -1578,7 +1692,7 @@ checkGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry ent
 
     if (bounded) {
         checker.result().setCallTypeArguments(node.green(), resolvedArguments);
-        checker.recordGenericCall(signature, resolvedArguments, node.span());
+        checker.recordGenericCall(signature, resolvedArguments, node.span(), callee.receiver);
     }
     return checker.store().substitute(signature.returnType(), owner, resolvedArguments);
 }

@@ -1,0 +1,321 @@
+// Types for sharing state between tasks. Every operation on these classes is thread-safe, so any
+// number of tasks can hold the same instance.
+import RawArray from @std.collections.rawarray;
+import Iterable from @std.collections.iterator;
+import Iterator from @std.collections.iterator;
+import ThreadLock from @std.system;
+import @std.system;
+
+// A value that tasks read and replace without a lock. The compiler turns 'read', 'write' and
+// 'compareAndSet' into the processor's atomic instructions, so the bodies below never run.
+// References are compared by identity.
+export shared final class Atomic<shared T> {
+    T value;
+
+    export constructor(this.value);
+
+    // Returns the current value.
+    export read() -> T {
+        return this.value;
+    }
+
+    // Replaces the value.
+    export write(T value) {
+        this.value = value;
+    }
+
+    // Replaces the value with `replacement` only if it is still `expected`, and returns whether it
+    // did.
+    export compareAndSet(T expected, T replacement) -> bool {
+        panic("Internal: 'compareAndSet' is lowered to an atomic instruction");
+    }
+
+    // Adds `amount` and returns the new value.
+    export add<T: Number<T>>(T amount) -> T {
+        while (true) {
+            T current = this.read();
+            T next = current.plus(amount);
+            if (this.compareAndSet(current, next)) {
+                return next;
+            }
+        }
+    }
+
+    // Adds one and returns the new value.
+    export increment<T: Number<T>>() -> T {
+        while (true) {
+            T current = this.read();
+            T next = current.incremented();
+            if (this.compareAndSet(current, next)) {
+                return next;
+            }
+        }
+    }
+
+    // Subtracts one and returns the new value.
+    export decrement<T: Number<T>>() -> T {
+        while (true) {
+            T current = this.read();
+            T next = current.decremented();
+            if (this.compareAndSet(current, next)) {
+                return next;
+            }
+        }
+    }
+}
+
+// A value that tasks change one at a time. The value itself does not need to be shareable, because
+// it never leaves the lock.
+export shared final class Mutex<T> {
+    const ThreadLock guard;
+    T value;
+    long holder;
+
+    export constructor(this.value) {
+        this.guard = system.createLock();
+        this.holder = 0;
+    }
+
+    // Waits until no other task holds the lock, then runs `body` with the value and returns its
+    // result. `body` must be a shared function and its result must be shareable, so the value cannot
+    // escape the lock.
+    export lock<shared R, E: Error>((shared (T) -> R throws E) body) -> R throws E {
+        this.enter();
+        R result = try body(this.value);
+        this.leave();
+        return result;
+    } catch (E failure) {
+        this.leave();
+        rethrow;
+    }
+
+    // Waits until no other task holds the lock, then replaces the value with what `body` returns. Use
+    // this for numbers and structs: 'lock' passes them as a copy, so changes made there are lost.
+    export update<E: Error>((shared (T) -> T throws E) body) throws E {
+        this.enter();
+        this.value = try body(this.value);
+        this.leave();
+    } catch (E failure) {
+        this.leave();
+        rethrow;
+    }
+
+    enter() {
+        long caller = system.threadToken();
+        system.acquireLock(this.guard);
+        if (this.holder == caller) {
+            system.releaseLock(this.guard);
+            panic("tried to lock a mutex inside a body this task is already running under its "
+                + "lock, which would wait for ever. Use the value that body was given instead");
+        }
+        while (this.holder != 0) {
+            system.waitOnLock(this.guard, -1);
+        }
+        this.holder = caller;
+        system.releaseLock(this.guard);
+    }
+
+    leave() {
+        system.acquireLock(this.guard);
+        this.holder = 0;
+        system.wakeLockWaiters(this.guard);
+        system.releaseLock(this.guard);
+    }
+
+    destructor() {
+        system.destroyLock(this.guard);
+    }
+}
+
+// Thrown by 'send' when the channel's receiving end has been released, so no one would ever receive
+// the value.
+export class ChannelClosed extends Error {
+    export constructor() {
+        super("could not send: the receiving end of the channel has been released, so nothing would "
+            + "ever receive the value. Keep the Channel while values are sent to it");
+    }
+}
+
+// The receiving end of a channel, which carries values from tasks that send to tasks that receive.
+// The channel closes when its last Sender is released, and a 'for' loop over it ends once it is
+// closed and empty.
+export shared final class Channel<shared T> implements Iterable<T> {
+    const ChannelState<T> state;
+
+    // Makes a channel that buffers up to `capacity` values; 'send' waits while the buffer is full.
+    // With a capacity of zero, every send waits until a task receives the value.
+    export constructor(long capacity) {
+        this.state = new ChannelState<T>(capacity);
+    }
+
+    // Returns the next value, waiting for one to be sent, or null once the channel is closed and
+    // empty.
+    export receive() -> T? {
+        return this.state.take(-1);
+    }
+
+    // Like 'receive()', but also returns null when nothing arrives within `timeoutMillis`
+    // milliseconds. 'isClosed' tells the two cases apart.
+    export receive(long timeoutMillis) -> T? {
+        return this.state.take(timeoutMillis < 0 ? 0 : timeoutMillis);
+    }
+
+    // Returns whether every Sender has been released, so no more values can arrive.
+    export isClosed() -> bool {
+        return this.state.isClosed();
+    }
+
+    // Returns a new Sender for this channel. The channel stays open while any Sender is alive.
+    export sender() -> Sender<T> {
+        this.state.addSender();
+        return new Sender<T>(this.state);
+    }
+
+    export override makeIterator() -> Iterator<T> {
+        return new ChannelIterator<T>(this);
+    }
+
+    destructor() {
+        this.state.releaseReceiver();
+    }
+}
+
+// Sends values into one channel. Releasing the last Sender closes the channel.
+export shared final class Sender<shared T> {
+    const ChannelState<T> state;
+
+    protected constructor(this.state);
+
+    // Puts `value` into the channel. Waits while the buffer is full, or, with a capacity of zero,
+    // until a task receives the value.
+    export send(T value) throws ChannelClosed {
+        try this.state.put(value);
+    }
+
+    destructor() {
+        this.state.releaseSender();
+    }
+}
+
+final class ChannelIterator<shared T> implements Iterator<T> {
+    const Channel<T> channel;
+
+    protected constructor(this.channel);
+
+    protected override next() -> T? {
+        return this.channel.receive();
+    }
+}
+
+// The state both ends of a channel share: a ring buffer of values not yet received, and the lock
+// that guards every change to it.
+shared final class ChannelState<shared T> {
+    const ThreadLock lock;
+    const long capacity;
+    RawArray<T> slots;
+    long head;
+    long count;
+    long received;
+    long senders;
+    bool everSent;
+    bool receiverReleased;
+
+    protected constructor(this.capacity) {
+        this.lock = system.createLock();
+        this.slots = RawArray<T>.allocate(this.capacity < 1 ? 1 : this.capacity);
+        this.head = 0;
+        this.count = 0;
+        this.received = 0;
+        this.senders = 0;
+        this.everSent = false;
+        this.receiverReleased = false;
+    }
+
+    protected put(T value) throws ChannelClosed {
+        system.acquireLock(this.lock);
+        while (!this.receiverReleased && this.count == this.slots.length()) {
+            system.waitOnLock(this.lock, -1);
+        }
+        if (this.receiverReleased) {
+            system.releaseLock(this.lock);
+            throw new ChannelClosed();
+        }
+        this.slots.write((this.head + this.count) % this.slots.length(), value);
+        this.count++;
+        long position = this.received + this.count;
+        system.wakeLockWaiters(this.lock);
+        if (this.capacity == 0) {
+            while (!this.receiverReleased && this.received < position) {
+                system.waitOnLock(this.lock, -1);
+            }
+        }
+        system.releaseLock(this.lock);
+    }
+
+    // Returns the next value. A negative `limitMillis` waits with no time limit.
+    protected take(long limitMillis) -> T? {
+        long deadline = system.monotonicMillis() + limitMillis;
+        system.acquireLock(this.lock);
+        while (this.count == 0 && !this.closed()) {
+            if (limitMillis < 0) {
+                system.waitOnLock(this.lock, -1);
+            } else {
+                long left = deadline - system.monotonicMillis();
+                if (left <= 0) {
+                    system.releaseLock(this.lock);
+                    return null;
+                }
+                system.waitOnLock(this.lock, left);
+            }
+        }
+        if (this.count == 0) {
+            system.releaseLock(this.lock);
+            return null;
+        }
+        T value = this.slots.read(this.head);
+        this.slots.clear(this.head);
+        this.head = (this.head + 1) % this.slots.length();
+        this.count--;
+        this.received++;
+        system.wakeLockWaiters(this.lock);
+        system.releaseLock(this.lock);
+        return value;
+    }
+
+    protected isClosed() -> bool {
+        system.acquireLock(this.lock);
+        bool ended = this.closed();
+        system.releaseLock(this.lock);
+        return ended;
+    }
+
+    // Whether a Sender was ever made and every one has been released.
+    closed() -> bool {
+        return this.everSent && this.senders == 0;
+    }
+
+    protected addSender() {
+        system.acquireLock(this.lock);
+        this.senders++;
+        this.everSent = true;
+        system.releaseLock(this.lock);
+    }
+
+    protected releaseSender() {
+        system.acquireLock(this.lock);
+        this.senders--;
+        system.wakeLockWaiters(this.lock);
+        system.releaseLock(this.lock);
+    }
+
+    protected releaseReceiver() {
+        system.acquireLock(this.lock);
+        this.receiverReleased = true;
+        system.wakeLockWaiters(this.lock);
+        system.releaseLock(this.lock);
+    }
+
+    destructor() {
+        system.destroyLock(this.lock);
+    }
+}

@@ -158,6 +158,27 @@ public class KeyTypeObligation extends Obligation {
     }
 }
 
+// An 'Atomic' instantiated at a value type that still names a type parameter, which fits one machine
+// word only for some arguments.
+public class AtomicValueObligation extends Obligation {
+    DeclaredType atomicTemplate;
+    Type openValue;
+
+    public constructor(DeclaredType template, Type value, Span span) {
+        this.atomicTemplate = template;
+        this.openValue = value;
+        super(span);
+    }
+
+    protected template() -> DeclaredType {
+        return this.atomicTemplate;
+    }
+
+    protected value() -> Type {
+        return this.openValue;
+    }
+}
+
 // 'new T[n]', whose element type only determines whether a freshly allocated slot is a valid value once
 // the argument is supplied.
 public class ArrayElementObligation extends Obligation {
@@ -270,14 +291,17 @@ public final class FunctionThrowsMention {
 
 // A generic call whose type arguments still mention a type parameter of the enclosing owner;
 // it names a concrete callee instantiation only once the owner's own arguments are supplied. A call
-// written inside a conditional member carries the member's constraints as guards.
+// written inside a conditional member carries the member's constraints as guards. A call of a generic
+// method carries the type that declares the method, whose type arguments the method's body also
+// reads.
 public final class OpenCall {
     protected Signature callee;
     protected Type[] arguments;
     protected MemberConstraint[] guards;
     protected Origin origin;
+    protected Type? receiver;
 
-    protected constructor(this.callee, this.arguments, this.guards, this.origin);
+    protected constructor(this.callee, this.arguments, this.guards, this.origin, this.receiver);
 
     public calledSignature() -> Signature {
         return this.callee;
@@ -296,8 +320,9 @@ public final class ConcreteCall {
     protected Signature callee;
     protected Type[] arguments;
     protected Origin origin;
+    protected Type? receiver;
 
-    protected constructor(this.callee, this.arguments, this.origin);
+    protected constructor(this.callee, this.arguments, this.origin, this.receiver);
 
     public calledSignature() -> Signature {
         return this.callee;
@@ -345,10 +370,22 @@ class OwnerEntry {
 public final class ObligationRegistry {
     Map<GreenNode, OwnerEntry> owners;
     List<ConcreteCall> concreteCalls;
+    Map<GreenNode, GreenNode> enclosingOwners;
 
     public constructor() {
         this.owners = new Map<GreenNode, OwnerEntry>();
         this.concreteCalls = new List<ConcreteCall>();
+        this.enclosingOwners = new Map<GreenNode, GreenNode>();
+    }
+
+    // Notes that the generic method 'owner' is declared in the generic type 'enclosing', so its
+    // body also names the type's own parameters.
+    public noteEnclosingOwner(GreenNode owner, GreenNode enclosing) {
+        this.enclosingOwners.set(owner, enclosing);
+    }
+
+    protected enclosingOwnerOf(GreenNode owner) -> GreenNode? {
+        return this.enclosingOwners.get(owner);
     }
 
     public recordObligation(GreenNode owner, string filePath, Obligation obligation) {
@@ -356,8 +393,9 @@ public final class ObligationRegistry {
     }
 
     public recordOpenCall(GreenNode owner, string filePath, Signature callee, Type[] arguments,
-                   MemberConstraint[] guards, Origin origin) {
-        this.entryFor(owner, filePath).openCalls().push(new OpenCall(callee, arguments, guards, origin));
+                   MemberConstraint[] guards, Origin origin, Type? receiver = null) {
+        this.entryFor(owner, filePath).openCalls().push(new OpenCall(callee, arguments, guards, origin,
+            receiver));
     }
 
     // Every generic call whose type arguments name type parameters of the generic it is written in.
@@ -374,8 +412,9 @@ public final class ObligationRegistry {
         return this.concreteCalls;
     }
 
-    public recordConcreteCall(Signature callee, Type[] arguments, Origin origin) {
-        this.concreteCalls.push(new ConcreteCall(callee, arguments, origin));
+    public recordConcreteCall(Signature callee, Type[] arguments, Origin origin,
+                              Type? receiver = null) {
+        this.concreteCalls.push(new ConcreteCall(callee, arguments, origin, receiver));
     }
 
     // Appends another registry's records after this one's; an owner both hold keeps one entry.
@@ -384,6 +423,9 @@ public final class ObligationRegistry {
             this.entryFor(entry.key, entry.value.file()).append(entry.value);
         }
         this.concreteCalls.pushAll(other.concreteCalls);
+        for (let enclosed in other.enclosingOwners) {
+            this.enclosingOwners.set(enclosed.key, enclosed.value);
+        }
     }
 
     protected entryOf(GreenNode owner) -> OwnerEntry? {
@@ -422,7 +464,8 @@ public check(TypeStore store, TypeNameDirectory names, ObligationRegistry regist
 }
 
 // One concrete type-argument assignment for one owner, plus the mention or call that supplied
-// the arguments and how many cascade steps produced it.
+// the arguments and how many cascade steps produced it. A generic method of a generic type also
+// carries the type arguments of the instantiation it is called on.
 class Assignment {
     protected GreenNode owner;
     protected Type[] arguments;
@@ -431,17 +474,21 @@ class Assignment {
     // One note for each generic between the line that wrote the type arguments and this owner, in
     // the order the program reaches them.
     protected RelatedLocation[] steps;
+    protected Type[] enclosing;
 
-    protected constructor(this.owner, this.arguments, this.origin, this.depth, this.steps);
+    protected constructor(this.owner, this.arguments, this.origin, this.depth, this.steps,
+                          this.enclosing);
 }
 
 class AssignmentKey {
     GreenNode keyOwner;
     Type[] keyArguments;
+    Type[] keyEnclosing;
 
-    protected constructor(GreenNode owner, Type[] arguments) {
+    protected constructor(GreenNode owner, Type[] arguments, Type[] enclosing) {
         this.keyOwner = owner;
         this.keyArguments = arguments;
+        this.keyEnclosing = enclosing;
     }
 
     override hash() -> long {
@@ -449,23 +496,37 @@ class AssignmentKey {
         for (let argument in this.keyArguments) {
             combined = combined * 31 + argument.hash();
         }
+        for (let argument in this.keyEnclosing) {
+            combined = combined * 37 + argument.hash();
+        }
         return combined;
     }
 
     override equals(AssignmentKey other) -> bool {
-        if (this.keyOwner != other.keyOwner) {
-            return false;
-        }
-        if (this.keyArguments.length != other.keyArguments.length) {
-            return false;
-        }
-        for (long i = 0; i < this.keyArguments.length; i++) {
-            if (this.keyArguments[i] != other.keyArguments[i]) {
-                return false;
-            }
-        }
-        return true;
+        return this.keyOwner == other.keyOwner && sameTypes(this.keyArguments, other.keyArguments)
+            && sameTypes(this.keyEnclosing, other.keyEnclosing);
     }
+}
+
+sameTypes(Type[] left, Type[] right) -> bool {
+    if (left.length != right.length) {
+        return false;
+    }
+    for (long i = 0; i < left.length; i++) {
+        if (left[i] != right[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The type arguments a generic method's body reads from the instantiation that declares it, or none
+// when the declaring type is not generic.
+enclosingArgumentsOf(Type? receiver) -> Type[] {
+    if (receiver is InstantiationType) {
+        return receiver.arguments();
+    }
+    return [];
 }
 
 class ObligationPass {
@@ -526,7 +587,8 @@ class ObligationPass {
         for (let call in this.registry.allConcreteCalls().toArray()) {
             let declaration = call.callee.declaration();
             if (declaration != null) {
-                this.push(declaration, call.arguments, call.origin, 0);
+                this.push(declaration, call.arguments, call.origin, 0, [],
+                    enclosingArgumentsOf(call.receiver));
             }
         }
         while (this.worklist.length() > 0) {
@@ -600,17 +662,18 @@ class ObligationPass {
     // at the line a reader wrote and names the instantiation they wrote there. Cascades past the
     // depth limit come from a polymorphically recursive generic call chain that would never
     // close; the judged prefix is deep enough for any real code.
-    push(GreenNode owner, Type[] arguments, Origin origin, long depth, RelatedLocation[] steps = []) {
+    push(GreenNode owner, Type[] arguments, Origin origin, long depth, RelatedLocation[] steps = [],
+         Type[] enclosing = []) {
         if (depth > Limits.cascadeDepth) {
             return;
         }
         if (!this.productive.contains(owner)) {
             return;
         }
-        if (!this.seen.add(new AssignmentKey(owner, arguments))) {
+        if (!this.seen.add(new AssignmentKey(owner, arguments, enclosing))) {
             return;
         }
-        this.worklist.push(new Assignment(owner, arguments, origin, depth, steps));
+        this.worklist.push(new Assignment(owner, arguments, origin, depth, steps, enclosing));
     }
 
     // The steps of 'assignment' with one more, the note at 'step' that reaches the next generic.
@@ -639,9 +702,18 @@ class ObligationPass {
                     continue;
                 }
                 let substituted = this.substituteAll(call.arguments, assignment);
+                let receiver = call.receiver;
+                Type[] enclosing = [];
+                if (receiver != null) {
+                    let concreteReceiver = this.substituteOne(receiver, assignment);
+                    if (concreteReceiver == null) {
+                        continue;
+                    }
+                    enclosing = enclosingArgumentsOf(concreteReceiver);
+                }
                 if (substituted != null) {
                     this.push(declaration, substituted, assignment.origin, assignment.depth + 1,
-                        this.stepsThrough(assignment, call.origin, "called"));
+                        this.stepsThrough(assignment, call.origin, "called"), enclosing);
                 }
             }
         }
@@ -682,8 +754,7 @@ class ObligationPass {
     substituteAll(Type[] arguments, Assignment assignment) -> Type[]? {
         let substituted = new List<Type>();
         for (let argument in arguments) {
-            let concrete = this.store.substitute(argument, assignment.owner,
-                assignment.arguments);
+            let concrete = this.substituted(argument, assignment);
             if (convert.containsTypeParam(concrete)) {
                 return null;
             }
@@ -702,8 +773,7 @@ class ObligationPass {
             }
             Type argument = assignment.arguments[index];
             for (let bound in guard.bounds()) {
-                Type here = this.store.substitute(bound, assignment.owner,
-                    assignment.arguments);
+                Type here = this.substituted(bound, assignment);
                 if (!hierarchy.satisfiesBound(argument, here, [])) {
                     return false;
                 }
@@ -771,6 +841,16 @@ class ObligationPass {
                             + "{insideGeneric.quoted(keyed.key())} here");
                 }
             },
+            is AtomicValueObligation held -> {
+                let concrete = this.substituteOne(held.value(), assignment);
+                if (concrete != null) {
+                    this.report(entry, assignment, obligation.span(),
+                        capabilities.atomicValueIssue(assignment.origin.display(), held.template(),
+                            concrete, whereWritten),
+                        "{insideGeneric.quotedName(held.template())} holds "
+                            + "{insideGeneric.quoted(held.value())} here");
+                }
+            },
             is ArrayElementObligation created -> {
                 let concrete = this.substituteOne(created.element(), assignment);
                 if (concrete != null) {
@@ -789,8 +869,19 @@ class ObligationPass {
         return this.names.namesFor(origin.file());
     }
 
-    substituteOne(Type open, Assignment assignment) -> Type? {
+    // The type with the assignment's arguments in place of its owner's type parameters, and of the
+    // parameters of the type that declares it when the owner is a generic method.
+    substituted(Type open, Assignment assignment) -> Type {
         let concrete = this.store.substitute(open, assignment.owner, assignment.arguments);
+        let enclosingOwner = this.registry.enclosingOwnerOf(assignment.owner);
+        if (enclosingOwner != null && assignment.enclosing.length > 0) {
+            concrete = this.store.substitute(concrete, enclosingOwner, assignment.enclosing);
+        }
+        return concrete;
+    }
+
+    substituteOne(Type open, Assignment assignment) -> Type? {
+        let concrete = this.substituted(open, assignment);
         if (concrete is ErrorType || convert.containsTypeParam(concrete)) {
             return null;
         }

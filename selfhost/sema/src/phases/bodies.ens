@@ -114,6 +114,8 @@ import TypeStore from model.types;
 import PrimitiveKind from model.types;
 import ObligationRegistry from phases.obligations;
 import Obligation from phases.obligations;
+import HashObligation from phases.obligations;
+import EqualityObligation from phases.obligations;
 import Origin from phases.obligations;
 import phases.obligations;
 import List from @std.collections.list;
@@ -579,6 +581,7 @@ public final class BodyChecker implements NoreturnCalls {
     GreenNode? obligationOwner;
     string genericOwnerName;
     string obligationOwnerDisplay;
+    bool valueBehaviorWaived;
 
     protected constructor(ModuleContext context, Map<string, ModuleContext> contextsByPath,
                 PreludeScope preludeScope, List<FileDiagnostic> collected) {
@@ -619,6 +622,7 @@ public final class BodyChecker implements NoreturnCalls {
         this.rightOperandWriteSets = new Map<GreenNode, Map<NarrowingPath, NarrowingFact>>();
         this.deferredObligations = context.obligations();
         this.obligationOwner = null;
+        this.valueBehaviorWaived = false;
         this.genericOwnerName = "";
         this.obligationOwnerDisplay = "";
     }
@@ -644,6 +648,7 @@ public final class BodyChecker implements NoreturnCalls {
         trial.discardedValue = this.discardedValue;
         trial.wholeValue = this.wholeValue;
         trial.obligationOwner = this.obligationOwner;
+        trial.valueBehaviorWaived = this.valueBehaviorWaived;
         trial.genericOwnerName = this.genericOwnerName;
         trial.obligationOwnerDisplay = this.obligationOwnerDisplay;
         this.typeResolver.beginTrial();
@@ -962,13 +967,27 @@ public final class BodyChecker implements NoreturnCalls {
         }
     }
 
-    // Records the deferred judgments and open generic calls of the generic function 'declaration' against
-    // it while its body is checked. 'name' and 'display' are its name and its quoted spelling with type
-    // parameters.
-    public enterFunctionObligationOwner(GreenNode declaration, string name, string display) {
+    // Records the deferred judgments and open generic calls of the generic function or method
+    // 'declaration' against it while its body is checked. 'name' and 'display' are its name and its
+    // quoted spelling with type parameters, and 'enclosing' is the generic type a method is declared
+    // in. Returns the owner it replaces, for 'restoreObligationOwner' to put back.
+    public enterFunctionObligationOwner(GreenNode declaration, string name, string display,
+                                        GreenNode? enclosing = null) -> ObligationOwnerState {
+        let replaced = new ObligationOwnerState(this.obligationOwner, this.genericOwnerName,
+            this.obligationOwnerDisplay);
         this.obligationOwner = declaration;
         this.genericOwnerName = name;
         this.obligationOwnerDisplay = display;
+        if (enclosing != null) {
+            this.deferredObligations.noteEnclosingOwner(declaration, enclosing);
+        }
+        return replaced;
+    }
+
+    public restoreObligationOwner(ObligationOwnerState replaced) {
+        this.obligationOwner = replaced.owner;
+        this.genericOwnerName = replaced.name;
+        this.obligationOwnerDisplay = replaced.display;
     }
 
     public leaveObligationOwner() {
@@ -981,7 +1000,18 @@ public final class BodyChecker implements NoreturnCalls {
         return this.genericOwnerName;
     }
 
+    // While a frozen collection's own 'equals' or 'hash' is checked, what it compares and hashes is
+    // not judged per instantiation: an instantiation over values with no '==' or no hash simply has
+    // none, and a use of it is refused where it is written instead.
+    public waiveValueBehavior(bool waived) {
+        this.valueBehaviorWaived = waived;
+    }
+
     public recordObligation(Obligation obligation) {
+        if (this.valueBehaviorWaived
+                && (obligation is HashObligation || obligation is EqualityObligation)) {
+            return;
+        }
         let owner = this.obligationOwner;
         if (owner != null) {
             obligation.setGuards(this.activeGuardsFor(owner));
@@ -991,8 +1021,10 @@ public final class BodyChecker implements NoreturnCalls {
         }
     }
 
-    public recordGenericCall(Signature signature, Type[] arguments, Span at) {
-        bool open = false;
+    // Records a call of a generic function or method with these type arguments. 'receiver' is the
+    // type that declares a generic method, whose own type arguments the method's body reads too.
+    public recordGenericCall(Signature signature, Type[] arguments, Span at, Type? receiver = null) {
+        bool open = receiver != null && convert.containsTypeParam(receiver);
         for (let argument in arguments) {
             if (convert.containsTypeParam(argument)) {
                 open = true;
@@ -1001,7 +1033,7 @@ public final class BodyChecker implements NoreturnCalls {
         if (!open) {
             this.deferredObligations.recordConcreteCall(signature, arguments,
                 new Origin(this.context().module().filePath(), at,
-                    obligations.quotedCall(signature.name(), arguments, this.names())));
+                    obligations.quotedCall(signature.name(), arguments, this.names())), receiver);
             return;
         }
         let owner = this.obligationOwner;
@@ -1009,7 +1041,7 @@ public final class BodyChecker implements NoreturnCalls {
             this.deferredObligations.recordOpenCall(owner, this.context().module().filePath(),
                 signature, arguments, this.activeGuardsFor(owner),
                 new Origin(this.context().module().filePath(), at,
-                    obligations.quotedCall(signature.name(), arguments, this.names())));
+                    obligations.quotedCall(signature.name(), arguments, this.names())), receiver);
         }
     }
 
@@ -1371,19 +1403,15 @@ public final class BodyChecker implements NoreturnCalls {
         }
     }
 
-    // The graph read what the embed names, so here its bytes only get their type: 'bytes', or a
-    // fresh 'byte[]' where one is the target. One it could not read is reported at its path
-    // already, and so is a standard library without the module that declares 'EmbeddedFile'.
-    analyzeEmbed(EmbedExpressionNode node, Type? target = null) -> Type {
+    // The graph read what the embed names, so here its bytes only get their type. One it could not
+    // read is reported at its path already, and so is a standard library without the module that
+    // declares 'EmbeddedFile'.
+    analyzeEmbed(EmbedExpressionNode node) -> Type {
         let content = this.context().module().embedded(node.span().start);
         if (content == null) {
             return this.store().errorType();
         }
         if (!content.folderForm) {
-            let array = this.store().arrayOf(this.store().primitive(PrimitiveKind.Byte));
-            if (target != null && convert.coreOf(target) == array) {
-                return array;
-            }
             return this.store().bytesType();
         }
         let file = this.store().findDeclared(StandardLibrary.embedModule, "EmbeddedFile");
@@ -1439,11 +1467,6 @@ public final class BodyChecker implements NoreturnCalls {
         }
         if (node is StructLiteralExpressionNode) {
             Type adapted = literaltyping.analyzeStructLiteralAdapt(this, node, target);
-            this.result().setType(node.green(), adapted);
-            return adapted;
-        }
-        if (node is EmbedExpressionNode) {
-            Type adapted = this.analyzeEmbed(node, target);
             this.result().setType(node.green(), adapted);
             return adapted;
         }
@@ -1590,4 +1613,13 @@ wholeValueOf(Statement statement) -> GreenNode? {
         return null;
     }
     return syntax.unwrapParentheses(value).green();
+}
+
+// The obligation owner a generic function or method's body replaces while it is checked.
+public final class ObligationOwnerState {
+    protected GreenNode? owner;
+    protected string name;
+    protected string display;
+
+    protected constructor(this.owner, this.name, this.display);
 }

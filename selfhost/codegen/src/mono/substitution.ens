@@ -1,6 +1,8 @@
 // The type-argument assignment one generic instance lowers under. A body is checked once in its
 // template, so applying the substitution is what turns every recorded type concrete. A record
-// instance also maps the template's self type, which the template type itself never mentions.
+// instance also maps the template's self type, which the template type itself never mentions. A
+// generic method of a generic type is lowered under its own arguments with the instantiation's
+// substitution enclosing them, which applies to everything the method's own does not.
 import GreenNode from @ens.frontend.syntax.green;
 import ArrayType from @ens.sema.model.types;
 import DeclaredType from @ens.sema.model.types;
@@ -9,6 +11,7 @@ import InstantiationType from @ens.sema.model.types;
 import OptionalType from @ens.sema.model.types;
 import Type from @ens.sema.model.types;
 import TypeParamType from @ens.sema.model.types;
+import ThrownListType from @ens.sema.model.types;
 import TypeStore from @ens.sema.model.types;
 import List from @std.collections.list;
 
@@ -17,8 +20,10 @@ public final class Substitution {
     Type[] typeArguments;
     Type? selfTemplate;
     Type? selfInstance;
+    Substitution? enclosingSubstitution;
 
-    public constructor(this.owningDeclaration, this.typeArguments, this.selfTemplate, this.selfInstance);
+    public constructor(this.owningDeclaration, this.typeArguments, this.selfTemplate, this.selfInstance,
+                       this.enclosingSubstitution = null);
 
     public owner() -> GreenNode {
         return this.owningDeclaration;
@@ -35,6 +40,21 @@ public final class Substitution {
     public instance() -> Type? {
         return this.selfInstance;
     }
+
+    public enclosing() -> Substitution? {
+        return this.enclosingSubstitution;
+    }
+
+    // Every type argument the instance is lowered under, the enclosing substitution's first.
+    public allArguments() -> Type[] {
+        let all = new List<Type>();
+        let enclosing = this.enclosingSubstitution;
+        if (enclosing != null) {
+            all.pushAll(List.of(enclosing.allArguments()));
+        }
+        all.pushAll(List.of(this.typeArguments));
+        return all.toArray();
+    }
 }
 
 // The substitution a record instantiation's members lower under.
@@ -45,9 +65,11 @@ public forInstantiation(InstantiationType instantiation) -> Substitution {
 }
 
 // The substitution one generic function instance lowers under. The declaration is the green node
-// sema interned the function's type parameters by.
-public forFunction(GreenNode declaration, Type[] arguments) -> Substitution {
-    return new Substitution(declaration, arguments, null, null);
+// sema interned the function's type parameters by. A generic method of a generic type is enclosed
+// by the substitution of the instantiation it is called on.
+public forFunction(GreenNode declaration, Type[] arguments, Substitution? enclosing = null)
+        -> Substitution {
+    return new Substitution(declaration, arguments, null, null, enclosing);
 }
 
 // The type with the substitution applied, recursing through optionals, arrays, and instantiation
@@ -62,9 +84,13 @@ public apply(TypeStore store, Substitution? substitution, Type type) -> Type {
         is TypeParamType parameter -> {
             Type[] arguments = substitution.arguments();
             if (parameter.owner() == substitution.owner() && parameter.index() < arguments.length) {
-                return arguments[parameter.index()];
+                let argument = arguments[parameter.index()];
+                if (argument is ThrownListType) {
+                    return argument.base();
+                }
+                return argument;
             }
-            return parameter;
+            return apply(store, substitution.enclosing(), parameter);
         },
         is OptionalType optional -> {
             return store.optionalOf(apply(store, substitution, optional.inner()));
@@ -79,7 +105,7 @@ public apply(TypeStore store, Substitution? substitution, Type type) -> Type {
             return store.functionOf(
                 applyAll(store, substitution, functionType.parameterTypes()),
                 apply(store, substitution, functionType.returnType()),
-                applyAll(store, substitution, functionType.thrownTypes()),
+                applyThrown(store, substitution, functionType.thrownTypes()),
                 functionType.isShared());
         },
         is InstantiationType nested -> {
@@ -95,12 +121,48 @@ public apply(TypeStore store, Substitution? substitution, Type type) -> Type {
             if (instance != null && declared == substitution.template()) {
                 return instance;
             }
-            return declared;
+            return apply(store, substitution.enclosing(), declared);
         },
         default -> {
             return type;
         },
     }
+}
+
+// A throws list with the substitution applied, where a type parameter bound to a whole list gives
+// every type in it, and each type is listed once.
+public applyThrown(TypeStore store, Substitution? substitution, Type[] thrownList) -> Type[] {
+    if (substitution == null) {
+        return thrownList;
+    }
+    let substituted = new List<Type>();
+    for (let entry in thrownList) {
+        Type[] given = [apply(store, substitution, entry)];
+        if (entry is TypeParamType) {
+            let argument = boundArgument(substitution, entry);
+            if (argument is ThrownListType) {
+                given = argument.members();
+            }
+        }
+        for (let member in given) {
+            if (!substituted.contains(member)) {
+                substituted.push(member);
+            }
+        }
+    }
+    return substituted.toArray();
+}
+
+// What the substitution, or one enclosing it, binds the type parameter to, or null when none does.
+boundArgument(Substitution? substitution, TypeParamType parameter) -> Type? {
+    if (substitution == null) {
+        return null;
+    }
+    if (parameter.owner() == substitution.owner()
+            && parameter.index() < substitution.arguments().length) {
+        return substitution.arguments()[parameter.index()];
+    }
+    return boundArgument(substitution.enclosing(), parameter);
 }
 
 public applyAll(TypeStore store, Substitution? substitution, Type[] typeList) -> Type[] {

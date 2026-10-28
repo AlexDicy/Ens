@@ -34,6 +34,7 @@ import OptionalType from @ens.sema.model.types;
 import StructType from @ens.sema.model.types;
 import Type from @ens.sema.model.types;
 import TypeStore from @ens.sema.model.types;
+import @ens.sema.model.types;
 import BodyRequests from mono.requests;
 import CallRequest from mono.requests;
 import mono.requests;
@@ -293,6 +294,11 @@ public final class Monomorphizer {
                 }
             }
             if (open) {
+                continue;
+            }
+            let method = call.method();
+            if (method != null) {
+                this.requestMethodInstance(method, arguments, active, depth);
                 continue;
             }
             this.requestFunction(call, arguments, depth);
@@ -567,8 +573,11 @@ public final class Monomorphizer {
                 overloadedIn(instanceMethods, method.name()));
             let info = new FunctionInfo(home, signature, method.visibility(), false, null,
                 receiverType, method, declaration, symbol, active);
-            this.record.members().push(info);
             this.index.register(signature, info);
+            if (signature.isGeneric()) {
+                continue;
+            }
+            this.record.members().push(info);
             bool lowerable = method.isConstructor()
                 || (declaration != null && declaration.body() != null);
             if (lowerable) {
@@ -615,6 +624,56 @@ public final class Monomorphizer {
         this.addPlannedFunction(home, info, depth);
         if (this.harvestsEveryBody) {
             this.harvest(this.requestsFor(home.result(), declaration), active, depth + 1);
+        }
+    }
+
+    // One generic method instance: the method 'recorded' names on its declaring type once the active
+    // substitution makes that type concrete, at these concrete type arguments. Its body lowers under
+    // its own arguments, enclosed by the substitution of the instantiation that declares it.
+    requestMethodInstance(Method recorded, Type[] arguments, Substitution? active, long depth) {
+        Type declaring = substitution.apply(this.store, active, recorded.definingType());
+        if (substitution.containsTypeParameter(declaring)) {
+            return;
+        }
+        this.requestTypeAt(declaring, depth);
+        let method = concreteMethodOn(declaring, recorded);
+        let owner = recorded.signature().declaration();
+        if (method == null || owner == null) {
+            let authority = types.authorityOf(declaring);
+            this.record.problems().push(new FileDiagnostic(authority?.filePath() ?? "",
+                "Internal: the generic method '{recorded.name()}' has no concrete method on "
+                + "'{typenames.display(declaring)}' to instantiate.", recorded.signature().nameSpan()));
+            return;
+        }
+        if (!this.seenFunctions.add(new InstanceKey(method.signature(), arguments))) {
+            return;
+        }
+        let templateInfo = this.index.infoFor(method.signature());
+        if (templateInfo == null) {
+            return;
+        }
+        let declaration = templateInfo.declaration();
+        if (declaration == null) {
+            return;
+        }
+        if (depth > Limits.cascade) {
+            this.reportOverflow(owner, recorded.name(),
+                templateInfo.context().module().filePath(), recorded.signature().nameSpan());
+            return;
+        }
+        let home = templateInfo.context();
+        let instanceSubstitution = substitution.forFunction(owner, arguments,
+            templateInfo.substitution());
+        let info = new FunctionInfo(home, method.signature(), templateInfo.visibility(), false,
+            null, templateInfo.receiverType(), method, declaration,
+            templateInfo.symbol() + symbols.instanceSuffix(arguments), instanceSubstitution);
+        this.record.functions().push(new PlannedFunctionInstance(method.signature(), arguments,
+            info));
+        this.index.registerFunctionInstance(method.signature(), arguments, info);
+        this.addPlannedFunction(home, info, depth);
+        if (this.harvestsEveryBody) {
+            this.harvest(this.requestsFor(home.result(), declaration), instanceSubstitution,
+                depth + 1);
         }
     }
 
@@ -665,6 +724,29 @@ bodyNodeOf(FunctionInfo info) -> SyntaxNode? {
     return null;
 }
 
+
+// The method of the concrete type 'declaring' that 'recorded' names. A template's members and
+// every instantiation's fill in the same order, so the position carries over.
+concreteMethodOn(Type declaring, Method recorded) -> Method? {
+    if (declaring == recorded.definingType()) {
+        return recorded;
+    }
+    for (let lists in [[typemembers.methodsOf(recorded.definingType()), typemembers.methodsOf(declaring)],
+            [typemembers.staticMethodsOf(recorded.definingType()),
+                typemembers.staticMethodsOf(declaring)]]) {
+        let recordedList = lists[0];
+        let concreteList = lists[1];
+        if (recordedList == null || concreteList == null) {
+            continue;
+        }
+        for (long i = 0; i < recordedList.length() && i < concreteList.length(); i++) {
+            if (recordedList.get(i) == recorded) {
+                return concreteList.get(i);
+            }
+        }
+    }
+    return null;
+}
 
 overloadedIn(List<Method> methods, string name) -> bool {
     long seen = 0;

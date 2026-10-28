@@ -74,24 +74,66 @@ refusal(BodyChecker checker, Expression argument, Type analyzed, Parameter decla
 // join. True when a lambda whose body gives no type leaves a type argument open, or when no type fits
 // all of those results, so no example can name it.
 public inferFromLambdas(BodyChecker checker, ArgumentListNode arguments, Parameter[] parameters,
-                        TypeArgumentInference inference) -> bool {
+                        Type returnType, TypeArgumentInference inference) -> bool {
     bool untyped = false;
+    bool[] throwsOnly = throwsOnlyParameters(parameters, returnType, inference);
+    let endless = new List<long>();
     for (long i = 0; i < arguments.argumentsCount() && i < parameters.length; i++) {
         let argument = arguments.arguments(i);
         Type template = convert.coreOf(parameters[i].type());
         if (argument is LambdaExpressionNode && template is FunctionType) {
+            inference.pendThrows(i, template.thrownTypes(), argument.green(), throwsOnly);
             let given = lambdaResult(checker, argument, template, inference);
             Type returned = template.returnType();
             if (given == null) {
                 untyped = untyped || inference.settled(returned) == null;
             } else if (returned is TypeParamType && returned.owner() == inference.declaration()) {
                 untyped = untyped || !inference.joinResult(i, returned, given);
+                if (given is ErrorType) {
+                    endless.push(i);
+                }
             } else {
                 inference.unifyArgument(i, returned, given);
             }
         }
     }
+    // A body that never ends normally returns nothing, so it binds its result to 'void' where no
+    // other argument gives that type parameter a type.
+    for (let index in endless) {
+        let template = convert.coreOf(parameters[index].type());
+        if (template is FunctionType) {
+            let returned = template.returnType();
+            if (returned is TypeParamType && inference.binding(returned.index()) == null) {
+                let ignored = inference.joinResult(index, returned,
+                    checker.store().primitive(PrimitiveKind.Void));
+            }
+        }
+    }
     return untyped;
+}
+
+// For each type parameter of the inference's declaration, whether the signature writes it only in
+// throws lists, so what it stands for can be a list a lambda's body decides. One that is also the
+// type of a value has to be one type, which no lambda's body shows before the exceptions phase.
+throwsOnlyParameters(Parameter[] parameters, Type returnType, TypeArgumentInference inference)
+        -> bool[] {
+    bool[] throwsOnly = new bool[inference.arity()];
+    for (long i = 0; i < throwsOnly.length; i++) {
+        throwsOnly[i] = true;
+    }
+    for (let parameter in parameters) {
+        markValueUses(parameter.type(), inference, throwsOnly);
+    }
+    markValueUses(returnType, inference, throwsOnly);
+    return throwsOnly;
+}
+
+markValueUses(Type type, TypeArgumentInference inference, bool[] throwsOnly) {
+    for (long i = 0; i < throwsOnly.length; i++) {
+        if (throwsOnly[i] && inference.mentionsSlotAsValue(type, i)) {
+            throwsOnly[i] = false;
+        }
+    }
 }
 
 // Checks the body of 'argument', a lambda passed for 'parameter' of a call refused for a type argument
@@ -118,7 +160,7 @@ public checkRefusedLambda(BodyChecker checker, LambdaExpressionNode argument, Pa
 lambdaResult(BodyChecker checker, LambdaExpressionNode lambda, FunctionType template,
              TypeArgumentInference inference) -> Type? {
     let settledParameters = settledAll(template.parameterTypes(), inference);
-    let settledThrown = settledAll(template.thrownTypes(), inference);
+    let settledThrown = inference.settledThrown(template.thrownTypes());
     if (settledParameters == null || settledThrown == null) {
         return null;
     }

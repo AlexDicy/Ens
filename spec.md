@@ -488,7 +488,11 @@ Speaker? quiet = null;     // nullable interface reference
 
 Classes, structs, and functions may be generic: they declare type parameters in angle brackets and work uniformly over any type argument. A type parameter can be used as a field type, a parameter or return type, a local type, and as the element type of an array.
 A type-parameter list names at least one type parameter, so an empty `<>` is an error.
-A method does not declare type parameters of its own; a type-parameter list on a member constrains the enclosing type's parameters instead, as described under conditional members below.
+A method may declare type parameters of its own, as in `mapped<R>((T) -> R transform) -> Cell<R>`, and a call infers them from its arguments the way a generic function's call does, or writes them after the method's name, as in `cell.mapped<string>(describe)`.
+A static method writes its own type arguments after its name and its type's after the type, as in `Cell<int>.wrapped<string>(text)`.
+A generic method is a separate method for each list of type arguments, so it cannot be `override` or `abstract`, no subclass can override it, and it shares its name with no other method of its type or of a base class.
+A constructor and an interface method declare no type parameters of their own.
+A name in a member's list that matches one of its type's parameters restates that parameter instead, as described under conditional members below.
 A type parameter takes its name for the whole of the declaration that introduces it, so that name is the parameter in a bound, in a member's signature, in a field or parameter default, and in a body alike.
 A class, struct, interface, enum, function, or module of that name declared or imported outside is unreachable under that name inside, while a parameter or a local of that name declared inside takes the name back for the values written after it.
 A type parameter is a type and never a value, so reading `T` as a value, calling `T()`, and writing `new T()` are each an error.
@@ -529,6 +533,7 @@ A lambda binds the type parameters its target's return type and throws list ment
 A type argument no argument mentions, such as one that appears only in the return type, must be passed explicitly.
 `void` means no value, and it is a type argument like any other, written as in `Holder<void>` or bound by a call.
 A function or a lambda that returns nothing, passed for a `() -> T` parameter, binds `T` to `void` unless another argument gives `T` a type, which then decides it, so `after(callback, 1)` against `after<T>(() -> T first, T second)` binds `T` to `int` and refuses `callback`.
+A lambda whose body never ends normally, as one that only throws, returns nothing as well, but fits whatever type another argument gives `T`, since it never produces a value of any type.
 An argument that is itself no value, such as a call to a function that returns nothing, is still refused wherever a value is passed.
 A value of type `void` takes no storage: a local, a field, a parameter or a capture of that type holds nothing, a struct literal leaves such a field out, and a function returning `T` returns nothing, so `Task<() -> void>` carries no value and `Channel<void>` carries only that something was sent.
 A `T?` over `void` is present or absent and holds nothing else.
@@ -596,8 +601,8 @@ source.read();
 
 A member of a generic class or struct, whether a method, a static, or a constructor, may constrain the enclosing type's parameters by restating them in its own type-parameter list with a bound.
 Such a member is conditional: it exists only on the instantiations whose type arguments satisfy the constraint, and it costs nothing anywhere else.
-A name in the list must match one of the enclosing type's parameters and must carry a bound.
-Restating a parameter without a bound is an error, which is what makes a rename of the type's parameter detectable, and a name that matches no parameter is an error too, because a member cannot introduce type parameters of its own.
+A name in the list that matches one of the enclosing type's parameters restates it and must carry a bound, and any other name in a method's list is a type parameter of the method's own.
+Restating a parameter without a bound is an error, because it would add nothing, and a name in a constructor's list that matches no parameter is an error too, because a constructor cannot introduce type parameters of its own.
 The constraint's bounds follow the same rules as declared bounds, and a bound may name the constrained parameter itself, as `Comparable<T>` does below.
 
 ```ens
@@ -620,7 +625,7 @@ Overload resolution never sees a conditional member where its constraint fails; 
 Inside the member's body the constrained parameter carries the extra bound, which also lets the body reach other members conditional on the same bound.
 
 A conditional member may not be `override` or `abstract`, may not be overridden or hidden by a subclass, and cannot satisfy an interface requirement, because all of those require a member that exists on every instantiation.
-An interface method cannot have a type-parameter list for the same reason, and a destructor cannot have one because it takes no parameters of any kind.
+An interface method cannot have a type-parameter list, for the same reason and because a method with type parameters of its own cannot be overridden, and a destructor cannot have one because it takes no parameters of any kind.
 A constraint cannot relate two different parameters, so a bound like `K: Comparable<V>` is not expressible.
 
 ---
@@ -773,7 +778,7 @@ The implicitly imported modules described below are the one exception: no import
 Two modules may import each other: circular imports are allowed, and declarations resolve across the cycle like any other import.
 
 A short list of standard-library modules is imported implicitly: `@std.core` and `@std.io.print`.
-Every exported name of such a module is in scope in every module with no import written: `@std.core`'s types `Error`, `StackFrame`, `Comparable`, and `Copyable` are used by name, and both modules' exported functions are called unqualified.
+Every exported name of such a module is in scope in every module with no import written: `@std.core`'s types `Error`, `StackFrame`, `Comparable`, `Number`, and `Copyable` are used by name, and both modules' exported functions are called unqualified.
 So `print(message)` and `eprint(message)`, which write a line to standard output and to standard error, come from the standard library rather than from the language, and no program imports anything to print a line.
 A declaration of your own with one of those names takes precedence inside the module that declares it.
 That precedence goes by name and not by signature: a `describe(int)` of your own hides every implicitly imported `describe`, so a call that does not fit yours is an error rather than a call to theirs, and the hidden one is reached by importing its module and qualifying the call.
@@ -1037,6 +1042,8 @@ Such a parameter stands for a whole throws list rather than for one type: a body
 Inside the generic, a call that throws `E` is written with `try` whatever the list turns out to be, so an instantiation whose list is empty does not report that `try` as unneeded.
 `catch (E caught)` catches every type in the list, and `caught` has the nearest class every one of them extends, which is `Error` for two unrelated kinds.
 Outside, an instantiation whose list is empty throws nothing, so a call of it is written without `try`, as any call that cannot throw is.
+A generic that also uses such a parameter as the type of a value, as `forward<E: Error>((() -> void throws E) body, E fallback) throws E` does, needs it to be exactly one type, so a call where it stands for a list of none or of several is refused.
+The parameter is bound from a lambda's body only where the signature writes it in throws lists alone, since what a lambda throws is known only once its body has been checked.
 
 If any exception is not handled and the method is not marked as `throws`, this should result in a compilation error explaining which exceptions were not handled and how to handle them (either with a `catch` block or via the `throws` keyword).
 
@@ -1982,7 +1989,7 @@ A hole or `.toString()` call whose type has no text form for any type argument, 
 ---
 
 `bytes` is immutable binary data, to a `byte[]` what a `string` is to text: a reference type whose contents never change, so a variable binds a reference, copying it copies the reference, and every operation that "changes" one returns a new one.
-It is what whole contents are handed around as, where a `byte[]` is what a stream fills: `readAll()`, `readBytes()`, `toBytes()` and `embed` return `bytes`, `read(buffer)` takes a `byte[]`, and `write` and `writeBytes` accept either.
+It is what whole contents are handed around as, where a `byte[]` is what a stream fills: `readAll()`, `readBytes()`, `toBytes()` and `embed` return `bytes`, `read(buffer)` takes a `byte[]`, `write` takes `bytes`, and `writeBytes` accepts either.
 `length` counts the bytes and `data[index]` reads one, with an index outside the data aborting the program, while writing one is refused when the program is compiled, as is passing a `bytes` where a `byte[]` is expected or the other way round.
 `slice(start, end)` and `slice(start)` return a half-open range as new data, copied from the original.
 `isEmpty()`, `contains(needle)`, `indexOf(needle)`, `indexOf(needle, from)`, `lastIndexOf(needle)`, `startsWith(prefix)` and `endsWith(suffix)` search exact bytes under the same rules as the string members of the same names.
@@ -2165,7 +2172,8 @@ A family's own name is a module too where one type stands at its head, which is 
 `@std.io` moves bytes, and two contracts from `@std.io.streams` describe every stream in it.
 `Reader` declares `read(byte[] buffer) -> long throws IoError`, which fills as much of the buffer as it has ready and returns how many bytes it wrote.
 That count is `0` only once the stream has ended, so a count shorter than the buffer is a reason to call `read` again, not a sign that the bytes have run out.
-`Writer` declares `write(data) throws IoError`, where `data` is a `byte[]` or a `bytes`, which takes all of it and keeps nothing, and `flush() throws IoError`, which hands over everything accepted but not yet passed on.
+`Writer` declares `write(bytes data) throws IoError`, which takes all of `data` and keeps nothing, and `flush() throws IoError`, which hands over everything accepted but not yet passed on.
+A `byte[]` is written by passing `bytes.of(array)`.
 `streams.copy(source, target)` moves everything the source has left into the target and returns how many bytes moved, flushing and closing neither, so flushing and closing the target is up to the caller.
 
 `@std.io` itself provides the streams a program starts with: `io.out()` is standard output as a `Writer`, `io.err()` is standard error, and `io.in()` is standard input as a `BufferedReader`.
@@ -2199,7 +2207,8 @@ Each call reaches the target once, so a line written through it arrives whole ra
 It is not a `Writer` itself, because it is not a destination for bytes.
 
 `BytesReader` and `BytesWriter` from `@std.io.memory` are streams over bytes already in memory, which is what drives anything written against `Reader` or `Writer` with no operating system taking part.
-A `BytesReader` hands out the `bytes` or the array it was given, in order, sharing that storage rather than copying it, and returns `0` for ever once the last of it is gone.
+A `BytesReader` hands out the `bytes` it was given, in order, sharing that storage rather than copying it, and returns `0` for ever once the last of it is gone.
+Given a `byte[]`, it copies the array once when it is made, so changing the array afterwards leaves what is still to be read as it was.
 A `BytesWriter` collects everything written into one growing array, which `toBytes()` returns as `bytes`, a copy so that the writer can go on, `length()` measures, and `clear()` empties.
 Neither of them can fail, so a call on either needs no `try`.
 
@@ -2509,6 +2518,7 @@ Two tasks that await each other, and a task that locks a `Mutex` it already hold
 `new Channel<T>(capacity)` is the receiving end: `receive()` waits for the next value and returns it, or `null` once the channel is closed and empty, `receive(timeoutMillis)` returns `null` after that many milliseconds as well, with `isClosed()` telling the two apart, and a `for` loop walks a channel one value at a time until it is closed and empty, so two loops on two tasks share the work between them.
 `channel.sender()` returns a `Sender<T>`, whose `send(value)` puts a value in and waits while the channel already holds `capacity` values; a capacity of zero makes every send wait for a receive.
 The channel closes when the last `Sender` is released, so a producer closes nothing and a loop over the channel ends exactly when every producer has finished; a sender kept in a field keeps the channel open for as long as the field does.
+A channel no `Sender` has been taken from yet is open, so a receive on it waits for the first one.
 A send on a channel whose receiving end has been released throws `ChannelClosed`, since the value would never arrive.
 There is no way to wait on two channels at once; two sources merge by sending into one channel, each through a sender of its own, and a wait with a time limit is `receive(timeoutMillis)`.
 
@@ -2525,7 +2535,11 @@ for (let line in lines) {                             // ends when the last prod
 `Mutex<T>` from `@std.tasks` holds one value that several tasks change in turn.
 `new Mutex(value)` takes the value in, and `mutex.lock(body)` runs `body` with the value while no other task has it, waiting for its turn, and returns what the body returns.
 The body is a `shared` function and its result must be shareable, so the value inside cannot leave the lock through a capture or a return, while a shareable part of it, such as an entry of a map of `shared` objects, can.
+A body is given the value itself when it is an object, which the body changes in place, and a copy when it is a number or a struct, so `mutex.update(body)` replaces the value with what the body returns instead, as in `hits.update((count) -> count + 1)`.
 `Atomic<T>` from `@std.tasks` holds one shareable value that tasks read and replace without a lock: `read()`, `write(value)`, `compareAndSet(expected, replacement) -> bool`, and for numbers `increment()`, `decrement()` and `add(amount)`, each returning the value after the change.
+The arithmetic members are conditional on `T: Number<T>`, the interface every number type implements with `plus`, `minus`, `incremented` and `decremented`, so they exist on an `Atomic<long>` or an `Atomic<double>` and on no `Atomic<string>`.
+`compareAndSet` compares a reference by identity and every other value bit for bit, which is what the processor compares.
+An `Atomic` holds a number, a `bool`, a `char`, an enum or a reference, possibly null, which the processor replaces in a single step; a struct, or a nullable value that is not a reference, is refused where the type is written, with `Mutex` as the fix.
 An `Atomic` of a `shared` class replaces a whole table under its readers, which see the old value or the new and never a mix of the two.
 
 `@std.parallel` runs one body over many pieces of data at once and returns when every piece is done, on the task that called it, which it parks for the whole call.
@@ -2546,7 +2560,7 @@ parallel.split(pixels, tiles, reading(depth), (tile, depthView) -> shade(tile, d
 
 ---
 
-Every value has a `hash()` method returning a `long`. Value types (primitives, enums, strings, structs) and arrays hash by their contents, so equal values hash equally; classes hash by identity, matching how `==` compares them.
+Every value but an external handle, a function value, and a floating-point number has a `hash()` method returning a `long`. Value types (primitives, enums, strings, structs) and arrays hash by their contents, so equal values hash equally; classes hash by identity, matching how `==` compares them.
 An optional hashes as its payload does while it is present and as one fixed value once it is absent, so every absent value hashes equally whatever its type.
 A class or a struct can declare its own `hash() -> long` to control its hashing, paired with `equals(T other) -> bool`, a method taking a single parameter of the declaring type `T` itself, to control equality.
 A method named `hash` must have exactly that signature, and neither `hash` nor `equals` can be `throws`, because the language takes a value's hash and compares two values where there is no room for a `try`; `equals` must return `bool`.
@@ -2602,6 +2616,7 @@ When nothing else refers to the container, its storage moves into the frozen one
 - `FrozenList<T>`, `FrozenMap<K, V>` and `FrozenSet<T>` from `@std.collections.frozen` hold what they were frozen with and offer the reads of their counterparts, `get`, `length()`, `isEmpty()`, `contains`, `indexOf`, `first()`, `last()`, `keys()`, `values()` and iteration in the same order, and none of `set`, `push`, `remove` or `clear`.
   `toList()`, `toMap()`, `toSet()` and `toArray()` return a writable copy, and `FrozenList.of(values)` freezes an array or a list in one step.
   A frozen collection compares and hashes by content, and it can be a key, since its content cannot change while it sits in the table.
+  One over values with no `==` or no hash, such as a `FrozenList<double>`, has none either, so comparing it, hashing it or keying by it is an error naming the value type, while it is a collection like any other.
 
 ```ens
 import Map from @std.collections.map;
