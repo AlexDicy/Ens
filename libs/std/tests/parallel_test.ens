@@ -1,0 +1,97 @@
+// Tests for the loops that run one body over many pieces of data at once.
+import @std.testing;
+import @std.parallel;
+import @std.tasks;
+import Atomic from @std.tasks;
+import Cancelled from @std.tasks;
+
+class Refused extends Error {
+    constructor(long value) {
+        super("refused {value}");
+    }
+}
+
+refuseAt(long value, long refused) -> long throws Refused {
+    if (value == refused) {
+        throw new Refused(value);
+    }
+    return value;
+}
+
+// What mapping `values` gives, as text, or the message of what the body threw.
+mappedText(long[] values, long refused) -> string throws Cancelled {
+    let mapped = try parallel.map(values, (value) -> try refuseAt(value, refused));
+    return "{mapped}";
+} catch (Refused failure) {
+    return failure.message;
+}
+
+test "map returns the results in the items' order" {
+    long[] values = new long[1000];
+    for (long i = 0; i < values.length; i++) {
+        values[i] = i;
+    }
+    let doubled = try parallel.map(values, (value) -> value * 2);
+    try testing.assertEqual(doubled.length, 1000L);
+    for (long i = 0; i < doubled.length; i++) {
+        try testing.assertEqual(doubled[i], i * 2);
+    }
+}
+
+test "map over no items runs nothing and returns no results" {
+    let calls = new Atomic<long>(0);
+    let mapped = try parallel.map(new long[0], (value) -> calls.increment());
+    try testing.assertEqual(mapped.length, 0L);
+    try testing.assertEqual(calls.read(), 0L);
+}
+
+test "a body that throws makes the call throw what it threw" {
+    try testing.assertEqual(try mappedText([1, 2, 3, 4], 3), "refused 3");
+    try testing.assertEqual(try mappedText([1, 2], 9), "[1, 2]");
+}
+
+test "each runs the body once per item" {
+    let total = new Atomic<long>(0);
+    try parallel.each([1, 2, 3, 4, 5], (value) -> {
+        total.add(value as long);
+    });
+    try testing.assertEqual(total.read(), 15L);
+}
+
+test "range runs the body once per index of a half-open range, and none for an empty one" {
+    let total = new Atomic<long>(0);
+    let calls = new Atomic<long>(0);
+    try parallel.range(10, 20, (index) -> {
+        total.add(index);
+        calls.increment();
+    });
+    try testing.assertEqual(total.read(), 145L);
+    try testing.assertEqual(calls.read(), 10L);
+    try parallel.range(5, 5, (index) -> {
+        calls.increment();
+    });
+    try parallel.range(5, 2, (index) -> {
+        calls.increment();
+    });
+    try testing.assertEqual(calls.read(), 10L);
+}
+
+// Waits, inside the call, for a cancel of the task running it.
+waitedOut(long[] values) -> string {
+    let mapped = try parallel.map(values, (value) -> {
+        try tasks.sleep(60000);
+        return value;
+    });
+    return "{mapped}";
+} catch (Cancelled stop) {
+    return stop.message;
+}
+
+test "a task cancelled inside a call stops its pieces and throws 'Cancelled'" {
+    string outcome = try tasks.scope((scope) -> {
+        let waiting = scope.start(() -> waitedOut([1, 2, 3]));
+        waiting.cancel();
+        return try waiting.await();
+    });
+    try testing.assertEqual(outcome, "the task was cancelled");
+}

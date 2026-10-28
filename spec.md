@@ -2165,7 +2165,7 @@ The word stays an ordinary identifier everywhere else, so a variable, field, par
 
 The library is a set of module families under `@std`, and an import names a module rather than a family, so the chapters below give the module every type and function lives in.
 `@std.core` and `@std.io.print` are the two modules the compiler imports for every program.
-The families are `@std.collections` for the walking contracts and the containers, `@std.text` for the members of `string` together with `StringBuilder` and the parsers, `@std.io` for byte streams and the streams a program starts with, `@std.fs` for paths and files, `@std.environment` for what surrounds a running program, `@std.process` for starting other programs, `@std.platform` for `Platform`, `@std.tasks` for tasks and the values they share, `@std.testing` for what a test throws, and `@std.ffi` for reading a C string.
+The families are `@std.collections` for the walking contracts and the containers, `@std.text` for the members of `string` together with `StringBuilder` and the parsers, `@std.io` for byte streams and the streams a program starts with, `@std.fs` for paths and files, `@std.environment` for what surrounds a running program, `@std.process` for starting other programs, `@std.platform` for `Platform`, `@std.tasks` for tasks and the values they share, `@std.parallel` for one body run over many pieces of data at once, `@std.testing` for what a test throws, and `@std.ffi` for reading a C string.
 A family's own name is a module too where one type stands at its head, which is why `@std.fs` is where `Path` lives while `@std.collections` is a prefix alone.
 `@std.system` exports nothing: it holds the library's own calls into the operating system, which are internal to the library rather than part of what a program writes.
 
@@ -2555,7 +2555,8 @@ An `Atomic` of a `shared` class replaces a whole table under its readers, which 
 
 `@std.parallel` runs one body over many pieces of data at once and returns when every piece is done, on the task that called it, which it parks for the whole call.
 `parallel.map(items, body)` runs the body once per item and returns an array of the results in the items' order, however the pieces finished; `parallel.each(items, body)` is the same for a body that returns nothing; `parallel.range(start, end, body)` runs the body once per index of a half-open range.
-A body that can throw makes the call throw the same types, the first failure cancels the pieces still running, and the call throws once every piece has ended.
+A body that can throw makes the call throw the same types, the first failure cancels the pieces still running, and the call throws once every piece has ended; like every wait, the call throws `Cancelled` in a cancelled task.
+The items are an array, and the work is cut into one share per processor, each run on a task of its own, so a call over a million items starts as many tasks as the machine has processors.
 Each body is a `shared` function, so it captures shareable values only, and the items are handed to other tasks, so their type must be shareable, as the `Path` values of a file walk are, while what a body returns may be anything, being a result.
 `parallel.split(array, parts, body)` cuts an array into `parts` disjoint `Slice<T>` views, runs the body once per slice on another task, and gives the array back whole once every body has returned; a slice is read and written through `get(index)` and `set(index, value)`, with `length()` and `start`, the index of its first element in the array.
 Only the calling task could write the array, and it is parked inside the call, so a body writes its slice with no copy and no lock, and the slice is a parameter that is not shareable, so no body can keep it past the call.
