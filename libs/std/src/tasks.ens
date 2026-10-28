@@ -109,7 +109,15 @@ export shared final class Mutex<T> {
         system.acquireLock(this.guard);
         if (this.holder == caller) {
             system.releaseLock(this.guard);
-            panic("tried to lock a mutex inside a body this task is already running under its "
+            string tried = "tried";
+            let control = Registry.running.current();
+            if (control != null) {
+                let site = startSite(control.startedAt);
+                if (site != null) {
+                    tried = "the task started at {site} tried";
+                }
+            }
+            panic("{tried} to lock a mutex inside a body this task is already running under its "
                 + "lock, which would wait for ever. Use the value that body was given instead");
         }
         while (this.holder != 0) {
@@ -389,8 +397,8 @@ export shared final class TaskScope {
 
     // Starts `body` on another task at once and returns the task without waiting for it.
     export start<T, E: Error>((shared () -> T throws E) body) -> Task<(() -> T throws E)> {
-        let control = new TaskControl(this.state);
-        let outcome = new TaskOutcome<T, E>(this.state.record(system.captureTrace(8)));
+        let control = new TaskControl(this.state, system.captureTrace(8));
+        let outcome = new TaskOutcome<T, E>(this.state.record(control.startedAt));
         this.state.begin(() -> {
             Registry.running.enter(control);
             outcome.complete(body);
@@ -416,7 +424,7 @@ export shared final class TaskScope {
     // Starts `body`, which returns nothing and cannot throw, on another task, for work nobody waits
     // for.
     export launch((shared () -> void) body) {
-        let control = new TaskControl(this.state);
+        let control = new TaskControl(this.state, system.captureTrace(8));
         this.state.begin(() -> {
             Registry.running.enter(control);
             body();
@@ -460,8 +468,20 @@ export shared final class Task<shared () -> T throws E> {
 
     // Waits for the task and returns what its body returned, or throws what its body threw. A result
     // another task may not hold is taken once, and awaiting it again aborts the program.
+    // A task that awaits a task waiting for it, directly or through others, aborts the program
+    // instead of waiting for ever.
     export await() -> T throws E {
-        return try this.outcome.take();
+        let waiting = Registry.running.current();
+        if (waiting == null) {
+            return try this.outcome.take();
+        }
+        waiting.startAwaiting(this.control);
+        T value = try this.outcome.take();
+        waiting.stopAwaiting();
+        return value;
+    } catch (E failure) {
+        Registry.running.current()?.stopAwaiting();
+        rethrow;
     }
 
     // Asks this task, and every task it started, to stop.
@@ -508,10 +528,33 @@ shared final class RunningTasks {
 // Whether one task was asked to stop, and the scope it belongs to.
 shared final class TaskControl {
     const ScopeState scope;
+    const long[] startedAt;
     const Atomic<bool> cancelled;
+    const Atomic<TaskControl?> awaiting;
 
-    protected constructor(this.scope) {
+    protected constructor(this.scope, this.startedAt) {
         this.cancelled = new Atomic<bool>(false);
+        this.awaiting = new Atomic<TaskControl?>(null);
+    }
+
+    // Records that this task waits for `target`, and aborts the program when `target` waits for
+    // this one, directly or through other tasks.
+    protected startAwaiting(TaskControl target) {
+        this.awaiting.write(target);
+        let chain = new List<TaskControl>();
+        chain.push(this);
+        TaskControl? next = target;
+        while (next != null && chain.length() <= Limits.awaitChain) {
+            if (next == this) {
+                panic(cycleRefusal(chain));
+            }
+            chain.push(next);
+            next = next.awaiting.read();
+        }
+    }
+
+    protected stopAwaiting() {
+        this.awaiting.write(null);
     }
 
     protected cancel() {
@@ -549,20 +592,56 @@ shared final class FailureRecord {
     // Why the scope aborts the program for this task.
     protected refusal() -> string {
         string started = "a task this scope started";
-        let frames = system.traceFrames(this.startedAt);
-        long caller = 0;
-        while (caller < frames.length && !frames[caller].function.startsWith("TaskScope.")) {
-            caller++;
-        }
-        while (caller < frames.length && frames[caller].function.startsWith("TaskScope.")) {
-            caller++;
-        }
-        if (caller < frames.length) {
-            started = "the task started at {frames[caller].file}:{frames[caller].line}";
+        let site = startSite(this.startedAt);
+        if (site != null) {
+            started = "the task started at {site}";
         }
         return "{started} threw {this.thrown}, and nothing awaited it, so nothing handled the "
             + "error. Await every task started with 'start', or catch the error inside its body";
     }
+}
+
+final class Limits {
+    // The most tasks an 'await' follows to find one that waits for the awaiting task.
+    protected static const long awaitChain = 10000;
+}
+
+// The 'file:line' of the call that started a task, read off the trace captured when it started,
+// or null when the trace does not reach it.
+startSite(long[] startedAt) -> string? {
+    let frames = system.traceFrames(startedAt);
+    long caller = 0;
+    while (caller < frames.length && !frames[caller].function.startsWith("TaskScope.")) {
+        caller++;
+    }
+    while (caller < frames.length && frames[caller].function.startsWith("TaskScope.")) {
+        caller++;
+    }
+    if (caller < frames.length) {
+        return "{frames[caller].file}:{frames[caller].line}";
+    }
+    return null;
+}
+
+// Why tasks that wait for each other abort the program, naming where each was started.
+cycleRefusal(List<TaskControl> chain) -> string {
+    let sites = new List<string>();
+    for (let control in chain) {
+        sites.push(startSite(control.startedAt) ?? "a line the trace does not reach");
+    }
+    if (sites.length() == 2) {
+        return "the task started at {sites.get(0)} waits for the task started at {sites.get(1)}, "
+            + "which waits for it in turn, so neither can ever finish";
+    }
+    string listed = "";
+    for (long i = 0; i < sites.length(); i++) {
+        if (i > 0) {
+            listed = listed + (i == sites.length() - 1 ? " and " : ", ");
+        }
+        listed = listed + sites.get(i);
+    }
+    return "the tasks started at {listed} each wait for the next, and the last for the first, so "
+        + "none of them can ever finish";
 }
 
 // What one task's body returned or threw, once it has finished.
