@@ -1982,7 +1982,7 @@ A hole or `.toString()` call whose type has no text form for any type argument, 
 ---
 
 `bytes` is immutable binary data, to a `byte[]` what a `string` is to text: a reference type whose contents never change, so a variable binds a reference, copying it copies the reference, and every operation that "changes" one returns a new one.
-It is what whole contents are handed around as, where a `byte[]` is what a stream fills: `readAll()`, `readBytes()`, `toBytes()` and `embed` return `bytes`, `read(buffer)` takes a `byte[]`, and `write` and `writeBytes` accept either.
+It is what whole contents are handed around as, where a `byte[]` is what a stream fills: `readAll()`, `readBytes()`, `toBytes()` and `embed` return `bytes`, `read(buffer)` takes a `byte[]`, `write` takes `bytes`, and `writeBytes` accepts either.
 `length` counts the bytes and `data[index]` reads one, with an index outside the data aborting the program, while writing one is refused when the program is compiled, as is passing a `bytes` where a `byte[]` is expected or the other way round.
 `slice(start, end)` and `slice(start)` return a half-open range as new data, copied from the original.
 `isEmpty()`, `contains(needle)`, `indexOf(needle)`, `indexOf(needle, from)`, `lastIndexOf(needle)`, `startsWith(prefix)` and `endsWith(suffix)` search exact bytes under the same rules as the string members of the same names.
@@ -2165,7 +2165,8 @@ A family's own name is a module too where one type stands at its head, which is 
 `@std.io` moves bytes, and two contracts from `@std.io.streams` describe every stream in it.
 `Reader` declares `read(byte[] buffer) -> long throws IoError`, which fills as much of the buffer as it has ready and returns how many bytes it wrote.
 That count is `0` only once the stream has ended, so a count shorter than the buffer is a reason to call `read` again, not a sign that the bytes have run out.
-`Writer` declares `write(data) throws IoError`, where `data` is a `byte[]` or a `bytes`, which takes all of it and keeps nothing, and `flush() throws IoError`, which hands over everything accepted but not yet passed on.
+`Writer` declares `write(bytes data) throws IoError`, which takes all of `data` and keeps nothing, and `flush() throws IoError`, which hands over everything accepted but not yet passed on.
+A `byte[]` is written by passing `bytes.of(array)`.
 `streams.copy(source, target)` moves everything the source has left into the target and returns how many bytes moved, flushing and closing neither, so flushing and closing the target is up to the caller.
 
 `@std.io` itself provides the streams a program starts with: `io.out()` is standard output as a `Writer`, `io.err()` is standard error, and `io.in()` is standard input as a `BufferedReader`.
@@ -2199,7 +2200,8 @@ Each call reaches the target once, so a line written through it arrives whole ra
 It is not a `Writer` itself, because it is not a destination for bytes.
 
 `BytesReader` and `BytesWriter` from `@std.io.memory` are streams over bytes already in memory, which is what drives anything written against `Reader` or `Writer` with no operating system taking part.
-A `BytesReader` hands out the `bytes` or the array it was given, in order, sharing that storage rather than copying it, and returns `0` for ever once the last of it is gone.
+A `BytesReader` hands out the `bytes` it was given, in order, sharing that storage rather than copying it, and returns `0` for ever once the last of it is gone.
+Given a `byte[]`, it copies the array once when it is made, so changing the array afterwards leaves what is still to be read as it was.
 A `BytesWriter` collects everything written into one growing array, which `toBytes()` returns as `bytes`, a copy so that the writer can go on, `length()` measures, and `clear()` empties.
 Neither of them can fail, so a call on either needs no `try`.
 
