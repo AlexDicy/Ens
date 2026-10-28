@@ -1037,6 +1037,8 @@ Such a parameter stands for a whole throws list rather than for one type: a body
 Inside the generic, a call that throws `E` is written with `try` whatever the list turns out to be, so an instantiation whose list is empty does not report that `try` as unneeded.
 `catch (E caught)` catches every type in the list, and `caught` has the nearest class every one of them extends, which is `Error` for two unrelated kinds.
 Outside, an instantiation whose list is empty throws nothing, so a call of it is written without `try`, as any call that cannot throw is.
+A generic that also uses such a parameter as the type of a value, as `forward<E: Error>((() -> void throws E) body, E fallback) throws E` does, needs it to be exactly one type, so a call where it stands for a list of none or of several is refused.
+The parameter is bound from a lambda's body only where the signature writes it in throws lists alone, since what a lambda throws is known only once its body has been checked.
 
 If any exception is not handled and the method is not marked as `throws`, this should result in a compilation error explaining which exceptions were not handled and how to handle them (either with a `catch` block or via the `throws` keyword).
 

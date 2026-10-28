@@ -844,6 +844,38 @@ export class TypeParamType extends Type {
     }
 }
 
+// What a type parameter written in a throws list is bound to when it stands for a whole list: the
+// types a body throws, none of them or more than one, since a list of exactly one type is that type
+// itself. Where the parameter is the type of a value, as the variable of 'catch (E caught)' is, it
+// stands for the nearest class every listed type extends.
+export class ThrownListType extends Type {
+    Type[] listedTypes;
+    Type listBase;
+
+    protected constructor(this.listedTypes, this.listBase);
+
+    export members() -> Type[] {
+        return this.listedTypes;
+    }
+
+    export base() -> Type {
+        return this.listBase;
+    }
+}
+
+// The throws list of a lambda argument before the exceptions phase has found what the lambda's body
+// throws. It binds a type parameter written only in throws lists, and the exceptions phase replaces
+// it with the list it settles on.
+export class PendingThrowsType extends Type {
+    GreenNode pendingLambda;
+
+    protected constructor(this.pendingLambda);
+
+    export lambda() -> GreenNode {
+        return this.pendingLambda;
+    }
+}
+
 // A reference to a generic type with its arguments, interned by (template, arguments) so equal
 // references share one identity. The type store fills the members in place - the template's
 // members with every type parameter replaced by the matching argument - once the template's own
@@ -1017,6 +1049,24 @@ sameTypeList(Type[] left, Type[] right) -> bool {
     return true;
 }
 
+class ThrownListKey {
+    Type[] keyMembers;
+
+    protected constructor(this.keyMembers);
+
+    override hash() -> long {
+        long combined = 17;
+        for (let member in this.keyMembers) {
+            combined = combined * 31 + member.hash();
+        }
+        return combined;
+    }
+
+    override equals(ThrownListKey other) -> bool {
+        return sameTypeList(this.keyMembers, other.keyMembers);
+    }
+}
+
 class InstantiationKey {
     DeclaredType keyTemplate;
     Type[] keyArguments;
@@ -1066,6 +1116,8 @@ export class TypeStore {
     Map<string, List<DeclaredType>> declaredByName;
     Map<TypeParamKey, TypeParamType> typeParameters;
     Map<InstantiationKey, InstantiationType> instantiations;
+    Map<ThrownListKey, ThrownListType> thrownLists;
+    Map<GreenNode, PendingThrowsType> pendingThrows;
     List<InstantiationType> pendingFills;
     List<InstantiationType> instantiationChain;
     // For each entry of instantiationChain, the member of its template being substituted, and the
@@ -1095,6 +1147,8 @@ export class TypeStore {
         this.declaredByName = new Map<string, List<DeclaredType>>();
         this.typeParameters = new Map<TypeParamKey, TypeParamType>();
         this.instantiations = new Map<InstantiationKey, InstantiationType>();
+        this.thrownLists = new Map<ThrownListKey, ThrownListType>();
+        this.pendingThrows = new Map<GreenNode, PendingThrowsType>();
         this.pendingFills = new List<InstantiationType>();
         this.instantiationChain = new List<InstantiationType>();
         this.fillingMembers = new List<string>();
@@ -1212,6 +1266,39 @@ export class TypeStore {
         return created;
     }
 
+    // The binding of a type parameter that stands for the throws list 'listed', each type once in
+    // the order first given: the one type itself for a list of one, and otherwise a list whose
+    // value type is 'base'.
+    export thrownListOf(Type[] listed, Type base) -> Type {
+        let members = new List<Type>();
+        for (let member in listed) {
+            if (!members.contains(member)) {
+                members.push(member);
+            }
+        }
+        if (members.length() == 1) {
+            return members.get(0);
+        }
+        let key = new ThrownListKey(members.toArray());
+        let existing = this.thrownLists.get(key);
+        if (existing != null) {
+            return existing;
+        }
+        let created = new ThrownListType(members.toArray(), base);
+        this.thrownLists.set(key, created);
+        return created;
+    }
+
+    export pendingThrowsOf(GreenNode lambda) -> PendingThrowsType {
+        let existing = this.pendingThrows.get(lambda);
+        if (existing != null) {
+            return existing;
+        }
+        let created = new PendingThrowsType(lambda);
+        this.pendingThrows.set(lambda, created);
+        return created;
+    }
+
     export typeParameter(GreenNode owner, long index, string name) -> TypeParamType {
         let key = new TypeParamKey(owner, index);
         let existing = this.typeParameters.get(key);
@@ -1317,7 +1404,11 @@ export class TypeStore {
         switch (type) {
             is TypeParamType parameter -> {
                 if (parameter.owner() == owner && parameter.index() < arguments.length) {
-                    return arguments[parameter.index()];
+                    let argument = arguments[parameter.index()];
+                    if (argument is ThrownListType) {
+                        return argument.base();
+                    }
+                    return argument;
                 }
                 return parameter;
             },
@@ -1334,7 +1425,7 @@ export class TypeStore {
                 return this.functionOf(
                     this.substituteAll(functionType.parameterTypes(), owner, arguments),
                     this.substitute(functionType.returnType(), owner, arguments),
-                    this.substituteAll(functionType.thrownTypes(), owner, arguments),
+                    this.substituteThrown(functionType.thrownTypes(), owner, arguments),
                     functionType.isShared());
             },
             is InstantiationType nested -> {
@@ -1343,6 +1434,77 @@ export class TypeStore {
             },
             default -> {
                 return type;
+            },
+        }
+    }
+
+    // A throws list with the substitution applied, where a type parameter bound to a whole list
+    // gives every type in it, and each type is listed once.
+    export substituteThrown(Type[] thrownList, GreenNode owner, Type[] arguments) -> Type[] {
+        let substituted = new List<Type>();
+        for (let entry in thrownList) {
+            Type replaced = this.substitute(entry, owner, arguments);
+            if (entry is TypeParamType && entry.owner() == owner && entry.index() < arguments.length) {
+                replaced = arguments[entry.index()];
+            }
+            if (replaced is ThrownListType) {
+                for (let member in replaced.members()) {
+                    if (!substituted.contains(member)) {
+                        substituted.push(member);
+                    }
+                }
+            } else if (!substituted.contains(replaced)) {
+                substituted.push(replaced);
+            }
+        }
+        return substituted.toArray();
+    }
+
+    // The type with 'pending' replaced by 'settled', the binding it was settled to: in a throws list
+    // by every type the binding stands for.
+    export settledPending(Type type, PendingThrowsType pending, Type settled) -> Type {
+        switch (type) {
+            is OptionalType optional -> {
+                return this.optionalOf(this.settledPending(optional.inner(), pending, settled));
+            },
+            is ArrayType array -> {
+                if (array.isBytes()) {
+                    return array;
+                }
+                return this.arrayOf(this.settledPending(array.element(), pending, settled));
+            },
+            is FunctionType functionType -> {
+                let parameters = new List<Type>();
+                for (let parameter in functionType.parameterTypes()) {
+                    parameters.push(this.settledPending(parameter, pending, settled));
+                }
+                let thrown = new List<Type>();
+                for (let entry in functionType.thrownTypes()) {
+                    Type[] given = [entry];
+                    if (entry == pending && settled is ThrownListType) {
+                        given = settled.members();
+                    } else if (entry == pending) {
+                        given = [settled];
+                    }
+                    for (let member in given) {
+                        if (!thrown.contains(member)) {
+                            thrown.push(member);
+                        }
+                    }
+                }
+                return this.functionOf(parameters.toArray(),
+                    this.settledPending(functionType.returnType(), pending, settled),
+                    thrown.toArray(), functionType.isShared());
+            },
+            is InstantiationType nested -> {
+                let arguments = new List<Type>();
+                for (let argument in nested.arguments()) {
+                    arguments.push(this.settledPending(argument, pending, settled));
+                }
+                return this.instantiationOf(nested.template(), arguments.toArray());
+            },
+            default -> {
+                return type == pending ? settled : type;
             },
         }
     }

@@ -95,8 +95,7 @@ public class TypeArgumentInference {
                     this.unifyEach(argumentIndex, functionType.parameterTypes(),
                         core.parameterTypes());
                     this.unifyAt(argumentIndex, functionType.returnType(), core.returnType(), false);
-                    this.unifyEach(argumentIndex, functionType.thrownTypes(),
-                        core.thrownTypes());
+                    this.unifyThrown(argumentIndex, functionType.thrownTypes(), core.thrownTypes());
                 }
             },
             is InstantiationType instantiation -> {
@@ -109,6 +108,54 @@ public class TypeArgumentInference {
             },
             default -> { },
         }
+    }
+
+    // Binds the first open slot the template's throws list names to every type the argument's list
+    // gives that the template's other entries do not, so it stands for the rest of the list, however
+    // many types that is.
+    unifyThrown(long argumentIndex, Type[] templateThrown, Type[] argumentThrown) {
+        TypeParamType? open = null;
+        let fixed = new List<Type>();
+        for (let entry in templateThrown) {
+            if (open == null && entry is TypeParamType && this.isOpen(entry)) {
+                open = entry;
+            } else {
+                fixed.push(entry);
+            }
+        }
+        if (open == null) {
+            this.unifyEach(argumentIndex, templateThrown, argumentThrown);
+            return;
+        }
+        let rest = new List<Type>();
+        for (let thrown in argumentThrown) {
+            if (thrown is ErrorType) {
+                return;
+            }
+            if (!fixed.contains(thrown)) {
+                rest.push(thrown);
+            }
+        }
+        Type fallback = hierarchy.classBoundOf(open) ?? this.store.errorType();
+        this.slotBindings.set(open.index(), convert.thrownListBinding(this.store, rest.toArray(), fallback));
+        this.slotSources.set(open.index(), argumentIndex);
+    }
+
+    // Binds each open slot the throws list of the lambda at 'argumentIndex' names, among those
+    // 'throwsOnly' admits, to what that lambda throws, which the exceptions phase settles once it
+    // knows the lambda's body.
+    public pendThrows(long argumentIndex, Type[] templateThrown, GreenNode lambda, bool[] throwsOnly) {
+        for (let entry in templateThrown) {
+            if (entry is TypeParamType && this.isOpen(entry) && throwsOnly[entry.index()]) {
+                this.slotBindings.set(entry.index(), this.store.pendingThrowsOf(lambda));
+                this.slotSources.set(entry.index(), argumentIndex);
+            }
+        }
+    }
+
+    isOpen(TypeParamType parameter) -> bool {
+        return parameter.owner() == this.owner && parameter.index() < this.slotBindings.length()
+            && this.slotBindings.get(parameter.index()) == null;
     }
 
     unifyEach(long argumentIndex, Type[] parameterTypes, Type[] argumentTypes) {
@@ -143,6 +190,21 @@ public class TypeArgumentInference {
         }
         this.slotBindings.set(parameter.index(), joined);
         return true;
+    }
+
+    // The index of the argument that bound the slot 'index', or a negative number when none did.
+    public sourceOf(long index) -> long {
+        return this.slotSources.get(index);
+    }
+
+    public arity() -> long {
+        return this.slotBindings.length();
+    }
+
+    // True when 'type' mentions the slot 'index' outside every throws list, where a value of its
+    // type could be.
+    public mentionsSlotAsValue(Type type, long index) -> bool {
+        return convert.mentionsAsValue(type, this.owner, index);
     }
 
     // The declaration whose type parameters the slots are.
@@ -181,6 +243,19 @@ public class TypeArgumentInference {
             arguments.push(this.binding(i) ?? this.store.errorType());
         }
         return this.store.substitute(templateType, this.owner, arguments.toArray());
+    }
+
+    // The template's throws list with every bound slot replaced by what it stands for, or null while
+    // it mentions a slot still open.
+    public settledThrown(Type[] templateThrown) -> Type[]? {
+        if (this.anyMentionsOpenSlot(templateThrown)) {
+            return null;
+        }
+        let arguments = new List<Type>();
+        for (long i = 0; i < this.slotBindings.length(); i++) {
+            arguments.push(this.binding(i) ?? this.store.errorType());
+        }
+        return this.store.substituteThrown(templateThrown, this.owner, arguments.toArray());
     }
 
     mentionsOpenSlot(Type templateType) -> bool {

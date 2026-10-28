@@ -36,7 +36,9 @@ import TypeNames from model.typenames;
 import TypeNameDirectory from model.typenames;
 import model.types;
 import FunctionType from model.types;
+import model.convert;
 import TypeParamType from model.types;
+import PendingThrowsType from model.types;
 import Type from model.types;
 import ErrorType from model.types;
 import DeclaredType from model.types;
@@ -67,6 +69,9 @@ public check(List<ModuleContext> contexts, TypeNameDirectory directory) -> FileD
                 changed = true;
             }
         }
+    }
+    for (long i = 0; i < workers.length(); i++) {
+        workers.get(i).settlePendingThrows();
     }
     for (long i = 0; i < workers.length(); i++) {
         workers.get(i).judgeOutward();
@@ -255,6 +260,20 @@ public contractOf(Signature signature, ThrowsRegistry registry, ClassType? error
         return new ThrowSet();
     }
     return registry.outwardFor(declaration);
+}
+
+// True when everything the signature declares it throws is one of its own type parameters, so an
+// instantiation whose lists are empty throws nothing and needs no 'try'.
+throwsOnlyItsParameters(Signature signature) -> bool {
+    if (signature.throwsTypes().length == 0) {
+        return false;
+    }
+    for (let thrown in signature.throwsTypes()) {
+        if (!(thrown is TypeParamType) || thrown.owner() != signature.declaration()) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // Which callables carry the trailing error-slot parameter in their machine interface. One dispatch
@@ -830,7 +849,7 @@ public final class ModuleExceptions {
     public requiresTry(CallExpressionNode call, ThrowSet contract) -> bool {
         let target = this.calleeSignatureOf(call);
         if (target != null) {
-            return target.declaresThrows();
+            return target.declaresThrows() && !(contract.raisesNothing() && throwsOnlyItsParameters(target));
         }
         return !contract.isEmpty();
     }
@@ -898,10 +917,72 @@ public final class ModuleExceptions {
         }
         let substituted = new ThrowSet();
         substituted.addUnresolvedOf(contract);
-        for (long i = 0; i < contract.members().length(); i++) {
-            this.addRaised(substituted, this.store.substitute(contract.members().get(i), owner, arguments));
+        for (let raised in this.store.substituteThrown(contract.members().toArray(), owner, arguments)) {
+            if (raised is PendingThrowsType) {
+                let lambdaThrows = this.throwsRegistry.outwardFor(raised.lambda());
+                substituted.addUnresolvedOf(lambdaThrows);
+                for (let member in lambdaThrows.members()) {
+                    this.addRaised(substituted, member);
+                }
+            } else {
+                this.addRaised(substituted, raised);
+            }
         }
         return substituted;
+    }
+
+    // Replaces each type argument that stood for what a lambda argument throws with the list the
+    // lambda's converged outward set holds, so every later phase reads the list itself.
+    protected settlePendingThrows() {
+        for (let call in this.moduleResult.callsAwaitingThrows()) {
+            let arguments = this.moduleResult.callTypeArgumentsOf(call) ?? [];
+            for (long i = 0; i < arguments.length; i++) {
+                let argument = arguments[i];
+                if (!(argument is PendingThrowsType)) {
+                    continue;
+                }
+                let thrown = this.throwsRegistry.outwardFor(argument.lambda()).members().toArray();
+                Type fallback = this.store.errorType();
+                let errorBase = this.errorBaseClass;
+                if (errorBase != null) {
+                    fallback = errorBase;
+                }
+                Type settled = convert.thrownListBinding(this.store, thrown, fallback);
+                this.moduleResult.settleThrows(argument, settled, this.store);
+            }
+        }
+    }
+
+    // True for a call of a generic callee that was refused before its type arguments were known,
+    // whose throws depend on the type arguments it was refused for.
+    public refusedForTypeArguments(CallExpressionNode call) -> bool {
+        let target = this.calleeSignatureOf(call);
+        return target != null && target.typeParameters().length > 0
+            && this.moduleResult.callTypeArgumentsOf(call.green()) == null;
+    }
+
+    // The index of the argument whose throws list the generic callee's whole 'throws' clause stands
+    // for, where every type the callee declares it throws is one of its own type parameters, or
+    // null for any other callee.
+    public throwsSourceArgument(CallExpressionNode call) -> long? {
+        let target = this.calleeSignatureOf(call);
+        if (target == null || !throwsOnlyItsParameters(target)) {
+            return null;
+        }
+        let parameters = target.parameters();
+        for (long i = 0; i < parameters.length; i++) {
+            let core = convert.coreOf(parameters[i].type());
+            if (core is FunctionType) {
+                for (let thrown in core.thrownTypes()) {
+                    for (let declared in target.throwsTypes()) {
+                        if (declared == thrown) {
+                            return i;
+                        }
+                    }
+                }
+            }
+        }
+        return null;
     }
 
     // A generic call refused before its type arguments were known raises an unresolved type in

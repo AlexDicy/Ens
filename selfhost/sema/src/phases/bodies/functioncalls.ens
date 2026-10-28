@@ -69,6 +69,9 @@ import PrimitiveKind from model.types;
 import ExternalType from model.types;
 import InstantiationType from model.types;
 import Visibility from model.types;
+import ThrownListType from model.types;
+import TypeParamType from model.types;
+import PendingThrowsType from model.types;
 import List from @std.collections.list;
 import Map from @std.collections.map;
 import model.narrow;
@@ -1378,6 +1381,61 @@ analyzeGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry e
 
 // Whether the lambdas of a call bound every type argument the call left open, filling those slots of
 // 'typeArguments' when they did.
+// The refusal of a call whose type argument stands for a throws list of none or several types,
+// where 'callee' also uses that type parameter as the type of a value, which has to be one type.
+// Null when no type argument is such a list or the callee uses none of them that way.
+public thrownListAsValue(BodyChecker checker, Signature signature, GreenNode owner,
+                         Type[] arguments, TypeParamType[] typeParameters, string callee,
+                         TypeArgumentInference? inference) -> string? {
+    for (long i = 0; i < arguments.length && i < typeParameters.length; i++) {
+        let listed = arguments[i];
+        if (!(listed is ThrownListType) || !usesAsValue(signature, owner, i)) {
+            continue;
+        }
+        string parameter = typeParameters[i].name();
+        string source = "the argument it is taken from";
+        if (inference != null && inference.sourceOf(i) >= 0) {
+            source = "argument {inference.sourceOf(i) + 1}";
+        }
+        string opening = "{callee} uses its type parameter '{parameter}' as the type of a value, so "
+            + "'{parameter}' has to be one type";
+        if (listed.members().length == 0) {
+            return "{opening}, but here it stands for an empty throws list, because {source} "
+                + "throws nothing.";
+        }
+        let spelled = new List<string>();
+        for (let member in listed.members()) {
+            spelled.push(checker.names().quoted(member));
+        }
+        return "{opening}, but here it stands for the throws list of {source}, which is "
+            + "{diagnostics.andJoined(spelled.toArray())}.";
+    }
+    return null;
+}
+
+usesAsValue(Signature signature, GreenNode owner, long index) -> bool {
+    if (convert.mentionsAsValue(signature.returnType(), owner, index)) {
+        return true;
+    }
+    for (let parameter in signature.parameters()) {
+        if (convert.mentionsAsValue(parameter.type(), owner, index)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// True when a type argument stands for what a lambda argument throws, which the exceptions phase
+// settles.
+public awaitsThrows(Type[] arguments) -> bool {
+    for (let argument in arguments) {
+        if (argument is PendingThrowsType) {
+            return true;
+        }
+    }
+    return false;
+}
+
 boundByLambdas(TypeArgumentInference inference, List<Type?> typeArguments) -> bool {
     for (long i = 0; i < typeArguments.length(); i++) {
         let bound = inference.binding(i);
@@ -1473,7 +1531,8 @@ checkGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry ent
             return checker.store().errorType();
         }
         if (argument == null && explicitList == null) {
-            bool untyped = voidtypearguments.inferFromLambdas(checker, arguments, parameters, inference);
+            bool untyped = voidtypearguments.inferFromLambdas(checker, arguments, parameters,
+                signature.returnType(), inference);
             if (!untyped && boundByLambdas(inference, typeArguments)) {
                 argument = typeArguments.get(i);
             } else {
@@ -1517,6 +1576,15 @@ checkGenericCall(BodyChecker checker, CallExpressionNode node, FunctionEntry ent
         resolved.push(argument);
     }
     Type[] resolvedArguments = resolved.toArray();
+    let listedAsValue = thrownListAsValue(checker, signature, owner, resolvedArguments,
+        typeParameters, "'{name}'", explicitList == null ? inference : null);
+    if (listedAsValue != null) {
+        checker.reporter().report(listedAsValue, node.span());
+        return checker.store().errorType();
+    }
+    if (awaitsThrows(resolvedArguments)) {
+        checker.result().notePendingThrows(node.green());
+    }
 
     bool bounded = true;
     for (long i = 0; i < arity; i++) {
