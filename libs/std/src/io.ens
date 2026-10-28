@@ -6,6 +6,7 @@ import IoError from @std.io.streams;
 import Reader from @std.io.streams;
 import Writer from @std.io.streams;
 import CFile from @std.system;
+import ThreadLock from @std.system;
 import @std.system;
 
 // Standard output, buffered, so a line written here reaches the operating system once that buffer
@@ -21,7 +22,7 @@ export err() -> Writer {
 
 // Standard input, as the one reader every call returns. Bytes read ahead cannot be put back,
 // so two readers would silently steal from each other.
-export in() -> BufferedReader {
+export in() -> StandardInput {
     return Standard.input;
 }
 
@@ -32,11 +33,67 @@ export flush() throws IoError {
 
 // Where the shared reader is kept, since a value that outlives a call has to belong to a type.
 final class Standard {
-    protected lazy const BufferedReader input = inputReader();
+    protected lazy const StandardInput input = new StandardInput();
 }
 
-inputReader() -> BufferedReader {
-    return new BufferedReader(new HandleReader(system.standardInput(), "standard input"));
+// Standard input, read through one buffer. Any task may read it, and tasks that read it at the same
+// time take turns, each read or line whole.
+export shared final class StandardInput implements Reader {
+    const ThreadLock lock;
+    const BufferedReader buffered;
+
+    protected constructor() {
+        this.lock = system.createLock();
+        this.buffered = new BufferedReader(new HandleReader(system.standardInput(),
+            "standard input"));
+    }
+
+    // Bytes out of the buffer, refilling it first when it is empty, and 0 only at the end of the
+    // stream.
+    export override read(byte[] buffer) -> long throws IoError {
+        system.acquireLock(this.lock);
+        long count = try this.buffered.read(buffer);
+        system.releaseLock(this.lock);
+        return count;
+    } catch (IoError failure) {
+        system.releaseLock(this.lock);
+        rethrow;
+    }
+
+    // The next line without its ending, or null once the stream has ended. A carriage return
+    // before the newline belongs to the ending, and a last line without one is a line of its own.
+    export readLine() -> string? throws IoError {
+        system.acquireLock(this.lock);
+        let line = try this.buffered.readLine();
+        system.releaseLock(this.lock);
+        return line;
+    } catch (IoError failure) {
+        system.releaseLock(this.lock);
+        rethrow;
+    }
+
+    // Everything left in the stream, as bytes.
+    export readAll() -> bytes throws IoError {
+        system.acquireLock(this.lock);
+        bytes all = try this.buffered.readAll();
+        system.releaseLock(this.lock);
+        return all;
+    } catch (IoError failure) {
+        system.releaseLock(this.lock);
+        rethrow;
+    }
+
+    // Everything left in the stream, as text. Bytes that do not spell UTF-8 are refused, since
+    // text in Ens is always valid UTF-8.
+    export readAllText() -> string throws IoError {
+        system.acquireLock(this.lock);
+        string all = try this.buffered.readAllText();
+        system.releaseLock(this.lock);
+        return all;
+    } catch (IoError failure) {
+        system.releaseLock(this.lock);
+        rethrow;
+    }
 }
 
 // Bytes onto one of the C library's own handles. That library holds whatever buffer there is, so

@@ -2000,7 +2000,7 @@ A literal of type `bytes` is written as an array literal where `bytes` is the ta
 ---
 
 `embed "path"` is an expression of type `bytes` holding the contents of the file at `path`, read when the program is compiled.
-`embed folder "path"` is an expression of type `EmbeddedFile[]` with one element for every file under the folder, at any depth.
+`embed folder "path"` is an expression of type `FrozenList<EmbeddedFile>` with one element for every file under the folder, at any depth, frozen because nothing can change what was embedded.
 `EmbeddedFile` is a struct from `@std.embed` with the file's `path` inside the folder, written with `/` between folders, and its `contents` as `bytes`.
 The elements are sorted by `path`, and a file or folder whose name starts with `.`, such as `.git`, is left out.
 The path is a string literal relative to the folder of the source file that writes it, with `/` between folders on every system.
@@ -2010,10 +2010,11 @@ An `embed` is not a compile-time constant, so a `static const` cannot be initial
 
 ```ens
 import EmbeddedFile from @std.embed;
+import FrozenList from @std.collections.frozen;
 
 final class Assets {
     lazy const bytes logo = embed "logo.png";
-    lazy const EmbeddedFile[] icons = embed folder "icons";
+    lazy const FrozenList<EmbeddedFile> icons = embed folder "icons";
 }
 ```
 
@@ -2116,6 +2117,7 @@ A class is shareable only when it is declared `shared`: it is then `final`, or `
 A class the library synchronizes inside, such as `Mutex`, `Atomic`, `Channel`, `Sender`, `Task` and `TaskScope`, is declared `shared` by the library and is shareable although what it holds changes.
 An interface is shareable when it is declared `shared interface`, which only `shared` classes and structs whose fields are all shareable may implement, so a value typed by it can cross.
 An `external` handle is shareable only when its declaration says `shared`, because the library behind it is what decides whether two threads may use it at once.
+A parameter of an `external` function that takes a function value has a `shared` function type, because the library may call the function from a thread of its own; a parameter without it is an error naming the type to write.
 A function value is shareable when its type is written with `shared` before the parameter list, as in `shared (Request) -> Response`, and a lambda written against such a type may capture only shareable values: a local or a parameter of a shareable type, a `const` field of `this` whose type is shareable, which it copies, and `this` itself only when its class is `shared`.
 A type parameter is shareable when it is declared `<shared T>`, every argument for it must then be shareable, and the body may treat a `T` value as shareable, so `Channel<shared T>` carries shareable values and nothing else.
 A `shared` generic class declares `shared` every type parameter a field's type mentions, since the field could not be shareable otherwise.
@@ -2163,7 +2165,7 @@ The word stays an ordinary identifier everywhere else, so a variable, field, par
 
 The library is a set of module families under `@std`, and an import names a module rather than a family, so the chapters below give the module every type and function lives in.
 `@std.core` and `@std.io.print` are the two modules the compiler imports for every program.
-The families are `@std.collections` for the walking contracts and the containers, `@std.text` for the members of `string` together with `StringBuilder` and the parsers, `@std.io` for byte streams and the streams a program starts with, `@std.fs` for paths and files, `@std.environment` for what surrounds a running program, `@std.process` for starting other programs, `@std.platform` for `Platform`, `@std.thread` for a wait, `@std.testing` for what a test throws, and `@std.ffi` for reading a C string.
+The families are `@std.collections` for the walking contracts and the containers, `@std.text` for the members of `string` together with `StringBuilder` and the parsers, `@std.io` for byte streams and the streams a program starts with, `@std.fs` for paths and files, `@std.environment` for what surrounds a running program, `@std.process` for starting other programs, `@std.platform` for `Platform`, `@std.tasks` for tasks and the values they share, `@std.parallel` for one body run over many pieces of data at once, `@std.testing` for what a test throws, and `@std.ffi` for reading a C string.
 A family's own name is a module too where one type stands at its head, which is why `@std.fs` is where `Path` lives while `@std.collections` is a prefix alone.
 `@std.system` exports nothing: it holds the library's own calls into the operating system, which are internal to the library rather than part of what a program writes.
 
@@ -2176,10 +2178,11 @@ That count is `0` only once the stream has ended, so a count shorter than the bu
 A `byte[]` is written by passing `bytes.of(array)`.
 `streams.copy(source, target)` moves everything the source has left into the target and returns how many bytes moved, flushing and closing neither, so flushing and closing the target is up to the caller.
 
-`@std.io` itself provides the streams a program starts with: `io.out()` is standard output as a `Writer`, `io.err()` is standard error, and `io.in()` is standard input as a `BufferedReader`.
+`@std.io` itself provides the streams a program starts with: `io.out()` is standard output as a `Writer`, `io.err()` is standard error, and `io.in()` is standard input as a `StandardInput`, a `Reader` with the `readLine()`, `readAll()` and `readAllText()` a `BufferedReader` has.
 Standard output is buffered, so a line written there reaches the operating system once that buffer fills or something hands it over, and standard error is not, so what a program reports survives a crash.
 The buffer belongs to the stream rather than to the writer, so it makes no difference which writer returned by `io.out()` a program keeps.
 `io.in()` returns the same reader every call, because bytes read ahead cannot be put back and two readers of one input would steal from each other.
+Any task may read it, and tasks reading it at the same time take turns, each read or line whole.
 `io.flush()` hands over everything accepted by `io.out()` and not yet given to the operating system.
 
 `print(message)` and `eprint(message)` come from `@std.io.print`, which every program has with no import written, and each writes its message and a newline, the first to standard output and the second to standard error.
@@ -2552,7 +2555,8 @@ An `Atomic` of a `shared` class replaces a whole table under its readers, which 
 
 `@std.parallel` runs one body over many pieces of data at once and returns when every piece is done, on the task that called it, which it parks for the whole call.
 `parallel.map(items, body)` runs the body once per item and returns an array of the results in the items' order, however the pieces finished; `parallel.each(items, body)` is the same for a body that returns nothing; `parallel.range(start, end, body)` runs the body once per index of a half-open range.
-A body that can throw makes the call throw the same types, the first failure cancels the pieces still running, and the call throws once every piece has ended.
+A body that can throw makes the call throw the same types, the first failure cancels the pieces still running, and the call throws once every piece has ended; like every wait, the call throws `Cancelled` in a cancelled task.
+The items are an array, and the work is cut into one share per processor, each run on a task of its own, so a call over a million items starts as many tasks as the machine has processors.
 Each body is a `shared` function, so it captures shareable values only, and the items are handed to other tasks, so their type must be shareable, as the `Path` values of a file walk are, while what a body returns may be anything, being a result.
 `parallel.split(array, parts, body)` cuts an array into `parts` disjoint `Slice<T>` views, runs the body once per slice on another task, and gives the array back whole once every body has returned; a slice is read and written through `get(index)` and `set(index, value)`, with `length()` and `start`, the index of its first element in the array.
 Only the calling task could write the array, and it is parked inside the call, so a body writes its slice with no copy and no lock, and the slice is a parameter that is not shareable, so no body can keep it past the call.

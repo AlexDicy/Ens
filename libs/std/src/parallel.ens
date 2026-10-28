@@ -1,0 +1,106 @@
+// One body run over many pieces of data at once. Each call returns once every piece is done, on the
+// task that called it, which waits inside the call the whole time. The work is cut into one share
+// per processor, each run on a task of its own.
+import FrozenList from @std.collections.frozen;
+import List from @std.collections.list;
+import @std.tasks;
+import Cancelled from @std.tasks;
+import Task from @std.tasks;
+import @std.system;
+
+// Runs `body` once per item and returns the results in the items' order, however the pieces
+// finished. The first piece to throw cancels the others, and the call throws once every piece has
+// ended. A task cancelled while it waits throws 'Cancelled'.
+export map<shared T, R, E: Error>(T[] items, (shared (T) -> R throws E) body) -> R[]
+        throws E, Cancelled {
+    let shared = FrozenList.of(items);
+    long pieces = pieceCount(items.length);
+    return try tasks.scope((scope) -> {
+        let started = new List<Task<(() -> List<R> throws E, Cancelled)>>();
+        for (long piece = 0; piece < pieces; piece++) {
+            long from = shareStart(piece, pieces, items.length);
+            long to = shareStart(piece + 1, pieces, items.length);
+            started.push(scope.start(() -> try mapped(shared, from, to, body)));
+        }
+        let results = new List<R>();
+        for (let task in started) {
+            results.pushAll(try task.await());
+        }
+        return results.toArray();
+    });
+}
+
+// Runs `body` once per item, like 'map' for a body that returns nothing.
+export each<shared T, E: Error>(T[] items, (shared (T) -> void throws E) body)
+        throws E, Cancelled {
+    let shared = FrozenList.of(items);
+    long pieces = pieceCount(items.length);
+    try tasks.scope((scope) -> {
+        let started = new List<Task<(() -> void throws E, Cancelled)>>();
+        for (long piece = 0; piece < pieces; piece++) {
+            long from = shareStart(piece, pieces, items.length);
+            long to = shareStart(piece + 1, pieces, items.length);
+            started.push(scope.start(() -> try visited(shared, from, to, body)));
+        }
+        for (let task in started) {
+            try task.await();
+        }
+    });
+}
+
+// Runs `body` once per index from `start` up to but not including `end`, like 'each'. A range that
+// ends where it starts, or before, runs nothing.
+export range<E: Error>(long start, long end, (shared (long) -> void throws E) body)
+        throws E, Cancelled {
+    long length = end > start ? end - start : 0;
+    long pieces = pieceCount(length);
+    try tasks.scope((scope) -> {
+        let started = new List<Task<(() -> void throws E, Cancelled)>>();
+        for (long piece = 0; piece < pieces; piece++) {
+            long from = start + shareStart(piece, pieces, length);
+            long to = start + shareStart(piece + 1, pieces, length);
+            started.push(scope.start(() -> try counted(from, to, body)));
+        }
+        for (let task in started) {
+            try task.await();
+        }
+    });
+}
+
+// How many tasks share `length` pieces of work: one per processor, and never more than the work.
+pieceCount(long length) -> long {
+    long processors = system.processorCount();
+    return length < processors ? length : processors;
+}
+
+// Where share `piece` of `pieces` starts in work `length` long, so the shares differ in length by
+// one at most.
+shareStart(long piece, long pieces, long length) -> long {
+    return piece * length / pieces;
+}
+
+mapped<shared T, R, E: Error>(FrozenList<T> items, long from, long to,
+        (shared (T) -> R throws E) body) -> List<R> throws E, Cancelled {
+    let results = new List<R>();
+    for (long i = from; i < to; i++) {
+        try tasks.checkCancelled();
+        results.push(try body(items.get(i)));
+    }
+    return results;
+}
+
+visited<shared T, E: Error>(FrozenList<T> items, long from, long to,
+        (shared (T) -> void throws E) body) throws E, Cancelled {
+    for (long i = from; i < to; i++) {
+        try tasks.checkCancelled();
+        try body(items.get(i));
+    }
+}
+
+counted<E: Error>(long from, long to, (shared (long) -> void throws E) body)
+        throws E, Cancelled {
+    for (long i = from; i < to; i++) {
+        try tasks.checkCancelled();
+        try body(i);
+    }
+}

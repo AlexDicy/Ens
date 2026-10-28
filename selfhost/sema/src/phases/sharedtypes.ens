@@ -21,6 +21,10 @@ import StructType from model.types;
 import TypeParamType from model.types;
 import InstantiationType from model.types;
 import ErrorType from model.types;
+import ArrayType from model.types;
+import TypeStore from model.types;
+import List from @std.collections.list;
+import support.diagnostics;
 
 // Checks the class 'classType', named at 'nameSpan': a shared one against every rule, and any other
 // one against the shared types it extends or implements.
@@ -135,6 +139,123 @@ checkField(Reporter reporter, TypeNames names, string subject, string holder, Fi
     reporter.report("{opening} has type {described(reason, names)}, so the field could change "
         + "while another task holds the same {holder}." + fixFor(reason.innermost(), names),
         field.nameSpan());
+}
+
+// Checks the lazy const 'field' of 'owner', whose initializer is written 'initializer' on one line
+// and needs nothing around it before '.frozen()', or null where no such text is at hand. Every task
+// can read a lazy const by name, so its type must be one another task may hold.
+public checkLazyConstant(Reporter reporter, TypeNames names, TypeStore store, DeclaredType owner,
+                         Field field, string? initializer) {
+    if (field.type() is ErrorType) {
+        return;
+    }
+    let reason = sharing.whyUnshareable(field.type());
+    if (reason == null || reason.innermost().kind() == UnshareableKind.OpenParameter) {
+        return;
+    }
+    string constant = names.quotedNamedCode(["", ".{field.name()}"], [owner]);
+    reporter.report("Lazy const {constant} has type {described(reason, names)}, and every task can "
+        + "read a lazy const by name, so its value could change while another task reads it."
+        + lazyConstantFix(reason, field.type(), initializer, names, store), field.nameSpan());
+}
+
+// The fix for a lazy const of the unshareable 'type', opening with a space: its frozen form for a
+// container whose values another task may hold, the fix for the innermost reason otherwise, and a
+// 'Mutex' for a value that has to change.
+lazyConstantFix(Unshareable reason, Type type, string? initializer, TypeNames names,
+                TypeStore store) -> string {
+    if (reason.innermost().kind() == UnshareableKind.FunctionValue) {
+        return fixFor(reason.innermost(), names);
+    }
+    let mutexImports = new List<string>();
+    string mutex = "{spelledStandardType(store, names, "std.tasks", "Mutex", mutexImports)}"
+        + "<{names.of(type)}>";
+    let frozenImports = new List<string>();
+    let frozen = frozenFormOf(type, names, store, frozenImports);
+    if (frozen == null) {
+        string fix = fixFor(reason.innermost(), names);
+        if (fix.length == 0) {
+            return " " + capitalized(withImports(mutexImports, "keep it in a '{mutex}' instead, "
+                + "which lets one task at a time use it")) + ".";
+        }
+        return fix + " If it has to change, "
+            + withImports(mutexImports, "keep it in a '{mutex}' instead") + ".";
+    }
+    string kept = withImports(mutexImports, "keep it in a '{mutex}' if it has to change");
+    string declared = "declare it as a '{frozen}' and end its initializer with '.frozen()'";
+    if (initializer != null) {
+        declared = "declare it as a '{frozen}' with the initializer '{initializer}.frozen()'";
+    }
+    return " {capitalized(withImports(frozenImports, declared))}, or {kept}.";
+}
+
+capitalized(string text) -> string {
+    return "{text.substring(0, 1).toUpperAscii()}{text.substring(1)}";
+}
+
+// 'clause' led by the imports it needs, as in "write 'import Mutex from @std.tasks;' and keep it".
+withImports(List<string> imports, string clause) -> string {
+    if (imports.isEmpty()) {
+        return clause;
+    }
+    let quoted = new List<string>();
+    for (let written in imports) {
+        quoted.push("'{written}'");
+    }
+    return "write {diagnostics.andJoined(quoted.toArray())} and {clause}";
+}
+
+// The frozen collection of the values of a list, map, set or array, spelled as the file writes
+// it, or null for any other type and for one holding values another task may not hold.
+frozenFormOf(Type type, TypeNames names, TypeStore store, List<string> imports) -> string? {
+    string template = "";
+    Type[] values = [];
+    if (type is ArrayType) {
+        if (type.isBytes()) {
+            return null;
+        }
+        template = "FrozenList";
+        values = [type.element()];
+    } else if (type is InstantiationType) {
+        let declared = type.template();
+        string module = declared.modulePath();
+        values = type.arguments();
+        if (declared.name() == "List" && module == "std.collections.list") {
+            template = "FrozenList";
+        } else if (declared.name() == "Map" && module == "std.collections.map") {
+            template = "FrozenMap";
+        } else if (declared.name() == "Set" && module == "std.collections.set") {
+            template = "FrozenSet";
+        }
+    }
+    if (template.length == 0) {
+        return null;
+    }
+    string arguments = "";
+    for (let value in values) {
+        if (sharing.whyUnshareable(value) != null) {
+            return null;
+        }
+        arguments = arguments.length == 0 ? names.of(value) : "{arguments}, {names.of(value)}";
+    }
+    string written = spelledStandardType(store, names, "std.collections.frozen", template, imports);
+    return "{written}<{arguments}>";
+}
+
+// The name the file writes for the standard library's type 'name' of module 'modulePath', adding
+// to 'imports' the import that gives it one where it has none.
+spelledStandardType(TypeStore store, TypeNames names, string modulePath, string name,
+                    List<string> imports) -> string {
+    let declared = store.findDeclared(modulePath, name);
+    if (declared != null) {
+        let known = names.nameFor(declared);
+        if (known != null) {
+            return known;
+        }
+    }
+    string bound = typenames.freeNameFor(name, modulePath, names);
+    imports.push(typenames.importWritten(name, bound, names.importPathTo(modulePath, "std")));
+    return bound;
 }
 
 // The type a reason is about, quoted, followed by what keeps another task from holding it, as in
