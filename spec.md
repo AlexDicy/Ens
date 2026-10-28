@@ -2485,10 +2485,12 @@ newestTag(string releases) -> string? throws JsonError {
 `tasks.scope(body)` makes a `TaskScope`, runs `body` with it on the calling task, and returns what the body returns once the body has returned and every task started in the scope has finished, so no task outlives the block that started it.
 `scope.start(body)` starts `body` on another task at once and returns a `Task` without waiting, so two calls in a row run two tasks at the same time.
 The type is `Task<F>` where `F` is the function type the task runs: a body returning a `Module` and throwing `ParseError` or `IoError` gives a `Task<(() -> Module throws ParseError, IoError)>`, a body returning a value and throwing nothing a `Task<() -> Module>`, and a body returning nothing a `Task<() -> void>`; a local holding one is written with `let`, and the type is inferred.
-`task.await()` waits for the task and returns what its body returned, or throws what its body threw, so a call of it is written with `try` exactly when the body can throw.
+`task.await()` waits for the task and returns what its body returned, or throws what its body threw, and like every wait it throws `Cancelled` in a cancelled task, so a call of it is always written with `try`.
 A `Task` is shareable, so a task may await one of its siblings, and a value that is not shareable is taken once, a second `await()` aborting the program, while a shareable value is returned to every awaiter.
-`scope.launch(body)` starts a body that returns nothing and cannot throw, and returns nothing: it is the form for work nobody waits for, such as serving one connection, and a body that could throw is refused with the advice the lambda rules give, to move the work into a function with a `catch` clause of its own.
+`scope.launch(body)` starts a body that returns nothing and throws nothing but `Cancelled`, and returns nothing: it is the form for work nobody waits for, such as serving one connection, and a body that could throw anything else is refused with the advice the lambda rules give, to move the work into a function with a `catch` clause of its own.
+A launched task that throws `Cancelled` after it was cancelled simply ends, and one that throws it without being cancelled aborts the program, since nothing awaits it to handle the error.
 A task started with `start` is meant to be awaited, so one that threw and was never awaited aborts the program when its scope ends, naming the line that started it, because an error nobody handled is unhandled.
+A task that throws `Cancelled` after it was cancelled has done what it was asked, so it is not counted, and neither is any task when the scope's body throws, since the body's error already carries the scope's failure out.
 `scope.startDedicated(priority, body)` is `start` on an operating-system thread of the task's own, for a loop that must not share one, such as audio or rendering, under the same rules for what the body may capture.
 Its `priority` is a `TaskPriority`: `Normal`, `High` for work someone is watching, or `Realtime` for work with a deadline, and a system that refuses the level runs the thread at the highest level it allows.
 A `TaskScope` is also made with `new TaskScope()` and kept in a field, for tasks that live as long as an object does; its destructor cancels every task in it and waits for them all, and since no task can hold a reference to a writable object such as its owner, the wait is never for itself.
@@ -2497,7 +2499,7 @@ Starting a task in a scope that has ended aborts the program.
 ```ens
 import @std.tasks;
 
-loadBoth(Path first, Path second) -> Module[] throws ParseError, IoError {
+loadBoth(Path first, Path second) -> Module[] throws ParseError, IoError, Cancelled {
     return try tasks.scope((scope) -> {
         let parsing = scope.start(() -> try parse(first));
         let other = scope.start(() -> try parse(second));
@@ -2508,12 +2510,15 @@ loadBoth(Path first, Path second) -> Module[] throws ParseError, IoError {
 
 A task stops when it is asked to and when it chooses to: cancellation is cooperative.
 `scope.cancel()` marks every task in the scope cancelled, `task.cancel()` marks one task and everything it started, and `scope.cancelAfter(millis)` marks the scope after that many milliseconds, which is how a deadline is written.
-The first task in a scope to throw marks the scope cancelled as well, so the others stop wasting work, while the scope still waits for every one of them before the error reaches whoever awaits it.
+The first task in a scope to throw, other than with the `Cancelled` it was asked for, marks the scope cancelled as well, so the others stop wasting work, while the scope still waits for every one of them before the error reaches whoever awaits it.
 A task reads `tasks.isCancelled()` to learn that it was asked to stop, and `tasks.checkCancelled()` throws `Cancelled` when it was, so a loop writes `try tasks.checkCancelled();` once per iteration, and its body's throws list, and so its task's type, then say that the task can be cut short.
-A call that waits, on a stream, a channel, a lock or a task, ends early in a cancelled task by throwing the error it declares anyway, an `IoError` for a read, with a `Cancelled` as its cause.
-A task whose body never checks runs to its end, and its type shows that it cannot be cut short.
+A call that waits, for a channel, a lock, another task or the clock, declares `Cancelled`: in a cancelled task it throws `Cancelled` instead of waiting, and a task cancelled while it waits is woken to throw it at once.
+A read from a stream ends early in a cancelled task by throwing the `IoError` it declares anyway, with a `Cancelled` as its cause.
+A `for` loop over a channel goes on waiting in a cancelled task, because cancelling the tasks that send to it releases their senders, and the loop then ends as the channel closes.
+A task whose body neither checks nor waits runs to its end, and its type shows that it cannot be cut short.
 Two tasks that await each other, and a task that locks a `Mutex` it already holds, could wait for ever, so each aborts the program naming the lines that started the tasks instead.
-`tasks.sleep(millis)` blocks the calling task until the monotonic clock has advanced by that many milliseconds; the count is a floor and never a ceiling, so nothing bounds how long a loaded machine leaves the task waiting, and a count of zero or less returns without waiting at all.
+`tasks.sleep(millis)` blocks the calling task until the monotonic clock has advanced by that many milliseconds; for a sleep that returns, the count is a floor and never a ceiling, so nothing bounds how long a loaded machine leaves the task waiting, and a count of zero or less returns without waiting at all.
+A sleep in a cancelled task ends at once by throwing `Cancelled`, which is how a deadline cuts short a retry's pause.
 
 `Channel<T>` from `@std.tasks` carries shareable values from the tasks that send to the tasks that receive.
 `new Channel<T>(capacity)` is the receiving end: `receive()` waits for the next value and returns it, or `null` once the channel is closed and empty, `receive(timeoutMillis)` returns `null` after that many milliseconds as well, with `isClosed()` telling the two apart, and a `for` loop walks a channel one value at a time until it is closed and empty, so two loops on two tasks share the work between them.
@@ -2521,12 +2526,13 @@ Two tasks that await each other, and a task that locks a `Mutex` it already hold
 The channel closes when the last `Sender` is released, so a producer closes nothing and a loop over the channel ends exactly when every producer has finished; a sender kept in a field keeps the channel open for as long as the field does.
 A channel no `Sender` has been taken from yet is open, so a receive on it waits for the first one.
 A send on a channel whose receiving end has been released throws `ChannelClosed`, since the value would never arrive.
+`receive` and `send` throw `Cancelled` in a cancelled task, as every wait does, and a send cut short while it waits for a receive takes its value back, so nothing receives it.
 There is no way to wait on two channels at once; two sources merge by sending into one channel, each through a sender of its own, and a wait with a time limit is `receive(timeoutMillis)`.
 
 ```ens
 const lines = new Channel<Line>(64);
 for (let path in paths) {
-    scope.launch(() -> read(path, lines.sender()));   // read(Path, Sender<Line>) holds one sender
+    scope.launch(() -> try read(path, lines.sender())); // read holds one Sender<Line>
 }
 for (let line in lines) {                             // ends when the last producer has finished
     consume(line);
@@ -2535,6 +2541,7 @@ for (let line in lines) {                             // ends when the last prod
 
 `Mutex<T>` from `@std.tasks` holds one value that several tasks change in turn.
 `new Mutex(value)` takes the value in, and `mutex.lock(body)` runs `body` with the value while no other task has it, waiting for its turn, and returns what the body returns.
+`lock` and `update` throw what the body throws and `Cancelled`, which a task cancelled while it waits for its turn throws without running the body.
 The body is a `shared` function and its result must be shareable, so the value inside cannot leave the lock through a capture or a return, while a shareable part of it, such as an entry of a map of `shared` objects, can.
 A body is given the value itself when it is an object, which the body changes in place, and a copy when it is a number or a struct, so `mutex.update(body)` replaces the value with what the body returns instead, as in `hits.update((count) -> count + 1)`.
 `Atomic<T>` from `@std.tasks` holds one shareable value that tasks read and replace without a lock: `read()`, `write(value)`, `compareAndSet(expected, replacement) -> bool`, and for numbers `increment()`, `decrement()` and `add(amount)`, each returning the value after the change.
