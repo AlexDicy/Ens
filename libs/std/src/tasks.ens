@@ -376,7 +376,7 @@ export shared final class TaskScope {
     // Starts `body` on another task at once and returns the task without waiting for it.
     export start<T, E: Error>((shared () -> T throws E) body) -> Task<(() -> T throws E)> {
         let control = new TaskControl(this.state);
-        let outcome = new TaskOutcome<T, E>(this.state.record());
+        let outcome = new TaskOutcome<T, E>(this.state.record(system.captureTrace(8)));
         this.state.begin(() -> {
             Registry.running.enter(control);
             outcome.complete(body);
@@ -498,18 +498,41 @@ shared final class TaskControl {
     }
 }
 
-// Whether a task threw and whether anything awaited it, which the scope reads when it ends.
+// Whether a task threw and whether anything awaited it, which the scope reads when it ends, with
+// where the task was started and what it threw.
 shared final class FailureRecord {
     const Atomic<bool> failed;
     const Atomic<bool> awaited;
+    const long[] startedAt;
+    string thrown;
 
-    protected constructor() {
+    protected constructor(this.startedAt) {
         this.failed = new Atomic<bool>(false);
         this.awaited = new Atomic<bool>(false);
+        this.thrown = "";
+    }
+
+    protected fail(Error error) {
+        this.thrown = "an error with the message '{error.message}'";
+        this.failed.write(true);
     }
 
     protected unhandled() -> bool {
         return this.failed.read() && !this.awaited.read();
+    }
+
+    // Why the scope aborts the program for this task.
+    protected refusal() -> string {
+        string started = "a task this scope started";
+        let frames = system.traceFrames(this.startedAt);
+        for (long i = 0; i + 1 < frames.length; i++) {
+            if (frames[i].function.startsWith("TaskScope.start")) {
+                started = "the task started at {frames[i + 1].file}:{frames[i + 1].line}";
+                break;
+            }
+        }
+        return "{started} threw {this.thrown}, and nothing awaited it, so nothing handled the "
+            + "error. Await every task started with 'start', or catch the error inside its body";
     }
 }
 
@@ -542,7 +565,7 @@ shared final class TaskOutcome<T, E: Error> {
         system.acquireLock(this.lock);
         this.failure = thrown;
         this.done = true;
-        this.record.failed.write(true);
+        this.record.fail(thrown);
         system.wakeLockWaiters(this.lock);
         system.releaseLock(this.lock);
     }
@@ -615,8 +638,8 @@ shared final class ScopeState {
         this.ended = false;
     }
 
-    protected record() -> FailureRecord {
-        let created = new FailureRecord();
+    protected record(long[] startedAt) -> FailureRecord {
+        let created = new FailureRecord(startedAt);
         system.acquireLock(this.lock);
         this.records.push(created);
         system.releaseLock(this.lock);
@@ -696,9 +719,7 @@ shared final class ScopeState {
         }
         for (let record in this.records) {
             if (record.unhandled()) {
-                panic("a task this scope started threw an error and nothing awaited it, so nothing "
-                    + "handled the error. Await every task started with 'start', or catch the "
-                    + "error inside its body");
+                panic(record.refusal());
             }
         }
     }
