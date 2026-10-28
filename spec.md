@@ -533,6 +533,7 @@ A lambda binds the type parameters its target's return type and throws list ment
 A type argument no argument mentions, such as one that appears only in the return type, must be passed explicitly.
 `void` means no value, and it is a type argument like any other, written as in `Holder<void>` or bound by a call.
 A function or a lambda that returns nothing, passed for a `() -> T` parameter, binds `T` to `void` unless another argument gives `T` a type, which then decides it, so `after(callback, 1)` against `after<T>(() -> T first, T second)` binds `T` to `int` and refuses `callback`.
+A lambda whose body never ends normally, as one that only throws, returns nothing as well, but fits whatever type another argument gives `T`, since it never produces a value of any type.
 An argument that is itself no value, such as a call to a function that returns nothing, is still refused wherever a value is passed.
 A value of type `void` takes no storage: a local, a field, a parameter or a capture of that type holds nothing, a struct literal leaves such a field out, and a function returning `T` returns nothing, so `Task<() -> void>` carries no value and `Channel<void>` carries only that something was sent.
 A `T?` over `void` is present or absent and holds nothing else.
