@@ -2560,8 +2560,10 @@ A body that can throw makes the call throw the same types, the first failure can
 The items are an array, and the work is cut into one share per processor, each run on a task of its own, so a call over a million items starts as many tasks as the machine has processors.
 Each body is a `shared` function, so it captures shareable values only, and the items are handed to other tasks, so their type must be shareable, as the `Path` values of a file walk are, while what a body returns may be anything, being a result.
 `parallel.split(array, parts, body)` cuts an array into `parts` disjoint `Slice<T>` views, runs the body once per slice on another task, and gives the array back whole once every body has returned; a slice is read and written through `get(index)` and `set(index, value)`, with `length()` and `start`, the index of its first element in the array.
-Only the calling task could write the array, and it is parked inside the call, so a body writes its slice with no copy and no lock, and the slice is a parameter that is not shareable, so no body can keep it past the call.
-`parallel.split(array, parts, reading(other), body)` lends every body a whole read-only view of a second array beside its slice, for data each piece reads while writing its own part; naming the array being written as a read view aborts the program, since a piece would read what another writes.
+Only the calling task could write the array, and it is parked inside the call, so a body writes its slice with no copy and no lock.
+A count of parts below one aborts the program, and more parts than elements give the extra bodies empty slices.
+`parallel.split(array, parts, reading(other), body)` lends every body a whole read-only view of a second array beside its slice, a `ReadView<T>` read through `get(index)` and `length()`, for data each piece reads while writing its own part; naming the array being written as a read view aborts the program, since a piece would read what another writes.
+A `Slice` and a `ReadView` are lent to one body only until it returns, so each can be a parameter or a local and be passed to a call, and nothing that could outlive the body may hold one: a field, an array element, a type argument, written or inferred, the result of a function, or a lambda's capture are each an error naming the type and how to pass it on instead.
 An element type that is a writable class is refused by the bound, because two slices could reach one object through two elements; an array of structs, or of `shared` objects, is what `split` is for.
 
 ```ens

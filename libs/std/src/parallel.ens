@@ -88,6 +88,171 @@ export range<E: Error>(long start, long end, (shared (long) -> void throws E) bo
     });
 }
 
+// Cuts `array` into `parts` disjoint slices, runs `body` once per slice on a task of its own, and
+// gives the array back whole once every body has returned. Only the calling task could write the
+// array, and it waits inside the call, so each body writes its slice with no copy and no lock. A
+// count of parts below one aborts the program.
+export split<shared T, E: Error>(T[] array, long parts, (shared (Slice<T>) -> void throws E) body)
+        throws E, Cancelled {
+    checkParts(parts);
+    let lent = new Lent<T>(array);
+    try tasks.scope((scope) -> {
+        let started = new List<Task<(() -> void throws E, Cancelled)>>();
+        for (long part = 0; part < parts; part++) {
+            long from = shareStart(part, parts, array.length);
+            long to = shareStart(part + 1, parts, array.length);
+            started.push(scope.start(() -> try sliced(lent, from, to, body)));
+        }
+        bool stopped = false;
+        for (let task in started) {
+            if (!(try finishedPiece<E>(task))) {
+                stopped = true;
+            }
+        }
+        if (stopped) {
+            throw new Cancelled();
+        }
+    });
+}
+
+// Like 'split', and lends every body a read view of the whole array `other` beside its slice, for
+// data each piece reads while it writes its own part. Naming the split array as `other` aborts the
+// program, since a piece would read what another writes.
+export split<shared T, shared U, E: Error>(T[] array, long parts, Reading<U> other,
+        (shared (Slice<T>, ReadView<U>) -> void throws E) body) throws E, Cancelled {
+    checkParts(parts);
+    if (new Storage().same(array, other.lent.array)) {
+        panic("tried to split an array and read the same array beside it, so one piece would read "
+            + "what another writes. Read a copy of it, or a different array");
+    }
+    let lent = new Lent<T>(array);
+    let read = other.lent;
+    try tasks.scope((scope) -> {
+        let started = new List<Task<(() -> void throws E, Cancelled)>>();
+        for (long part = 0; part < parts; part++) {
+            long from = shareStart(part, parts, array.length);
+            long to = shareStart(part + 1, parts, array.length);
+            started.push(scope.start(() -> try slicedBeside(lent, from, to, read, body)));
+        }
+        bool stopped = false;
+        for (let task in started) {
+            if (!(try finishedPiece<E>(task))) {
+                stopped = true;
+            }
+        }
+        if (stopped) {
+            throw new Cancelled();
+        }
+    });
+}
+
+// The array `array`, for 'split' to lend every body a read view of beside its slice.
+export reading<shared U>(U[] array) -> Reading<U> {
+    return new Reading<U>(new Lent<U>(array));
+}
+
+// A part of an array, which one body of 'split' reads and writes until it returns. A slice can be
+// a parameter or a local, and nothing can keep it longer: it cannot be a field, an array element,
+// a type argument or a return value, and no lambda can capture it.
+export final class Slice<shared T> {
+    const Lent<T> lent;
+    const long end;
+
+    // The index of the slice's first element in the array.
+    export const long start;
+
+    protected constructor(this.lent, this.start, this.end);
+
+    // How many elements the slice has.
+    export length() -> long {
+        return this.end - this.start;
+    }
+
+    // The element at `index`, counted from the slice's first.
+    export get(long index) -> T {
+        this.check(index, "read");
+        return this.lent.array[this.start + index];
+    }
+
+    // Replaces the element at `index`, counted from the slice's first.
+    export set(long index, T value) {
+        this.check(index, "write");
+        this.lent.array[this.start + index] = value;
+    }
+
+    check(long index, string attempt) {
+        if (index < 0 || index >= this.length()) {
+            panic("tried to {attempt} index {index} of a slice of length {this.length()}. Check "
+                + "the index against length() first");
+        }
+    }
+}
+
+// An array one body of 'split' reads beside its slice, until it returns. A view can be
+// kept no longer than a 'Slice' can.
+export final class ReadView<shared U> {
+    const Lent<U> lent;
+
+    protected constructor(this.lent);
+
+    // How many elements the array has.
+    export length() -> long {
+        return this.lent.array.length;
+    }
+
+    // The element at `index`.
+    export get(long index) -> U {
+        if (index < 0 || index >= this.length()) {
+            panic("tried to read index {index} of a view of length {this.length()}. Check the "
+                + "index against length() first");
+        }
+        return this.lent.array[index];
+    }
+}
+
+// An array named for 'split' to lend as a read view, which only 'split' opens.
+export final class Reading<shared U> {
+    protected const Lent<U> lent;
+
+    protected constructor(this.lent);
+}
+
+// The array a 'split' lends its pieces. It crosses to their tasks only inside the call, while the
+// task that owns the array waits.
+shared final class Lent<T> {
+    const T[] array;
+
+    protected constructor(this.array);
+}
+
+// Tells two references to one array from two equal arrays, which '==' cannot, since it compares
+// contents. The compiler compares the two references, so the body below never runs.
+final class Storage {
+    protected constructor();
+
+    protected same<A, B>(A[] first, B[] second) -> bool {
+        panic("Internal: 'same' is lowered to a comparison of the two references");
+    }
+}
+
+checkParts(long parts) {
+    if (parts < 1) {
+        panic("tried to split an array into {parts} parts. Pass a count of at least one");
+    }
+}
+
+sliced<shared T, E: Error>(Lent<T> lent, long from, long to,
+        (shared (Slice<T>) -> void throws E) body) throws E, Cancelled {
+    try tasks.checkCancelled();
+    try body(new Slice<T>(lent, from, to));
+}
+
+slicedBeside<shared T, shared U, E: Error>(Lent<T> lent, long from, long to, Lent<U> read,
+        (shared (Slice<T>, ReadView<U>) -> void throws E) body) throws E, Cancelled {
+    try tasks.checkCancelled();
+    try body(new Slice<T>(lent, from, to), new ReadView<U>(read));
+}
+
 // What one piece of 'map' gave: its results, or null when it stopped because another piece threw.
 // A piece that throws passes its error on, so the call throws what failed rather than the
 // 'Cancelled' of a piece stopped because of it, and a cancel of the calling task stops it.

@@ -1,0 +1,107 @@
+// A slice and a read view of '@std.parallel' are lent to one body for as long as it runs, so they
+// can be parameters and locals and nothing that could outlive the body.
+import @std.testing;
+import FakeFileLoader from sema_support;
+import ProgramAnalysis from pipeline;
+import sema_support;
+
+// The stand-in '@std.parallel' these tests lend from.
+parallelLibrary() -> string {
+    return "export final class Slice<T> \{\n"
+        + "    protected constructor();\n"
+        + "\n"
+        + "    export length() -> long \{\n"
+        + "        return 0;\n"
+        + "    \}\n"
+        + "\}\n"
+        + "\n"
+        + "export final class ReadView<T> \{\n"
+        + "    protected constructor();\n"
+        + "\}\n";
+}
+
+analyzed(string main) -> ProgramAnalysis {
+    let loader = new FakeFileLoader();
+    loader.add("/stdlib/std/src/parallel.ens", parallelLibrary());
+    loader.add("/proj/src/main.ens", main);
+    return sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+}
+
+test "a lent value can be a parameter, a local and an argument, and a function may take one" {
+    let analysis = analyzed("import Slice from @std.parallel;\n"
+        + "import ReadView from @std.parallel;\n"
+        + "measure(Slice<int> slice, ReadView<int>? view) -> long \{\n"
+        + "    let same = slice;\n"
+        + "    (Slice<int>) -> long count = (given) -> given.length();\n"
+        + "    return count(same);\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertProgramClean(analysis);
+}
+
+test "a lent value cannot be anything that outlives the body it was lent to" {
+    let analysis = analyzed("import Slice from @std.parallel;\n"
+        + "import ReadView from @std.parallel;\n"
+        + "final class Box<T> \{\n"
+        + "    constructor();\n"
+        + "\}\n"
+        + "final class Keeper \{\n"
+        + "    static const long width = 2;\n"
+        + "    ReadView<int>? view = null;\n"
+        + "\}\n"
+        + "keep(Slice<int> slice) -> (() -> Slice<int>) \{\n"
+        + "    return () -> slice;\n"
+        + "\}\n"
+        + "hold(Box<Slice<int>> box, Slice<int>[] slices) \{ \}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let declared = analysis.signatureDiagnostics();
+    try testing.assertEqual(declared.length, 3L);
+    try sema_support.assertDiagnostic(declared, 0, "/proj/src/main.ens",
+        "A function cannot return a 'Slice<int>', because it is part of an array lent to one body "
+        + "of a 'parallel.split' call only until that body returns. Return what it holds instead, "
+        + "or pass it on as an argument.");
+    try sema_support.assertDiagnostic(declared, 1, "/proj/src/main.ens",
+        "A 'Slice<int>' cannot be a type argument, because it is part of an array lent to one body "
+        + "of a 'parallel.split' call only until that body returns. Pass it only to parameters "
+        + "written with its own type, as in 'Slice<int> slice'.");
+    try sema_support.assertDiagnostic(declared, 2, "/proj/src/main.ens",
+        "An array cannot hold a 'Slice<int>', because it is part of an array lent to one body of a "
+        + "'parallel.split' call only until that body returns. Pass it only to parameters written "
+        + "with its own type, as in 'Slice<int> slice'.");
+    let checked = analysis.checkDiagnostics();
+    try testing.assertEqual(checked.length, 1L);
+    try sema_support.assertDiagnostic(checked, 0, "/proj/src/main.ens",
+        "Field 'view' of class 'Keeper' has type 'ReadView<int>?', but a 'ReadView<int>' is an "
+        + "array lent to one body of a 'parallel.split' call only until that body returns, "
+        + "so no field may keep it. Pass it as a parameter to the methods that use it.");
+}
+
+test "a lambda cannot capture a lent value, and a call cannot bind one as a type argument" {
+    let analysis = analyzed("import Slice from @std.parallel;\n"
+        + "identity<T>(T value) -> T \{\n"
+        + "    return value;\n"
+        + "\}\n"
+        + "use(Slice<int> slice) -> long \{\n"
+        + "    let again = identity(slice);\n"
+        + "    () -> long later = () -> slice.length();\n"
+        + "    return later();\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    try testing.assertEqual(reported.length, 2L);
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "A 'Slice<int>' cannot be a type argument, because it is part of an array lent to one body "
+        + "of a 'parallel.split' call only until that body returns. Pass it only to parameters "
+        + "written with its own type, as in 'Slice<int> slice'.");
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
+        "This lambda captures 'slice', which has type 'Slice<int>', but a 'Slice<int>' is part of "
+        + "an array lent to one body of a 'parallel.split' call only until that body returns, so "
+        + "no lambda may keep it. Use 'slice' outside the lambda, or make it a parameter of the "
+        + "lambda.");
+}
