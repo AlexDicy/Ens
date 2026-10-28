@@ -966,12 +966,16 @@ public collectStaticMethod(TypeResolver resolver, Reporter reporter, DeclaredTyp
                            TypeNames names, bool allowBodiless = false) {
     string quotedOwner = names.quotedName(owner);
     string subject = "Static method '{methodName}' of {ownerPhrase(owner, names)}";
-    MemberConstraint[] constraints = readMemberConstraints(resolver, reporter, owner, member, subject, names);
+    let listed = readMemberTypeParameters(resolver, reporter, owner, member, methodName, subject,
+        false, names);
+    MemberConstraint[] constraints = listed.constraints();
     if (constraints.length > 0) {
         resolver.pushMemberConstraints(owner.declaration(), constraints);
     }
+    resolver.pushTypeParameters(listed.own());
     let signature = buildSignature(resolver, reporter, member, methodName, nameSpan, false,
-        false, allowBodiless, modifiers.declaresNoreturn, null, names, []);
+        false, allowBodiless, modifiers.declaresNoreturn, null, names, listed.own());
+    resolver.popTypeParameters(listed.own().length);
     if (constraints.length > 0) {
         resolver.popMemberConstraints();
     }
@@ -984,6 +988,12 @@ public collectStaticMethod(TypeResolver resolver, Reporter reporter, DeclaredTyp
     checkNoreturnPlacement(reporter, member, false, false, modifiers.declaresNoreturn, quotedOwner);
     checkStaticInstanceCollision(reporter, owner, methodName, true, nameSpan, names);
     checkStaticFieldMethodCollision(reporter, owner, methodName, nameSpan, names);
+    let overloaded = genericOverloadRefusal(staticMethods, methodName, signature, subject, false,
+        names);
+    if (overloaded != null) {
+        reporter.report(overloaded, nameSpan);
+        return;
+    }
     if (findSameSignature(staticMethods, methodName, signature) != null) {
         reporter.report(repeatedOverloadMessage(subject, "methods"), nameSpan);
         return;
@@ -1030,32 +1040,70 @@ public checkStaticFieldMethodCollision(Reporter reporter, DeclaredType owner, st
     }
 }
 
-// Reads a member's type-parameter list as constraints on the enclosing type's parameters: a name
-// matching an enclosing parameter must carry a bound and constrains it, a name matching none is
-// rejected because a member cannot introduce type parameters of its own, and a list on a
-// non-generic type is rejected whole. The bounds resolve under the shared bound rules.
-public readMemberConstraints(TypeResolver resolver, Reporter reporter, DeclaredType owner,
-                             FunctionDeclarationNode member, string memberSubject,
-                             TypeNames names)
-        -> MemberConstraint[] {
+// What a member's '<...>' list declares: bounds on its type's own type parameters, which make the
+// member conditional, and the type parameters the member declares of its own.
+public final class MemberTypeParameters {
+    MemberConstraint[] listedConstraints;
+    TypeParamType[] ownParameters;
+
+    public constructor(this.listedConstraints, this.ownParameters);
+
+    public constraints() -> MemberConstraint[] {
+        return this.listedConstraints;
+    }
+
+    public own() -> TypeParamType[] {
+        return this.ownParameters;
+    }
+}
+
+// Reads a member's type-parameter list. A name matching one of the enclosing type's parameters
+// restates it, must carry a bound, and constrains it. Any other name is a type parameter of the
+// member's own, which a constructor cannot declare. The member's own parameters are in scope while
+// every bound in the list resolves.
+public readMemberTypeParameters(TypeResolver resolver, Reporter reporter, DeclaredType owner,
+                                FunctionDeclarationNode member, string memberName,
+                                string memberSubject, bool isConstructor, TypeNames names)
+        -> MemberTypeParameters {
+    let none = new MemberTypeParameters([], []);
     let list = member.typeParameters();
     if (list == null) {
-        return [];
+        return none;
     }
     string[] parameterNames = owner.typeParameters();
-    if (parameterNames.length == 0) {
-        reporter.report("{memberSubject} cannot have a type-parameter list, because "
-            + "{names.quotedName(owner)} declares no type parameters for it to constrain. Remove "
-            + "the '<...>' list.", list.span());
-        return [];
-    }
     if (list.parametersCount() == 0) {
-        reporter.report("{memberSubject} declares an empty type-parameter list '<>'. A member's '<...>' "
-            + "list only adds bounds to its type's own type parameters, so an empty one adds none. "
-            + "Remove '<>'.", list.span());
-        return [];
+        string fix = "Remove '<>', or name a type parameter inside it, as in "
+            + "'{memberName}<{declare.unusedTypeParameterName(List.of(parameterNames), "T")}>'.";
+        if (isConstructor) {
+            fix = "Remove '<>'.";
+        }
+        reporter.report("{memberSubject} declares an empty type-parameter list '<>'. {fix}",
+            list.span());
+        return none;
     }
-    let constraints = new List<MemberConstraint>();
+    if (isConstructor && parameterNames.length == 0) {
+        reporter.report("{memberSubject} cannot have a type-parameter list, because "
+            + "{names.quotedName(owner)} declares no type parameters for it to constrain, and a "
+            + "constructor cannot declare type parameters of its own. Remove the '<...>' list.",
+            list.span());
+        return none;
+    }
+    let own = new List<TypeParamType>();
+    let ownPositions = new List<long>();
+    let restatedPositions = new List<long>();
+    let restatedIndices = new List<long>();
+    let written = new List<string>();
+    for (long i = 0; i < list.parametersCount(); i++) {
+        written.push(list.parameters(i).name().text());
+    }
+    for (let parameterName in parameterNames) {
+        written.push(parameterName);
+    }
+    let renamed = new List<string>();
+    for (long i = 0; i < list.parametersCount(); i++) {
+        renamed.push(list.parameters(i).name().text());
+    }
+    let repeatedPositions = new List<long>();
     for (long i = 0; i < list.parametersCount(); i++) {
         let declaration = list.parameters(i);
         string name = declaration.name().text();
@@ -1063,37 +1111,78 @@ public readMemberConstraints(TypeResolver resolver, Reporter reporter, DeclaredT
             continue;
         }
         long index = parameterIndexNamed(parameterNames, name);
-        if (index < 0) {
+        if (index < 0 && isConstructor) {
             reporter.report(unknownTypeParameterMessage(name, names.quotedName(owner), parameterNames),
                 declaration.name().span());
             continue;
         }
-        bool repeated = false;
-        for (long c = 0; c < constraints.length(); c++) {
-            if (constraints.get(c).parameterIndex() == index) {
-                repeated = true;
-                break;
+        if (index < 0) {
+            bool repeatedOwn = false;
+            for (let earlier in own) {
+                if (earlier.name() == name) {
+                    repeatedOwn = true;
+                }
             }
+            if (repeatedOwn) {
+                string fresh = declare.unusedTypeParameterName(written, name);
+                written.push(fresh);
+                renamed.set(i, fresh);
+                repeatedPositions.push(i);
+                continue;
+            }
+            let parameter = resolver.typeStore().typeParameter(member.green(), own.length(), name);
+            parameter.setOwnerName(memberName);
+            if (declaration.sharedKeyword() != null) {
+                parameter.markShared();
+            }
+            own.push(parameter);
+            ownPositions.push(i);
+            continue;
         }
-        if (repeated) {
+        if (restatedIndices.contains(index)) {
             reporter.report("Type parameter '{name}' is already listed here. Write one entry for "
                 + "each type parameter, and join its bounds with '+', as in "
                 + "'{name}: Speaker + Comparable<{name}>'.", declaration.name().span());
             continue;
         }
-        let boundsClause = declaration.bounds();
-        if (boundsClause == null) {
+        if (declaration.bounds() == null) {
             reporter.report("'{name}' restates type parameter '{name}' of {names.quotedName(owner)} but "
                 + "adds no bound. Write the bound this member needs, as in "
                 + "'<{name}: Comparable<{name}>>'.", declaration.name().span());
             continue;
         }
-        Type[] bounds = resolver.resolveBoundList(name, boundsClause);
-        if (bounds.length > 0) {
-            constraints.push(new MemberConstraint(index, bounds));
+        restatedPositions.push(i);
+        restatedIndices.push(index);
+    }
+    string example = "{memberName}<{string.joined(renamed.toArray(), ", ")}>";
+    for (let position in repeatedPositions) {
+        let repeated = list.parameters(position).name();
+        reporter.report("{memberSubject} declares type parameter '{repeated.text()}' twice. Rename "
+            + "the second one, as in '{example}'.", repeated.span());
+    }
+    TypeParamType[] ownParameters = own.toArray();
+    resolver.pushTypeParameters(ownParameters);
+    for (long o = 0; o < ownParameters.length; o++) {
+        let boundsClause = list.parameters(ownPositions.get(o)).bounds();
+        if (boundsClause != null) {
+            ownParameters[o].setBounds(resolver.resolveBoundList(ownParameters[o].name(),
+                boundsClause));
         }
     }
-    return constraints.toArray();
+    let constraints = new List<MemberConstraint>();
+    for (long r = 0; r < restatedPositions.length(); r++) {
+        let declaration = list.parameters(restatedPositions.get(r));
+        let boundsClause = declaration.bounds();
+        if (boundsClause == null) {
+            continue;
+        }
+        Type[] bounds = resolver.resolveBoundList(declaration.name().text(), boundsClause);
+        if (bounds.length > 0) {
+            constraints.push(new MemberConstraint(restatedIndices.get(r), bounds));
+        }
+    }
+    resolver.popTypeParameters(ownParameters.length);
+    return new MemberTypeParameters(constraints.toArray(), ownParameters);
 }
 
 parameterIndexNamed(string[] names, string name) -> long {
@@ -1105,24 +1194,88 @@ parameterIndexNamed(string[] names, string name) -> long {
     return -1;
 }
 
-// The refusal of a name in a method's '<...>' list that is none of its type's type parameters.
+// The refusal of a name in a constructor's '<...>' list that is none of its type's type
+// parameters.
 unknownTypeParameterMessage(string name, string quotedOwner, string[] parameterNames) -> string {
     if (parameterNames.length == 1) {
         string only = parameterNames[0];
         return "'{name}' is not a type parameter of {quotedOwner}, whose only type parameter is "
-            + "'{only}'. A method of {quotedOwner} can add bounds to '{only}' in its '<...>' list, "
-            + "but cannot declare type parameters of its own. Rename '{name}' to '{only}', or "
-            + "move the method out of {quotedOwner}.";
+            + "'{only}'. A constructor of {quotedOwner} can add bounds to '{only}' in its '<...>' "
+            + "list, but cannot declare type parameters of its own. Rename '{name}' to '{only}', or "
+            + "remove '{name}' from the list.";
     }
     let quoted = new List<string>();
     for (let parameter in parameterNames) {
         quoted.push("'{parameter}'");
     }
     return "'{name}' is not a type parameter of {quotedOwner}, whose type parameters are "
-        + "{diagnostics.andJoined(quoted.toArray())}. A method of {quotedOwner} can add bounds to "
-        + "them in its '<...>' list, but cannot declare type parameters of its own. Rename "
-        + "'{name}' to {diagnostics.andJoined(quoted.toArray(), "or")}, or move the method out of "
-        + "{quotedOwner}.";
+        + "{diagnostics.andJoined(quoted.toArray())}. A constructor of {quotedOwner} can add "
+        + "bounds to them in its '<...>' list, but cannot declare type parameters of its own. "
+        + "Rename '{name}' to {diagnostics.andJoined(quoted.toArray(), "or")}, or remove '{name}' "
+        + "from the list.";
+}
+
+// A method with type parameters of its own is a separate function for each list of type
+// arguments, so no subclass can replace it and it replaces nothing: 'override' and 'abstract' are
+// both refused.
+public checkOwnTypeParameterMarkers(Reporter reporter, TypeParamType[] own,
+                                    MemberModifiers modifiers, string memberName, DeclaredType owner,
+                                    Span nameSpan, TypeNames names) {
+    if (own.length == 0) {
+        return;
+    }
+    string subject = "Method '{memberName}' of {names.quotedName(owner)}";
+    string listed = ownTypeParameterWords(own);
+    if (modifiers.declaresOverride) {
+        reporter.report("{subject} cannot be 'override', because it declares {listed} of its own, "
+            + "and a generic method is a separate method for each list of type arguments, so it "
+            + "cannot replace a method of a base class. Remove {listed} from the '<...>' list, or "
+            + "remove 'override' and rename the method.", nameSpan);
+    }
+    if (modifiers.declaresAbstract) {
+        reporter.report("{subject} cannot be 'abstract', because it declares {listed} of its own, "
+            + "and a generic method cannot be overridden, so no subclass could supply its body. "
+            + "Give '{memberName}' a body and remove 'abstract', or remove {listed} from the "
+            + "'<...>' list.", nameSpan);
+    }
+}
+
+// The member's own type parameters as a message lists them, as in "type parameter 'R'".
+public ownTypeParameterWords(TypeParamType[] own) -> string {
+    let quoted = new List<string>();
+    for (let parameter in own) {
+        quoted.push("'{parameter.name()}'");
+    }
+    if (quoted.length() == 1) {
+        return "type parameter {quoted.get(0)}";
+    }
+    return "type parameters {diagnostics.andJoined(quoted.toArray())}";
+}
+
+// The refusal of a method that shares its name with another method of 'methods' when either of the
+// two is generic, or null when none does. 'inherited' says the methods are a base class's, which
+// this class cannot rename.
+public genericOverloadRefusal(List<Method>? methods, string name, Signature signature,
+                              string subject, bool inherited, TypeNames names) -> string? {
+    if (methods == null) {
+        return null;
+    }
+    for (let other in methods) {
+        if (other.name() != name || other.isConstructor() || other.isDestructor()) {
+            continue;
+        }
+        if (!other.signature().isGeneric() && !signature.isGeneric()) {
+            continue;
+        }
+        if (inherited) {
+            return "{subject} has the name of method '{name}' of "
+                + "{names.quoted(other.definingType())}, and a generic method cannot share its name "
+                + "with another method, even one of a base class. Rename this '{name}'.";
+        }
+        return "{subject} cannot be overloaded, because one of its declarations is generic, and a "
+            + "generic method cannot share its name. Rename one of them.";
+    }
+    return null;
 }
 
 // A conditional member exists only where its constraints hold, so it can neither replace a

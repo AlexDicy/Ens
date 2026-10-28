@@ -488,7 +488,11 @@ Speaker? quiet = null;     // nullable interface reference
 
 Classes, structs, and functions may be generic: they declare type parameters in angle brackets and work uniformly over any type argument. A type parameter can be used as a field type, a parameter or return type, a local type, and as the element type of an array.
 A type-parameter list names at least one type parameter, so an empty `<>` is an error.
-A method does not declare type parameters of its own; a type-parameter list on a member constrains the enclosing type's parameters instead, as described under conditional members below.
+A method may declare type parameters of its own, as in `mapped<R>((T) -> R transform) -> Cell<R>`, and a call infers them from its arguments the way a generic function's call does, or writes them after the method's name, as in `cell.mapped<string>(describe)`.
+A static method writes its own type arguments after its name and its type's after the type, as in `Cell<int>.wrapped<string>(text)`.
+A generic method is a separate method for each list of type arguments, so it cannot be `override` or `abstract`, no subclass can override it, and it shares its name with no other method of its type or of a base class.
+A constructor and an interface method declare no type parameters of their own.
+A name in a member's list that matches one of its type's parameters restates that parameter instead, as described under conditional members below.
 A type parameter takes its name for the whole of the declaration that introduces it, so that name is the parameter in a bound, in a member's signature, in a field or parameter default, and in a body alike.
 A class, struct, interface, enum, function, or module of that name declared or imported outside is unreachable under that name inside, while a parameter or a local of that name declared inside takes the name back for the values written after it.
 A type parameter is a type and never a value, so reading `T` as a value, calling `T()`, and writing `new T()` are each an error.
@@ -596,8 +600,8 @@ source.read();
 
 A member of a generic class or struct, whether a method, a static, or a constructor, may constrain the enclosing type's parameters by restating them in its own type-parameter list with a bound.
 Such a member is conditional: it exists only on the instantiations whose type arguments satisfy the constraint, and it costs nothing anywhere else.
-A name in the list must match one of the enclosing type's parameters and must carry a bound.
-Restating a parameter without a bound is an error, which is what makes a rename of the type's parameter detectable, and a name that matches no parameter is an error too, because a member cannot introduce type parameters of its own.
+A name in the list that matches one of the enclosing type's parameters restates it and must carry a bound, and any other name in a method's list is a type parameter of the method's own.
+Restating a parameter without a bound is an error, because it would add nothing, and a name in a constructor's list that matches no parameter is an error too, because a constructor cannot introduce type parameters of its own.
 The constraint's bounds follow the same rules as declared bounds, and a bound may name the constrained parameter itself, as `Comparable<T>` does below.
 
 ```ens
@@ -620,7 +624,7 @@ Overload resolution never sees a conditional member where its constraint fails; 
 Inside the member's body the constrained parameter carries the extra bound, which also lets the body reach other members conditional on the same bound.
 
 A conditional member may not be `override` or `abstract`, may not be overridden or hidden by a subclass, and cannot satisfy an interface requirement, because all of those require a member that exists on every instantiation.
-An interface method cannot have a type-parameter list for the same reason, and a destructor cannot have one because it takes no parameters of any kind.
+An interface method cannot have a type-parameter list, for the same reason and because a method with type parameters of its own cannot be overridden, and a destructor cannot have one because it takes no parameters of any kind.
 A constraint cannot relate two different parameters, so a bound like `K: Comparable<V>` is not expressible.
 
 ---

@@ -10,6 +10,7 @@ import PrefixExpressionNode from @ens.frontend.syntax.generated.nodes;
 import FunctionDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import MemberListNode from @ens.frontend.syntax.generated.nodes;
 import FieldDeclarationNode from @ens.frontend.syntax.generated.nodes;
+import TypeParameterListNode from @ens.frontend.syntax.generated.nodes;
 import SyntaxKind from @ens.frontend.syntax.generated.kind;
 import Span from @ens.frontend.support.source;
 import ClassItem from context;
@@ -248,14 +249,17 @@ collectStructMethod(SignatureCollector collector, StructType structType, Functio
     if (isConstructor) {
         constraintSubject = members.specialMemberSubject(true, structName);
     }
-    let constraints = members.readMemberConstraints(collector.resolver(), collector.reporter(),
-        structType, member, constraintSubject, collector.names());
+    let listed = members.readMemberTypeParameters(collector.resolver(), collector.reporter(),
+        structType, member, methodName, constraintSubject, isConstructor, collector.names());
+    let constraints = listed.constraints();
     if (constraints.length > 0) {
         collector.resolver().pushMemberConstraints(structType.declaration(), constraints);
     }
+    collector.resolver().pushTypeParameters(listed.own());
     let signature = members.buildSignature(collector.resolver(), collector.reporter(), member, methodName,
         nameSpan, isConstructor, false, isConstructor || modifiers.declaresAbstract,
-        modifiers.declaresNoreturn && !isConstructor, structType, collector.names(), []);
+        modifiers.declaresNoreturn && !isConstructor, structType, collector.names(), listed.own());
+    collector.resolver().popTypeParameters(listed.own().length);
     if (constraints.length > 0) {
         collector.resolver().popMemberConstraints();
     }
@@ -297,6 +301,15 @@ collectStructMethod(SignatureCollector collector, StructType structType, Functio
     if (!isConstructor) {
         members.checkConditionalMarkers(collector.reporter(), constraints, modifiers, methodName,
             structType, nameSpan, collector.names());
+        members.checkOwnTypeParameterMarkers(collector.reporter(), listed.own(), modifiers,
+            methodName, structType, nameSpan, collector.names());
+        let overloaded = members.genericOverloadRefusal(structType.methods(), methodName, signature,
+            "Method '{methodName}' of struct {collector.names().quotedName(structType)}", false,
+            collector.names());
+        if (overloaded != null && !(listed.own().length > 0 && modifiers.declaresOverride)) {
+            collector.reporter().report(overloaded, nameSpan);
+            return;
+        }
     }
     if (members.findSameSignature(structType.methods(), methodName, signature) != null) {
         string subject = "Method '{methodName}' of struct {collector.names().quotedName(structType)}";
@@ -448,10 +461,17 @@ collectPrimitiveMember(SignatureCollector collector, PrimitiveBinding binding,
     members.refuseMutating(collector.reporter(), modifiers,
         "Method '{name}' of the '{binding.name()}' binding", "a primitive value has no fields to change",
         "Remove 'mutating'.", nameSpan);
-    let constraints = members.readMemberConstraints(collector.resolver(), collector.reporter(), binding,
-        member, "Method '{name}' of the '{binding.name()}' binding", collector.names());
+    string subject = "Method '{name}' of the '{binding.name()}' binding";
+    let listed = members.readMemberTypeParameters(collector.resolver(), collector.reporter(), binding,
+        member, name, subject, false, collector.names());
+    let constraints = listed.constraints();
+    collector.resolver().pushTypeParameters(listed.own());
     let signature = members.buildSignature(collector.resolver(), collector.reporter(), member, name,
-        nameSpan, false, false, true, modifiers.declaresNoreturn, null, collector.names(), []);
+        nameSpan, false, false, true, modifiers.declaresNoreturn, null, collector.names(),
+        listed.own());
+    collector.resolver().popTypeParameters(listed.own().length);
+    members.checkOwnTypeParameterMarkers(collector.reporter(), listed.own(), modifiers, name,
+        binding, nameSpan, collector.names());
     Visibility visibility = members.memberVisibility(modifiers, binding, "Method", name,
         collector.reporter(), collector.names());
     members.checkThrowsPlacement(collector.reporter(), member, false, false, binding, collector.names());
@@ -459,9 +479,14 @@ collectPrimitiveMember(SignatureCollector collector, PrimitiveBinding binding,
         modifiers.declaresNoreturn, "'{binding.name()}'");
     members.checkStaticInstanceCollision(collector.reporter(), binding, name, false, nameSpan,
         collector.names());
+    let overloaded = members.genericOverloadRefusal(binding.methods(), name, signature, subject,
+        false, collector.names());
+    if (overloaded != null && !(listed.own().length > 0 && modifiers.declaresOverride)) {
+        collector.reporter().report(overloaded, nameSpan);
+        return;
+    }
     if (members.findSameSignature(binding.methods(), name, signature) != null) {
-        collector.reporter().report(members.repeatedOverloadMessage(
-            "Method '{name}' of the '{binding.name()}' binding", "methods"), nameSpan);
+        collector.reporter().report(members.repeatedOverloadMessage(subject, "methods"), nameSpan);
         return;
     }
     binding.methods().push(new Method(signature, visibility, false, false,
@@ -622,11 +647,12 @@ collectInterfaceMethod(SignatureCollector collector, InterfaceType interfaceType
             + "implementing class provides its own. Replace the body with ';'.", nameSpan);
     }
     let constraintList = member.typeParameters();
+    TypeParamType[] refusedOwn = [];
     if (constraintList != null) {
-        collector.reporter().report("Interface method '{name}' cannot have a '<...>' list, "
-            + "because it would then exist only for some type arguments, and an interface "
-            + "method must exist for every one. Remove the '<...>' list, or move the method to "
-            + "the implementing classes.", constraintList.span());
+        collector.reporter().report(interfaceTypeParameterListRefusal(name, constraintList,
+            interfaceType.typeParameters()), constraintList.span());
+        refusedOwn = refusedOwnTypeParameters(collector, member, name, constraintList,
+            interfaceType.typeParameters());
     }
     let throwsClause = member.throwsClause();
     if (throwsClause != null && throwsClause.typesCount() == 0) {
@@ -634,8 +660,10 @@ collectInterfaceMethod(SignatureCollector collector, InterfaceType interfaceType
         collector.reporter().report("Method '{name}' of interface {owner} " + members.unlistedThrowsProblem(),
             throwsClause.throwsKeyword().span());
     }
+    collector.resolver().pushTypeParameters(refusedOwn);
     let signature = members.buildSignature(collector.resolver(), collector.reporter(), member, name,
-        nameSpan, false, true, true, modifiers.declaresNoreturn, null, collector.names(), []);
+        nameSpan, false, true, true, modifiers.declaresNoreturn, null, collector.names(), refusedOwn);
+    collector.resolver().popTypeParameters(refusedOwn.length);
     members.checkNoreturnPlacement(collector.reporter(), member, false, false,
         modifiers.declaresNoreturn, collector.names().quotedName(interfaceType));
     members.checkHashSignature(collector.reporter(), member, signature, false, interfaceType,
@@ -982,4 +1010,42 @@ signedIntegerLiteral(Expression expr) -> LiteralExpressionNode? {
 
 isEnumIntegerLiteralKind(SyntaxKind kind) -> bool {
     return kind == SyntaxKind.IntLiteral || kind == SyntaxKind.LongLiteral;
+}
+
+// The type parameters a refused list on an interface method declares of its own, so the signature
+// still resolves the names it uses.
+refusedOwnTypeParameters(SignatureCollector collector, FunctionDeclarationNode member, string name,
+                         TypeParameterListNode list, string[] interfaceParameters)
+        -> TypeParamType[] {
+    let own = new List<TypeParamType>();
+    for (long i = 0; i < list.parametersCount(); i++) {
+        string listed = list.parameters(i).name().text();
+        if (listed.length == 0 || List.of(interfaceParameters).contains(listed)) {
+            continue;
+        }
+        let parameter = collector.resolver().typeStore().typeParameter(member.green(), own.length(),
+            listed);
+        parameter.setOwnerName(name);
+        own.push(parameter);
+    }
+    return own.toArray();
+}
+
+// The refusal of a '<...>' list on an interface method. A list that only restates the
+// interface's own type parameters would make the method conditional, and any other name would be
+// a type parameter of the method's own, which no implementing class could override.
+interfaceTypeParameterListRefusal(string name, TypeParameterListNode list,
+                                  string[] interfaceParameters) -> string {
+    for (long i = 0; i < list.parametersCount(); i++) {
+        string listed = list.parameters(i).name().text();
+        if (listed.length > 0 && !List.of(interfaceParameters).contains(listed)) {
+            return "Interface method '{name}' cannot declare type parameter '{listed}' of its own, "
+                + "because each implementing class overrides it, and a generic method is a separate "
+                + "method for each list of type arguments, so it cannot be overridden. Remove the "
+                + "'<...>' list, or declare '{name}' in each implementing class instead.";
+        }
+    }
+    return "Interface method '{name}' cannot have a '<...>' list, because it would then exist "
+        + "only for some type arguments, and an interface method must exist for every one. Remove "
+        + "the '<...>' list, or move the method to the implementing classes.";
 }

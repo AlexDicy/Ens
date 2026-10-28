@@ -70,6 +70,7 @@ import FunctionName from phases.bodies;
 import TypeName from phases.bodies;
 import BuiltShape from phases.bodies.functioncalls;
 import PendingArguments from phases.bodies.functioncalls;
+import GenericCallee from phases.bodies.functioncalls;
 import support.syntax;
 
 // What a member access's written head names when it is a type rather than a value: the
@@ -594,7 +595,8 @@ public analyzeStaticCall(BodyChecker checker, CallExpressionNode node, MemberExp
         return checker.store().errorType();
     }
     let writtenOnMethod = node.typeArguments();
-    if (writtenOnMethod != null) {
+    if (writtenOnMethod != null && memberaccess.staticsNamed(head, name).length() > 0
+            && !namesGenericStatic(head, name)) {
         string written = wording.greenSpelling(writtenOnMethod.green());
         if (owner.isGeneric()) {
             string listed = concreteTypeArguments(owner.typeParameters().length);
@@ -603,12 +605,14 @@ public analyzeStaticCall(BodyChecker checker, CallExpressionNode node, MemberExp
             }
             string example = checker.names().quotedNamedCode(["",
                 "<{listed}>.{name}{functioncalls.argumentsSpelling(arguments)}"], [owner]);
-            checker.reporter().report("Type arguments are never written after a method name. Write them "
-                + "after the type name, as in {example}.", writtenOnMethod.span());
-        } else {
-            checker.reporter().report("Type arguments are never written after a method name, and "
-                + "{checker.names().quotedName(owner)} is not generic. Remove '{written}'.",
+            checker.reporter().report("'{name}' declares no type parameters of its own, so its call "
+                + "takes no type arguments after its name. Write the type arguments of "
+                + "{checker.names().quotedName(owner)} after the type's name, as in {example}.",
                 writtenOnMethod.span());
+        } else {
+            checker.reporter().report("'{name}' declares no type parameters of its own, and "
+                + "{checker.names().quotedName(owner)} is not generic, so the call takes no type "
+                + "arguments. Remove '{written}'.", writtenOnMethod.span());
         }
         functioncalls.analyzeArgumentsOnly(checker, arguments);
         return checker.store().errorType();
@@ -638,7 +642,28 @@ public analyzeStaticCall(BodyChecker checker, CallExpressionNode node, MemberExp
         functioncalls.analyzeArgumentsOnly(checker, arguments);
         return checker.store().errorType();
     }
+    if (candidates.length() == 1 && candidates.get(0).signature().isGeneric()) {
+        let single = candidates.get(0);
+        memberaccess.checkMemberAccess(checker, name, single.visibility(), single.definingType(),
+            member.member().span());
+        checker.result().setMethod(member.green(), single);
+        let callee = new GenericCallee(name, "method",
+            "{wording.oneLineSpelling(member.object())}.{name}", head);
+        return functioncalls.analyzeGenericCallTo(checker, node, single.signature(), callee,
+            expected);
+    }
     return finishStaticCall(checker, node, member, name, candidates);
+}
+
+// Whether a static of this name declares type parameters of its own, which a call writes after the
+// method's name.
+namesGenericStatic(Type head, string name) -> bool {
+    for (let candidate in memberaccess.staticsNamed(head, name)) {
+        if (candidate.signature().isGeneric()) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Resolves a static call against a concrete owner, mirroring finishMethodCall: overloads
@@ -934,10 +959,14 @@ checkInferredStaticCall(BodyChecker checker, CallExpressionNode node, MemberExpr
             node.span());
         return signature.returnType();
     }
+    let own = ownTypeArgumentsOf(checker, node, member, instantiation, signature, argumentTypes);
+    if (own == null) {
+        return checker.store().errorType();
+    }
     for (long i = 0; i < count && i < parameters.length; i++) {
         let argument = arguments.arguments(i);
         if (argument is Expression) {
-            Type parameterType = parameters[i].type();
+            Type parameterType = substitutedOwn(checker, signature, own, parameters[i].type());
             let origin = literalfixes.argumentOrigin(checker, argument, signature, i, parameterType);
             Type actual = argumentTypes.get(i);
             if (argument is LambdaExpressionNode && checker.inTrial()) {
@@ -979,7 +1008,85 @@ checkInferredStaticCall(BodyChecker checker, CallExpressionNode node, MemberExpr
         }
     }
     pending.analyzedBefore(parameters.length);
-    return signature.returnType();
+    if (own.length > 0) {
+        checker.result().setCallTypeArguments(node.green(), own);
+        checker.recordGenericCall(signature, own, node.span(), instantiation);
+    }
+    return substitutedOwn(checker, signature, own, signature.returnType());
+}
+
+// The type arguments of a static's own type parameters at a call whose type's arguments were
+// inferred: the ones written after the method's name, or else the ones the arguments give. None for
+// a static that declares none, and null once a refusal is reported.
+ownTypeArgumentsOf(BodyChecker checker, CallExpressionNode node, MemberExpressionNode member,
+                   InstantiationType instantiation, Signature signature, List<Type> argumentTypes)
+        -> Type[]? {
+    TypeParamType[] own = signature.typeParameters();
+    let owner = signature.declaration();
+    if (own.length == 0 || owner == null) {
+        return [];
+    }
+    string name = signature.name();
+    let written = node.typeArguments();
+    let bound = new List<Type>();
+    if (written != null) {
+        if (written.argumentsCount() != own.length) {
+            let names = new List<string>();
+            for (let parameter in own) {
+                names.push(parameter.name());
+            }
+            checker.reporter().report(calls.countRefusal("Generic method '{name}' takes",
+                own.length, own.length, written.argumentsCount(), "type argument", names.toArray()),
+                node.span());
+            return null;
+        }
+        for (long i = 0; i < own.length; i++) {
+            bound.push(checker.resolver().resolveType(written.arguments(i)));
+        }
+    } else {
+        let inference = new TypeArgumentInference(checker.store(), owner, own.length);
+        Parameter[] parameters = signature.parameters();
+        for (long i = 0; i < argumentTypes.length() && i < parameters.length; i++) {
+            inference.unifyArgument(i, parameters[i].type(), argumentTypes.get(i));
+        }
+        for (long i = 0; i < own.length; i++) {
+            let inferred = inference.binding(i);
+            if (inferred == null) {
+                string example = checker.names().quotedCode(["", ".{name}<"
+                    + concreteTypeArguments(own.length) + ">"
+                    + functioncalls.argumentsSpelling(node.arguments())], [instantiation]);
+                checker.reporter().report("'{name}' is generic, and this call does not show what "
+                    + "its type argument '{own[i].name()}' is. Write its type arguments, as in "
+                    + "{example}.", node.span());
+                return null;
+            }
+            bound.push(inferred);
+        }
+    }
+    Type[] arguments = bound.toArray();
+    bool satisfied = true;
+    for (long i = 0; i < own.length; i++) {
+        Span at = node.span();
+        if (written != null) {
+            at = written.arguments(i).span();
+        }
+        if (!checker.resolver().checkArgumentBounds(own[i], arguments, at, instantiation)) {
+            satisfied = false;
+        }
+    }
+    if (!satisfied) {
+        return null;
+    }
+    return arguments;
+}
+
+// The type with a generic static's own type arguments in place of its type parameters.
+substitutedOwn(BodyChecker checker, Signature signature, Type[] own, Type type) -> Type {
+    let owner = signature.declaration();
+    if (own.length == 0 || owner == null) {
+        return type;
+    }
+    return checker.store().substitute(type, owner, own);
 }
 
 // Several candidates inferred complete vectors: rank their substituted signatures over the types the
