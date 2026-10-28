@@ -1386,6 +1386,17 @@ task("test")
             return library:match("^ld%-linux.*%.so%.%d+$") ~= nil
         end
 
+        -- the standard output a fixture's '@stdout' lines pin, a line each
+        local function pinnedStdout(fixture)
+            local lines = {}
+            local source = io.readfile(path.join(tests_dir, fixture .. ".ens")) or ""
+            for line in source:gmatch("[^\r\n]+") do
+                local pinned = line:match("^// @stdout (.*)$")
+                if pinned then table.insert(lines, pinned) end
+            end
+            return table.concat(lines, "\n")
+        end
+
         local function run_linux_link(job)
             local name = job.name
             local log = path.join(out_dir, name .. ".log")
@@ -1415,6 +1426,8 @@ task("test")
                 {fixture = "hello", rc = 0, stdout = "Hello, world!", stderr = ""},
                 {fixture = "exc_main_unhandled", rc = 1, stdout = "",
                     stderr = "at main (exc_main_unhandled.ens:10)"},
+                {fixture = "tasks_runtime", rc = 0, stdout = pinnedStdout("tasks_runtime"),
+                    stderr = ""},
             }
             local allowed = {["libc.so.6"] = true, ["libm.so.6"] = true,
                 ["libgcc_s.so.1"] = true}
@@ -1506,6 +1519,8 @@ task("test")
                 {fixture = "hello", rc = 0, stdout = "Hello, world!", stderr = ""},
                 {fixture = "exc_main_unhandled", rc = 1, stdout = "",
                     stderr = "at main (exc_main_unhandled.ens:10)"},
+                {fixture = "tasks_runtime", rc = 0, stdout = pinnedStdout("tasks_runtime"),
+                    stderr = ""},
             }
             -- the DLLs every Windows has: the system's own, and the C runtime it ships with
             local function systemDll(dll)
@@ -1629,6 +1644,9 @@ task("test")
                     {label = "hello", argv = {"build", path.join(tests_dir, "hello.ens"),
                         "--target", target.triple, "--no-link", "--objects",
                         path.join(folder, "hello")}},
+                    {label = "tasks_runtime", argv = {"build",
+                        path.join(tests_dir, "tasks_runtime.ens"), "--target", target.triple,
+                        "--no-link", "--objects", path.join(folder, "tasks_runtime")}},
                 }
                 local compiled = true
                 for _, build in ipairs(builds) do
