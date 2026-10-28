@@ -1,35 +1,36 @@
-// What tasks share and change in turn. Every member of these classes is synchronized inside, so a
-// value of one may be held by any number of tasks at once.
+// Types for sharing state between tasks. Every operation on these classes is thread-safe, so any
+// number of tasks can hold the same instance.
 import RawArray from @std.collections.rawarray;
 import Iterable from @std.collections.iterator;
 import Iterator from @std.collections.iterator;
 import ThreadLock from @std.system;
 import @std.system;
 
-// One value that tasks read and replace without a lock. The compiler lowers 'read', 'write' and
-// 'compareAndSet' to the processor's atomic instructions, so the bodies below are never emitted. A
-// reference is compared by identity, the way the processor compares one.
+// A value that tasks read and replace without a lock. The compiler turns 'read', 'write' and
+// 'compareAndSet' into the processor's atomic instructions, so the bodies below never run.
+// References are compared by identity.
 export shared final class Atomic<shared T> {
     T value;
 
     export constructor(this.value);
 
-    // The value as it is now.
+    // Returns the current value.
     export read() -> T {
         return this.value;
     }
 
-    // Replaces the value, so every later read returns `value`.
+    // Replaces the value.
     export write(T value) {
         this.value = value;
     }
 
-    // Replaces the value with `replacement` when it is still `expected`, and reports whether it did.
+    // Replaces the value with `replacement` only if it is still `expected`, and returns whether it
+    // did.
     export compareAndSet(T expected, T replacement) -> bool {
         panic("Internal: 'compareAndSet' is lowered to an atomic instruction");
     }
 
-    // Adds `amount` to the value and returns the sum.
+    // Adds `amount` and returns the new value.
     export add<T: Number<T>>(T amount) -> T {
         while (true) {
             T current = this.read();
@@ -40,7 +41,7 @@ export shared final class Atomic<shared T> {
         }
     }
 
-    // Adds one to the value and returns the result.
+    // Adds one and returns the new value.
     export increment<T: Number<T>>() -> T {
         while (true) {
             T current = this.read();
@@ -51,7 +52,7 @@ export shared final class Atomic<shared T> {
         }
     }
 
-    // Takes one from the value and returns the result.
+    // Subtracts one and returns the new value.
     export decrement<T: Number<T>>() -> T {
         while (true) {
             T current = this.read();
@@ -63,8 +64,8 @@ export shared final class Atomic<shared T> {
     }
 }
 
-// One value that tasks change in turn: 'lock' runs a body with it while no other task holds it, so
-// the value itself never has to be one another task may hold.
+// A value that tasks change one at a time. The value itself does not need to be shareable, because
+// it never leaves the lock.
 export shared final class Mutex<T> {
     const ThreadLock guard;
     T value;
@@ -75,9 +76,9 @@ export shared final class Mutex<T> {
         this.holder = 0;
     }
 
-    // Runs `body` with the value once no other task holds it, waiting for its turn, and returns what
-    // the body returns. The body is a shared function and its result is shareable, so the value
-    // cannot leave the lock through a capture or a return.
+    // Waits until no other task holds the lock, then runs `body` with the value and returns its
+    // result. `body` must be a shared function and its result must be shareable, so the value cannot
+    // escape the lock.
     export lock<shared R, E: Error>((shared (T) -> R throws E) body) -> R throws E {
         this.enter();
         R result = try body(this.value);
@@ -88,8 +89,8 @@ export shared final class Mutex<T> {
         rethrow;
     }
 
-    // Replaces the value with what `body` returns for it, once no other task holds it, waiting for
-    // its turn. A number or a struct reaches a body as a copy, so this is how one of them changes.
+    // Waits until no other task holds the lock, then replaces the value with what `body` returns. Use
+    // this for numbers and structs: 'lock' passes them as a copy, so changes made there are lost.
     export update<E: Error>((shared (T) -> T throws E) body) throws E {
         this.enter();
         this.value = try body(this.value);
@@ -126,8 +127,8 @@ export shared final class Mutex<T> {
     }
 }
 
-// Thrown by a send once the channel's receiving end has been released, since nothing would ever
-// receive the value.
+// Thrown by 'send' when the channel's receiving end has been released, so no one would ever receive
+// the value.
 export class ChannelClosed extends Error {
     export constructor() {
         super("could not send: the receiving end of the channel has been released, so nothing would "
@@ -135,36 +136,36 @@ export class ChannelClosed extends Error {
     }
 }
 
-// The receiving end of a channel, which carries values from the tasks that send to the tasks that
-// receive. It closes when the last Sender is released, and a loop over it ends once it is closed and
-// every value sent has been received.
+// The receiving end of a channel, which carries values from tasks that send to tasks that receive.
+// The channel closes when its last Sender is released, and a 'for' loop over it ends once it is
+// closed and empty.
 export shared final class Channel<shared T> implements Iterable<T> {
     const ChannelState<T> state;
 
-    // A channel that holds up to `capacity` values no task has received yet, so a send waits while
-    // it is full. A capacity of zero makes every send wait until a task receives the value.
+    // Makes a channel that buffers up to `capacity` values; 'send' waits while the buffer is full.
+    // With a capacity of zero, every send waits until a task receives the value.
     export constructor(long capacity) {
         this.state = new ChannelState<T>(capacity);
     }
 
-    // The next value, waiting until one is sent, or null once the channel is closed and empty.
+    // Returns the next value, waiting for one to be sent, or null once the channel is closed and
+    // empty.
     export receive() -> T? {
         return this.state.take(-1);
     }
 
-    // The next value, or null once the channel is closed and empty or `timeoutMillis` milliseconds
-    // went by with nothing sent. 'isClosed' tells the two apart.
+    // Like 'receive()', but also returns null when nothing arrives within `timeoutMillis`
+    // milliseconds. 'isClosed' tells the two cases apart.
     export receive(long timeoutMillis) -> T? {
         return this.state.take(timeoutMillis < 0 ? 0 : timeoutMillis);
     }
 
-    // Whether every Sender of the channel has been released, so no value is sent to it any more.
+    // Returns whether every Sender has been released, so no more values can arrive.
     export isClosed() -> bool {
         return this.state.isClosed();
     }
 
-    // A new end to send values into the channel through. The channel stays open while any Sender
-    // of it is held.
+    // Returns a new Sender for this channel. The channel stays open while any Sender is alive.
     export sender() -> Sender<T> {
         this.state.addSender();
         return new Sender<T>(this.state);
@@ -179,14 +180,14 @@ export shared final class Channel<shared T> implements Iterable<T> {
     }
 }
 
-// An end that sends values into one channel. Releasing the last one closes the channel.
+// Sends values into one channel. Releasing the last Sender closes the channel.
 export shared final class Sender<shared T> {
     const ChannelState<T> state;
 
     protected constructor(this.state);
 
-    // Puts `value` into the channel, waiting while the channel holds as many values as it can, and
-    // for a channel of capacity zero until a task receives it.
+    // Puts `value` into the channel. Waits while the buffer is full, or, with a capacity of zero,
+    // until a task receives the value.
     export send(T value) throws ChannelClosed {
         try this.state.put(value);
     }
@@ -206,8 +207,8 @@ final class ChannelIterator<shared T> implements Iterator<T> {
     }
 }
 
-// What the ends of one channel share: the values sent and not yet received, in a ring of slots,
-// and the lock every change to them is made under.
+// The state both ends of a channel share: a ring buffer of values not yet received, and the lock
+// that guards every change to it.
 shared final class ChannelState<shared T> {
     const ThreadLock lock;
     const long capacity;
@@ -251,7 +252,7 @@ shared final class ChannelState<shared T> {
         system.releaseLock(this.lock);
     }
 
-    // The next value, waiting for one without a limit when `limitMillis` is negative.
+    // Returns the next value. A negative `limitMillis` waits with no time limit.
     protected take(long limitMillis) -> T? {
         long deadline = system.monotonicMillis() + limitMillis;
         system.acquireLock(this.lock);
@@ -288,7 +289,7 @@ shared final class ChannelState<shared T> {
         return ended;
     }
 
-    // Closed once a sender has been made and every one has been released.
+    // Whether a Sender was ever made and every one has been released.
     closed() -> bool {
         return this.everSent && this.senders == 0;
     }
