@@ -493,6 +493,15 @@ equalityComparabilityIssueOf(string instantiation, Type structType, TypeNames na
         }
         return null;
     }
+    let frozenOpaque = frozenLeaf(structType, false);
+    if (frozenOpaque != null) {
+        return equalitySubject(instantiation, structType,
+                "{names.quoted(structType)} cannot be compared with '=='", names)
+            + ": a frozen collection compares the values it holds, and "
+            + "{names.quoted(frozenOpaque)} has no '=='; {noEqualityReason(frozenOpaque)}. "
+            + suggestedFix(instantiation, "Compare the values you need directly instead.",
+                "Use a type argument whose values have an '==' of their own.");
+    }
     let authority = types.authorityOf(structType);
     if (authority == null) {
         return null;
@@ -589,6 +598,14 @@ hashabilityIssueOf(string instantiation, Type receiver, TypeNames names) -> stri
         }
         return null;
     }
+    let frozenOpaque = frozenLeaf(core, true);
+    if (frozenOpaque != null) {
+        return hashSubject(instantiation, receiver, "{names.quoted(receiver)} cannot be hashed", names)
+            + ": a frozen collection hashes the values it holds, and {names.quoted(frozenOpaque)} "
+            + "has no hash; {noHashReason(frozenOpaque)}. "
+            + suggestedFix(instantiation, "Hash a value you keep beside the collection instead.",
+                "Use a type argument whose values have a hash of their own.");
+    }
     if (!types.isStructLike(core)) {
         return null;
     }
@@ -678,6 +695,12 @@ public keyedContainerOf(DeclaredType template) -> KeyedContainer? {
     if (isDeclaredAs(template, "Set", "set")) {
         return new KeyedContainer(0, "a Set element", "element", "the set", "its hash", true);
     }
+    if (isDeclaredAs(template, "FrozenMap", "frozen")) {
+        return new KeyedContainer(0, "a FrozenMap key", "key", "the map", "its hash", true);
+    }
+    if (isDeclaredAs(template, "FrozenSet", "frozen")) {
+        return new KeyedContainer(0, "a FrozenSet element", "element", "the set", "its hash", true);
+    }
     if (isDeclaredAs(template, "SortedMap", "sortedmap")) {
         return new KeyedContainer(0, "a SortedMap key", "key", "the map",
             "its place in the order", false);
@@ -743,6 +766,13 @@ keyTypeIssueOf(string instantiation, DeclaredType container, Type key, TypeNames
                 + "number whose 'equals' compares it with 'compareTo(...) == 0' and whose "
                 + "'hash' returns 'toCanonicalBits() as long'.");
     }
+    let frozenOpaque = frozenLeaf(core, true);
+    if (frozenOpaque != null) {
+        return refused + "a frozen collection hashes the values it holds, and "
+            + "{names.quoted(frozenOpaque)} has no hash; {noHashReason(frozenOpaque)}. "
+            + suggestedFix(instantiation, "Key by a value you keep beside the collection instead.",
+                "Pass a type argument whose values have a hash of their own.");
+    }
     if (!types.isStructLike(core)) {
         return null;
     }
@@ -798,6 +828,57 @@ isStandardCollection(Type core) -> bool {
         || isDeclaredAs(template, "Set", "set") || isDeclaredAs(template, "Deque", "deque")
         || isDeclaredAs(template, "PriorityQueue", "priorityqueue")
         || isDeclaredAs(template, "SortedMap", "sortedmap");
+}
+
+// True for 'FrozenList', 'FrozenMap' and 'FrozenSet' of '@std.collections.frozen', which compare and
+// hash by the values they hold, so each has an '==' and a hash exactly when those values do.
+public isFrozenCollection(DeclaredType template) -> bool {
+    return template is ClassType && (isDeclaredAs(template, "FrozenList", "frozen")
+        || isDeclaredAs(template, "FrozenMap", "frozen") || isDeclaredAs(template, "FrozenSet", "frozen"));
+}
+
+// The type a frozen collection holds, at any depth, that has no hash when 'hashing' and no '=='
+// otherwise, or null when every value has one or the type is no frozen collection. A value whose
+// type is a type parameter is left for the judgment of each instantiation.
+frozenLeaf(Type type, bool hashing) -> Type? {
+    Type core = convert.coreOf(type);
+    if (!(core is InstantiationType) || !isFrozenCollection(core.template())) {
+        return null;
+    }
+    for (let argument in core.arguments()) {
+        let leaf = opaqueValueOf(argument, hashing);
+        if (leaf != null) {
+            return leaf;
+        }
+    }
+    return null;
+}
+
+// The type within 'type' that has no hash when 'hashing' and no '==' otherwise: the type itself, an
+// array's elements, a struct's field, or a frozen collection's values.
+opaqueValueOf(Type type, bool hashing) -> Type? {
+    Type core = convert.coreOf(type);
+    if (core is TypeParamType) {
+        return null;
+    }
+    if (core is ArrayType) {
+        Type element = innermostElementOf(core);
+        if (isOpaqueLeaf(element, hashing)) {
+            return element;
+        }
+        return opaqueValueOf(element, hashing);
+    }
+    if (isOpaqueLeaf(core, hashing)) {
+        return core;
+    }
+    if (types.isStructLike(core)) {
+        let field = firstOpaqueField(core, new Set<Type>(), hashing);
+        if (field != null) {
+            return field.leaf();
+        }
+        return null;
+    }
+    return frozenLeaf(core, hashing);
 }
 
 // True for 'Atomic' of '@std.tasks', whose one type argument is a value the processor reads and
@@ -1212,6 +1293,10 @@ class OffendingField {
 
 // Why a leaf type has no '=='.
 noEqualityReason(Type leaf) -> string {
+    if (frozenLeaf(leaf, false) != null) {
+        return "a frozen collection compares the values it holds, and its values have no '==' of "
+            + "their own";
+    }
     if (leaf is ArrayType) {
         return "an array compares element by element, and its elements have no '==' of "
             + "their own";
@@ -1221,6 +1306,10 @@ noEqualityReason(Type leaf) -> string {
 
 // Why a leaf type has no 'hash'.
 noHashReason(Type leaf) -> string {
+    if (frozenLeaf(leaf, true) != null) {
+        return "a frozen collection hashes the values it holds, and its values have no hash of "
+            + "their own";
+    }
     if (leaf is FunctionType) {
         return "a function value has no identity, so it has no hash";
     }
@@ -1282,7 +1371,7 @@ firstOpaqueField(Type structType, Set<Type> visiting, bool hashing) -> Offending
             }
             continue;
         }
-        if (isOpaqueLeaf(core, hashing)) {
+        if (isOpaqueLeaf(core, hashing) || frozenLeaf(core, hashing) != null) {
             return OffendingField.at(field.name(), core, declaring);
         }
         if (types.isStructLike(core)) {

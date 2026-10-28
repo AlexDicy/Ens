@@ -2616,6 +2616,7 @@ When nothing else refers to the container, its storage moves into the frozen one
 - `FrozenList<T>`, `FrozenMap<K, V>` and `FrozenSet<T>` from `@std.collections.frozen` hold what they were frozen with and offer the reads of their counterparts, `get`, `length()`, `isEmpty()`, `contains`, `indexOf`, `first()`, `last()`, `keys()`, `values()` and iteration in the same order, and none of `set`, `push`, `remove` or `clear`.
   `toList()`, `toMap()`, `toSet()` and `toArray()` return a writable copy, and `FrozenList.of(values)` freezes an array or a list in one step.
   A frozen collection compares and hashes by content, and it can be a key, since its content cannot change while it sits in the table.
+  One over values with no `==` or no hash, such as a `FrozenList<double>`, has none either, so comparing it, hashing it or keying by it is an error naming the value type, while it is a collection like any other.
 
 ```ens
 import Map from @std.collections.map;
