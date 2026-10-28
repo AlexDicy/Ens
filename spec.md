@@ -2000,7 +2000,7 @@ A literal of type `bytes` is written as an array literal where `bytes` is the ta
 ---
 
 `embed "path"` is an expression of type `bytes` holding the contents of the file at `path`, read when the program is compiled.
-`embed folder "path"` is an expression of type `EmbeddedFile[]` with one element for every file under the folder, at any depth.
+`embed folder "path"` is an expression of type `FrozenList<EmbeddedFile>` with one element for every file under the folder, at any depth, frozen because nothing can change what was embedded.
 `EmbeddedFile` is a struct from `@std.embed` with the file's `path` inside the folder, written with `/` between folders, and its `contents` as `bytes`.
 The elements are sorted by `path`, and a file or folder whose name starts with `.`, such as `.git`, is left out.
 The path is a string literal relative to the folder of the source file that writes it, with `/` between folders on every system.
@@ -2010,10 +2010,11 @@ An `embed` is not a compile-time constant, so a `static const` cannot be initial
 
 ```ens
 import EmbeddedFile from @std.embed;
+import FrozenList from @std.collections.frozen;
 
 final class Assets {
     lazy const bytes logo = embed "logo.png";
-    lazy const EmbeddedFile[] icons = embed folder "icons";
+    lazy const FrozenList<EmbeddedFile> icons = embed folder "icons";
 }
 ```
 
