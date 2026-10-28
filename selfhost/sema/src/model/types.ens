@@ -359,11 +359,13 @@ export sealed abstract class DeclaredType extends Type {
     bool editableDeclaration;
     string declaredPackageName;
     bool markedShared;
+    bool writtenAsFunction;
 
     protected constructor(string name, string modulePath, string packagePrefix, string filePath,
                 GreenNode declaration, Visibility visibility, string[] typeParameters) {
         this.editableDeclaration = true;
         this.markedShared = false;
+        this.writtenAsFunction = false;
         this.declaredPackageName = "";
         this.declaredName = name;
         this.declaredModulePath = modulePath;
@@ -425,6 +427,16 @@ export sealed abstract class DeclaredType extends Type {
 
     export isGeneric() -> bool {
         return this.declaredTypeParameters.length > 0;
+    }
+
+    // Whether the type's list matches a function type, as 'Task<shared () -> T throws E>' does, so a
+    // reference to it writes one function type, as in 'Task<() -> int>', for its two parameters.
+    export isWrittenAsFunction() -> bool {
+        return this.writtenAsFunction;
+    }
+
+    public markWrittenAsFunction() {
+        this.writtenAsFunction = true;
     }
 
     // Whether the declaration is marked 'shared', which a class, an interface or an external type may
@@ -1429,13 +1441,30 @@ export class TypeStore {
                     functionType.isShared());
             },
             is InstantiationType nested -> {
-                return this.instantiationOf(nested.template(),
-                    this.substituteAll(nested.arguments(), owner, arguments));
+                Type[] substituted = this.substituteAll(nested.arguments(), owner, arguments);
+                if (nested.template().isWrittenAsFunction() && substituted.length == 2) {
+                    substituted[1] = this.substitutedList(nested.arguments()[1], owner, arguments);
+                }
+                return this.instantiationOf(nested.template(), substituted);
             },
             default -> {
                 return type;
             },
         }
+    }
+
+    // A type argument that stands for a throws list, with the substitution applied: a type parameter
+    // bound to a whole list gives that list, and a list gives each of its types substituted.
+    substitutedList(Type listed, GreenNode owner, Type[] arguments) -> Type {
+        if (listed is TypeParamType && listed.owner() == owner
+                && listed.index() < arguments.length) {
+            return arguments[listed.index()];
+        }
+        if (listed is ThrownListType) {
+            return this.thrownListOf(this.substituteThrown(listed.members(), owner, arguments),
+                listed.base());
+        }
+        return this.substitute(listed, owner, arguments);
     }
 
     // A throws list with the substitution applied, where a type parameter bound to a whole list
@@ -1615,12 +1644,25 @@ export class TypeStore {
                 this.substitute(parameter.type(), owner, arguments), parameter.bindsField(),
                 parameter.isOut(), parameter.hasDefault(), parameter.span()));
         }
+        let thrown = new List<Type>();
+        let thrownSpans = new List<Span>();
+        Type[] declaredThrown = signature.throwsTypes();
+        Span[] declaredSpans = signature.throwsTypeSpans();
+        for (long i = 0; i < declaredThrown.length; i++) {
+            for (let entry in this.substituteThrown([declaredThrown[i]], owner, arguments)) {
+                if (!thrown.contains(entry)) {
+                    thrown.push(entry);
+                    thrownSpans.push(i < declaredSpans.length ? declaredSpans[i] : signature.nameSpan());
+                }
+            }
+        }
+        bool emptied = signature.throwsNothingHere()
+            || (declaredThrown.length > 0 && thrown.length() == 0);
         return new Signature(signature.name(), parameters.toArray(),
             this.substitute(signature.returnType(), owner, arguments),
-            signature.declaresThrows(), signature.isNoreturn(),
-            this.substituteAll(signature.throwsTypes(), owner, arguments),
-            signature.throwsTypeSpans(), signature.typeParameters(),
-            signature.declaration(), signature.nameSpan());
+            signature.declaresThrows() && !emptied, signature.isNoreturn(), thrown.toArray(),
+            thrownSpans.toArray(), signature.typeParameters(),
+            signature.declaration(), signature.nameSpan(), emptied);
     }
 
     export findDeclared(string modulePath, string name) -> DeclaredType? {

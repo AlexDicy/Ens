@@ -1,0 +1,156 @@
+// A standard-library class whose type-parameter list is written as a function type, as in
+// 'class Probe<shared () -> T throws E>', is written with the function type it runs, as in
+// 'Probe<() -> int>': its result and its whole throws list are its two type arguments.
+import @std.testing;
+import FakeFileLoader from sema_support;
+import ProgramAnalysis from pipeline;
+import sema_support;
+
+// The stand-in '@std.tasks' these tests write the form in.
+probeLibrary() -> string {
+    return "export shared final class Probe<shared () -> T throws E> \{\n"
+        + "    const (shared () -> T throws E) body;\n"
+        + "\n"
+        + "    export constructor(this.body);\n"
+        + "\n"
+        + "    export run() -> T throws E \{\n"
+        + "        return try this.body();\n"
+        + "    \}\n"
+        + "\}\n"
+        + "\n"
+        + "export probing<shared T, E: Error>((shared () -> T throws E) body) -> "
+        + "Probe<(() -> T throws E)> \{\n"
+        + "    return new Probe<(() -> T throws E)>(body);\n"
+        + "\}\n";
+}
+
+analyzed(string library, string main) -> ProgramAnalysis {
+    let loader = new FakeFileLoader();
+    loader.add("/stdlib/std/src/tasks.ens", library);
+    loader.add("/proj/src/main.ens", main);
+    return sema_support.analyzeAll(loader, "/proj/src", ["main.ens"]);
+}
+
+brokenError() -> string {
+    return "class Broken extends Error \{\n"
+        + "    constructor() \{\n"
+        + "        super(\"broken\");\n"
+        + "    \}\n"
+        + "\}\n";
+}
+
+test "a type written with the function type it runs takes its result and throws list from it" {
+    let analysis = analyzed(probeLibrary(), "import Probe from @std.tasks;\n"
+        + "import @std.tasks;\n"
+        + brokenError()
+        + "attempt(Probe<(() -> int throws Broken)> failing) -> int \{\n"
+        + "    return try failing.run();\n"
+        + "\} catch (Broken broken) \{\n"
+        + "    return 0;\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    Probe<() -> int> quiet = tasks.probing(() -> 41);\n"
+        + "    string shown = quiet;\n"
+        + "    return quiet.run() + attempt(tasks.probing(() -> \{\n"
+        + "        throw new Broken();\n"
+        + "        return 0;\n"
+        + "    \}));\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.signatureDiagnostics());
+    let reported = analysis.bodyDiagnostics();
+    try testing.assertEqual(reported.length, 1L);
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "Variable 'shown' has type 'string', but its value has type 'Probe<() -> int>'. Declare "
+        + "'shown' as a 'Probe<() -> int>' instead.");
+    try sema_support.assertNoDiagnostics(analysis.exceptionDiagnostics());
+}
+
+test "a lambda given where the expected type names the throws list is held to that list" {
+    let analysis = analyzed(probeLibrary(), "import Probe from @std.tasks;\n"
+        + "import @std.tasks;\n"
+        + brokenError()
+        + "class Other extends Error \{\n"
+        + "    constructor() \{\n"
+        + "        super(\"other\");\n"
+        + "    \}\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    Probe<() -> int> quiet = tasks.probing(() -> \{\n"
+        + "        throw new Broken();\n"
+        + "        return 0;\n"
+        + "    \});\n"
+        + "    Probe<(() -> int throws Broken)> named = tasks.probing(() -> \{\n"
+        + "        throw new Other();\n"
+        + "        return 0;\n"
+        + "    \});\n"
+        + "    return 0;\n"
+        + "\}\n");
+    try sema_support.assertNoDiagnostics(analysis.bodyDiagnostics());
+    let reported = analysis.exceptionDiagnostics();
+    try testing.assertEqual(reported.length, 2L);
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "This lambda can throw 'Broken', but the call to 'probing' is given to a 'Probe<() -> int>', "
+        + "which says the function throws nothing. Change 'Probe<() -> int>' to "
+        + "'Probe<(() -> int throws Broken)>', or move the throwing code into a named function that "
+        + "catches 'Broken' with a 'catch' clause.");
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
+        "This lambda can throw 'Other', but the call to 'probing' is given to a "
+        + "'Probe<(() -> int throws Broken)>', which says the function throws only 'Broken'. Change "
+        + "'Probe<(() -> int throws Broken)>' to 'Probe<(() -> int throws Broken, Other)>', or move "
+        + "the throwing code into a named function that catches 'Other' with a 'catch' clause.");
+}
+
+test "a type written with the function type it runs is refused in any other shape" {
+    let analysis = analyzed(probeLibrary(), "import Probe from @std.tasks;\n"
+        + "main() -> int \{\n"
+        + "    Probe<int, int>? pair = null;\n"
+        + "    Probe<int>? plain = null;\n"
+        + "    Probe<(int) -> int>? taking = null;\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.bodyDiagnostics();
+    try testing.assertEqual(reported.length, 3L);
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "'Probe' takes one type argument, the function type it runs, as in 'Probe<() -> int>', but "
+        + "two are written here.");
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
+        "'Probe' takes one type argument, the function type it runs, which takes no parameters, as "
+        + "in 'Probe<() -> int>', but 'int' is written here.");
+    try sema_support.assertDiagnostic(reported, 2, "/proj/src/main.ens",
+        "'Probe' takes one type argument, the function type it runs, which takes no parameters, as "
+        + "in 'Probe<() -> int>', but '(int) -> int' is written here.");
+}
+
+test "only a class of the standard library writes a function type as its type-parameter list" {
+    let analysis = analyzed(probeLibrary()
+        + "export final class Shaped<() -> T> \{\n"
+        + "    export constructor();\n"
+        + "\}\n", "import Shaped from @std.tasks;\n"
+        + "final class Job<shared () -> T throws E> \{\n"
+        + "    constructor();\n"
+        + "\}\n"
+        + "struct Point<() -> T throws E> \{\n"
+        + "    int x;\n"
+        + "\}\n"
+        + "interface Source<() -> T throws E> \{\n"
+        + "\}\n"
+        + "main() -> int \{\n"
+        + "    return 0;\n"
+        + "\}\n");
+    let reported = analysis.signatureDiagnostics();
+    try testing.assertEqual(reported.length, 4L);
+    try sema_support.assertDiagnostic(reported, 0, "/proj/src/main.ens",
+        "Class 'Job' writes a function type as its type-parameter list, and only the standard "
+        + "library can declare a class that way. Name the type parameters instead, as in "
+        + "'Job<T, E: Error>'.");
+    try sema_support.assertDiagnostic(reported, 1, "/proj/src/main.ens",
+        "Struct 'Point' writes a function type as its type-parameter list, which only a class can "
+        + "do. Name the type parameters instead, as in 'Point<T, E: Error>'.");
+    try sema_support.assertDiagnostic(reported, 2, "/proj/src/main.ens",
+        "Interface 'Source' writes a function type as its type-parameter list, which only a class "
+        + "can do. Name the type parameters instead, as in 'Source<T, E: Error>'.");
+    try sema_support.assertDiagnostic(reported, 3, "/stdlib/std/src/tasks.ens",
+        "Class 'Shaped' writes a function type as its type-parameter list, so the function type "
+        + "takes no parameters and names its result and the one type it throws, as in "
+        + "'() -> T throws E'.");
+}
