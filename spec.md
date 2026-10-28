@@ -2535,6 +2535,7 @@ for (let line in lines) {                             // ends when the last prod
 `Mutex<T>` from `@std.tasks` holds one value that several tasks change in turn.
 `new Mutex(value)` takes the value in, and `mutex.lock(body)` runs `body` with the value while no other task has it, waiting for its turn, and returns what the body returns.
 The body is a `shared` function and its result must be shareable, so the value inside cannot leave the lock through a capture or a return, while a shareable part of it, such as an entry of a map of `shared` objects, can.
+A body is given the value itself when it is an object, which the body changes in place, and a copy when it is a number or a struct, so `mutex.update(body)` replaces the value with what the body returns instead, as in `hits.update((count) -> count + 1)`.
 `Atomic<T>` from `@std.tasks` holds one shareable value that tasks read and replace without a lock: `read()`, `write(value)`, `compareAndSet(expected, replacement) -> bool`, and for numbers `increment()`, `decrement()` and `add(amount)`, each returning the value after the change.
 The arithmetic members are conditional on `T: Number<T>`, the interface every number type implements with `plus`, `minus`, `incremented` and `decremented`, so they exist on an `Atomic<long>` or an `Atomic<double>` and on no `Atomic<string>`.
 `compareAndSet` compares a reference by identity and every other value bit for bit, which is what the processor compares.

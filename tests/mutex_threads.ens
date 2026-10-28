@@ -1,0 +1,111 @@
+// @exit 0
+// @stdout total 400000
+// @stdout hits 40000 at 3,4
+// @stdout words 3 apple 2
+// @stdout caught broken, length 2
+// Four threads add to one object's count under a mutex and to a number through 'update', a struct
+// changes through 'update', a map of words changes in place under its lock, and a body that throws
+// releases the lock and passes the error on.
+import Mutex from @std.tasks;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+
+external type NativeThread;
+
+external from libc {
+    ens_thread_start((() -> void) body, out int error) -> NativeThread?;
+    ens_thread_join(NativeThread thread);
+}
+
+class Broken extends Error {
+    constructor() {
+        super("broken");
+    }
+}
+
+struct Point {
+    int x;
+    int y;
+}
+
+final class Tally {
+    long count = 0;
+}
+
+addMany(Mutex<Tally> tally) {
+    for (long i = 0; i < 100000; i++) {
+        tally.lock((held) -> {
+            held.count = held.count + 1;
+        });
+    }
+}
+
+failInside(Mutex<List<int>> numbers) -> string {
+    try numbers.lock((list) -> {
+        list.push(2);
+        if (list.length() > 1) {
+            throw new Broken();
+        }
+        return list.length();
+    });
+    return "not thrown";
+} catch (Broken broken) {
+    long length = numbers.lock((list) -> list.length());
+    return "caught {broken.message}, length {length}";
+}
+
+main() -> int {
+    let tally = new Mutex<Tally>(new Tally());
+    let threads = new NativeThread?[4];
+    for (long t = 0; t < 4; t++) {
+        int error = 0;
+        threads[t] = ens_thread_start(() -> addMany(tally), out error);
+    }
+    for (long t = 0; t < 4; t++) {
+        let thread = threads[t];
+        if (thread != null) {
+            ens_thread_join(thread);
+        }
+    }
+    long total = tally.lock((held) -> held.count);
+    print("total {total}");
+
+    let hits = new Mutex<int>(0);
+    let counters = new NativeThread?[4];
+    for (long t = 0; t < 4; t++) {
+        int error = 0;
+        counters[t] = ens_thread_start(() -> {
+            for (long i = 0; i < 10000; i++) {
+                hits.update((count) -> count + 1);
+            }
+        }, out error);
+    }
+    for (long t = 0; t < 4; t++) {
+        let thread = counters[t];
+        if (thread != null) {
+            ens_thread_join(thread);
+        }
+    }
+    Point origin = {x: 2, y: 4};
+    let cursor = new Mutex<Point>(origin);
+    cursor.update((point) -> {
+        Point moved = {x: point.x + 1, y: point.y};
+        return moved;
+    });
+    int seen = hits.lock((count) -> count);
+    Point now = cursor.lock((point) -> point);
+    print("hits {seen} at {now.x},{now.y}");
+
+    let words = new Mutex<Map<string, int>>(new Map<string, int>());
+    for (let word in ["apple", "pear", "apple", "fig"]) {
+        words.lock((counts) -> counts.set(word, (counts.get(word) ?? 0) + 1));
+    }
+    long distinct = words.lock((counts) -> counts.length());
+    int apples = words.lock((counts) -> counts.get("apple") ?? 0);
+    print("words {distinct} apple {apples}");
+
+    let numbers = new Mutex<List<int>>(new List<int>());
+    numbers.lock((list) -> list.push(1));
+    print(failInside(numbers));
+    return 0;
+}

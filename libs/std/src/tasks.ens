@@ -63,6 +63,69 @@ export shared final class Atomic<shared T> {
     }
 }
 
+// One value that tasks change in turn: 'lock' runs a body with it while no other task holds it, so
+// the value itself never has to be one another task may hold.
+export shared final class Mutex<T> {
+    const ThreadLock guard;
+    T value;
+    long holder;
+
+    export constructor(this.value) {
+        this.guard = system.createLock();
+        this.holder = 0;
+    }
+
+    // Runs `body` with the value once no other task holds it, waiting for its turn, and returns what
+    // the body returns. The body is a shared function and its result is shareable, so the value
+    // cannot leave the lock through a capture or a return.
+    export lock<shared R, E: Error>((shared (T) -> R throws E) body) -> R throws E {
+        this.enter();
+        R result = try body(this.value);
+        this.leave();
+        return result;
+    } catch (E failure) {
+        this.leave();
+        rethrow;
+    }
+
+    // Replaces the value with what `body` returns for it, once no other task holds it, waiting for
+    // its turn. A number or a struct reaches a body as a copy, so this is how one of them changes.
+    export update<E: Error>((shared (T) -> T throws E) body) throws E {
+        this.enter();
+        this.value = try body(this.value);
+        this.leave();
+    } catch (E failure) {
+        this.leave();
+        rethrow;
+    }
+
+    enter() {
+        long caller = system.threadToken();
+        system.acquireLock(this.guard);
+        if (this.holder == caller) {
+            system.releaseLock(this.guard);
+            panic("tried to lock a mutex inside a body this task is already running under its "
+                + "lock, which would wait for ever. Use the value that body was given instead");
+        }
+        while (this.holder != 0) {
+            system.waitOnLock(this.guard, -1);
+        }
+        this.holder = caller;
+        system.releaseLock(this.guard);
+    }
+
+    leave() {
+        system.acquireLock(this.guard);
+        this.holder = 0;
+        system.wakeLockWaiters(this.guard);
+        system.releaseLock(this.guard);
+    }
+
+    destructor() {
+        system.destroyLock(this.guard);
+    }
+}
+
 // Thrown by a send once the channel's receiving end has been released, since nothing would ever
 // receive the value.
 export class ChannelClosed extends Error {
