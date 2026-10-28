@@ -41,6 +41,8 @@ import FunctionType from model.types;
 import TypeParamType from model.types;
 import model.convert;
 import ThrowsContext from result;
+import InstantiationType from model.types;
+import PendingUse from result;
 import Type from model.types;
 import ErrorType from model.types;
 import DeclaredType from model.types;
@@ -179,6 +181,11 @@ public final class ThrowValidation {
                 this.refuseAgainstContext(lambda, argument.call, context, outward, allowed);
                 return;
             }
+            let use = this.result.pendingUseOf(lambda.green());
+            if (use != null) {
+                this.refuseAgainstUse(lambda, argument.call, use, outward, allowed);
+                return;
+            }
         }
         if (allowed.length == 0) {
             if (outward.isEmpty()) {
@@ -242,42 +249,77 @@ public final class ThrowValidation {
     refuseAgainstContext(LambdaExpressionNode lambda, CallExpressionNode call,
                          ThrowsContext context, ThrowSet outward, Type[] allowed) {
         let strays = this.strayUnderScope(outward, exceptions.throwSetOf(allowed, this.errorClass));
-        if (strays.isEmpty()) {
-            return;
-        }
         let signature = this.module.calleeSignatureOf(call);
         let owner = signature?.declaration();
         Type[]? arguments = this.result.callTypeArgumentsOf(call.green());
-        if (signature == null || owner == null || arguments == null) {
+        if (strays.isEmpty() || signature == null || owner == null || arguments == null) {
             return;
         }
+        Type[] union = this.widenedList(allowed, strays);
+        Type[] widened = arguments.slice(0, arguments.length);
+        for (let index in context.indexes()) {
+            widened[index] = this.listBinding(union);
+        }
+        Type suggested = this.module.typeStore().substitute(signature.returnType(), owner, widened);
+        this.refuseGivenType(lambda, signature.name(), context.expected(), suggested, union, strays,
+            allowed, null);
+    }
+
+    // A lambda whose list a later use of the call's value gave is held to that list, so the fix is
+    // to the type the value was given to there.
+    refuseAgainstUse(LambdaExpressionNode lambda, CallExpressionNode call, PendingUse use,
+                     ThrowSet outward, Type[] allowed) {
+        let strays = this.strayUnderScope(outward, exceptions.throwSetOf(allowed, this.errorClass));
+        let signature = this.module.calleeSignatureOf(call);
+        let given = use.given();
+        if (strays.isEmpty() || signature == null || !(given is InstantiationType)) {
+            return;
+        }
+        Type[] union = this.widenedList(allowed, strays);
+        Type[] arguments = given.arguments().slice(0, given.arguments().length);
+        arguments[1] = this.listBinding(union);
+        Type suggested = this.module.typeStore().instantiationOf(given.template(), arguments);
+        this.refuseGivenType(lambda, signature.name(), given, suggested, union, strays, allowed,
+            new RelatedLocation(this.fileNames.filePath(), use.span(),
+                "the value is given to {typenames.typeArticle(this.names.quoted(given))} "
+                + "{this.names.quoted(given)} here"));
+    }
+
+    widenedList(Type[] allowed, ThrowSet strays) -> Type[] {
         let listed = new ThrowSet();
         listed.addAll(exceptions.throwSetOf(allowed, this.errorClass));
         listed.addAll(strays);
-        Type[] union = sortedTypes(listed, this.names);
-        Type[] widened = arguments.slice(0, arguments.length);
+        return sortedTypes(listed, this.names);
+    }
+
+    listBinding(Type[] members) -> Type {
         Type fallback = this.module.typeStore().errorType();
         let errorClass = this.errorClass;
         if (errorClass != null) {
             fallback = errorClass;
         }
-        for (let index in context.indexes()) {
-            widened[index] = convert.thrownListBinding(this.module.typeStore(), union, fallback);
-        }
+        return convert.thrownListBinding(this.module.typeStore(), members, fallback);
+    }
+
+    refuseGivenType(LambdaExpressionNode lambda, string callee, Type expected, Type suggested,
+                    Type[] union, ThrowSet strays, Type[] allowed, RelatedLocation? note) {
         let imported = typenames.importsFor(union, this.names);
-        string expected = this.names.quoted(context.expected());
-        string suggested = imported.names().quoted(this.module.typeStore().substitute(signature.returnType(),
-            owner, widened));
+        string expectedText = this.names.quoted(expected);
         string says = "nothing";
         if (allowed.length > 0) {
             says = "only {nameList(exceptions.throwSetOf(allowed, this.errorClass), this.names)}";
         }
-        string fix = typenames.withImportsFirst(imported, "Change {expected} to {suggested}");
-        this.reporter.report("This lambda can throw {nameList(strays, this.names)}, but the call to "
-            + "'{signature.name()}' is given to {typenames.typeArticle(expected)} {expected}, which "
-            + "says the function throws {says}. {fix}, or "
-            + namedFunctionFix("throwing code", nameList(strays, this.names)),
-            lambda.arrow().span());
+        string fix = typenames.withImportsFirst(imported,
+            "Change {expectedText} to {imported.names().quoted(suggested)}");
+        string message = "This lambda can throw {nameList(strays, this.names)}, but the value of the "
+            + "call to '{callee}' is given to {typenames.typeArticle(expectedText)} {expectedText}, "
+            + "which says the function throws {says}. {fix}, or "
+            + namedFunctionFix("throwing code", nameList(strays, this.names));
+        if (note == null) {
+            this.reporter.report(message, lambda.arrow().span());
+            return;
+        }
+        this.reporter.report(message, lambda.arrow().span(), [note]);
     }
 
     lambdaTargetThrownTypes(LambdaExpressionNode lambda) -> Type[] {
