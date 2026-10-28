@@ -535,11 +535,11 @@ A type argument no argument mentions, such as one that appears only in the retur
 A function or a lambda that returns nothing, passed for a `() -> T` parameter, binds `T` to `void` unless another argument gives `T` a type, which then decides it, so `after(callback, 1)` against `after<T>(() -> T first, T second)` binds `T` to `int` and refuses `callback`.
 A lambda whose body never ends normally, as one that only throws, returns nothing as well, but fits whatever type another argument gives `T`, since it never produces a value of any type.
 An argument that is itself no value, such as a call to a function that returns nothing, is still refused wherever a value is passed.
-A value of type `void` takes no storage: a local, a field, a parameter or a capture of that type holds nothing, a struct literal leaves such a field out, and a function returning `T` returns nothing, so `Task<() -> void>` carries no value and `Channel<void>` carries only that something was sent.
+A value of type `void` takes no storage: a local, a field, a parameter or a capture of that type holds nothing, a struct literal leaves such a field out, and a function returning `T` returns nothing, so a `Task<() -> void>` carries no value.
 A `T?` over `void` is present or absent and holds nothing else.
 A field of type `void` takes no part in a struct's `==`, its hash, or its JSON form, while a value of type `void` has no text form, so writing one in an interpolation is refused.
 A parameter that a `void` type argument makes `void` takes no argument, so `same<void>(1)` is refused.
-An array of `void` would have nothing to hold, so a generic that makes one, as `List<T>` and `Map<K, V>` do for their storage, refuses `void` at the instantiation under the rule for judgments deferred to type arguments, naming the line that makes the array; `List<void>` is therefore an error, and so is `void[]` anywhere.
+An array of `void` would have nothing to hold, so a generic that makes one, as `List<T>`, `Map<K, V>` and `Channel<T>` do for their storage, refuses `void` at the instantiation under the rule for judgments deferred to type arguments, naming the line that makes the array; `List<void>` is therefore an error, and so is `void[]` anywhere.
 
 ```ens
 firstOf<T>(List<T> items) -> T {
