@@ -39,6 +39,7 @@ import FunctionType from model.types;
 import model.convert;
 import TypeParamType from model.types;
 import PendingThrowsType from model.types;
+import ThrownListType from model.types;
 import Type from model.types;
 import ErrorType from model.types;
 import DeclaredType from model.types;
@@ -250,10 +251,14 @@ public throwSetOf(Type[] declared, ClassType? errorBase) -> ThrowSet {
 }
 
 // What a call to the signature may raise at the caller: the declared throws list when it names
-// types, the computed outward set otherwise.
+// types, nothing when the types it named stand for empty lists, and the computed outward set
+// otherwise.
 public contractOf(Signature signature, ThrowsRegistry registry, ClassType? errorBase) -> ThrowSet {
     if (signature.declaresThrows() && signature.throwsTypes().length > 0) {
         return throwSetOf(signature.throwsTypes(), errorBase);
+    }
+    if (signature.throwsNothingHere()) {
+        return new ThrowSet();
     }
     let declaration = signature.declaration();
     if (declaration == null) {
@@ -262,18 +267,28 @@ public contractOf(Signature signature, ThrowsRegistry registry, ClassType? error
     return registry.outwardFor(declaration);
 }
 
-// True when everything the signature declares it throws is one of its own type parameters, so an
-// instantiation whose lists are empty throws nothing and needs no 'try'.
+// True when everything the signature declares it throws is one of its own type parameters or what a
+// lambda throws, so an instantiation whose lists are empty throws nothing and needs no 'try'.
 throwsOnlyItsParameters(Signature signature) -> bool {
     if (signature.throwsTypes().length == 0) {
         return false;
     }
     for (let thrown in signature.throwsTypes()) {
-        if (!(thrown is TypeParamType) || thrown.owner() != signature.declaration()) {
+        bool parameter = thrown is TypeParamType && thrown.owner() == signature.declaration();
+        if (!parameter && !(thrown is PendingThrowsType)) {
             return false;
         }
     }
     return true;
+}
+
+declaresPending(Signature signature) -> bool {
+    for (let thrown in signature.throwsTypes()) {
+        if (thrown is PendingThrowsType) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Which callables carry the trailing error-slot parameter in their machine interface. One dispatch
@@ -417,6 +432,10 @@ public final class ModuleExceptions {
     }
 
     // The outward and judged throw sets of every module.
+    public typeStore() -> TypeStore {
+        return this.store;
+    }
+
     public registry() -> ThrowsRegistry {
         return this.throwsRegistry;
     }
@@ -815,7 +834,7 @@ public final class ModuleExceptions {
 
     // The static target of a call, or null for calls that can never propagate: constructor
     // chains and unresolved callees.
-    calleeSignatureOf(CallExpressionNode call) -> Signature? {
+    public calleeSignatureOf(CallExpressionNode call) -> Signature? {
         switch (call.callee()) {
             is IdentifierExpressionNode identifier -> {
                 return this.moduleResult.callableOf(identifier.green());
@@ -906,6 +925,9 @@ public final class ModuleExceptions {
         if (target == null) {
             return throwSetOf(this.calleeFunctionThrownTypes(call), this.errorBaseClass);
         }
+        if (declaresPending(target)) {
+            return this.pendingContract(target);
+        }
         let contract = this.contractFor(target);
         let arguments = this.moduleResult.callTypeArgumentsOf(call.green());
         let owner = target.declaration();
@@ -931,9 +953,40 @@ public final class ModuleExceptions {
         return substituted;
     }
 
+    // What a call raises whose target, a member of a type that mentions what a lambda throws, lists
+    // that lambda's throws: the list a use of the value gave it, or what the lambda's body raises.
+    pendingContract(Signature target) -> ThrowSet {
+        let raised = new ThrowSet();
+        for (let entry in target.throwsTypes()) {
+            if (!(entry is PendingThrowsType)) {
+                this.addRaised(raised, entry);
+                continue;
+            }
+            let use = this.moduleResult.pendingUseOf(entry.lambda());
+            if (use != null) {
+                let list = use.list();
+                Type[] members = [list];
+                if (list is ThrownListType) {
+                    members = list.members();
+                }
+                for (let member in members) {
+                    this.addRaised(raised, member);
+                }
+                continue;
+            }
+            let lambdaThrows = this.throwsRegistry.outwardFor(entry.lambda());
+            raised.addUnresolvedOf(lambdaThrows);
+            for (let member in lambdaThrows.members()) {
+                this.addRaised(raised, member);
+            }
+        }
+        return raised;
+    }
+
     // Replaces each type argument that stood for what a lambda argument throws with the list the
     // lambda's converged outward set holds, so every later phase reads the list itself.
     protected settlePendingThrows() {
+        let settledLists = new Map<PendingThrowsType, Type>();
         for (let call in this.moduleResult.callsAwaitingThrows()) {
             let arguments = this.moduleResult.callTypeArgumentsOf(call) ?? [];
             for (long i = 0; i < arguments.length; i++) {
@@ -941,16 +994,28 @@ public final class ModuleExceptions {
                 if (!(argument is PendingThrowsType)) {
                     continue;
                 }
-                let thrown = this.throwsRegistry.outwardFor(argument.lambda()).members().toArray();
-                Type fallback = this.store.errorType();
-                let errorBase = this.errorBaseClass;
-                if (errorBase != null) {
-                    fallback = errorBase;
-                }
-                Type settled = convert.thrownListBinding(this.store, thrown, fallback);
+                Type settled = this.settledListOf(argument);
+                settledLists.set(argument, settled);
                 this.moduleResult.settleThrows(argument, settled, this.store);
             }
         }
+        this.moduleResult.settleRecordedTypes(this.store, settledLists);
+    }
+
+    // The list what a lambda throws stands for: the one a use of its value gave it, against which
+    // the lambda is judged, or else the lambda's converged outward set.
+    settledListOf(PendingThrowsType pending) -> Type {
+        let use = this.moduleResult.pendingUseOf(pending.lambda());
+        if (use != null) {
+            return use.list();
+        }
+        let thrown = this.throwsRegistry.outwardFor(pending.lambda()).members().toArray();
+        Type fallback = this.store.errorType();
+        let errorBase = this.errorBaseClass;
+        if (errorBase != null) {
+            fallback = errorBase;
+        }
+        return convert.thrownListBinding(this.store, thrown, fallback);
     }
 
     // True for a call of a generic callee that was refused before its type arguments were known,

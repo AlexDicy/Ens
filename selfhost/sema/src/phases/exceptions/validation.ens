@@ -39,6 +39,10 @@ import QuotedCode from model.typenames;
 import model.types;
 import FunctionType from model.types;
 import TypeParamType from model.types;
+import model.convert;
+import ThrowsContext from result;
+import InstantiationType from model.types;
+import PendingUse from result;
 import Type from model.types;
 import ErrorType from model.types;
 import DeclaredType from model.types;
@@ -170,6 +174,19 @@ public final class ThrowValidation {
             return;
         }
         Type[] allowed = target.thrownTypes();
+        let argument = this.argumentCalls.get(lambda.green());
+        if (argument != null && !outward.isEmpty()) {
+            let context = this.result.throwsContextOf(argument.call.green());
+            if (context != null) {
+                this.refuseAgainstContext(lambda, argument.call, context, outward, allowed);
+                return;
+            }
+            let use = this.result.pendingUseOf(lambda.green());
+            if (use != null) {
+                this.refuseAgainstUse(lambda, argument.call, use, outward, allowed);
+                return;
+            }
+        }
         if (allowed.length == 0) {
             if (outward.isEmpty()) {
                 string example = "'(() -> void throws Error)'";
@@ -192,6 +209,9 @@ public final class ThrowValidation {
             string elsewhere = namedFunctionFix("throwing code", nameList(outward, this.names));
             let parameter = site.parameter;
             let otherFile = site.otherFile;
+            if (this.refusedForUneditable(lambda, site, thrown, "nothing")) {
+                return;
+            }
             if (parameter != null && otherFile != null) {
                 string place = "the type of parameter '{parameter.name()}' of '{site.callable}'";
                 string fix = "Add {clause} there, as in {written}, or {elsewhere}";
@@ -217,14 +237,115 @@ public final class ThrowValidation {
                 + "{written}, or {elsewhere}", lambda.arrow().span());
             return;
         }
-        let strays = this.strayUnderScope(outward, exceptions.throwSetOf(allowed, this.errorClass));
+        let permitted = exceptions.throwSetOf(allowed, this.errorClass);
+        let strays = this.strayUnderScope(outward, permitted);
         if (!strays.isEmpty()) {
             string thrown = nameList(strays, this.names);
+            if (this.refusedForUneditable(lambda, this.targetSite(lambda), thrown,
+                    "only {nameList(permitted, this.names)}")) {
+                return;
+            }
             this.reporter.report("This lambda can throw {thrown}, which the function type it is given "
                 + "to does not list. Add {nameList(strays, this.names)} to that function type's 'throws' "
                 + "list, or " + namedFunctionFix("throwing code", nameList(strays, this.names)),
                 lambda.arrow().span());
         }
+    }
+
+    // Refuses a lambda that throws `thrown` where it is given to a parameter of a library the
+    // program cannot edit, whose function type throws `listed`, and returns whether it did. Only a
+    // named function can fix that.
+    refusedForUneditable(LambdaExpressionNode lambda, LambdaTargetSite site, string thrown,
+                         string listed) -> bool {
+        let parameter = site.parameter;
+        let otherFile = site.otherFile;
+        if (parameter == null || otherFile == null || site.editable) {
+            return false;
+        }
+        this.reporter.report("This lambda can throw {thrown}, but '{site.callable}' takes a function "
+            + "that throws {listed}. Move the throwing code into a named function that catches "
+            + "{thrown} with a 'catch' clause.", lambda.arrow().span(),
+            [new RelatedLocation(otherFile, parameter.span(),
+                "parameter '{parameter.name()}' of '{site.callable}' is declared here")]);
+        return true;
+    }
+
+    // A lambda passed to a call whose value is given to a type that lists what the call's function
+    // throws is held to that list, so the fix is to that type.
+    refuseAgainstContext(LambdaExpressionNode lambda, CallExpressionNode call,
+                         ThrowsContext context, ThrowSet outward, Type[] allowed) {
+        let strays = this.strayUnderScope(outward, exceptions.throwSetOf(allowed, this.errorClass));
+        let signature = this.module.calleeSignatureOf(call);
+        let owner = signature?.declaration();
+        Type[]? arguments = this.result.callTypeArgumentsOf(call.green());
+        if (strays.isEmpty() || signature == null || owner == null || arguments == null) {
+            return;
+        }
+        Type[] union = this.widenedList(allowed, strays);
+        Type[] widened = arguments.slice(0, arguments.length);
+        for (let index in context.indexes()) {
+            widened[index] = this.listBinding(union);
+        }
+        Type suggested = this.module.typeStore().substitute(signature.returnType(), owner, widened);
+        this.refuseGivenType(lambda, signature.name(), context.expected(), suggested, union, strays,
+            allowed, null);
+    }
+
+    // A lambda whose list a later use of the call's value gave is held to that list, so the fix is
+    // to the type the value was given to there.
+    refuseAgainstUse(LambdaExpressionNode lambda, CallExpressionNode call, PendingUse use,
+                     ThrowSet outward, Type[] allowed) {
+        let strays = this.strayUnderScope(outward, exceptions.throwSetOf(allowed, this.errorClass));
+        let signature = this.module.calleeSignatureOf(call);
+        let given = use.given();
+        if (strays.isEmpty() || signature == null || !(given is InstantiationType)) {
+            return;
+        }
+        Type[] union = this.widenedList(allowed, strays);
+        Type[] arguments = given.arguments().slice(0, given.arguments().length);
+        arguments[1] = this.listBinding(union);
+        Type suggested = this.module.typeStore().instantiationOf(given.template(), arguments);
+        this.refuseGivenType(lambda, signature.name(), given, suggested, union, strays, allowed,
+            new RelatedLocation(this.fileNames.filePath(), use.span(),
+                "the value is given to {typenames.typeArticle(this.names.quoted(given))} "
+                + "{this.names.quoted(given)} here"));
+    }
+
+    widenedList(Type[] allowed, ThrowSet strays) -> Type[] {
+        let listed = new ThrowSet();
+        listed.addAll(exceptions.throwSetOf(allowed, this.errorClass));
+        listed.addAll(strays);
+        return sortedTypes(listed, this.names);
+    }
+
+    listBinding(Type[] members) -> Type {
+        Type fallback = this.module.typeStore().errorType();
+        let errorClass = this.errorClass;
+        if (errorClass != null) {
+            fallback = errorClass;
+        }
+        return convert.thrownListBinding(this.module.typeStore(), members, fallback);
+    }
+
+    refuseGivenType(LambdaExpressionNode lambda, string callee, Type expected, Type suggested,
+                    Type[] union, ThrowSet strays, Type[] allowed, RelatedLocation? note) {
+        let imported = typenames.importsFor(union, this.names);
+        string expectedText = this.names.quoted(expected);
+        string says = "nothing";
+        if (allowed.length > 0) {
+            says = "only {nameList(exceptions.throwSetOf(allowed, this.errorClass), this.names)}";
+        }
+        string fix = typenames.withImportsFirst(imported,
+            "Change {expectedText} to {imported.names().quoted(suggested)}");
+        string message = "This lambda can throw {nameList(strays, this.names)}, but the value of the "
+            + "call to '{callee}' is given to {typenames.typeArticle(expectedText)} {expectedText}, "
+            + "which says the function throws {says}. {fix}, or "
+            + namedFunctionFix("throwing code", nameList(strays, this.names));
+        if (note == null) {
+            this.reporter.report(message, lambda.arrow().span());
+            return;
+        }
+        this.reporter.report(message, lambda.arrow().span(), [note]);
     }
 
     lambdaTargetThrownTypes(LambdaExpressionNode lambda) -> Type[] {
@@ -251,7 +372,8 @@ public final class ThrowValidation {
                 if (owner != null) {
                     let names = this.directory.namesFor(owner.filePath()).withParametersOf(owner,
                         method.signature().typeParameters());
-                    return this.siteIn(names, owner.filePath(), method.signature(), argument);
+                    return this.siteIn(names, owner.filePath(), method.signature(), argument,
+                        owner.isEditable());
                 }
             }
         }
@@ -260,15 +382,15 @@ public final class ThrowValidation {
         if (function != null && declaringFile != null) {
             let names = this.directory.namesFor(declaringFile).withParametersOf(null,
                 function.typeParameters());
-            return this.siteIn(names, declaringFile, function, argument);
+            return this.siteIn(names, declaringFile, function, argument, names.isEditable());
         }
         return new LambdaTargetSite(this.fileNames, null, null, "");
     }
 
     // The site of a lambda passed as 'argument' to 'signature', declared in the file 'filePath'
     // whose names are 'names'. The parameter is named only where that file is not this one.
-    siteIn(TypeNames names, string filePath, Signature signature, LambdaArgument argument)
-           -> LambdaTargetSite {
+    siteIn(TypeNames names, string filePath, Signature signature, LambdaArgument argument,
+           bool editable = true) -> LambdaTargetSite {
         if (filePath == this.fileNames.filePath()) {
             return new LambdaTargetSite(names, null, null, "");
         }
@@ -283,7 +405,7 @@ public final class ThrowValidation {
         } else if (argument.position < parameters.length) {
             parameter = parameters[argument.position];
         }
-        return new LambdaTargetSite(names, filePath, parameter, signature.name());
+        return new LambdaTargetSite(names, filePath, parameter, signature.name(), editable);
     }
 
     // Records the lambdas the call passes as arguments, alone or as values of a '?:' or a switch, for
@@ -1544,8 +1666,12 @@ final class LambdaTargetSite {
     string? otherFile;
     Parameter? parameter;
     string callable;
+    bool editable;
 
-    constructor(this.names, this.otherFile, this.parameter, this.callable);
+    constructor(this.names, this.otherFile, this.parameter, this.callable,
+                bool editable = true) {
+        this.editable = editable;
+    }
 }
 
 // The function type 'target' with the 'throws' list 'thrown', in the parentheses a function type with

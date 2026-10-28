@@ -195,6 +195,115 @@ public joinRuntime(Runtime runtime) -> RuntimeFunction {
     return runtime.endDefinition(definition);
 }
 
+// The priorities a dedicated task's thread asks for, in each system's own numbers.
+final class Priorities {
+    // Win32's THREAD_PRIORITY_HIGHEST and THREAD_PRIORITY_TIME_CRITICAL.
+    protected static const long windowsHigh = 2;
+    protected static const long windowsRealtime = 15;
+    // QOS_CLASS_USER_INTERACTIVE, the class macOS runs ahead of every other.
+    protected static const long darwinInteractive = 0x21;
+    // The policy a realtime thread runs under: SCHED_RR on macOS and SCHED_FIFO on Linux.
+    protected static const long darwinRealtimePolicy = 2;
+    protected static const long linuxRealtimePolicy = 1;
+    // The nice value a high thread asks Linux for.
+    protected static const long linuxHighNice = -10;
+    // Room for a struct sched_param: an int, and four more bytes on macOS.
+    protected static const long scheduleBytes = 16;
+}
+
+// void ens_thread_raise(i32 level): runs the calling thread at level 1, ahead of ordinary threads,
+// or 2, as soon as it is ready, as far as the system allows. A refused realtime level falls back to
+// the high one, and a refused high level leaves the thread as it was.
+public raiseRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.voidType.functionType([runtime.int32Type]);
+    let known = runtime.existing("ens_thread_raise", type);
+    if (known != null) {
+        return known;
+    }
+    if (runtime.onWindows()) {
+        return windowsRaise(runtime, type);
+    }
+    return posixRaise(runtime, type);
+}
+
+windowsRaise(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let current = runtime.libc("GetCurrentThread", runtime.pointerType.functionType([]));
+    let set = runtime.libc("SetThreadPriority",
+        runtime.int32Type.functionType([runtime.pointerType, runtime.int32Type]));
+    let definition = runtime.beginDefinition("ens_thread_raise", type);
+    let builder = runtime.builder;
+    let level = runtime.parameter(definition, 0);
+    let raise = runtime.block(definition, "raise.set");
+    let done = runtime.block(definition, "raise.done");
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, level, runtime.int32(0),
+        "normal"), done, raise);
+
+    builder.positionAtEnd(raise);
+    let realtime = instructions.buildICmpEQ(builder, level, runtime.int32(2), "realtime");
+    let priority = instructions.buildSelect(builder, realtime,
+        runtime.int32(Priorities.windowsRealtime), runtime.int32(Priorities.windowsHigh),
+        "priority");
+    runtime.call(set, [runtime.call(current, [], "thread"), priority], "");
+    instructions.buildBr(builder, done);
+
+    builder.positionAtEnd(done);
+    instructions.buildRetVoid(builder);
+    return runtime.endDefinition(definition);
+}
+
+posixRaise(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let current = runtime.libc("pthread_self", runtime.int64Type.functionType([]));
+    let highest = runtime.libc("sched_get_priority_max",
+        runtime.int32Type.functionType([runtime.int32Type]));
+    let schedule = runtime.libc("pthread_setschedparam", runtime.int32Type.functionType([
+        runtime.int64Type, runtime.int32Type, runtime.pointerType]));
+    let definition = runtime.beginDefinition("ens_thread_raise", type);
+    let builder = runtime.builder;
+    let level = runtime.parameter(definition, 0);
+    let realtime = runtime.block(definition, "raise.realtime");
+    let choose = runtime.block(definition, "raise.choose");
+    let high = runtime.block(definition, "raise.high");
+    let done = runtime.block(definition, "raise.done");
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, level, runtime.int32(2),
+        "wanted"), realtime, choose);
+
+    builder.positionAtEnd(choose);
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, level, runtime.int32(1),
+        "high"), high, done);
+
+    builder.positionAtEnd(realtime);
+    long policy = Priorities.linuxRealtimePolicy;
+    if (runtime.onDarwin()) {
+        policy = Priorities.darwinRealtimePolicy;
+    }
+    let parameters = memory.buildAlloca(builder,
+        runtime.int8Type.arrayType(Priorities.scheduleBytes as ulong), "schedule");
+    memory.buildStore(builder, runtime.call(highest, [runtime.int32(policy)], "highest"),
+        parameters);
+    let code = runtime.call(schedule, [runtime.call(current, [], "thread"), runtime.int32(policy),
+        parameters], "code");
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, code, runtime.int32(0),
+        "granted"), done, high);
+
+    builder.positionAtEnd(high);
+    if (runtime.onDarwin()) {
+        let interactive = runtime.libc("pthread_set_qos_class_self_np",
+            runtime.int32Type.functionType([runtime.int32Type, runtime.int32Type]));
+        runtime.call(interactive, [runtime.int32(Priorities.darwinInteractive), runtime.int32(0)],
+            "");
+    } else {
+        let nice = runtime.libc("setpriority", runtime.int32Type.functionType([runtime.int32Type,
+            runtime.int32Type, runtime.int32Type]));
+        runtime.call(nice, [runtime.int32(0), runtime.int32(0),
+            runtime.int32(Priorities.linuxHighNice)], "");
+    }
+    instructions.buildBr(builder, done);
+
+    builder.positionAtEnd(done);
+    instructions.buildRetVoid(builder);
+    return runtime.endDefinition(definition);
+}
+
 // long ens_thread_token(): a number no two running threads share, and never zero.
 public threadTokenRuntime(Runtime runtime) -> RuntimeFunction {
     let type = runtime.int64Type.functionType([]);

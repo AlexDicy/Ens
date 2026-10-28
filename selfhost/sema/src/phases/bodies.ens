@@ -71,6 +71,11 @@ import PreludeScope from phases.prelude;
 import program.implicit;
 import StandardLibrary from program.implicit;
 import model.convert;
+import PendingUse from result;
+import ArrayType from model.types;
+import OptionalType from model.types;
+import InstantiationType from model.types;
+import PendingThrowsType from model.types;
 import NoreturnCalls from model.flow;
 import model.flow;
 import LiteralOrigin from phases.bodies.literaltargets;
@@ -676,6 +681,71 @@ public final class BodyChecker implements NoreturnCalls {
     public endTrial() {
         this.typeResolver.endTrial();
         this.semaResult.endTrial();
+    }
+
+    // Whether a value of type 'source' can be given where 'target' is expected, at 'at'. A type that
+    // mentions what a lambda throws, which the exceptions phase settles, fits a type naming a throws
+    // list in that place, and the lambda is held to that list from then on.
+    public acceptsValue(Type target, Type source, Span at) -> bool {
+        if (convert.isAssignableStrict(target, source)) {
+            return true;
+        }
+        if (!this.store().mentionsPending(source) || !this.pendingFits(target, source, at, false)) {
+            return false;
+        }
+        return this.pendingFits(target, source, at, true);
+    }
+
+    // Whether 'source' is 'target' with lists a lambda throws where 'target' names lists, each
+    // already standing for the list named there or, when 'binding', made to stand for it.
+    pendingFits(Type target, Type source, Span at, bool binding) -> bool {
+        if (target == source) {
+            return true;
+        }
+        if (target is OptionalType && source is OptionalType) {
+            return this.pendingFits(target.inner(), source.inner(), at, binding);
+        }
+        if (target is OptionalType) {
+            return this.pendingFits(target.inner(), source, at, binding);
+        }
+        if (target is ArrayType && source is ArrayType) {
+            return this.pendingFits(target.element(), source.element(), at, binding);
+        }
+        if (!(target is InstantiationType) || !(source is InstantiationType)
+                || target.template() != source.template()) {
+            return false;
+        }
+        Type[] wanted = target.arguments();
+        Type[] given = source.arguments();
+        if (wanted.length != given.length) {
+            return false;
+        }
+        for (long i = 0; i < given.length; i++) {
+            let listed = given[i];
+            if (i == 1 && target.template().isWrittenAsFunction() && listed is PendingThrowsType) {
+                if (!this.pendingStandsFor(listed, wanted[i], target, at, binding)) {
+                    return false;
+                }
+            } else if (!this.pendingFits(wanted[i], listed, at, binding)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    pendingStandsFor(PendingThrowsType pending, Type list, Type given, Span at, bool binding)
+            -> bool {
+        if (convert.containsTypeParam(list) || this.store().mentionsPending(list)) {
+            return false;
+        }
+        let use = this.result().pendingUseOf(pending.lambda());
+        if (use != null) {
+            return use.list() == list;
+        }
+        if (binding) {
+            this.result().setPendingUse(pending.lambda(), new PendingUse(list, given, at));
+        }
+        return true;
     }
 
     // Whether this checker runs a trial, which needs only the types code gives and what it changes. A

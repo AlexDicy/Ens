@@ -1,8 +1,12 @@
-// Types for sharing state between tasks. Every operation on these classes is thread-safe, so any
-// number of tasks can hold the same instance.
+// Tasks, and the types for sharing state between them. Every operation on these classes is
+// thread-safe, so any number of tasks can hold the same instance. Each task runs on a thread of its
+// own.
 import RawArray from @std.collections.rawarray;
 import Iterable from @std.collections.iterator;
 import Iterator from @std.collections.iterator;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+import NativeThread from @std.system;
 import ThreadLock from @std.system;
 import @std.system;
 
@@ -67,20 +71,33 @@ export shared final class Atomic<shared T> {
 // A value that tasks change one at a time. The value itself does not need to be shareable, because
 // it never leaves the lock.
 export shared final class Mutex<T> {
-    const ThreadLock guard;
+    const Monitor guard;
     T value;
     long holder;
 
     export constructor(this.value) {
-        this.guard = system.createLock();
+        this.guard = new Monitor();
         this.holder = 0;
     }
 
     // Waits until no other task holds the lock, then runs `body` with the value and returns its
-    // result. `body` must be a shared function and its result must be shareable, so the value cannot
-    // escape the lock.
-    export lock<shared R, E: Error>((shared (T) -> R throws E) body) -> R throws E {
-        this.enter();
+    // result. `body` must be a shared function and its result must be shareable, so the value
+    // cannot escape the lock. A task cancelled while it waits throws 'Cancelled' without running
+    // `body`.
+    export lock<shared R, E: Error>((shared (T) -> R throws E) body) -> R throws E, Cancelled {
+        try this.enter();
+        return try this.holding(body);
+    }
+
+    // Waits until no other task holds the lock, then replaces the value with what `body` returns.
+    // Use this for numbers and structs: 'lock' passes them as a copy, so changes made there are
+    // lost. A task cancelled while it waits throws 'Cancelled' without running `body`.
+    export update<E: Error>((shared (T) -> T throws E) body) throws E, Cancelled {
+        try this.enter();
+        try this.replacing(body);
+    }
+
+    holding<shared R, E: Error>((shared (T) -> R throws E) body) -> R throws E {
         R result = try body(this.value);
         this.leave();
         return result;
@@ -89,10 +106,7 @@ export shared final class Mutex<T> {
         rethrow;
     }
 
-    // Waits until no other task holds the lock, then replaces the value with what `body` returns. Use
-    // this for numbers and structs: 'lock' passes them as a copy, so changes made there are lost.
-    export update<E: Error>((shared (T) -> T throws E) body) throws E {
-        this.enter();
+    replacing<E: Error>((shared (T) -> T throws E) body) throws E {
         this.value = try body(this.value);
         this.leave();
     } catch (E failure) {
@@ -100,30 +114,37 @@ export shared final class Mutex<T> {
         rethrow;
     }
 
-    enter() {
+    enter() throws Cancelled {
         long caller = system.threadToken();
-        system.acquireLock(this.guard);
+        this.guard.enter();
         if (this.holder == caller) {
-            system.releaseLock(this.guard);
-            panic("tried to lock a mutex inside a body this task is already running under its "
+            this.guard.leave();
+            string tried = "tried";
+            let control = Registry.running.current();
+            if (control != null) {
+                let site = startSite(control.startedAt);
+                if (site != null) {
+                    tried = "the task started at {site} tried";
+                }
+            }
+            panic("{tried} to lock a mutex inside a body this task is already running under its "
                 + "lock, which would wait for ever. Use the value that body was given instead");
         }
         while (this.holder != 0) {
-            system.waitOnLock(this.guard, -1);
+            if (!this.guard.waitUnlessCancelled(-1)) {
+                this.guard.leave();
+                throw new Cancelled();
+            }
         }
         this.holder = caller;
-        system.releaseLock(this.guard);
+        this.guard.leave();
     }
 
     leave() {
-        system.acquireLock(this.guard);
+        this.guard.enter();
         this.holder = 0;
-        system.wakeLockWaiters(this.guard);
-        system.releaseLock(this.guard);
-    }
-
-    destructor() {
-        system.destroyLock(this.guard);
+        this.guard.wakeAll();
+        this.guard.leave();
     }
 }
 
@@ -149,15 +170,15 @@ export shared final class Channel<shared T> implements Iterable<T> {
     }
 
     // Returns the next value, waiting for one to be sent, or null once the channel is closed and
-    // empty.
-    export receive() -> T? {
-        return this.state.take(-1);
+    // empty. A task cancelled while it waits throws 'Cancelled'.
+    export receive() -> T? throws Cancelled {
+        return try this.state.take(-1);
     }
 
     // Like 'receive()', but also returns null when nothing arrives within `timeoutMillis`
     // milliseconds. 'isClosed' tells the two cases apart.
-    export receive(long timeoutMillis) -> T? {
-        return this.state.take(timeoutMillis < 0 ? 0 : timeoutMillis);
+    export receive(long timeoutMillis) -> T? throws Cancelled {
+        return try this.state.take(timeoutMillis < 0 ? 0 : timeoutMillis);
     }
 
     // Returns whether every Sender has been released, so no more values can arrive.
@@ -175,6 +196,11 @@ export shared final class Channel<shared T> implements Iterable<T> {
         return new ChannelIterator<T>(this);
     }
 
+    // Returns the next value like 'receive()', waiting for it even in a cancelled task.
+    protected receiveWaiting() -> T? {
+        return this.state.takeWaiting();
+    }
+
     destructor() {
         this.state.releaseReceiver();
     }
@@ -187,8 +213,9 @@ export shared final class Sender<shared T> {
     protected constructor(this.state);
 
     // Puts `value` into the channel. Waits while the buffer is full, or, with a capacity of zero,
-    // until a task receives the value.
-    export send(T value) throws ChannelClosed {
+    // until a task receives the value. A task cancelled while it waits throws 'Cancelled', and the
+    // value is not sent.
+    export send(T value) throws ChannelClosed, Cancelled {
         try this.state.put(value);
     }
 
@@ -197,20 +224,22 @@ export shared final class Sender<shared T> {
     }
 }
 
+// Walks a channel until it is closed and empty. Its waits go on in a cancelled task, because the
+// channel closes once the tasks sending to it stop.
 final class ChannelIterator<shared T> implements Iterator<T> {
     const Channel<T> channel;
 
     protected constructor(this.channel);
 
     protected override next() -> T? {
-        return this.channel.receive();
+        return this.channel.receiveWaiting();
     }
 }
 
 // The state both ends of a channel share: a ring buffer of values not yet received, and the lock
 // that guards every change to it.
 shared final class ChannelState<shared T> {
-    const ThreadLock lock;
+    const Monitor lock;
     const long capacity;
     RawArray<T> slots;
     long head;
@@ -221,7 +250,7 @@ shared final class ChannelState<shared T> {
     bool receiverReleased;
 
     protected constructor(this.capacity) {
-        this.lock = system.createLock();
+        this.lock = new Monitor();
         this.slots = RawArray<T>.allocate(this.capacity < 1 ? 1 : this.capacity);
         this.head = 0;
         this.count = 0;
@@ -231,45 +260,89 @@ shared final class ChannelState<shared T> {
         this.receiverReleased = false;
     }
 
-    protected put(T value) throws ChannelClosed {
-        system.acquireLock(this.lock);
+    protected put(T value) throws ChannelClosed, Cancelled {
+        this.lock.enter();
         while (!this.receiverReleased && this.count == this.slots.length()) {
-            system.waitOnLock(this.lock, -1);
+            if (!this.lock.waitUnlessCancelled(-1)) {
+                this.lock.leave();
+                throw new Cancelled();
+            }
         }
         if (this.receiverReleased) {
-            system.releaseLock(this.lock);
+            this.lock.leave();
             throw new ChannelClosed();
         }
         this.slots.write((this.head + this.count) % this.slots.length(), value);
         this.count++;
         long position = this.received + this.count;
-        system.wakeLockWaiters(this.lock);
+        this.lock.wakeAll();
         if (this.capacity == 0) {
             while (!this.receiverReleased && this.received < position) {
-                system.waitOnLock(this.lock, -1);
+                if (!this.lock.waitUnlessCancelled(-1) && this.received < position) {
+                    this.withdraw();
+                    throw new Cancelled();
+                }
+            }
+            if (this.received < position) {
+                this.withdraw();
+                throw new ChannelClosed();
             }
         }
-        system.releaseLock(this.lock);
+        this.lock.leave();
+    }
+
+    // Takes back the value a send with a capacity of zero put in, which nothing received, and
+    // releases the lock.
+    withdraw() {
+        this.slots.clear(this.head);
+        this.count--;
+        this.lock.wakeAll();
+        this.lock.leave();
     }
 
     // Returns the next value. A negative `limitMillis` waits with no time limit.
-    protected take(long limitMillis) -> T? {
+    protected take(long limitMillis) -> T? throws Cancelled {
+        this.lock.enter();
+        if (!this.awaitValue(limitMillis, true)) {
+            this.lock.leave();
+            throw new Cancelled();
+        }
+        return this.removeHead();
+    }
+
+    // Returns the next value, waiting for it with no time limit even in a cancelled task.
+    protected takeWaiting() -> T? {
+        this.lock.enter();
+        let waited = this.awaitValue(-1, false);
+        return this.removeHead();
+    }
+
+    // Waits, with the lock held, until a value is there, the channel is closed, or `limitMillis`
+    // milliseconds pass when it is not negative. Returns false when `cancellable` is set and the
+    // calling task is cancelled first.
+    awaitValue(long limitMillis, bool cancellable) -> bool {
         long deadline = system.monotonicMillis() + limitMillis;
-        system.acquireLock(this.lock);
         while (this.count == 0 && !this.closed()) {
-            if (limitMillis < 0) {
-                system.waitOnLock(this.lock, -1);
-            } else {
-                long left = deadline - system.monotonicMillis();
+            long left = -1;
+            if (limitMillis >= 0) {
+                left = deadline - system.monotonicMillis();
                 if (left <= 0) {
-                    system.releaseLock(this.lock);
-                    return null;
+                    return true;
                 }
-                system.waitOnLock(this.lock, left);
+            }
+            if (!cancellable) {
+                this.lock.wait(left);
+            } else if (!this.lock.waitUnlessCancelled(left)) {
+                return false;
             }
         }
+        return true;
+    }
+
+    // Takes the value at the head, or null when there is none, and releases the lock.
+    removeHead() -> T? {
         if (this.count == 0) {
-            system.releaseLock(this.lock);
+            this.lock.leave();
             return null;
         }
         T value = this.slots.read(this.head);
@@ -277,15 +350,15 @@ shared final class ChannelState<shared T> {
         this.head = (this.head + 1) % this.slots.length();
         this.count--;
         this.received++;
-        system.wakeLockWaiters(this.lock);
-        system.releaseLock(this.lock);
+        this.lock.wakeAll();
+        this.lock.leave();
         return value;
     }
 
     protected isClosed() -> bool {
-        system.acquireLock(this.lock);
+        this.lock.enter();
         bool ended = this.closed();
-        system.releaseLock(this.lock);
+        this.lock.leave();
         return ended;
     }
 
@@ -295,24 +368,703 @@ shared final class ChannelState<shared T> {
     }
 
     protected addSender() {
-        system.acquireLock(this.lock);
+        this.lock.enter();
         this.senders++;
         this.everSent = true;
-        system.releaseLock(this.lock);
+        this.lock.leave();
     }
 
     protected releaseSender() {
-        system.acquireLock(this.lock);
+        this.lock.enter();
         this.senders--;
-        system.wakeLockWaiters(this.lock);
-        system.releaseLock(this.lock);
+        this.lock.wakeAll();
+        this.lock.leave();
     }
 
     protected releaseReceiver() {
-        system.acquireLock(this.lock);
+        this.lock.enter();
         this.receiverReleased = true;
-        system.wakeLockWaiters(this.lock);
+        this.lock.wakeAll();
+        this.lock.leave();
+    }
+}
+
+// Thrown by 'checkCancelled' in a task that was asked to stop.
+export class Cancelled extends Error {
+    export constructor() {
+        super("the task was cancelled");
+    }
+}
+
+// Runs `body` with a new scope on the calling task, and returns what the body returns once the body
+// has returned and every task started in the scope has finished. When the body throws, the scope's
+// tasks are cancelled and waited for before the error goes on.
+export scope<R, E: Error>(((TaskScope) -> R throws E) body) -> R throws E {
+    let created = new TaskScope();
+    return try created.run(body);
+}
+
+// Returns whether the calling task was asked to stop, by its own 'cancel', by a scope it belongs to,
+// or by the task that started that scope.
+export isCancelled() -> bool {
+    let control = Registry.running.current();
+    return control != null && control.isCancelled();
+}
+
+// Throws 'Cancelled' when the calling task was asked to stop.
+export checkCancelled() throws Cancelled {
+    if (isCancelled()) {
+        throw new Cancelled();
+    }
+}
+
+// Blocks the calling task until the monotonic clock has advanced by `millis` milliseconds. The wait
+// can last longer, and a count of zero or less returns without waiting. A task cancelled while it
+// waits throws 'Cancelled' at once.
+export sleep(long millis) throws Cancelled {
+    if (millis <= 0) {
+        return;
+    }
+    long deadline = system.monotonicMillis() + millis;
+    let alarm = new Monitor();
+    alarm.enter();
+    long left = millis;
+    while (left > 0) {
+        if (!alarm.waitUnlessCancelled(left)) {
+            alarm.leave();
+            throw new Cancelled();
+        }
+        left = deadline - system.monotonicMillis();
+    }
+    alarm.leave();
+}
+
+// How urgently the system runs the thread of a task started with 'startDedicated'. A system that
+// refuses a level, as one often does for a program without the privilege, runs the thread at the
+// highest level it allows.
+export enum TaskPriority {
+    // As every other thread runs.
+    Normal = 0,
+
+    // Ahead of ordinary threads, for work someone is watching, such as rendering.
+    High = 1,
+
+    // As soon as it is ready, for work with a deadline, such as filling an audio buffer.
+    Realtime = 2,
+}
+
+// A set of tasks that ends only when all of them have. Releasing a scope cancels the tasks still in
+// it and waits for them.
+export shared final class TaskScope {
+    const ScopeState state;
+
+    export constructor() {
+        this.state = new ScopeState(Registry.running.current());
+    }
+
+    // Starts `body` on another task at once and returns the task without waiting for it.
+    export start<T, E: Error>((shared () -> T throws E) body) -> Task<(() -> T throws E)> {
+        let control = new TaskControl(this.state, system.captureTrace(8));
+        let outcome = new TaskOutcome<T, E>(this.state.record(control.startedAt));
+        this.state.begin(control, () -> {
+            Registry.running.enter(control);
+            outcome.complete(body, control);
+            if (outcome.threw()) {
+                this.state.cancel();
+            }
+            Registry.running.leave();
+        });
+        return new Task<(() -> T throws E)>(control, outcome);
+    }
+
+    // Starts `body` like 'start', on an operating-system thread of its own that the system runs at
+    // `priority`, for a loop that must not share a thread, such as audio or rendering.
+    export startDedicated<T, E: Error>(TaskPriority priority, (shared () -> T throws E) body)
+            -> Task<(() -> T throws E)> {
+        int level = priority as int;
+        return this.start(() -> {
+            system.raiseThreadPriority(level);
+            return try body();
+        });
+    }
+
+    // Starts `body`, which returns nothing, on another task, for work nobody waits for. The body
+    // can throw only 'Cancelled', which ends a task that was asked to stop; thrown by a task
+    // nothing cancelled, it aborts the program.
+    export launch((shared () -> void throws Cancelled) body) {
+        let control = new TaskControl(this.state, system.captureTrace(8));
+        this.state.begin(control, () -> {
+            Registry.running.enter(control);
+            runLaunched(body, control);
+            Registry.running.leave();
+        });
+    }
+
+    // Asks every task in the scope to stop.
+    export cancel() {
+        this.state.cancel();
+    }
+
+    // Asks every task in the scope to stop once `millis` milliseconds have passed, unless the scope
+    // has ended by then.
+    export cancelAfter(long millis) {
+        this.state.cancelAfter(millis);
+    }
+
+    public run<R, E: Error>(((TaskScope) -> R throws E) body) -> R throws E {
+        R result = try body(this);
+        this.state.end(true);
+        return result;
+    } catch (E failure) {
+        this.state.cancel();
+        this.state.end(false);
+        rethrow;
+    }
+
+    destructor() {
+        this.state.cancel();
+        this.state.end(true);
+    }
+}
+
+// A task a scope started, written with the function type it runs, as in 'Task<() -> int>'.
+export shared final class Task<shared () -> T throws E> {
+    const TaskControl control;
+    const TaskOutcome<T, E> outcome;
+
+    protected constructor(this.control, this.outcome);
+
+    // Waits for the task and returns what its body returned, or throws what its body threw. A
+    // result another task may not hold is taken once, and awaiting it again aborts the program. A
+    // task that awaits a task waiting for it, directly or through others, aborts the program
+    // instead of waiting for ever, and a task cancelled while it waits throws 'Cancelled'.
+    export await() -> T throws E, Cancelled {
+        let waiting = Registry.running.current();
+        waiting?.startAwaiting(this.control);
+        return try this.outcome.take(waiting);
+    }
+
+    // Asks this task, and every task it started, to stop.
+    export cancel() {
+        this.control.cancel();
+    }
+}
+
+// Which task runs on each thread, so a body can ask whether its task was asked to stop.
+final class Registry {
+    protected lazy const RunningTasks running = new RunningTasks();
+}
+
+shared final class RunningTasks {
+    const ThreadLock lock;
+    Map<long, TaskControl> byThread;
+
+    protected constructor() {
+        this.lock = system.createLock();
+        this.byThread = new Map<long, TaskControl>();
+    }
+
+    protected enter(TaskControl control) {
+        system.acquireLock(this.lock);
+        this.byThread.set(system.threadToken(), control);
         system.releaseLock(this.lock);
+    }
+
+    protected leave() {
+        system.acquireLock(this.lock);
+        let removed = this.byThread.remove(system.threadToken());
+        system.releaseLock(this.lock);
+    }
+
+    // The task running on the calling thread, or null outside every task.
+    protected current() -> TaskControl? {
+        system.acquireLock(this.lock);
+        let control = this.byThread.get(system.threadToken());
+        system.releaseLock(this.lock);
+        return control;
+    }
+}
+
+// Whether one task was asked to stop, the scope it belongs to, what it is waiting on, and the
+// scopes it started, whose tasks a cancel of this one wakes as well.
+shared final class TaskControl {
+    const ScopeState scope;
+    const long[] startedAt;
+    const Atomic<bool> cancelled;
+    const Atomic<TaskControl?> awaiting;
+    const ThreadLock lock;
+    Monitor? blockedOn;
+    List<ScopeState> scopes;
+
+    protected constructor(this.scope, this.startedAt) {
+        this.cancelled = new Atomic<bool>(false);
+        this.awaiting = new Atomic<TaskControl?>(null);
+        this.lock = system.createLock();
+        this.blockedOn = null;
+        this.scopes = new List<ScopeState>();
+    }
+
+    // Records that this task waits for `target`, and aborts the program when `target` waits for
+    // this one, directly or through other tasks.
+    protected startAwaiting(TaskControl target) {
+        this.awaiting.write(target);
+        let chain = new List<TaskControl>();
+        chain.push(this);
+        TaskControl? next = target;
+        while (next != null && chain.length() <= Limits.awaitChain) {
+            if (next == this) {
+                panic(cycleRefusal(chain));
+            }
+            chain.push(next);
+            next = next.awaiting.read();
+        }
+    }
+
+    protected stopAwaiting() {
+        this.awaiting.write(null);
+    }
+
+    protected cancel() {
+        this.cancelled.write(true);
+        this.wake();
+    }
+
+    protected isCancelled() -> bool {
+        return this.cancelled.read() || this.scope.isCancelled();
+    }
+
+    // Records that the task waits on `monitor`, which the task holds.
+    protected block(Monitor monitor) {
+        system.acquireLock(this.lock);
+        this.blockedOn = monitor;
+        system.releaseLock(this.lock);
+    }
+
+    protected unblock() {
+        system.acquireLock(this.lock);
+        this.blockedOn = null;
+        system.releaseLock(this.lock);
+    }
+
+    protected adopt(ScopeState started) {
+        system.acquireLock(this.lock);
+        this.scopes.push(started);
+        system.releaseLock(this.lock);
+    }
+
+    protected disown(ScopeState ended) {
+        system.acquireLock(this.lock);
+        let removed = this.scopes.remove(ended);
+        system.releaseLock(this.lock);
+    }
+
+    // Wakes the task from the wait it is in, and every task in the scopes it started, so each of
+    // them checks again whether it was cancelled.
+    protected wake() {
+        system.acquireLock(this.lock);
+        let monitor = this.blockedOn;
+        let started = this.scopes.toArray();
+        system.releaseLock(this.lock);
+        if (monitor != null) {
+            monitor.enter();
+            monitor.wakeAll();
+            monitor.leave();
+        }
+        for (let scope in started) {
+            scope.wakeTasks();
+        }
+    }
+
+    destructor() {
+        system.destroyLock(this.lock);
+    }
+}
+
+// A lock that tasks wait on until another task wakes them. A task cancelled while it waits on one
+// is woken, which is why the task keeps a reference to it for as long as it waits.
+shared final class Monitor {
+    const ThreadLock lock;
+
+    protected constructor() {
+        this.lock = system.createLock();
+    }
+
+    protected enter() {
+        system.acquireLock(this.lock);
+    }
+
+    protected leave() {
+        system.releaseLock(this.lock);
+    }
+
+    protected wakeAll() {
+        system.wakeLockWaiters(this.lock);
+    }
+
+    // Waits, with the monitor held, until it is woken or `millis` milliseconds pass, with no limit
+    // when `millis` is negative.
+    protected wait(long millis) {
+        system.waitOnLock(this.lock, millis);
+    }
+
+    // Like 'wait', but returns false, without waiting or as soon as it is woken, when the calling
+    // task is cancelled.
+    protected waitUnlessCancelled(long millis) -> bool {
+        let control = Registry.running.current();
+        if (control == null) {
+            this.wait(millis);
+            return true;
+        }
+        control.block(this);
+        bool waiting = !control.isCancelled();
+        if (waiting) {
+            this.wait(millis);
+        }
+        control.unblock();
+        return waiting && !control.isCancelled();
+    }
+
+    destructor() {
+        system.destroyLock(this.lock);
+    }
+}
+
+// Whether a task threw and whether anything awaited it, which the scope reads when it ends, with
+// where the task was started and what it threw.
+shared final class FailureRecord {
+    const Atomic<bool> failed;
+    const Atomic<bool> awaited;
+    const long[] startedAt;
+    string thrown;
+
+    protected constructor(this.startedAt) {
+        this.failed = new Atomic<bool>(false);
+        this.awaited = new Atomic<bool>(false);
+        this.thrown = "";
+    }
+
+    protected fail(Error error) {
+        this.thrown = "an error with the message '{error.message}'";
+        this.failed.write(true);
+    }
+
+    protected unhandled() -> bool {
+        return this.failed.read() && !this.awaited.read();
+    }
+
+    // Why the scope aborts the program for this task.
+    protected refusal() -> string {
+        string started = "a task this scope started";
+        let site = startSite(this.startedAt);
+        if (site != null) {
+            started = "the task started at {site}";
+        }
+        return "{started} threw {this.thrown}, and nothing awaited it, so nothing handled the "
+            + "error. Await every task started with 'start', or catch the error inside its body";
+    }
+}
+
+final class Limits {
+    // The most tasks an 'await' follows to find one that waits for the awaiting task.
+    protected static const long awaitChain = 10000;
+}
+
+// Whether `thrown` is the 'Cancelled' of a task that was asked to stop, which did what it was
+// asked.
+stoppedAsAsked(Error thrown, TaskControl control) -> bool {
+    return thrown is Cancelled && control.isCancelled();
+}
+
+// Runs the body of a task started with 'launch'.
+runLaunched((shared () -> void throws Cancelled) body, TaskControl control) {
+    try body();
+} catch (Cancelled stop) {
+    if (!control.isCancelled()) {
+        string started = "a task started with 'launch'";
+        let site = startSite(control.startedAt);
+        if (site != null) {
+            started = "the task started at {site}";
+        }
+        panic("{started} threw 'Cancelled' although nothing cancelled it, and nothing awaits a "
+            + "task started with 'launch', so nothing would handle the error. Catch 'Cancelled' "
+            + "inside its body");
+    }
+}
+
+// The 'file:line' of the call that started a task, read off the trace captured when it started,
+// or null when the trace does not reach it.
+startSite(long[] startedAt) -> string? {
+    let frames = system.traceFrames(startedAt);
+    long caller = 0;
+    while (caller < frames.length && !frames[caller].function.startsWith("TaskScope.")) {
+        caller++;
+    }
+    while (caller < frames.length && frames[caller].function.startsWith("TaskScope.")) {
+        caller++;
+    }
+    if (caller < frames.length) {
+        return "{frames[caller].file}:{frames[caller].line}";
+    }
+    return null;
+}
+
+// Why tasks that wait for each other abort the program, naming where each was started.
+cycleRefusal(List<TaskControl> chain) -> string {
+    let sites = new List<string>();
+    for (let control in chain) {
+        sites.push(startSite(control.startedAt) ?? "a line the trace does not reach");
+    }
+    if (sites.length() == 2) {
+        return "the task started at {sites.get(0)} waits for the task started at {sites.get(1)}, "
+            + "which waits for it in turn, so neither can ever finish";
+    }
+    string listed = "";
+    for (long i = 0; i < sites.length(); i++) {
+        if (i > 0) {
+            listed = listed + (i == sites.length() - 1 ? " and " : ", ");
+        }
+        listed = listed + sites.get(i);
+    }
+    return "the tasks started at {listed} each wait for the next, and the last for the first, so "
+        + "none of them can ever finish";
+}
+
+// What one task's body returned or threw, once it has finished.
+shared final class TaskOutcome<T, E: Error> {
+    const Monitor lock;
+    const FailureRecord record;
+    RawArray<T> result;
+    E? failure;
+    bool done;
+    bool taken;
+
+    protected constructor(this.record) {
+        this.lock = new Monitor();
+        this.result = RawArray<T>.allocate(1);
+        this.failure = null;
+        this.done = false;
+        this.taken = false;
+    }
+
+    // Runs `body` for the task `control` controls, and keeps what it returns or throws. A
+    // 'Cancelled' the task throws after it was asked to stop is kept for an awaiter but is no
+    // failure.
+    protected complete((shared () -> T throws E) body, TaskControl control) {
+        T value = try body();
+        this.lock.enter();
+        this.result.write(0, value);
+        this.done = true;
+        this.lock.wakeAll();
+        this.lock.leave();
+    } catch (E thrown) {
+        this.lock.enter();
+        this.failure = thrown;
+        this.done = true;
+        if (!stoppedAsAsked(thrown, control)) {
+            this.record.fail(thrown);
+        }
+        this.lock.wakeAll();
+        this.lock.leave();
+    }
+
+    protected threw() -> bool {
+        return this.record.failed.read();
+    }
+
+    // Waits for the outcome and takes it. `waiting` is the task that awaits it, which stops
+    // awaiting however the wait ends.
+    protected take(TaskControl? waiting) -> T throws E, Cancelled {
+        this.lock.enter();
+        while (!this.done) {
+            if (!this.lock.waitUnlessCancelled(-1)) {
+                this.lock.leave();
+                waiting?.stopAwaiting();
+                throw new Cancelled();
+            }
+        }
+        waiting?.stopAwaiting();
+        this.record.awaited.write(true);
+        let thrown = this.failure;
+        bool repeatable = thrown == null ? this.resultIsShareable() : this.failureIsShareable();
+        if (this.taken && !repeatable) {
+            this.lock.leave();
+            panic("tried to await a task whose outcome another 'await' already took. A result or "
+                + "an error that another task may not hold is taken once, so keep what the first "
+                + "'await' gave");
+        }
+        this.taken = true;
+        if (thrown != null) {
+            this.lock.leave();
+            throw thrown;
+        }
+        T value = this.result.read(0);
+        if (!repeatable) {
+            this.result.clear(0);
+        }
+        this.lock.leave();
+        return value;
+    }
+
+    // Whether another task may hold a 'T'. The compiler answers this for each instance, so the body
+    // below never runs.
+    resultIsShareable() -> bool {
+        return false;
+    }
+
+    // Whether another task may hold an 'E'. The compiler answers this for each instance, so the body
+    // below never runs.
+    failureIsShareable() -> bool {
+        return false;
+    }
+}
+
+// The tasks of one scope: the threads still to be waited for, whether the scope was asked to stop,
+// and whether it has ended.
+shared final class ScopeState {
+    const ThreadLock lock;
+    const TaskControl? owner;
+    List<NativeThread> threads;
+    List<NativeThread> timers;
+    List<FailureRecord> records;
+    Map<long, TaskControl> running;
+    long started;
+    bool cancelled;
+    bool ended;
+
+    protected constructor(this.owner) {
+        this.lock = system.createLock();
+        this.threads = new List<NativeThread>();
+        this.timers = new List<NativeThread>();
+        this.records = new List<FailureRecord>();
+        this.running = new Map<long, TaskControl>();
+        this.started = 0;
+        this.cancelled = false;
+        this.ended = false;
+        let parent = this.owner;
+        if (parent != null) {
+            parent.adopt(this);
+        }
+    }
+
+    protected record(long[] startedAt) -> FailureRecord {
+        let created = new FailureRecord(startedAt);
+        system.acquireLock(this.lock);
+        this.records.push(created);
+        system.releaseLock(this.lock);
+        return created;
+    }
+
+    // Starts `work` for the task `control` controls on a thread of its own.
+    protected begin(TaskControl control, (shared () -> void) work) {
+        system.acquireLock(this.lock);
+        if (this.ended) {
+            system.releaseLock(this.lock);
+            panic("tried to start a task in a scope that has ended. Start it while the scope's body "
+                + "runs, or in a scope that is still open");
+        }
+        long task = this.started;
+        this.started++;
+        this.running.set(task, control);
+        this.threads.push(system.startThread(() -> {
+            work();
+            this.finish(task);
+        }));
+        system.releaseLock(this.lock);
+    }
+
+    finish(long task) {
+        system.acquireLock(this.lock);
+        let removed = this.running.remove(task);
+        system.releaseLock(this.lock);
+    }
+
+    protected cancel() {
+        system.acquireLock(this.lock);
+        this.cancelled = true;
+        system.releaseLock(this.lock);
+        this.wakeTasks();
+    }
+
+    // Wakes every task of the scope from the wait it is in.
+    protected wakeTasks() {
+        let controls = new List<TaskControl>();
+        system.acquireLock(this.lock);
+        controls.pushAll(this.running.values());
+        system.releaseLock(this.lock);
+        for (let control in controls) {
+            control.wake();
+        }
+    }
+
+    protected isCancelled() -> bool {
+        system.acquireLock(this.lock);
+        bool asked = this.cancelled;
+        system.releaseLock(this.lock);
+        let started = this.owner;
+        return asked || (started != null && started.isCancelled());
+    }
+
+    // Starts a timer that cancels the scope at the deadline, or ends with the scope if that is first.
+    protected cancelAfter(long millis) {
+        long deadline = system.monotonicMillis() + millis;
+        system.acquireLock(this.lock);
+        if (this.ended) {
+            system.releaseLock(this.lock);
+            panic("tried to set a deadline on a scope that has ended. Call 'cancelAfter' while the "
+                + "scope's body runs");
+        }
+        this.timers.push(system.startThread(() -> this.cancelAt(deadline)));
+        system.releaseLock(this.lock);
+    }
+
+    cancelAt(long deadline) {
+        system.acquireLock(this.lock);
+        long left = deadline - system.monotonicMillis();
+        while (!this.ended && left > 0) {
+            system.waitOnLock(this.lock, left);
+            left = deadline - system.monotonicMillis();
+        }
+        bool due = !this.ended;
+        system.releaseLock(this.lock);
+        if (due) {
+            this.cancel();
+        }
+    }
+
+    // Waits for every task the scope started, including any they start meanwhile, then ends the
+    // scope and its timers. When `reporting` is set, a task that threw and that nothing awaited
+    // aborts the program here.
+    protected end(bool reporting) {
+        while (true) {
+            system.acquireLock(this.lock);
+            if (this.threads.isEmpty()) {
+                this.ended = true;
+                system.wakeLockWaiters(this.lock);
+                system.releaseLock(this.lock);
+                break;
+            }
+            let thread = this.threads.pop();
+            system.releaseLock(this.lock);
+            system.joinThread(thread);
+        }
+        while (!this.timers.isEmpty()) {
+            system.joinThread(this.timers.pop());
+        }
+        let parent = this.owner;
+        if (parent != null) {
+            parent.disown(this);
+        }
+        system.acquireLock(this.lock);
+        let finished = this.records;
+        this.records = new List<FailureRecord>();
+        system.releaseLock(this.lock);
+        if (reporting) {
+            for (let record in finished) {
+                if (record.unhandled()) {
+                    panic(record.refusal());
+                }
+            }
+        }
     }
 
     destructor() {

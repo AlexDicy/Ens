@@ -1,10 +1,16 @@
-// Single-threaded tests for Atomic, Mutex and Channel. The fixtures in 'tests/' cover the
-// multi-threaded cases.
+// Tests for scopes and the tasks they start, and single-threaded tests for Atomic, Mutex and
+// Channel, whose multi-threaded cases the fixtures in 'tests/' cover.
 import @std.testing;
+import @std.tasks;
+import Cancelled from @std.tasks;
+import Task from @std.tasks;
+import TaskScope from @std.tasks;
+import TaskPriority from @std.tasks;
 import Atomic from @std.tasks;
 import Mutex from @std.tasks;
 import Channel from @std.tasks;
 import ChannelClosed from @std.tasks;
+import Sender from @std.tasks;
 import List from @std.collections.list;
 
 test "an atomic reads what was written, and counts from it" {
@@ -34,15 +40,15 @@ test "a channel hands values over in the order they were sent" {
     try sender.send(1);
     try sender.send(2);
     try sender.send(3);
-    try testing.assertEqual<int?>(channel.receive(), 1);
-    try testing.assertEqual<int?>(channel.receive(), 2);
-    try testing.assertEqual<int?>(channel.receive(), 3);
+    try testing.assertEqual<int?>(try channel.receive(), 1);
+    try testing.assertEqual<int?>(try channel.receive(), 2);
+    try testing.assertEqual<int?>(try channel.receive(), 3);
 }
 
 test "a wait with a limit returns null with the channel still open" {
     let channel = new Channel<int>(1);
     let sender = channel.sender();
-    try testing.assertEqual<int?>(channel.receive(1), null);
+    try testing.assertEqual<int?>(try channel.receive(1), null);
     try testing.assertFalse(channel.isClosed(), "a sender is still held");
 }
 
@@ -58,15 +64,21 @@ test "releasing the last sender closes the channel once its values are received"
         walked.push(value);
     }
     try testing.assertEqual(walked.toArray(), ["left"]);
-    try testing.assertEqual<string?>(channel.receive(), null);
+    try testing.assertEqual<string?>(try channel.receive(), null);
+}
+
+// What sending one value does: "sent", or the message of the 'ChannelClosed' it threw.
+sendOne(Sender<int> sender) -> string throws Cancelled {
+    try sender.send(1);
+    return "sent";
+} catch (ChannelClosed closed) {
+    return closed.message;
 }
 
 test "a send after the receiving end is released throws" {
     let sender = new Channel<int>(1).sender();
-    let failure = try testing.assertThrows<ChannelClosed>(() -> {
-        try sender.send(1);
-    });
-    try testing.assertTrue(failure.message.startsWith("could not send"), failure.message);
+    let outcome = try sendOne(sender);
+    try testing.assertTrue(outcome.startsWith("could not send"), outcome);
 }
 
 final class Tally {
@@ -79,7 +91,7 @@ class Refused extends Error {
     }
 }
 
-countThrough(Mutex<Tally> tally, long limit) -> long throws Refused {
+countThrough(Mutex<Tally> tally, long limit) -> long throws Refused, Cancelled {
     return try tally.lock((held) -> {
         if (held.count >= limit) {
             throw new Refused();
@@ -89,7 +101,7 @@ countThrough(Mutex<Tally> tally, long limit) -> long throws Refused {
     });
 }
 
-refusedAt(Mutex<Tally> tally, long limit) -> bool {
+refusedAt(Mutex<Tally> tally, long limit) -> bool throws Cancelled {
     let ignored = try countThrough(tally, limit);
     return false;
 } catch (Refused error) {
@@ -98,23 +110,292 @@ refusedAt(Mutex<Tally> tally, long limit) -> bool {
 
 test "a mutex body changes the value in place and gives its result back" {
     let tally = new Mutex<Tally>(new Tally());
-    tally.lock((held) -> {
+    try tally.lock((held) -> {
         held.count = 4;
     });
-    long doubled = tally.lock((held) -> held.count * 2);
+    long doubled = try tally.lock((held) -> held.count * 2);
     try testing.assertEqual(doubled, 8L);
 }
 
 test "a mutex updates a number or a struct with what its body returns" {
     let hits = new Mutex<int>(0);
-    hits.update((count) -> count + 1);
-    hits.update((count) -> count + 1);
-    try testing.assertEqual(hits.lock((count) -> count), 2);
+    try hits.update((count) -> count + 1);
+    try hits.update((count) -> count + 1);
+    try testing.assertEqual(try hits.lock((count) -> count), 2);
 }
 
 test "a mutex body that throws passes the error on and leaves the mutex free" {
     let tally = new Mutex<Tally>(new Tally());
     try testing.assertEqual(try countThrough(tally, 1), 1L);
-    try testing.assertTrue(refusedAt(tally, 1), "the second count is over the limit");
+    try testing.assertTrue(try refusedAt(tally, 1), "the second count is over the limit");
     try testing.assertEqual(try countThrough(tally, 5), 2L);
+}
+
+refuse() -> int throws Refused {
+    throw new Refused();
+    return 0;
+}
+
+// Checks for cancellation until it is asked to stop, so the test that starts it ends it.
+untilCancelled() -> int throws Cancelled {
+    while (true) {
+        try tasks.checkCancelled();
+        try tasks.sleep(1);
+    }
+    return 0;
+}
+
+awaitedMessage(Task<(() -> int throws Cancelled)> task) -> string {
+    return "{try task.await()}";
+} catch (Cancelled stop) {
+    return stop.message;
+}
+
+test "a scope returns what its body returns once every task it started has finished" {
+    let finished = new Atomic<int>(0);
+    int total = try tasks.scope((scope) -> {
+        let first = scope.start(() -> 20);
+        let second = scope.start(() -> 22);
+        scope.launch(() -> {
+            finished.increment();
+        });
+        return try first.await() + try second.await();
+    });
+    try testing.assertEqual(total, 42);
+    try testing.assertEqual(finished.read(), 1);
+}
+
+test "awaiting a task that threw throws what it threw" {
+    string outcome = try tasks.scope((scope) -> {
+        let failing = scope.start(() -> try refuse());
+        return try attemptRefused(failing);
+    });
+    try testing.assertEqual(outcome, "refused");
+}
+
+attemptRefused(Task<(() -> int throws Refused)> task) -> string throws Cancelled {
+    return "{try task.await()}";
+} catch (Refused refused) {
+    return refused.message;
+}
+
+test "a shareable result is given to every awaiter" {
+    string twice = try tasks.scope((scope) -> {
+        let named = scope.start(() -> "named");
+        return try named.await() + try named.await();
+    });
+    try testing.assertEqual(twice, "namednamed");
+}
+
+test "a cancelled scope stops a task that checks, which then throws 'Cancelled'" {
+    string outcome = tasks.scope((scope) -> {
+        let waiting = scope.start(() -> try untilCancelled());
+        scope.cancel();
+        return awaitedMessage(waiting);
+    });
+    try testing.assertEqual(outcome, "the task was cancelled");
+}
+
+test "cancelling a task stops it and the tasks it started" {
+    string outcome = try tasks.scope((scope) -> {
+        let parent = scope.start(() -> tasks.scope((inner) -> {
+            let child = inner.start(() -> try untilCancelled());
+            return awaitedMessage(child).length as int;
+        }));
+        parent.cancel();
+        return "{try parent.await()}";
+    });
+    try testing.assertEqual(outcome, "22");
+}
+
+test "a deadline cancels the scope's tasks once it passes" {
+    string outcome = tasks.scope((scope) -> {
+        scope.cancelAfter(5);
+        return awaitedMessage(scope.start(() -> try untilCancelled()));
+    });
+    try testing.assertEqual(outcome, "the task was cancelled");
+}
+
+test "code outside every task is never cancelled" {
+    try testing.assertFalse(tasks.isCancelled(), "no task was asked to stop");
+    try tasks.checkCancelled();
+}
+
+// Sleeps until its task is cancelled, then records that it stopped.
+idleUntilCancelled(Atomic<bool> stopped) {
+    while (true) {
+        try tasks.sleep(1);
+    }
+} catch (Cancelled stop) {
+    stopped.write(true);
+}
+
+test "a scope kept in an object cancels and waits for its tasks when it is released" {
+    let stopped = new Atomic<bool>(false);
+    let kept = new TaskScope();
+    kept.launch(() -> idleUntilCancelled(stopped));
+    kept = new TaskScope();
+    try testing.assertTrue(stopped.read(), "the released scope waited for its task to stop");
+}
+
+test "a dedicated task runs its body whatever priority the system grants" {
+    int total = try tasks.scope((scope) -> {
+        let realtime = scope.startDedicated(TaskPriority.Realtime, () -> 4);
+        let high = scope.startDedicated(TaskPriority.High, () -> 2);
+        return try realtime.await() + try high.await();
+    });
+    try testing.assertEqual(total, 6);
+}
+
+// What awaiting `task` gives, as text: its result, or the message of what it threw.
+awaitedText(Task<(() -> string throws Cancelled)> task) -> string {
+    return try task.await();
+} catch (Cancelled stop) {
+    return stop.message;
+}
+
+test "a cancelled task's sleep ends at once and throws 'Cancelled'" {
+    string outcome = tasks.scope((scope) -> {
+        let sleeping = scope.start(() -> {
+            try tasks.sleep(60000);
+            return "slept";
+        });
+        sleeping.cancel();
+        return awaitedText(sleeping);
+    });
+    try testing.assertEqual(outcome, "the task was cancelled");
+}
+
+test "a cancelled task waiting to receive throws 'Cancelled'" {
+    let channel = new Channel<string>(1);
+    let sender = channel.sender();
+    string outcome = tasks.scope((scope) -> {
+        let receiving = scope.start(() -> (try channel.receive()) ?? "closed");
+        receiving.cancel();
+        return awaitedText(receiving);
+    });
+    try testing.assertEqual(outcome, "the task was cancelled");
+}
+
+test "a cancelled task waiting for a mutex throws 'Cancelled' without running its body" {
+    let tally = new Mutex<Tally>(new Tally());
+    string outcome = try tasks.scope((scope) -> {
+        return try tally.lock((held) -> {
+            let waiting = scope.start(() -> {
+                try tally.lock((inner) -> {
+                    inner.count = 1;
+                });
+                return "locked";
+            });
+            waiting.cancel();
+            return awaitedText(waiting);
+        });
+    });
+    try testing.assertEqual(outcome, "the task was cancelled");
+    try testing.assertEqual(try tally.lock((held) -> held.count), 0L);
+}
+
+test "a cancelled task awaiting another throws 'Cancelled', and the cancelled tasks abort nothing" {
+    string outcome = tasks.scope((scope) -> {
+        let sleeping = scope.start(() -> {
+            try tasks.sleep(60000);
+            return "slept";
+        });
+        let awaiting = scope.start(() -> try sleeping.await());
+        awaiting.cancel();
+        let text = awaitedText(awaiting);
+        scope.cancel();
+        return text;
+    });
+    try testing.assertEqual(outcome, "the task was cancelled");
+}
+
+// What sending one value does: "sent", or the message of the 'ChannelClosed' it threw.
+sendText(Sender<string> sender) -> string throws Cancelled {
+    try sender.send("unwanted");
+    return "sent";
+} catch (ChannelClosed closed) {
+    return closed.message;
+}
+
+test "a send waiting for a receive throws once the receiving end is released" {
+    let scope = new TaskScope();
+    Task<(() -> string throws Cancelled)>? sending = null;
+    {
+        let channel = new Channel<string>(0);
+        let sender = channel.sender();
+        sending = scope.start(() -> try sendText(sender));
+        try tasks.sleep(5);
+    }
+    if (sending != null) {
+        let outcome = try sending.await();
+        try testing.assertTrue(outcome.startsWith("could not send"), outcome);
+    }
+}
+
+test "a cancelled send waiting for a receive takes its value back" {
+    let channel = new Channel<string>(0);
+    let sender = channel.sender();
+    string outcome = tasks.scope((scope) -> {
+        let sending = scope.start(() -> try sendText(sender));
+        sending.cancel();
+        return awaitedText(sending);
+    });
+    try testing.assertEqual(outcome, "the task was cancelled");
+    try testing.assertEqual<string?>(try channel.receive(1), null);
+}
+
+test "a loop over a channel goes on waiting in a cancelled task until the channel closes" {
+    let channel = new Channel<int>(2);
+    long walked = try tasks.scope((scope) -> {
+        let walking = scope.start(() -> {
+            long count = 0;
+            for (let value in channel) {
+                count++;
+            }
+            return count;
+        });
+        {
+            let sender = channel.sender();
+            walking.cancel();
+            try sender.send(1);
+            try sender.send(2);
+        }
+        return try walking.await();
+    });
+    try testing.assertEqual(walked, 2L);
+}
+
+test "a task that throws 'Cancelled' after it was cancelled is no unhandled failure" {
+    tasks.scope((scope) -> {
+        let waiting = scope.start(() -> try untilCancelled());
+        scope.cancel();
+    });
+}
+
+firstFailure() -> string throws Cancelled {
+    return try tasks.scope((scope) -> {
+        let first = scope.start(() -> try refuse());
+        let second = scope.start(() -> try refuse());
+        return "{try first.await() + try second.await()}";
+    });
+} catch (Refused refused) {
+    return refused.message;
+}
+
+test "when a scope's body throws, the failures nothing awaited are dropped" {
+    try testing.assertEqual(try firstFailure(), "refused");
+}
+
+test "a launched task that throws 'Cancelled' once it is cancelled just ends" {
+    tasks.scope((scope) -> {
+        for (int i = 0; i < 3; i++) {
+            scope.launch(() -> {
+                while (true) {
+                    try tasks.sleep(1);
+                }
+            });
+        }
+        scope.cancel();
+    });
 }

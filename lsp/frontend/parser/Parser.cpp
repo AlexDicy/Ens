@@ -1231,7 +1231,10 @@ void Parser::parseTypeHead() {
 void Parser::parseTypeParamList() {
     builder.startNode(SyntaxKind::TypeParamList);
     expect(SyntaxKind::Lt, "'<'");
-    if (!atClosingGt() && !atEnd()) {
+    if (atSharedFunctionType() || atArrowAfterParentheses()) {
+        // The standard library writes a list as the function type a class runs: `Task<shared () -> T throws E>`.
+        parseFunctionType();
+    } else if (!atClosingGt() && !atEnd()) {
         parseTypeParam();
         while (eat(SyntaxKind::Comma)) {
             if (atClosingGt()) break;

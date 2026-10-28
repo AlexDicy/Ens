@@ -5,6 +5,8 @@ import Span from @ens.frontend.support.source;
 import SyntaxNode from @ens.frontend.syntax.node;
 import LocalBinding from model.scopes;
 import LambdaInfo from model.lambdas;
+import LambdaCapture from model.lambdas;
+import model.typemembers;
 import Field from model.typemembers;
 import Method from model.typemembers;
 import Signature from model.typemembers;
@@ -13,6 +15,45 @@ import TypeStore from model.types;
 import PendingThrowsType from model.types;
 import List from @std.collections.list;
 import Map from @std.collections.map;
+
+// Where a value whose type mentions what a lambda throws was first given to a type that names that
+// list: the list it stands for from then on, the type it was given to, and where.
+export final class PendingUse {
+    Type boundList;
+    Type givenType;
+    Span givenAt;
+
+    public constructor(this.boundList, this.givenType, this.givenAt);
+
+    export list() -> Type {
+        return this.boundList;
+    }
+
+    export given() -> Type {
+        return this.givenType;
+    }
+
+    export span() -> Span {
+        return this.givenAt;
+    }
+}
+
+// The type a generic call's value is given to, and the indexes of the type arguments whose throws
+// lists it gave.
+export final class ThrowsContext {
+    Type expectedType;
+    long[] boundIndexes;
+
+    public constructor(this.expectedType, this.boundIndexes);
+
+    export expected() -> Type {
+        return this.expectedType;
+    }
+
+    export indexes() -> long[] {
+        return this.boundIndexes;
+    }
+}
 
 export class SemaResult {
     Trials trials;
@@ -25,6 +66,9 @@ export class SemaResult {
     NodeTable<Field> staticConstFields;
     NodeTable<Type[]> callTypeArguments;
     NodeTable<bool> pendingThrowsCalls;
+    NodeTable<ThrowsContext> throwsContexts;
+    NodeTable<PendingUse> pendingUses;
+    bool provisionalValues;
     NodeTable<long[]> argumentOrders;
     NodeTable<Type> methodReceivers;
     NodeTable<Type[]> throwsSets;
@@ -49,6 +93,9 @@ export class SemaResult {
         this.staticConstFields = new NodeTable<Field>(this.trials);
         this.callTypeArguments = new NodeTable<Type[]>(this.trials);
         this.pendingThrowsCalls = new NodeTable<bool>(this.trials);
+        this.throwsContexts = new NodeTable<ThrowsContext>(this.trials);
+        this.pendingUses = new NodeTable<PendingUse>(this.trials);
+        this.provisionalValues = false;
         this.argumentOrders = new NodeTable<long[]>(this.trials);
         this.methodReceivers = new NodeTable<Type>(this.trials);
         this.throwsSets = new NodeTable<Type[]>(this.trials);
@@ -165,6 +212,77 @@ export class SemaResult {
     // exceptions phase settles.
     public notePendingThrows(GreenNode call) {
         this.pendingThrowsCalls.set(call, true);
+    }
+
+    // Records that the type the call's value is given to gave the throws lists of some of its type
+    // arguments, so a lambda argument is held to those lists.
+    public setThrowsContext(GreenNode call, ThrowsContext context) {
+        this.throwsContexts.set(call, context);
+    }
+
+    export throwsContextOf(GreenNode call) -> ThrowsContext? {
+        return this.throwsContexts.get(call);
+    }
+
+    // Records that what the lambda 'lambda' throws stands for the list a use gave it.
+    public setPendingUse(GreenNode lambda, PendingUse use) {
+        this.pendingUses.set(lambda, use);
+    }
+
+    export pendingUseOf(GreenNode lambda) -> PendingUse? {
+        return this.pendingUses.get(lambda);
+    }
+
+    // Records that a value's type mentions what a lambda throws, so every type recorded for the
+    // module is settled once the exceptions phase knows it.
+    public noteProvisionalValue() {
+        this.provisionalValues = true;
+    }
+
+    // Replaces each pending throws list 'settled' maps in every type recorded for the module, once
+    // a value's type mentioned one. A local, a method or a lambda recorded at such a type is
+    // replaced by its counterpart at the settled type, and every node naming it is given that one.
+    public settleRecordedTypes(TypeStore store, Map<PendingThrowsType, Type> settled) {
+        if (!this.provisionalValues || settled.isEmpty()) {
+            return;
+        }
+        for (let node in this.resolvedTypes.keys()) {
+            let recorded = this.resolvedTypes.get(node);
+            if (recorded != null && store.mentionsPending(recorded)) {
+                this.resolvedTypes.set(node, store.settledPendings(recorded, settled));
+            }
+        }
+        for (let node in this.methodReceivers.keys()) {
+            let recorded = this.methodReceivers.get(node);
+            if (recorded != null && store.mentionsPending(recorded)) {
+                this.methodReceivers.set(node, store.settledPendings(recorded, settled));
+            }
+        }
+        for (let node in this.callTypeArguments.keys()) {
+            let recorded = this.callTypeArguments.get(node);
+            if (recorded != null) {
+                this.callTypeArguments.set(node, settledAll(store, recorded, settled));
+            }
+        }
+        let bindings = new Map<LocalBinding, LocalBinding>();
+        for (let node in this.resolvedBindings.keys()) {
+            let recorded = this.resolvedBindings.get(node);
+            if (recorded != null) {
+                this.resolvedBindings.set(node, settledBinding(store, recorded, settled, bindings));
+            }
+        }
+        for (let node in this.resolvedMethods.keys()) {
+            let recorded = this.resolvedMethods.get(node);
+            if (recorded != null && store.mentionsPending(recorded.definingType())) {
+                this.resolvedMethods.set(node, settledMethod(store, recorded, settled));
+            }
+        }
+        for (let node in this.lambdas.keys()) {
+            let recorded = this.lambdas.get(node);
+            if (recorded != null) {
+                this.lambdas.set(node, settledLambda(store, recorded, settled, bindings));
+            }
+        }
     }
 
     export callsAwaitingThrows() -> GreenNode[] {
@@ -457,6 +575,69 @@ export final class CatchFinish {
     export gaps() -> EscapeGap[] {
         return this.escapeGaps;
     }
+}
+
+settledAll(TypeStore store, Type[] types, Map<PendingThrowsType, Type> settled) -> Type[] {
+    let replaced = new List<Type>();
+    for (let type in types) {
+        replaced.push(store.settledPendings(type, settled));
+    }
+    return replaced.toArray();
+}
+
+// The binding at its settled type, one per binding however many nodes name it.
+settledBinding(TypeStore store, LocalBinding binding, Map<PendingThrowsType, Type> settled,
+               Map<LocalBinding, LocalBinding> replaced) -> LocalBinding {
+    let known = replaced.get(binding);
+    if (known != null) {
+        return known;
+    }
+    if (!store.mentionsPending(binding.type())) {
+        return binding;
+    }
+    let created = new LocalBinding(binding.name(), store.settledPendings(binding.type(), settled),
+        binding.kind(), binding.isConst(), binding.nameSpan());
+    replaced.set(binding, created);
+    return created;
+}
+
+// The method at the same position of the settled type that declares it, an instantiation's
+// members being filled parallel to its template's.
+settledMethod(TypeStore store, Method method, Map<PendingThrowsType, Type> settled) -> Method {
+    let owner = method.definingType();
+    let settledOwner = store.settledPendings(owner, settled);
+    return counterpartIn(typemembers.methodsOf(owner), typemembers.methodsOf(settledOwner), method)
+        ?? counterpartIn(typemembers.staticMethodsOf(owner),
+            typemembers.staticMethodsOf(settledOwner), method)
+        ?? method;
+}
+
+counterpartIn(List<Method>? recorded, List<Method>? counterparts, Method method) -> Method? {
+    if (recorded == null || counterparts == null) {
+        return null;
+    }
+    for (long i = 0; i < recorded.length() && i < counterparts.length(); i++) {
+        if (recorded.get(i) == method) {
+            return counterparts.get(i);
+        }
+    }
+    return null;
+}
+
+settledLambda(TypeStore store, LambdaInfo info, Map<PendingThrowsType, Type> settled,
+              Map<LocalBinding, LocalBinding> bindings) -> LambdaInfo {
+    let captures = new List<LambdaCapture>();
+    for (let capture in info.captures()) {
+        let binding = capture.binding();
+        LocalBinding? kept = null;
+        if (binding != null) {
+            kept = settledBinding(store, binding, settled, bindings);
+        }
+        captures.push(new LambdaCapture(kept, store.settledPendings(capture.type(), settled),
+            capture.field()));
+    }
+    return new LambdaInfo(info.signature(), store.settledPendings(info.type(), settled),
+        captures.toArray());
 }
 
 // The open trials of one SemaResult and what undoes each write made while one is open, latest
