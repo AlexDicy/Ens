@@ -9,6 +9,7 @@ import LambdaExpressionNode from @ens.frontend.syntax.generated.nodes;
 import LambdaParameterNode from @ens.frontend.syntax.generated.nodes;
 import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
 import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ThisExpressionNode from @ens.frontend.syntax.generated.nodes;
 import ParenthesizedExpressionNode from @ens.frontend.syntax.generated.nodes;
 import ArrayLiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
 import StructLiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
@@ -48,6 +49,8 @@ import phases.bodies.voidcalls;
 import phases.bodies.valuejoins;
 import Parameter from model.typemembers;
 import Signature from model.typemembers;
+import Field from model.typemembers;
+import model.typemembers;
 import model.typenames;
 import phases.calls;
 import model.types;
@@ -126,6 +129,15 @@ public final class LambdaFrame {
         return true;
     }
 
+    // Records that the lambda copies the field 'field' of the receiver as 'binding', once.
+    protected captureField(Field field, LocalBinding binding) {
+        if (this.holds(binding)) {
+            return;
+        }
+        this.capturedBindings.push(binding);
+        this.captures.push(new LambdaCapture(binding, binding.type(), field));
+    }
+
     protected holds(LocalBinding binding) -> bool {
         for (long i = 0; i < this.capturedBindings.length(); i++) {
             if (this.capturedBindings.get(i) == binding) {
@@ -141,6 +153,18 @@ public final class LambdaFrame {
 
     protected result() -> LambdaCapture[] {
         return this.captures.toArray();
+    }
+
+    // The binding the lambda reads its copy of 'field' through, one for each field.
+    protected copiedBinding(Field field) -> LocalBinding {
+        for (let capture in this.captures) {
+            let binding = capture.binding();
+            if (capture.field() == field && binding != null) {
+                return binding;
+            }
+        }
+        return new LocalBinding(field.name(), field.type(), BindingKind.CopiedField, true,
+            field.nameSpan());
     }
 
     // A frame for the same lambda that holds what this one has captured so far and records later
@@ -558,6 +582,36 @@ public captureReceiver(BodyChecker checker, Type receiver, Span at) {
     for (long i = 0; i < depth; i++) {
         let ignored = checker.lambdaFrames().get(i).captureReceiver(receiver);
     }
+}
+
+// The type of the read 'node', 'this.name' inside a lambda, where 'name' is a 'const' field of a class
+// receiver whose type another task may hold: the lambda copies the field's value when it is created
+// rather than capturing 'this', and reads that copy. Null where the read is anything else, which is
+// then analyzed as a member read through 'this'. A constructor may still assign the field after
+// the lambda is created, so a lambda written in one reads it through 'this'.
+public copiedFieldRead(BodyChecker checker, MemberExpressionNode node) -> Type? {
+    long depth = checker.lambdaFrames().length();
+    let receiver = checker.frame().thisType();
+    if (depth == 0 || receiver == null || checker.frame().enclosedByConstructor()
+            || !(syntax.unwrapParentheses(node.object()) is ThisExpressionNode)
+            || types.classOf(receiver) == null) {
+        return null;
+    }
+    let field = typemembers.inheritedOrOwnField(receiver, node.member().text());
+    if (field == null || !field.isConst() || field.isStatic() || field.isLazy() || field.isWeak()
+            || types.authorityOf(field.definingType()) != types.authorityOf(receiver)
+            || sharing.whyUnshareable(field.type()) != null) {
+        return null;
+    }
+    let outermost = checker.lambdaFrames().get(0);
+    let binding = outermost.copiedBinding(field);
+    outermost.captureField(field, binding);
+    for (long i = 1; i < depth; i++) {
+        checker.lambdaFrames().get(i).captureBinding(binding);
+    }
+    checker.result().setType(node.object().green(), receiver);
+    checker.result().setBinding(node.green(), binding);
+    return narrowing.narrowedFieldType(checker, node, field.type());
 }
 
 // Whether the binding is declared outside the lambda being checked, so a write to it would land on
