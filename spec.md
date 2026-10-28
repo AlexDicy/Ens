@@ -2490,6 +2490,7 @@ A `Task` is shareable, so a task may await one of its siblings, and a value that
 `scope.launch(body)` starts a body that returns nothing and cannot throw, and returns nothing: it is the form for work nobody waits for, such as serving one connection, and a body that could throw is refused with the advice the lambda rules give, to move the work into a function with a `catch` clause of its own.
 A task started with `start` is meant to be awaited, so one that threw and was never awaited aborts the program when its scope ends, naming the line that started it, because an error nobody handled is unhandled.
 `scope.startDedicated(priority, body)` is `start` on an operating-system thread of the task's own, for a loop that must not share one, such as audio or rendering, under the same rules for what the body may capture.
+Its `priority` is a `TaskPriority`: `Normal`, `High` for work someone is watching, or `Realtime` for work with a deadline, and a system that refuses the level runs the thread at the highest level it allows.
 A `TaskScope` is also made with `new TaskScope()` and kept in a field, for tasks that live as long as an object does; its destructor cancels every task in it and waits for them all, and since no task can hold a reference to a writable object such as its owner, the wait is never for itself.
 Starting a task in a scope that has ended aborts the program.
 
