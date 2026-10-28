@@ -2176,10 +2176,11 @@ That count is `0` only once the stream has ended, so a count shorter than the bu
 A `byte[]` is written by passing `bytes.of(array)`.
 `streams.copy(source, target)` moves everything the source has left into the target and returns how many bytes moved, flushing and closing neither, so flushing and closing the target is up to the caller.
 
-`@std.io` itself provides the streams a program starts with: `io.out()` is standard output as a `Writer`, `io.err()` is standard error, and `io.in()` is standard input as a `BufferedReader`.
+`@std.io` itself provides the streams a program starts with: `io.out()` is standard output as a `Writer`, `io.err()` is standard error, and `io.in()` is standard input as a `StandardInput`, a `Reader` with the `readLine()`, `readAll()` and `readAllText()` a `BufferedReader` has.
 Standard output is buffered, so a line written there reaches the operating system once that buffer fills or something hands it over, and standard error is not, so what a program reports survives a crash.
 The buffer belongs to the stream rather than to the writer, so it makes no difference which writer returned by `io.out()` a program keeps.
 `io.in()` returns the same reader every call, because bytes read ahead cannot be put back and two readers of one input would steal from each other.
+Any task may read it, and tasks reading it at the same time take turns, each read or line whole.
 `io.flush()` hands over everything accepted by `io.out()` and not yet given to the operating system.
 
 `print(message)` and `eprint(message)` come from `@std.io.print`, which every program has with no import written, and each writes its message and a newline, the first to standard output and the second to standard error.
