@@ -1,6 +1,10 @@
-// Single-threaded tests for Atomic, Mutex and Channel. The fixtures in 'tests/' cover the
-// multi-threaded cases.
+// Tests for scopes and the tasks they start, and single-threaded tests for Atomic, Mutex and
+// Channel, whose multi-threaded cases the fixtures in 'tests/' cover.
 import @std.testing;
+import @std.tasks;
+import Cancelled from @std.tasks;
+import Task from @std.tasks;
+import TaskScope from @std.tasks;
 import Atomic from @std.tasks;
 import Mutex from @std.tasks;
 import Channel from @std.tasks;
@@ -117,4 +121,107 @@ test "a mutex body that throws passes the error on and leaves the mutex free" {
     try testing.assertEqual(try countThrough(tally, 1), 1L);
     try testing.assertTrue(refusedAt(tally, 1), "the second count is over the limit");
     try testing.assertEqual(try countThrough(tally, 5), 2L);
+}
+
+refuse() -> int throws Refused {
+    throw new Refused();
+    return 0;
+}
+
+// Checks for cancellation until it is asked to stop, so the test that starts it ends it.
+untilCancelled() -> int throws Cancelled {
+    while (true) {
+        try tasks.checkCancelled();
+        tasks.sleep(1);
+    }
+    return 0;
+}
+
+awaitedMessage(Task<(() -> int throws Cancelled)> task) -> string {
+    return "{try task.await()}";
+} catch (Cancelled stop) {
+    return stop.message;
+}
+
+test "a scope returns what its body returns once every task it started has finished" {
+    let finished = new Atomic<int>(0);
+    int total = tasks.scope((scope) -> {
+        let first = scope.start(() -> 20);
+        let second = scope.start(() -> 22);
+        scope.launch(() -> {
+            finished.increment();
+        });
+        return first.await() + second.await();
+    });
+    try testing.assertEqual(total, 42);
+    try testing.assertEqual(finished.read(), 1);
+}
+
+test "awaiting a task that threw throws what it threw" {
+    string outcome = tasks.scope((scope) -> {
+        let failing = scope.start(() -> try refuse());
+        return attemptRefused(failing);
+    });
+    try testing.assertEqual(outcome, "refused");
+}
+
+attemptRefused(Task<(() -> int throws Refused)> task) -> string {
+    return "{try task.await()}";
+} catch (Refused refused) {
+    return refused.message;
+}
+
+test "a shareable result is given to every awaiter" {
+    string twice = tasks.scope((scope) -> {
+        let named = scope.start(() -> "named");
+        return named.await() + named.await();
+    });
+    try testing.assertEqual(twice, "namednamed");
+}
+
+test "a cancelled scope stops a task that checks, which then throws 'Cancelled'" {
+    string outcome = tasks.scope((scope) -> {
+        let waiting = scope.start(() -> try untilCancelled());
+        scope.cancel();
+        return awaitedMessage(waiting);
+    });
+    try testing.assertEqual(outcome, "the task was cancelled");
+}
+
+test "cancelling a task stops it and the tasks it started" {
+    string outcome = tasks.scope((scope) -> {
+        let parent = scope.start(() -> tasks.scope((inner) -> {
+            let child = inner.start(() -> try untilCancelled());
+            return awaitedMessage(child).length as int;
+        }));
+        parent.cancel();
+        return "{parent.await()}";
+    });
+    try testing.assertEqual(outcome, "22");
+}
+
+test "a deadline cancels the scope's tasks once it passes" {
+    string outcome = tasks.scope((scope) -> {
+        scope.cancelAfter(5);
+        return awaitedMessage(scope.start(() -> try untilCancelled()));
+    });
+    try testing.assertEqual(outcome, "the task was cancelled");
+}
+
+test "code outside every task is never cancelled" {
+    try testing.assertFalse(tasks.isCancelled(), "no task was asked to stop");
+    try tasks.checkCancelled();
+}
+
+test "a scope kept in an object cancels and waits for its tasks when it is released" {
+    let stopped = new Atomic<bool>(false);
+    let kept = new TaskScope();
+    kept.launch(() -> {
+        while (!tasks.isCancelled()) {
+            tasks.sleep(1);
+        }
+        stopped.write(true);
+    });
+    kept = new TaskScope();
+    try testing.assertTrue(stopped.read(), "the released scope waited for its task to stop");
 }
