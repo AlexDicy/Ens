@@ -4,12 +4,15 @@
 // @stdout tokens: steady true, own true, nonzero true
 // The thread and lock bridges the compiler defines: four threads add to one count under a lock, a
 // fifth sleeps on the lock's condition until it is woken, and a timed wait on the main thread ends
-// by itself. A thread's token stays the same while it runs and differs from another thread's.
+// by itself. A thread's token stays the same while it runs and differs from another thread's. The
+// count is read and written in two steps, so only the lock keeps two threads from losing an add.
+import Atomic from @std.tasks;
+
 external type NativeThread;
-external type NativeLock;
+shared external type NativeLock;
 
 external from libc {
-    ens_thread_start((() -> void) body, out int error) -> NativeThread?;
+    ens_thread_start((shared () -> void) body, out int error) -> NativeThread?;
     ens_thread_join(NativeThread thread);
     ens_lock_create() -> NativeLock?;
     ens_lock_destroy(NativeLock lock);
@@ -20,18 +23,14 @@ external from libc {
     ens_thread_token() -> long;
 }
 
-final class Tokens {
-    long other = 0;
-}
-
-final class Counter {
-    long total;
-    bool ready;
+shared final class Counter {
+    const Atomic<long> total;
+    const Atomic<bool> ready;
     const NativeLock lock;
 
     constructor(this.lock) {
-        this.total = 0;
-        this.ready = false;
+        this.total = new Atomic<long>(0);
+        this.ready = new Atomic<bool>(false);
     }
 }
 
@@ -47,7 +46,7 @@ main() -> int {
         threads[t] = ens_thread_start(() -> {
             for (long i = 0; i < 100000; i++) {
                 ens_lock_acquire(counter.lock);
-                counter.total = counter.total + 1;
+                counter.total.write(counter.total.read() + 1);
                 ens_lock_release(counter.lock);
             }
         }, out error);
@@ -55,7 +54,7 @@ main() -> int {
     int waiterError = 0;
     let waiter = ens_thread_start(() -> {
         ens_lock_acquire(counter.lock);
-        while (!counter.ready) {
+        while (!counter.ready.read()) {
             ens_lock_wait(counter.lock, -1);
         }
         ens_lock_release(counter.lock);
@@ -68,7 +67,7 @@ main() -> int {
         }
     }
     ens_lock_acquire(lock);
-    counter.ready = true;
+    counter.ready.write(true);
     ens_lock_notify_all(lock);
     ens_lock_release(lock);
     if (waiter != null) {
@@ -77,17 +76,17 @@ main() -> int {
     ens_lock_acquire(lock);
     ens_lock_wait(lock, 20);
     ens_lock_release(lock);
-    print("total {counter.total}");
-    let tokens = new Tokens();
+    print("total {counter.total.read()}");
+    let other = new Atomic<long>(0);
     int tokenError = 0;
     let reader = ens_thread_start(() -> {
-        tokens.other = ens_thread_token();
+        other.write(ens_thread_token());
     }, out tokenError);
     if (reader != null) {
         ens_thread_join(reader);
     }
     long mine = ens_thread_token();
-    print("tokens: steady {mine == ens_thread_token()}, own {mine != tokens.other}, "
-        + "nonzero {mine != 0 && tokens.other != 0}");
+    print("tokens: steady {mine == ens_thread_token()}, own {mine != other.read()}, "
+        + "nonzero {mine != 0 && other.read() != 0}");
     return 0;
 }
