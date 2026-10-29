@@ -796,7 +796,7 @@ No other module may define a top-level `main`; the compiler rejects one wherever
 
 `main` is declared either as `main()` or as `main() -> int`, and it may add `throws` or `noreturn` like any other function.
 The `int` it returns becomes the process exit code, a `main()` that returns nothing exits with 0, and an exception that escapes `main` is reported on stderr and exits with 1.
-`main` runs on a stack of 8 MiB on Windows, as it does by default on Linux and macOS.
+`main` runs on a stack of 8 MiB on Windows, as it does by default on Linux and macOS, and every task runs on a stack of 8 MiB on every platform.
 Any other return type is an error, and so are parameters and type parameters: nothing passes arguments to `main`, and a program reads its command line through `environment.arguments()` from `@std.environment`, which returns the arguments without the program's own name.
 
 Importing from packages follows the format `@packageorg.packagename.path`.
@@ -2505,6 +2505,7 @@ A task started with `start` is meant to be awaited, so one that threw and was ne
 A task that throws `Cancelled` after it was cancelled has done what it was asked, so it is not counted, and neither is any task when the scope's body throws, since the body's error already carries the scope's failure out.
 `scope.startDedicated(priority, body)` is `start` on an operating-system thread of the task's own, for a loop that must not share one, such as audio or rendering, under the same rules for what the body may capture.
 Its `priority` is a `TaskPriority`: `Normal`, `High` for work someone is watching, or `Realtime` for work with a deadline, and a system that refuses the level runs the thread at the highest level it allows.
+Every other task runs on whichever thread of the program's pool is free when it starts or wakes, so it may be on one thread before a wait and another after it; a library that has to be called from one thread throughout is used from a task started with `startDedicated`.
 A `TaskScope` is also made with `new TaskScope()` and kept in a field, for tasks that live as long as an object does; its destructor cancels every task in it and waits for them all, and since no task can hold a reference to a writable object such as its owner, the wait is never for itself.
 Starting a task in a scope that has ended aborts the program.
 

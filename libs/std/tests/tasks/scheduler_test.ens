@@ -1,0 +1,106 @@
+// Tests for the pool tasks run over: that many tasks run and are all awaited, that a task waiting
+// leaves its thread to others, and that tasks parked together are released one wake at a time.
+import @std.testing;
+import @std.tasks;
+import Cancelled from @std.tasks;
+import Channel from @std.tasks;
+import ChannelClosed from @std.tasks;
+import Sender from @std.tasks;
+import Task from @std.tasks;
+import Atomic from @std.tasks;
+import List from @std.collections.list;
+import @std.environment;
+
+startAndAwait(long count) -> long throws Cancelled {
+    return try tasks.scope((scope) -> {
+        let handles = new List<Task<() -> long>>();
+        for (long i = 0; i < count; i++) {
+            handles.push(scope.start(() -> i));
+        }
+        long total = 0;
+        for (let handle in handles) {
+            total = total + try handle.await();
+        }
+        return total;
+    });
+}
+
+test "ten thousand tasks started at once all run and are awaited" {
+    try testing.assertEqual(try startAndAwait(10000), 49995000L);
+}
+
+test "tasks started by a task are run and awaited the same way" {
+    long total = try tasks.scope((scope) -> {
+        let outer = scope.start(() -> try startAndAwait(2000));
+        return try outer.await();
+    });
+    try testing.assertEqual(total, 1999000L);
+}
+
+// Receives one value and adds it to the total.
+receiveOne(Channel<long> gate, Atomic<long> total) throws Cancelled {
+    let value = try gate.receive();
+    let added = total.add(value ?? 0);
+}
+
+test "tasks that wait leave their threads to the tasks that wake them" {
+    long waiting = environment.processorCount() * 4 + 4;
+    let gate = new Channel<long>(0);
+    let sender = gate.sender();
+    let total = new Atomic<long>(0);
+    tasks.scope((scope) -> {
+        for (long i = 0; i < waiting; i++) {
+            scope.launch(() -> try receiveOne(gate, total));
+        }
+        scope.launch(() -> {
+            for (long i = 1; i <= waiting; i++) {
+                try sendOrStop(sender, i);
+            }
+        });
+    });
+    try testing.assertEqual(total.read(), waiting * (waiting + 1) / 2);
+}
+
+sendOrStop(Sender<long> sender, long value) throws Cancelled {
+    try sender.send(value);
+} catch (ChannelClosed closed) {
+    panic("the channel closed while its receivers waited");
+}
+
+test "two thousand tasks parked on one channel are each released by one send" {
+    long count = 2000;
+    let gate = new Channel<long>(0);
+    let sender = gate.sender();
+    let total = new Atomic<long>(0);
+    try tasks.scope((scope) -> {
+        for (long i = 0; i < count; i++) {
+            scope.launch(() -> try receiveOne(gate, total));
+        }
+        for (long i = 1; i <= count; i++) {
+            try sendOrStop(sender, i);
+        }
+    });
+    try testing.assertEqual(total.read(), count * (count + 1) / 2);
+}
+
+test "a task that sleeps while others run wakes and finishes" {
+    let order = new Channel<string>(8);
+    let out = order.sender();
+    tasks.scope((scope) -> {
+        scope.launch(() -> {
+            try tasks.sleep(30);
+            try sendText(out, "slept");
+        });
+        scope.launch(() -> try sendText(out, "ran"));
+    });
+    let first = try order.receive(0) ?? "";
+    let second = try order.receive(0) ?? "";
+    try testing.assertEqual(first, "ran");
+    try testing.assertEqual(second, "slept");
+}
+
+sendText(Sender<string> out, string text) throws Cancelled {
+    try out.send(text);
+} catch (ChannelClosed closed) {
+    panic("the receiving end was released");
+}

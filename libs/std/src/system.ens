@@ -10,6 +10,11 @@ public external type Child;
 public shared external type ThreadLock;
 // An operating-system thread, which 'joinThread' waits for and frees.
 public external type NativeThread;
+// A stack of its own with the registers that resume it, which the task scheduler switches a
+// thread between. Every operation on one is the scheduler's, so the handle may cross threads.
+public shared external type Context;
+// The record a thread keeps for the task scheduler, read by the supervisor from another thread.
+public shared external type ThreadRecord;
 
 // The compiler defines the 'ens_' bridges wherever they are referenced. The bridge that starts a
 // program takes the arguments twice over: a POSIX target builds an argument vector out of the NUL
@@ -77,6 +82,17 @@ external from libc {
     ens_thread_join(NativeThread thread);
     ens_thread_raise(int level);
     ens_processor_count() -> long;
+    ens_context_adopt() -> Context?;
+    ens_context_create(long stackBytes, out int error) -> Context?;
+    ens_context_set_body(Context context, (shared () -> void) body);
+    ens_context_switch(Context from, Context to);
+    ens_context_release(Context context);
+    ens_thread_record() -> ThreadRecord?;
+    ens_thread_record_read(long slot) -> long;
+    ens_thread_record_write(long slot, long value);
+    ens_record_read(ThreadRecord record, long slot) -> long;
+    ens_task_token() -> long;
+    ens_monitor_tick_advance() -> long;
     ens_capture_trace(int maxDepth) -> long[];
     ens_trace_frames(long[] addresses) -> StackFrame[];
 }
@@ -532,6 +548,88 @@ public processorCount() -> long {
 // A number that identifies the calling thread: never zero, and different for every running thread.
 public threadToken() -> long {
     return ens_thread_token();
+}
+
+// A number that identifies the calling task, or the calling thread when it runs none: never zero,
+// and different for every running task and thread.
+public taskToken() -> long {
+    return ens_task_token();
+}
+
+// The calling thread's own stack as a context, so the thread can switch to a task's and be
+// switched back to. Panics when the system refuses.
+public adoptContext() -> Context {
+    let context = ens_context_adopt();
+    if (context == null) {
+        panic("could not prepare a thread to run tasks: the system refused. Start fewer tasks at "
+            + "once");
+    }
+    return context;
+}
+
+// A context with a stack of `stackBytes`, which runs the body it is given when first switched to.
+// Panics when the system cannot reserve the stack.
+public createContext(long stackBytes) -> Context {
+    int error = 0;
+    let context = ens_context_create(stackBytes, out error);
+    if (context == null) {
+        panic("could not reserve a stack for a task: the system refused with error number {error}. "
+            + "Start fewer tasks at once");
+    }
+    return context;
+}
+
+// The body a context runs when next switched to, after being made or after its last body returned.
+public setContextBody(Context context, (shared () -> void) body) {
+    ens_context_set_body(context, body);
+}
+
+// Leaves `from`, the running context, and resumes `to`. Returns when a context switches back.
+public switchContext(Context from, Context to) {
+    ens_context_switch(from, to);
+}
+
+// Frees a context that is not running and will not be switched to again.
+public releaseContext(Context context) {
+    ens_context_release(context);
+}
+
+// The calling thread's record, made on the first ask. Panics when there is no memory for it.
+public threadRecord() -> ThreadRecord {
+    let record = ens_thread_record();
+    if (record == null) {
+        panic("could not make a thread's record for running tasks: the system has no memory for "
+            + "it. Start fewer tasks at once");
+    }
+    return record;
+}
+
+// The slots of a thread's record: the token of the task it runs, the tick the call it is inside
+// began at, and its worker's number plus one.
+public enum RecordSlot {
+    task = 0,
+    call = 1,
+    worker = 2,
+}
+
+// A slot of the calling thread's record, 0 when the thread has none.
+public readThreadSlot(RecordSlot slot) -> long {
+    return ens_thread_record_read(slot as long);
+}
+
+public writeThreadSlot(RecordSlot slot, long value) {
+    ens_thread_record_write(slot as long, value);
+}
+
+// A slot of any thread's record.
+public readRecordSlot(ThreadRecord record, RecordSlot slot) -> long {
+    return ens_record_read(record, slot as long);
+}
+
+// Moves the supervisor's tick on by one and returns it, which a call records on its thread when it
+// begins.
+public advanceMonitorTick() -> long {
+    return ens_monitor_tick_advance();
 }
 
 // Starts a thread that runs `body`. Panics when the system cannot start one.
