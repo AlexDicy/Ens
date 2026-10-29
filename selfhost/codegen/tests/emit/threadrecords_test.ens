@@ -1,0 +1,104 @@
+// The thread record bridges each platform is given, held to the verifier from whichever host runs
+// the suite: where a record is kept, that the key and the monitor's tick are one word for the
+// whole program, and what a call's entry and leave write.
+import @std.testing;
+import @ens.llvm.target;
+import EmissionHost from support;
+import emit.threadrecords;
+
+// The module's text once one target's record bridges are emitted.
+moduleText(string triple) -> string throws {
+    let host = new EmissionHost("records_{triple}");
+    host.retarget(triple);
+    let runtime = host.runtime;
+    runtime.call(threadrecords.recordRuntime(runtime), [], "record");
+    runtime.call(threadrecords.readRuntime(runtime), [runtime.int64(0)], "task");
+    runtime.call(threadrecords.writeRuntime(runtime), [runtime.int64(0), runtime.int64(7)], "");
+    runtime.call(threadrecords.recordReadRuntime(runtime),
+        [runtime.nullPointer(), runtime.int64(1)], "other");
+    runtime.call(threadrecords.taskTokenRuntime(runtime), [], "token");
+    runtime.call(threadrecords.tickAdvanceRuntime(runtime), [], "tick");
+    let entered = runtime.call(threadrecords.callEnterRuntime(runtime), [], "entered");
+    runtime.call(threadrecords.callLeaveRuntime(runtime), [entered], "");
+    string text = host.text();
+    try host.finish();
+    return text;
+}
+
+// One function's body, from its definition to the brace that closes it.
+bodyOf(string text, string name) -> string throws {
+    long start = text.indexOf("define internal {name}(");
+    try testing.assertTrue(start >= 0, "'{name}' was never defined: {text}");
+    string rest = text.substring(start, text.length);
+    long end = rest.indexOf("\n}");
+    try testing.assertTrue(end >= 0, "'{name}' was left unclosed: {rest}");
+    return rest.substring(0, end);
+}
+
+test "a POSIX record lives under a pthread key, which is eight bytes wide only on macOS" {
+    string linux = try moduleText("x86_64-unknown-linux-gnu");
+    try testing.assertTrue(linux.indexOf("@pthread_key_create(ptr @ens_thread_key, ptr @free)") >= 0,
+        "Linux does not make the key with free as its destructor: {linux}");
+    try testing.assertTrue(linux.indexOf("@pthread_getspecific(i32 %key.get)") >= 0
+        && linux.indexOf("@pthread_setspecific(i32 %key.set, ptr %made)") >= 0,
+        "Linux does not keep the record under a four-byte key: {linux}");
+    string darwin = try moduleText("aarch64-apple-darwin23");
+    try testing.assertTrue(darwin.indexOf("@pthread_getspecific(i64 %key)") >= 0
+        && darwin.indexOf("@pthread_setspecific(i64 %key, ptr %made)") >= 0,
+        "macOS does not keep the record under an eight-byte key: {darwin}");
+    try testing.assertTrue(linux.indexOf("Tls") < 0 && darwin.indexOf("Tls") < 0,
+        "a POSIX record reaches the Windows storage");
+}
+
+test "a Windows record lives in a thread-local storage slot" {
+    string text = try moduleText("x86_64-pc-windows-msvc");
+    try testing.assertTrue(text.indexOf("call i32 @TlsAlloc()") >= 0,
+        "Windows does not allocate the slot: {text}");
+    try testing.assertTrue(text.indexOf("@TlsGetValue(i32 %key.get)") >= 0
+        && text.indexOf("@TlsSetValue(i32 %key.set, ptr %made)") >= 0,
+        "Windows does not keep the record in the slot: {text}");
+    try testing.assertTrue(text.indexOf("pthread") < 0,
+        "a Windows record reaches a pthread call: {text}");
+}
+
+test "the key, its state and the monitor's tick are one word each for the whole program" {
+    string text = try moduleText(target.hostTargetTriple());
+    for (let name in ["ens_thread_key_state", "ens_thread_key", "ens_monitor_tick"]) {
+        try testing.assertTrue(text.indexOf("@{name} = linkonce_odr global i64 0, ") >= 0,
+            "'{name}' is not one shared word: {text}");
+    }
+    string linux = try moduleText("x86_64-unknown-linux-gnu");
+    try testing.assertTrue(linux.indexOf("@ens_monitor_tick = linkonce_odr global i64 0, comdat, align 8")
+        >= 0 && linux.indexOf("$ens_monitor_tick = comdat any") >= 0,
+        "Linux does not put the shared word in a group the linker keeps one of: {linux}");
+    string darwin = try moduleText("aarch64-apple-darwin23");
+    try testing.assertTrue(darwin.indexOf("comdat") < 0,
+        "macOS is given a group its object format has not: {darwin}");
+}
+
+test "a task token is the record's task, or the thread's own token without one" {
+    string linux = try moduleText("x86_64-unknown-linux-gnu");
+    string body = try bodyOf(linux, "i64 @ens_task_token");
+    try testing.assertTrue(body.indexOf("call ptr @ens_thread_record_existing()") >= 0
+        && body.indexOf("call i64 @pthread_self()") >= 0,
+        "Linux does not read the record first and the thread second: {body}");
+    string windows = try moduleText("x86_64-pc-windows-msvc");
+    string windowsBody = try bodyOf(windows, "i64 @ens_task_token");
+    try testing.assertTrue(windowsBody.indexOf("call i32 @GetCurrentThreadId()") >= 0,
+        "Windows does not fall back to the thread's id: {windowsBody}");
+}
+
+test "entering a call records the monitor's tick and leaving clears it" {
+    string text = try moduleText(target.hostTargetTriple());
+    string enter = try bodyOf(text, "ptr @ens_call_enter");
+    try testing.assertTrue(enter.indexOf("load atomic i64, ptr @ens_monitor_tick monotonic") >= 0
+        && enter.indexOf("getelementptr i64, ptr %record, i64 1") >= 0
+        && enter.indexOf("store atomic i64 %count, ptr %slot monotonic") >= 0,
+        "entering does not write the tick into the call slot: {enter}");
+    string leave = try bodyOf(text, "void @ens_call_leave");
+    try testing.assertTrue(leave.indexOf("store atomic i64 0, ptr %slot monotonic") >= 0,
+        "leaving does not clear the call slot: {leave}");
+    string advance = try bodyOf(text, "i64 @ens_monitor_tick_advance");
+    try testing.assertTrue(advance.indexOf("atomicrmw add ptr @ens_monitor_tick, i64 1 acq_rel") >= 0,
+        "advancing does not add one to the shared tick: {advance}");
+}

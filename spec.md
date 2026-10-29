@@ -796,6 +796,7 @@ No other module may define a top-level `main`; the compiler rejects one wherever
 
 `main` is declared either as `main()` or as `main() -> int`, and it may add `throws` or `noreturn` like any other function.
 The `int` it returns becomes the process exit code, a `main()` that returns nothing exits with 0, and an exception that escapes `main` is reported on stderr and exits with 1.
+`main` runs on a stack of 8 MiB on Windows, as it does by default on Linux and macOS.
 Any other return type is an error, and so are parameters and type parameters: nothing passes arguments to `main`, and a program reads its command line through `environment.arguments()` from `@std.environment`, which returns the arguments without the program's own name.
 
 Importing from packages follows the format `@packageorg.packagename.path`.
