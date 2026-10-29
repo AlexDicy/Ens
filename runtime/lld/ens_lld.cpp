@@ -83,6 +83,10 @@ struct RunningLink {
 
 std::atomic<RunningLink*> linkInProgress{nullptr};
 
+// lld keeps one linker context for the whole process, so two links from two threads would build
+// into the same one. Each link holds this for as long as it runs, and the next waits for it.
+std::mutex oneLinkAtATime;
+
 void reportStoppedLink(const std::string& program, const std::string& text) {
     const llvm::StringRef reported = llvm::StringRef(text).trim();
     llvm::raw_ostream& stream = llvm::errs();
@@ -231,6 +235,7 @@ int ens_lld_link_program(int flavor, const char* argumentBlock, long long argume
 
     // Constructed before the first link, so llvm_shutdown has it to destroy.
     *stoppedLinkReporter;
+    std::lock_guard<std::mutex> alone(oneLinkAtATime);
     RunningLink running;
     if (program != nullptr) running.program = program;
     linkInProgress.store(&running);

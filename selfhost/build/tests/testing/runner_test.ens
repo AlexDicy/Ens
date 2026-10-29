@@ -10,10 +10,11 @@ import DiscoveredTest from testing.discovery;
 import testing.discovery;
 import Runner from testing.runner;
 import RunnerOverlay from testing.runner;
+import RunnerOutput from testing.runner;
 import testing.runner;
 import support;
 
-test "the runner imports each module once and calls every test in order" {
+test "the runner imports each module once and calls every test by its place in the run" {
     let rootFolder = try support.scratch("runner-source");
     Path root = rootFolder.path();
     try support.writeFile(root, "alpha_test.ens", "test \"first\" \{ \}\n\ntest \"second\" \{ \}\n");
@@ -28,38 +29,56 @@ test "the runner imports each module once and calls every test in order" {
     try assertContains(source, "try alpha_test.$test0();");
     try assertContains(source, "try alpha_test.$test1();");
     try assertContains(source, "try beta_test.$test0();");
-    try assertContains(source, "print(\"PASS \" + \"third\");");
-    try assertContains(source, "if ($run2()) \{");
-    try assertContains(source, "print(\"\{passed\}/3 tests passed\");");
-    try assertContains(source, "if (passed == 3) \{");
+    try assertContains(source, "    $started(2);\n");
+    try assertContains(source, "    $finished(2, \"PASS \" + \"third\", true);\n");
+    try assertContains(source, "        2 -> $run2(),\n");
+    try assertContains(source, "    while (position < 3) \{\n");
+    try assertContains(source, "print(\"\{count\}/3 tests passed\");");
+    try assertContains(source, "if (count == 3) \{");
 }
 
-test "each result is printed before the next test runs" {
+// Every line about a test carries the marker and the test's place, the lines of one event go out
+// in one print, and each is flushed at once.
+test "the runner marks and flushes every line it writes about a test" {
     let tests = try discovered("runner-flush", "test \"first\" \{ \}\n\ntest \"second\" \{ \}\n");
     string source = runner.source(tests);
-    try assertContains(source, "    if ($run0()) \{\n        passed = passed + 1;\n    \}\n"
-        + "    $flush();\n    if ($run1()) \{");
-    try assertContains(source, "    \}\n    $flush();\n    return passed;\n");
     try assertOnce(source, "$flush() \{\n    try io.flush();\n\} catch (IoError ignored) \{\n\}\n");
+    try assertContains(source, "    print(\"$ens_test_runner start \{position\}\");\n    $flush();\n");
+    try assertContains(source,
+        "        written = written + \"$ens_test_runner line \{position\} \{line\}\\n\";\n");
+    try assertContains(source,
+        "    print(written + \"$ens_test_runner \{verdict\} \{position\}\");\n    $flush();\n");
 }
 
-// A group counts the passes of its own tests and the entry point walks the groups in a loop, so no
-// function counts more than one group's passes in a row, however many tests there are.
-test "the tests run in groups the entry point walks in a loop" {
+// Each dispatch function chooses between one group's tests, and the entry point's choice is of a
+// group, so no switch grows with the suite.
+test "the runner dispatches to a test through its group" {
     let text = new StringBuilder();
     for (long i = 0; i < 65; i++) {
         text.append("test \"case {i}\" \{ \}\n");
     }
     let tests = try discovered("runner-groups", text.toString());
     string source = runner.source(tests);
-    try assertContains(source, "$group0() -> int \{\n    int passed = 0;\n    if ($run0()) \{");
-    try assertContains(source, "    if ($run63()) \{\n        passed = passed + 1;\n    \}\n"
-        + "    $flush();\n    return passed;\n");
-    try assertContains(source, "$group1() -> int \{\n    int passed = 0;\n    if ($run64()) \{");
+    try assertContains(source, "$group0(long position) -> bool \{\n    return switch (position) \{\n"
+        + "        0 -> $run0(),\n");
+    try assertContains(source, "        63 -> $run63(),\n        default -> false,\n");
+    try assertContains(source, "$group1(long position) -> bool \{\n    return switch (position) \{\n"
+        + "        64 -> $run64(),\n        default -> false,\n");
+    try assertContains(source, "    return switch (position / 64) \{\n        0 -> $group0(position),\n"
+        + "        1 -> $group1(position),\n        default -> false,\n");
+    try assertContains(source, "print(\"\{count\}/65 tests passed\");");
+}
+
+// The workers take the next test nobody has started, as many of them as the run was given jobs
+// and never more than there are tests.
+test "the runner starts one worker per job, each taking the next test" {
+    let tests = try discovered("runner-jobs", "test \"first\" \{ \}\n\ntest \"second\" \{ \}\n");
+    string source = runner.source(tests);
+    try assertContains(source, "    long position = next.increment() - 1;\n");
+    try assertContains(source, "    long? jobs = given.length > 0 ? parse.parseLong(given[0]) : null;\n");
     try assertContains(source,
-        "    (() -> int)[] groups = [() -> $group0(), () -> $group1()];\n");
-    try assertContains(source, "    for (let group in groups) \{\n        passed = passed + group();");
-    try assertContains(source, "print(\"\{passed\}/65 tests passed\");");
+        "        for (long worker = 0; worker < jobs && worker < 2; worker++) \{\n"
+        + "            scope.launch(() -> $work(next, passed));\n");
 }
 
 test "the runner uses nothing outside the language" {
@@ -72,23 +91,25 @@ test "the runner uses nothing outside the language" {
         "the runner declares no external bindings: {source}");
 }
 
-test "a failure prints the message and stops the trace at the runner's own file" {
+test "a failure reports the message and stops the trace at the runner's own file" {
     let rootFolder = try support.scratch("runner-trace");
     Path root = rootFolder.path();
     try support.writeFile(root, "alpha_test.ens", "test \"first\" \{ \}\n");
     let plan = discovery.plan(new SystemFileLoader(), root, "");
     string source = runner.source(plan.tests());
     try assertContains(source, "catch (Error thrown) \{");
-    try assertContains(source, "print(\"FAIL \" + \"first\" + \": \" + thrown.message);");
+    try assertContains(source,
+        "    string result = \"FAIL \" + \"first\" + \": \" + thrown.message;\n");
     try assertContains(source, "if (frame.file == \"$ens_test_runner.ens\") \{");
+    try assertContains(source, "    $finished(0, result, false);\n");
 }
 
 test "the runner with no tests still compiles to a program that passes" {
     DiscoveredTest[] none = [];
     string source = runner.source(none);
     try assertContains(source, "main() -> int \{");
-    try assertContains(source, "print(\"\{passed\}/0 tests passed\");");
-    try assertContains(source, "if (passed == 0) \{");
+    try assertContains(source, "print(\"\{count\}/0 tests passed\");");
+    try assertContains(source, "if (count == 0) \{");
 }
 
 test "the overlay covers the runner and passes everything else on" {
@@ -115,42 +136,52 @@ test "the overlay covers the runner and passes everything else on" {
 
 test "the code the runner ends with reports what happened to the run" {
     let tests = try discovered("outcome", "test \"first\" \{ \}\n\ntest \"second\" \{ \}\n");
-    try testing.assertEqual(runner.outcomeOf(0, tests, 2).exitCode(), 0);
-    try testing.assertEqual(runner.outcomeOf(0, tests, 2).failure(), "");
-    try testing.assertEqual(runner.outcomeOf(1, tests, 2).exitCode(), 1);
-    try testing.assertEqual(runner.outcomeOf(1, tests, 2).failure(), "");
+    let done = outputOf(tests, ["start 0", "line 0 PASS first", "pass 0", "start 1",
+        "line 1 PASS second", "pass 1"]);
+    try testing.assertEqual(runner.outcomeOf(0, tests, done).exitCode(), 0);
+    try testing.assertEqual(runner.outcomeOf(0, tests, done).failure(), "");
+    try testing.assertEqual(runner.outcomeOf(1, tests, done).exitCode(), 1);
+    try testing.assertEqual(runner.outcomeOf(1, tests, done).failure(), "");
 
-    let crashed = runner.outcomeOf(-1073741819, tests, 1);
+    let partway = outputOf(tests, ["start 0", "start 1", "line 0 PASS first", "pass 0"]);
+    let crashed = runner.outcomeOf(-1073741819, tests, partway);
     try testing.assertEqual(crashed.exitCode(), 2);
     try testing.assertEqual(crashed.failure(), "the test program stopped with code -1073741819 "
         + "while running 'second'. Run that test alone with 'ens test --filter \"second\"' to see "
         + "its output");
 }
 
-// A runner that ends with 1 before every result is in did not reach its own count of failures, so
-// the code is a stop like any other and names the test it stopped in.
-test "a run that ends with 1 before every result arrived names the test it stopped in" {
+// A runner that ends with 0 or 1 before every result is in did not reach its own count, so the
+// code is a stop like any other and names the test it stopped in.
+test "a run that ends with 0 or 1 before every result arrived names the test it stopped in" {
     let tests = try discovered("outcome-early", "test \"first\" \{ \}\n\ntest \"second\" \{ \}\n");
-    let silent = runner.outcomeOf(1, tests, 0);
-    try testing.assertEqual(silent.exitCode(), 2);
-    try testing.assertEqual(silent.failure(), "the test program stopped with code 1 while running "
-        + "'first'. Run that test alone with 'ens test --filter \"first\"' to see its output");
+    let first = outputOf(tests, ["start 0"]);
+    for (int code in [0, 1]) {
+        let silent = runner.outcomeOf(code, tests, first);
+        try testing.assertEqual(silent.exitCode(), 2);
+        try testing.assertEqual(silent.failure(), "the test program stopped with code {code} "
+            + "while running 'first'. Run that test alone with 'ens test --filter \"first\"' to "
+            + "see its output");
+    }
 }
 
-// A 0 before every result is in is not a pass: the tests after the one that ended the run never ran.
-test "a run that ends with 0 before every result arrived names the test it stopped in" {
-    let tests = try discovered("outcome-early-zero",
-        "test \"first\" \{ \}\n\ntest \"second\" \{ \}\n");
-    let ended = runner.outcomeOf(0, tests, 0);
-    try testing.assertEqual(ended.exitCode(), 2);
-    try testing.assertEqual(ended.failure(), "the test program stopped with code 0 while running "
-        + "'first'. Run that test alone with 'ens test --filter \"first\"' to see its output");
+// Several tests were running when the program stopped, and any of them could have stopped it, so
+// the stop names all of them and how to find which.
+test "a run that stopped while several tests ran names each of them" {
+    let tests = try discovered("outcome-several",
+        "test \"first\" \{ \}\n\ntest \"second\" \{ \}\n\ntest \"third\" \{ \}\n");
+    let stopped = runner.outcomeOf(1, tests, outputOf(tests, ["start 0", "start 1", "start 2",
+        "line 1 PASS second", "pass 1"]));
+    try testing.assertEqual(stopped.exitCode(), 2);
+    try testing.assertEqual(stopped.failure(), "the test program stopped with code 1 while "
+        + "'first' and 'third' were running at the same time, so one of them stopped it. Run the "
+        + "tests one at a time with '--jobs 1' to see which");
 }
 
 // With one test in the run there is nothing to run it apart from, so the stop names it and ends.
 test "a run of one test that stopped names the test without suggesting running it alone" {
     let tests = try discovered("outcome-one", "test \"only\" \{ \}\n");
-    let stopped = runner.outcomeOf(1, tests, 0);
+    let stopped = runner.outcomeOf(1, tests, outputOf(tests, ["start 0"]));
     try testing.assertEqual(stopped.exitCode(), 2);
     try testing.assertEqual(stopped.failure(),
         "the test program stopped with code 1 while running 'only'");
@@ -158,7 +189,8 @@ test "a run of one test that stopped names the test without suggesting running i
 
 test "a run that stopped with every result in reports that rather than naming a test" {
     let tests = try discovered("outcome-late", "test \"only\" \{ \}\n");
-    let crashed = runner.outcomeOf(3, tests, 1);
+    let crashed = runner.outcomeOf(3, tests, outputOf(tests, ["start 0", "line 0 PASS only",
+        "pass 0"]));
     try testing.assertEqual(crashed.exitCode(), 2);
     try testing.assertEqual(crashed.failure(), "the test program ended with code 3 after all of "
         + "its tests had reported a result, so the failure is outside the tests");
@@ -166,28 +198,62 @@ test "a run that stopped with every result in reports that rather than naming a 
         "there is no test to point a filter at: {crashed.failure()}");
 }
 
-test "a result line is the one its own test prints, and nothing else is" {
-    let tests = try discovered("results", "test \"adds\" \{ \}\n\ntest \"subtracts\" \{ \}\n");
-    try testing.assertTrue(runner.reportsResult("PASS adds", tests[0]), "the pass of the test");
-    try testing.assertTrue(runner.reportsResult("FAIL adds: expected 2, got 3", tests[0]),
-        "the failure of the test, with what went wrong after it");
-    try testing.assertFalse(runner.reportsResult("PASS adds", tests[1]),
-        "another test's result is not this one's");
-    try testing.assertFalse(runner.reportsResult("PASS adds twice", tests[0]),
-        "a longer description that starts the same is not this test");
-    try testing.assertFalse(runner.reportsResult("  at assertEqual (testing.ens:7)", tests[0]),
-        "a frame under a failure is not a result");
-    try testing.assertFalse(runner.reportsResult("FAIL adds", tests[0]),
-        "a failure says what went wrong after the description");
+test "a run that stopped between tests says no test was running" {
+    let tests = try discovered("outcome-between", "test \"first\" \{ \}\n\ntest \"second\" \{ \}\n");
+    let stopped = runner.outcomeOf(1, tests, outputOf(tests, ["start 0", "line 0 PASS first",
+        "pass 0"]));
+    try testing.assertEqual(stopped.exitCode(), 2);
+    try testing.assertEqual(stopped.failure(), "the test program stopped with code 1 when no test "
+        + "was running, after 1 of 2 had reported a result, so the failure is outside the tests");
 }
 
-test "a result line reports whether the test it belongs to passed" {
-    let tests = try discovered("passes", "test \"adds\" \{ \}\n\ntest \"subtracts\" \{ \}\n");
-    try testing.assertTrue(runner.reportsPass("PASS adds", tests[0]), "a pass");
-    try testing.assertFalse(runner.reportsPass("FAIL adds: expected 2, got 3", tests[0]),
-        "a failure is not a pass");
-    try testing.assertFalse(runner.reportsPass("PASS adds", tests[1]),
-        "another test's pass is not this one's");
+// Results come out in the order the tests were given, each as soon as every test before it has
+// finished, while a test's own line is shown the moment it arrives.
+test "the output shows results in order and a test's own lines at once" {
+    let tests = try discovered("output-order",
+        "test \"first\" \{ \}\n\ntest \"second\" \{ \}\n\ntest \"third\" \{ \}\n");
+    let output = new RunnerOutput(tests);
+    try assertShown(output, "$ens_test_runner start 0", []);
+    try assertShown(output, "$ens_test_runner start 1", []);
+    try assertShown(output, "$ens_test_runner line 1 FAIL second: expected '1', got '2'", []);
+    try assertShown(output, "$ens_test_runner line 1   at \"second\" (alpha_test.ens:3)", []);
+    try assertShown(output, "$ens_test_runner fail 1", []);
+    try assertShown(output, "printed by a test", ["printed by a test"]);
+    try assertShown(output, "$ens_test_runner start 2", []);
+    try assertShown(output, "$ens_test_runner line 2 PASS third", []);
+    try assertShown(output, "$ens_test_runner pass 2", []);
+    try assertShown(output, "$ens_test_runner line 0 PASS first", []);
+    try assertShown(output, "$ens_test_runner pass 0", ["PASS first",
+        "FAIL second: expected '1', got '2'", "  at \"second\" (alpha_test.ens:3)", "PASS third"]);
+    try testing.assertEqual(output.finished(), 3L);
+    try testing.assertEqual(output.passed(), 2L);
+    try testing.assertEqual(output.running().length, 0L);
+}
+
+// A test that finished after one before it that never did still has a result, shown once the
+// runner has ended.
+test "the results held behind an unfinished test are shown when the runner ends" {
+    let tests = try discovered("output-held", "test \"first\" \{ \}\n\ntest \"second\" \{ \}\n");
+    let output = new RunnerOutput(tests);
+    try assertShown(output, "$ens_test_runner start 0", []);
+    try assertShown(output, "$ens_test_runner start 1", []);
+    try assertShown(output, "$ens_test_runner line 1 PASS second", []);
+    try assertShown(output, "$ens_test_runner pass 1", []);
+    string[] remaining = output.remaining();
+    try testing.assertEqual(remaining.length, 1L);
+    try testing.assertEqual(remaining[0], "PASS second");
+    try testing.assertEqual(output.running()[0].description(), "first");
+}
+
+// A line that starts like the runner's but names no test of the run is a test's own output.
+test "a marked line naming no test of the run is shown as it is" {
+    let tests = try discovered("output-foreign", "test \"only\" \{ \}\n");
+    let output = new RunnerOutput(tests);
+    try assertShown(output, "$ens_test_runner start 7", ["$ens_test_runner start 7"]);
+    try assertShown(output, "$ens_test_runner start x", ["$ens_test_runner start x"]);
+    try assertShown(output, "$ens_test_runner begin 0", ["$ens_test_runner begin 0"]);
+    try assertShown(output, "$ens_test_runner", ["$ens_test_runner"]);
+    try testing.assertEqual(output.running().length, 0L);
 }
 
 test "the runner's file name is one no source file can have" {
@@ -237,6 +303,23 @@ discovered(string label, string source) -> DiscoveredTest[] throws {
     try support.writeFile(root, "alpha_test.ens", source);
     let plan = discovery.plan(new SystemFileLoader(), root, "");
     return plan.tests();
+}
+
+// What a runner that wrote `events`, each after the marker, leaves the command knowing.
+outputOf(DiscoveredTest[] tests, string[] events) -> RunnerOutput {
+    let output = new RunnerOutput(tests);
+    for (let event in events) {
+        let shown = output.accept(Runner.marker + event);
+    }
+    return output;
+}
+
+assertShown(RunnerOutput output, string line, string[] expected) throws {
+    string[] shown = output.accept(line);
+    try testing.assertEqual(shown.length, expected.length);
+    for (long i = 0; i < shown.length; i++) {
+        try testing.assertEqual(shown[i], expected[i]);
+    }
 }
 
 assertContains(string text, string fragment) throws {

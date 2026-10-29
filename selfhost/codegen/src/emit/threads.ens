@@ -217,10 +217,14 @@ final class Processors {
     protected static const long linuxOnline = 84;
     // ALL_PROCESSOR_GROUPS, which counts the processors of every group.
     protected static const long windowsAllGroups = 0xFFFF;
+    // The words of the affinity mask 'sched_getaffinity' fills: room for 1024 processors, the
+    // size of the C library's own 'cpu_set_t'.
+    protected static const long linuxMaskWords = 16;
 }
 
-// long ens_processor_count(): how many processors are online to run the program's threads, and at
-// least one.
+// long ens_processor_count(): how many processors the program's threads may run on, and at least
+// one. That is the process's affinity mask where the system has one, and every online processor
+// where it has none or would not report it.
 public processorCountRuntime(Runtime runtime) -> RuntimeFunction {
     let type = runtime.int64Type.functionType([]);
     let known = runtime.existing("ens_processor_count", type);
@@ -231,20 +235,81 @@ public processorCountRuntime(Runtime runtime) -> RuntimeFunction {
     let builder = runtime.builder;
     Value counted = runtime.int64(1);
     if (runtime.onWindows()) {
-        let active = runtime.libc("GetActiveProcessorCount",
-            runtime.int32Type.functionType([runtime.int16Type]));
-        counted = instructions.buildZExt(builder, runtime.call(active,
-            [runtime.int16Type.constInt(Processors.windowsAllGroups as ulong, false)], "active"), runtime.int64Type, "count");
+        counted = windowsProcessors(runtime);
+    } else if (runtime.onDarwin()) {
+        counted = onlineProcessors(runtime, Processors.darwinOnline);
     } else {
-        let sysconf = runtime.libc("sysconf",
-            runtime.int64Type.functionType([runtime.int32Type]));
-        long name = runtime.onDarwin() ? Processors.darwinOnline : Processors.linuxOnline;
-        counted = runtime.call(sysconf, [runtime.int32(name)], "count");
+        counted = linuxProcessors(runtime);
     }
     let tooFew = instructions.buildICmpSLT(builder, counted, runtime.int64(1), "few");
     instructions.buildRet(builder, instructions.buildSelect(builder, tooFew, runtime.int64(1),
         counted, "processors"));
     return runtime.endDefinition(definition);
+}
+
+onlineProcessors(Runtime runtime, long name) -> Value {
+    let sysconf = runtime.libc("sysconf", runtime.int64Type.functionType([runtime.int32Type]));
+    return runtime.call(sysconf, [runtime.int32(name)], "online");
+}
+
+// The processors of the calling process's affinity mask, or every online one when the mask
+// cannot be read, as on a machine with more processors than the mask has room for.
+linuxProcessors(Runtime runtime) -> Value {
+    let builder = runtime.builder;
+    let maskType = runtime.int64Type.arrayType(Processors.linuxMaskWords as ulong);
+    let mask = memory.buildAlloca(builder, maskType, "mask");
+    memory.buildMemSet(builder, mask, runtime.int8(0), runtime.int64(Processors.linuxMaskWords * 8),
+        8);
+    let affinity = runtime.libc("sched_getaffinity", runtime.int32Type.functionType([
+        runtime.int32Type, runtime.int64Type, runtime.pointerType]));
+    let read = runtime.call(affinity, [runtime.int32(0), runtime.int64(Processors.linuxMaskWords * 8),
+        mask], "read");
+    Value allowed = runtime.int64(0);
+    for (long word = 0; word < Processors.linuxMaskWords; word++) {
+        let at = memory.buildGEP(builder, runtime.int64Type, mask, [runtime.int64(word)], "word");
+        let bits = memory.buildLoad(builder, runtime.int64Type, at, "bits");
+        allowed = instructions.buildAdd(builder, allowed, setBits(runtime, bits), "allowed");
+    }
+    let readMask = instructions.buildICmpEQ(builder, read, runtime.int32(0), "masked");
+    return instructions.buildSelect(builder, readMask, allowed,
+        onlineProcessors(runtime, Processors.linuxOnline), "count");
+}
+
+// The processors of the process's affinity mask when it was restricted to some of them, and the
+// active processors of every group otherwise. A process whose threads span several groups has
+// no single mask, and the call reports both masks as zero.
+windowsProcessors(Runtime runtime) -> Value {
+    let builder = runtime.builder;
+    let process = runtime.call(runtime.libc("GetCurrentProcess",
+        runtime.pointerType.functionType([])), [], "process");
+    let processMask = memory.buildAlloca(builder, runtime.int64Type, "processMask");
+    let systemMask = memory.buildAlloca(builder, runtime.int64Type, "systemMask");
+    memory.buildStore(builder, runtime.int64(0), processMask);
+    memory.buildStore(builder, runtime.int64(0), systemMask);
+    let masks = runtime.libc("GetProcessAffinityMask", runtime.int32Type.functionType([
+        runtime.pointerType, runtime.pointerType, runtime.pointerType]));
+    let read = runtime.call(masks, [process, processMask, systemMask], "read");
+    let ownMask = memory.buildLoad(builder, runtime.int64Type, processMask, "own");
+    let wholeMask = memory.buildLoad(builder, runtime.int64Type, systemMask, "whole");
+    let restricted = instructions.buildAnd(builder,
+        instructions.buildICmpNE(builder, read, runtime.int32(0), "readMasks"),
+        instructions.buildAnd(builder,
+            instructions.buildICmpNE(builder, ownMask, runtime.int64(0), "someMask"),
+            instructions.buildICmpNE(builder, ownMask, wholeMask, "narrower"), "narrowed"),
+        "restricted");
+    let active = runtime.libc("GetActiveProcessorCount",
+        runtime.int32Type.functionType([runtime.int16Type]));
+    let every = instructions.buildZExt(builder, runtime.call(active,
+        [runtime.int16Type.constInt(Processors.windowsAllGroups as ulong, false)], "active"),
+        runtime.int64Type, "every");
+    return instructions.buildSelect(builder, restricted, setBits(runtime, ownMask), every,
+        "count");
+}
+
+setBits(Runtime runtime, Value word) -> Value {
+    let population = runtime.libc("llvm.ctpop.i64",
+        runtime.int64Type.functionType([runtime.int64Type]));
+    return runtime.call(population, [word], "set");
 }
 
 // void ens_thread_raise(i32 level): runs the calling thread at level 1, ahead of ordinary threads,

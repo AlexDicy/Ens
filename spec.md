@@ -1004,7 +1004,7 @@ Commands use the same three exit codes: `0` when the command did what was asked,
 `--strip` leaves the symbol table out of the executable: the names of its functions and variables, which a debugger or a profiler reads and the program itself never does, since a stack trace reads a table of its own.
 On macOS a stripped executable also exports nothing, the way a Linux or Windows executable already exports nothing.
 A Windows executable carries no symbol table to begin with, so `--strip` changes nothing there.
-`ens test` also takes `--filter` and `--tests`, described in the section on tests.
+`ens test` also takes `--filter`, `--tests` and `--jobs`, described in the section on tests.
 
 `ens` is also a version multiplexer: a command can be handed to another installed toolchain, and that toolchain's exit code becomes this command's own.
 Whenever the newest installed toolchain is newer than the running one, it runs every command except `ens toolchain remove`, so the `ens` a machine runs is always the newest one it has.
@@ -1166,9 +1166,13 @@ test "empty input is refused" {
 }
 ```
 
-`ens test [path] [--tests <folder>] [--filter <substring>]` discovers every `_test.ens` file under the tests folder (a package's `tests/` folder, or the source folder itself when there is none) and runs the tests in a deterministic order: files by path, tests in source order.
+`ens test [path] [--tests <folder>] [--filter <substring>] [--jobs <count>]` discovers every `_test.ens` file under the tests folder (a package's `tests/` folder, or the source folder itself when there is none) and orders the tests deterministically: files by path, tests in source order.
+Several tests run at the same time: as many as `--jobs` says, and by default one for each processor `environment.processorCount()` counts, each task taking the next test in that order that has not started.
+They run in one program, so they share what a program shares: the files on disk, state an `external` call changes, and the values a test keeps where others can reach them, such as a `lazy const`.
+`--jobs 1` runs them one after another.
 With `--tests`, test files live outside the source tree: their imports resolve against the source folder first and then the tests folder, and a module present under both folders is an error.
-Each test prints one line, a failing test also prints its message and the stack trace of the failure, and the run ends with a summary:
+Each test prints one line, a failing test also prints its message and the stack trace of the failure, and the run ends with a summary.
+The results come out in the test order whichever test finished first, each as soon as every test before it has finished, while a line a test prints of its own appears as it is printed:
 
 ```
 PASS addition adds small integers
@@ -1180,6 +1184,7 @@ FAIL subtraction fails on purpose: expected '1', got '-1'
 
 `--filter` runs only the tests whose description contains the substring.
 The exit code is `0` when every test passes, `1` when any test fails, and `2` when the tests do not compile or a test run stops before it has run them all.
+A run that stops, on a panic, an exit or a crash, names the tests that had started and not finished, since the stop happened in one of them, and still shows the results of the tests that had finished.
 Test files must have unique file names, and neither a test file nor anything it imports may define `main()`.
 
 At a workspace root every member is tested against its own tests.
@@ -2349,6 +2354,8 @@ listing(Path folder) throws FileSystemError {
 `environment.arguments()` returns the arguments the program was started with as a `string[]`, not counting the program's own name, which every system passes as the first of them.
 The program's own identity is `environment.executablePath()`, which returns the path of the running program itself, or `null` when the operating system would not report it.
 `environment.currentDirectory()` returns the directory the program was started in, and `.` when the operating system would not report it; it is read and never written, so to work somewhere else, a program joins this onto the paths it uses.
+`environment.processorCount()` returns how many processors the program can run on, and at least one: those the system lets its threads use, which is fewer than the machine has when the process is limited to some of them, and fewer still on Linux when a control group's CPU quota pays it for less processor time, the quota over its period rounded up.
+It is counted the first time it is asked for, and the same count is returned from then on.
 `environment.platform()` returns the system the program was built for as a `Platform` from `@std.platform`, one of `Windows`, `Linux` and `MacOS`, which was fixed when the program was compiled and cannot change while it runs.
 `Linux` is also the result on every other system the compiler can target, whose behavior it treats as Linux's.
 
@@ -2557,7 +2564,7 @@ An `Atomic` of a `shared` class replaces a whole table under its readers, which 
 `@std.parallel` runs one body over many pieces of data at once and returns when every piece is done, on the task that called it, which it parks for the whole call.
 `parallel.map(items, body)` runs the body once per item and returns an array of the results in the items' order, however the pieces finished; `parallel.each(items, body)` is the same for a body that returns nothing; `parallel.range(start, end, body)` runs the body once per index of a half-open range.
 A body that can throw makes the call throw the same types, the first failure cancels the pieces still running, and the call throws once every piece has ended; like every wait, the call throws `Cancelled` in a cancelled task.
-The items are an array, and the work is cut into one share per processor, each run on a task of its own, so a call over a million items starts as many tasks as the machine has processors.
+The items are an array, and the work is cut into one share per processor `environment.processorCount()` counts, each run on a task of its own, so a call over a million items starts as many tasks as the program has processors.
 Each body is a `shared` function, so it captures shareable values only, and the items are handed to other tasks, so their type must be shareable, as the `Path` values of a file walk are, while what a body returns may be anything, being a result.
 `parallel.split(array, parts, body)` cuts an array into `parts` disjoint `Slice<T>` views, runs the body once per slice on another task, and gives the array back whole once every body has returned; a slice is read and written through `get(index)` and `set(index, value)`, with `length()` and `start`, the index of its first element in the array.
 Only the calling task could write the array, and it is parked inside the call, so a body writes its slice with no copy and no lock.

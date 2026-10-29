@@ -2470,6 +2470,14 @@ task("test")
             run({"test", bare}, nil, 0, "There are no tests in")
             run({"test", suite, "--tests", path.join(root, "nowhere")}, nil, 2, "is not a folder")
 
+            -- '--jobs' takes how many tests run at once, one at the least
+            run({"test", suite, "--jobs", "1"}, nil, 0, "2/2 tests passed")
+            for _, written in ipairs({"0", "many"}) do
+                run({"test", suite, "--jobs", written}, nil, 2, "'" .. written .. "' is not a "
+                    .. "number of tests to run at once. Write a whole number from 1 up, as in "
+                    .. "'--jobs 4'")
+            end
+
             -- '--tests' names where the tests of one target live
             run({"test", suite, "--tests", path.join(suite, "tests")}, nil, 0, "2/2 tests passed")
 
