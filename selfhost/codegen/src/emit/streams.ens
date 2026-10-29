@@ -2,12 +2,14 @@
 // error number inside the same function, because a number read any later is a number some other
 // call is free to have written first. The number is the library's errno on every target, including
 // Windows, since a C stream call is what reports it and the Microsoft runtime sets it too.
+import TypeRef from @ens.llvm.types;
 import Value from @ens.llvm.values;
 import @ens.llvm.instructions;
 import @ens.llvm.memory;
 import DarwinStat from emit.nativeshapes;
 import FileMode from emit.nativeshapes;
 import emit.nativeshapes;
+import Win32Error from emit.errorkinds;
 import WatchState from emit.pollers;
 import emit.pollers;
 import Runtime from emit.runtime;
@@ -136,8 +138,10 @@ final class Interrupted {
 // i32 ens_stream_watch(ptr handle, ptr poller, i64 token, ptr error): one wake under 'token' once
 // the stream has bytes to read or has reached its end, as ens_poller_watch_descriptor reports it. A
 // regular file is ready, since its reads never wait and macOS would never report one at its end.
-// A Windows stream is unwatchable, since neither a console nor an anonymous pipe reaches a
-// completion port, so it is read in a call of its own.
+// On Windows a disk file or a device other than a console is ready, a pipe is watched through a
+// read of zero bytes, which waits for bytes without taking any, and a console is unwatchable,
+// since a line-mode read waits for Enter whatever the console holds, so it is read in a call of
+// its own.
 public watchRuntime(Runtime runtime) -> RuntimeFunction {
     let type = runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType,
         runtime.int64Type, runtime.pointerType]);
@@ -146,9 +150,7 @@ public watchRuntime(Runtime runtime) -> RuntimeFunction {
         return known;
     }
     if (runtime.onWindows()) {
-        let definition = runtime.beginDefinition("ens_stream_watch", type);
-        instructions.buildRet(runtime.builder, runtime.int32(WatchState.unwatchable as int));
-        return runtime.endDefinition(definition);
+        return windowsWatch(runtime, type);
     }
     let watch = pollers.watchDescriptorRuntime(runtime);
     let definition = runtime.beginDefinition("ens_stream_watch", type);
@@ -180,6 +182,142 @@ public watchRuntime(Runtime runtime) -> RuntimeFunction {
     instructions.buildRet(builder, runtime.call(watch, [runtime.parameter(definition, 1),
         descriptor, runtime.parameter(definition, 2), runtime.parameter(definition, 3)],
         "state"));
+    return runtime.endDefinition(definition);
+}
+
+// What GetFileType reports for a handle.
+final class FileType {
+    static const long disk = 1;
+    static const long character = 2;
+    static const long pipe = 3;
+}
+
+// Where a Windows pipe watch keeps what its work item needs: the pipe, the port and the token.
+final class PipeWatch {
+    static const long pipe = 0;
+    static const long port = 8;
+    static const long token = 16;
+    static const long bytes = 24;
+}
+
+windowsWatch(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let fileType = runtime.libc("GetFileType",
+        runtime.int32Type.functionType([runtime.pointerType]));
+    let consoleMode = runtime.libc("GetConsoleMode",
+        runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType]));
+    let peek = runtime.libc("PeekNamedPipe", runtime.int32Type.functionType([runtime.pointerType,
+        runtime.pointerType, runtime.int32Type, runtime.pointerType, runtime.pointerType,
+        runtime.pointerType]));
+    let submit = runtime.libc("TrySubmitThreadpoolCallback", runtime.int32Type.functionType([
+        runtime.pointerType, runtime.pointerType, runtime.pointerType]));
+    let allocate = runtime.calloc();
+    let deallocate = runtime.free();
+    let ready = pipeReadyRuntime(runtime);
+    let definition = runtime.beginDefinition("ens_stream_watch", type);
+    let builder = runtime.builder;
+    let poller = runtime.parameter(definition, 1);
+    let error = runtime.parameter(definition, 3);
+    let characterBlock = runtime.block(definition, "watch.character");
+    let otherBlock = runtime.block(definition, "watch.other");
+    let pipeBlock = runtime.block(definition, "watch.pipe");
+    let emptyBlock = runtime.block(definition, "watch.empty");
+    let recordBlock = runtime.block(definition, "watch.record");
+    let submittedBlock = runtime.block(definition, "watch.submitted");
+    let unsubmittedBlock = runtime.block(definition, "watch.unsubmitted");
+    let noMemoryBlock = runtime.block(definition, "watch.no.memory");
+    let consoleBlock = runtime.block(definition, "watch.console");
+    let readyBlock = runtime.block(definition, "watch.ready");
+    let handle = windows.streamHandle(runtime, runtime.parameter(definition, 0));
+    let kind = runtime.call(fileType, [handle], "kind");
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, kind,
+        runtime.int32(FileType.character), ""), characterBlock, otherBlock);
+
+    builder.positionAtEnd(characterBlock);
+    let mode = memory.buildAlloca(builder, runtime.int32Type, "mode");
+    instructions.buildCondBr(builder, instructions.buildICmpNE(builder,
+        runtime.call(consoleMode, [handle, mode], "console"), runtime.int32(0), ""),
+        consoleBlock, readyBlock);
+
+    builder.positionAtEnd(otherBlock);
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, kind,
+        runtime.int32(FileType.pipe), ""), pipeBlock, readyBlock);
+
+    // A pipe holding bytes, or one whose writer is gone, needs no wait.
+    builder.positionAtEnd(pipeBlock);
+    let available = memory.buildAlloca(builder, runtime.int32Type, "available");
+    memory.buildStore(builder, runtime.int32(0), available);
+    let peeked = runtime.call(peek, [handle, runtime.nullPointer(), runtime.int32(0),
+        runtime.nullPointer(), available, runtime.nullPointer()], "peeked");
+    instructions.buildCondBr(builder, instructions.buildAnd(builder,
+        instructions.buildICmpNE(builder, peeked, runtime.int32(0), ""),
+        instructions.buildICmpEQ(builder, memory.buildLoad(builder, runtime.int32Type, available,
+            ""), runtime.int32(0), ""), "empty"), emptyBlock, readyBlock);
+
+    builder.positionAtEnd(emptyBlock);
+    let record = runtime.call(allocate, [runtime.int64(1), runtime.int64(PipeWatch.bytes)],
+        "record");
+    instructions.buildCondBr(builder, runtime.isNull(record), noMemoryBlock, recordBlock);
+
+    builder.positionAtEnd(recordBlock);
+    memory.buildStore(builder, handle, runtime.offsetPointer(record, PipeWatch.pipe, ""));
+    memory.buildStore(builder, pollers.portOf(runtime, poller),
+        runtime.offsetPointer(record, PipeWatch.port, ""));
+    memory.buildStore(builder, runtime.parameter(definition, 2),
+        runtime.offsetPointer(record, PipeWatch.token, ""));
+    let submitted = runtime.call(submit, [ready.function, record, runtime.nullPointer()],
+        "submitted");
+    let why = runtime.lastError();
+    instructions.buildCondBr(builder, instructions.buildICmpNE(builder, submitted,
+        runtime.int32(0), ""), submittedBlock, unsubmittedBlock);
+
+    builder.positionAtEnd(submittedBlock);
+    instructions.buildRet(builder, runtime.int32(WatchState.watching as int));
+
+    builder.positionAtEnd(unsubmittedBlock);
+    runtime.call(deallocate, [record], "");
+    memory.buildStore(builder, why, error);
+    instructions.buildRet(builder, runtime.int32(WatchState.failed as int));
+
+    builder.positionAtEnd(noMemoryBlock);
+    memory.buildStore(builder, runtime.int32(Win32Error.notEnoughMemory), error);
+    instructions.buildRet(builder, runtime.int32(WatchState.failed as int));
+
+    builder.positionAtEnd(consoleBlock);
+    instructions.buildRet(builder, runtime.int32(WatchState.unwatchable as int));
+
+    builder.positionAtEnd(readyBlock);
+    instructions.buildRet(builder, runtime.int32(WatchState.ready as int));
+    return runtime.endDefinition(definition);
+}
+
+// The thread-pool work item a pipe watch submits: a read of zero bytes, which returns once the
+// pipe holds bytes or its writer is gone and takes none of them, then the token posted to the
+// poller's port. The record is the work item's own and is freed here.
+pipeReadyRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.voidType.functionType([runtime.pointerType, runtime.pointerType]);
+    let known = runtime.existing("ens_stream_pipe_ready", type);
+    if (known != null) {
+        return known;
+    }
+    let readFile = runtime.libc("ReadFile", runtime.int32Type.functionType([runtime.pointerType,
+        runtime.pointerType, runtime.int32Type, runtime.pointerType, runtime.pointerType]));
+    let post = pollers.postFunction(runtime);
+    let deallocate = runtime.free();
+    let definition = runtime.beginDefinition("ens_stream_pipe_ready", type);
+    let builder = runtime.builder;
+    let record = runtime.parameter(definition, 1);
+    let none = memory.buildAlloca(builder, runtime.int8Type, "none");
+    let count = memory.buildAlloca(builder, runtime.int32Type, "count");
+    runtime.call(readFile, [memory.buildLoad(builder, runtime.pointerType,
+        runtime.offsetPointer(record, PipeWatch.pipe, ""), "pipe"), none, runtime.int32(0), count,
+        runtime.nullPointer()], "");
+    runtime.call(post, [memory.buildLoad(builder, runtime.pointerType,
+        runtime.offsetPointer(record, PipeWatch.port, ""), "port"), runtime.int32(0),
+        memory.buildLoad(builder, runtime.int64Type,
+            runtime.offsetPointer(record, PipeWatch.token, ""), "token"), runtime.nullPointer()],
+        "");
+    runtime.call(deallocate, [record], "");
+    instructions.buildRetVoid(builder);
     return runtime.endDefinition(definition);
 }
 
