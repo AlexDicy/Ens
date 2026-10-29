@@ -200,7 +200,8 @@ When neither overload is more specific, the call is a compile error that lists t
 Overloads that are not visible from the call site lose to visible ones; visibility is only an error when no visible overload matches.
 Named arguments participate in selection: an overload is only considered when every named argument names one of its parameters.
 A subclass may add a new overload of an inherited method name; `override` still requires the exact signature of the method it replaces.
-External functions and generic functions cannot be overloaded.
+External functions cannot be overloaded, and neither can generic methods.
+A generic function shares its name only with declarations that take a different number of arguments, counting the arguments a default leaves out, so the number of arguments a call passes picks it before any argument's type is read.
 
 ```ens
 calculateArea(Rectangle rectangle) -> uint {
@@ -788,7 +789,7 @@ A module may also declare a function with the same name and parameter types as o
 Every call to that name in the module that writes the declaration goes to it, and every other module keeps the function the language provides.
 Such a declaration is an ordinary function and takes nothing from the one it stands in for: a `panic` of your own never returns only if you write `noreturn` on it.
 A declaration whose parameter types differ is an ordinary overload alongside the provided function, exactly as two declarations of your own overload each other.
-A generic declaration of that name is rejected either way, because a generic function cannot be overloaded and replacing the provided function needs its parameter list.
+A generic declaration of that name is rejected when it can take as many arguments as the provided function, because a generic function shares its name only with declarations that take a different number of arguments.
 
 A program's entry point is the top-level function `main` in its **main module**: `src/main.ens` for a package or a folder of sources, or the compiled file itself for a single-file program.
 No other module may define a top-level `main`; the compiler rejects one wherever it is loaded from, including through an import of another package's main module.
@@ -2559,8 +2560,10 @@ A body that can throw makes the call throw the same types, the first failure can
 The items are an array, and the work is cut into one share per processor, each run on a task of its own, so a call over a million items starts as many tasks as the machine has processors.
 Each body is a `shared` function, so it captures shareable values only, and the items are handed to other tasks, so their type must be shareable, as the `Path` values of a file walk are, while what a body returns may be anything, being a result.
 `parallel.split(array, parts, body)` cuts an array into `parts` disjoint `Slice<T>` views, runs the body once per slice on another task, and gives the array back whole once every body has returned; a slice is read and written through `get(index)` and `set(index, value)`, with `length()` and `start`, the index of its first element in the array.
-Only the calling task could write the array, and it is parked inside the call, so a body writes its slice with no copy and no lock, and the slice is a parameter that is not shareable, so no body can keep it past the call.
-`parallel.split(array, parts, reading(other), body)` lends every body a whole read-only view of a second array beside its slice, for data each piece reads while writing its own part; naming the array being written as a read view aborts the program, since a piece would read what another writes.
+Only the calling task could write the array, and it is parked inside the call, so a body writes its slice with no copy and no lock.
+A count of parts below one aborts the program, and more parts than elements give the extra bodies empty slices.
+`parallel.split(array, parts, reading(other), body)` lends every body a whole read-only view of a second array beside its slice, a `ReadView<T>` read through `get(index)` and `length()`, for data each piece reads while writing its own part; naming the array being written as a read view aborts the program, since a piece would read what another writes.
+A `Slice` and a `ReadView` are lent to one body only until it returns, so each can be a parameter or a local and be passed to a call, and nothing that could outlive the body may hold one: a field, an array element, a type argument, written or inferred, the result of a function, or a lambda's capture are each an error naming the type and how to pass it on instead.
 An element type that is a writable class is refused by the bound, because two slices could reach one object through two elements; an array of structs, or of `shared` objects, is what `split` is for.
 
 ```ens
