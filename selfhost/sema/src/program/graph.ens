@@ -27,6 +27,8 @@ import EmbedScan from program.embeds;
 import EmbedScope from program.embeds;
 import program.embeds;
 import program.frozencalls;
+import @std.parallel;
+import Cancelled from @std.tasks;
 import support.paths;
 import Path from @std.fs;
 import List from @std.collections.list;
@@ -281,6 +283,32 @@ export buildFileProgram(FileLoader loader, Path sourceRoot, Path testsRoot, Path
     return builder.buildProgram(entryFile);
 }
 
+// One file to parse: where it was read from, and its text.
+struct ParseInput {
+    string path;
+    string text;
+}
+
+// One file parsed, with the source it was parsed from.
+final class ParsedFile {
+    protected Source source;
+    protected ParseResult result;
+
+    protected constructor(this.source, this.result);
+}
+
+// Every input parsed, in the inputs' order. Each file parses on its own, so they parse at once.
+parsedAll(ParseInput[] inputs) -> ParsedFile[] {
+    return try parallel.map(inputs, (input) -> parsedFile(input));
+} catch (Cancelled stop) {
+    panic("Internal: parsing was cancelled, and nothing cancels the task that loads a program");
+}
+
+parsedFile(ParseInput input) -> ParsedFile {
+    let parsing = new Source(input.path, input.text);
+    return new ParsedFile(parsing, parser.parse(parsing));
+}
+
 class WorkItem {
     protected Workspace owner;
     protected Path baseFolder;
@@ -432,11 +460,17 @@ class GraphBuilder {
         return this.rootWorkspace.sourceRoot();
     }
 
+    // Loads every module the seeds reach, a wave at a time: the files queued so far are read in
+    // order, parsed at once, and processed in the same order, which queues the next wave. The
+    // modules therefore come out in the order a one-at-a-time walk gives.
     run() -> GraphResult {
         while (this.nextWorkIndex < this.workItems.length()) {
-            let item = this.workItems.get(this.nextWorkIndex);
-            this.nextWorkIndex++;
-            this.process(item);
+            let wave = new List<WorkItem>();
+            while (this.nextWorkIndex < this.workItems.length()) {
+                wave.push(this.workItems.get(this.nextWorkIndex));
+                this.nextWorkIndex++;
+            }
+            this.processWave(wave);
         }
         NativeInfo[] natives = this.collectNatives();
         this.keep(this.workspaceLoader.diagnostics());
@@ -496,16 +530,31 @@ class GraphBuilder {
         return collected;
     }
 
-    process(WorkItem item) {
-        Path filePath = item.baseFolder.join(item.relativePath);
-        let read = this.readFile(filePath);
-        let text = read.text;
-        if (text == null) {
-            this.report(filePath, source.makeSpan(0, 0), read.problem);
-            return;
+    processWave(List<WorkItem> wave) {
+        let readable = new List<WorkItem>();
+        let inputs = new List<ParseInput>();
+        for (let item in wave) {
+            Path filePath = item.baseFolder.join(item.relativePath);
+            let read = this.readFile(filePath);
+            let text = read.text;
+            if (text == null) {
+                this.report(filePath, source.makeSpan(0, 0), read.problem);
+                continue;
+            }
+            readable.push(item);
+            inputs.push({path: filePath.toString(), text: text});
         }
-        let moduleSource = new Source(filePath.toString(), text);
-        let parsed = parser.parse(moduleSource);
+        let parsed = parsedAll(inputs.toArray());
+        for (long i = 0; i < readable.length(); i++) {
+            this.process(readable.get(i), parsed[i]);
+        }
+    }
+
+    process(WorkItem item, ParsedFile file) {
+        Path filePath = item.baseFolder.join(item.relativePath);
+        let moduleSource = file.source;
+        let parsed = file.result;
+        string text = moduleSource.text();
         let scan = this.resolveImports(item, filePath, parsed);
         let loaded = new Module(item.canonicalPath, filePath.toString(),
             item.owner.packagePrefix(), moduleSource, parsed, scan.importedPaths,
