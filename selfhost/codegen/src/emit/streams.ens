@@ -5,6 +5,11 @@
 import Value from @ens.llvm.values;
 import @ens.llvm.instructions;
 import @ens.llvm.memory;
+import DarwinStat from emit.nativeshapes;
+import FileMode from emit.nativeshapes;
+import emit.nativeshapes;
+import WatchState from emit.pollers;
+import emit.pollers;
 import Runtime from emit.runtime;
 import RuntimeFunction from emit.runtime;
 import emit.filesystem.windows;
@@ -126,6 +131,56 @@ readOnce(Runtime runtime, Value descriptor, Value buffer, Value capacity) -> Val
 // for numbers the same. The Windows library never reports it from a read.
 final class Interrupted {
     static const long number = 4;
+}
+
+// i32 ens_stream_watch(ptr handle, ptr poller, i64 token, ptr error): one wake under 'token' once
+// the stream has bytes to read or has reached its end, as ens_poller_watch_descriptor reports it. A
+// regular file is ready, since its reads never wait and macOS would never report one at its end.
+// A Windows stream is unwatchable, since neither a console nor an anonymous pipe reaches a
+// completion port, so it is read in a call of its own.
+public watchRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType,
+        runtime.int64Type, runtime.pointerType]);
+    let known = runtime.existing("ens_stream_watch", type);
+    if (known != null) {
+        return known;
+    }
+    if (runtime.onWindows()) {
+        let definition = runtime.beginDefinition("ens_stream_watch", type);
+        instructions.buildRet(runtime.builder, runtime.int32(WatchState.unwatchable as int));
+        return runtime.endDefinition(definition);
+    }
+    let watch = pollers.watchDescriptorRuntime(runtime);
+    let definition = runtime.beginDefinition("ens_stream_watch", type);
+    let builder = runtime.builder;
+    let descriptor = runtime.call(descriptorFunction(runtime), [runtime.parameter(definition, 0)],
+        "descriptor");
+    if (runtime.onDarwin()) {
+        let describe = runtime.libc(nativeshapes.entryPointName(runtime.target, "fstat"),
+            runtime.int32Type.functionType([runtime.int32Type, runtime.pointerType]));
+        let result = memory.buildAlloca(builder,
+            runtime.int8Type.arrayType(DarwinStat.structBytes as ulong), "stat");
+        let regular = runtime.block(definition, "watch.regular");
+        let other = runtime.block(definition, "watch.other");
+        let described = runtime.call(describe, [descriptor, result], "described");
+        let mode = memory.buildLoad(builder, runtime.int16Type,
+            runtime.offsetPointer(result, DarwinStat.modeOffset, ""), "mode");
+        instructions.buildCondBr(builder, instructions.buildAnd(builder,
+            instructions.buildICmpEQ(builder, described, runtime.int32(0), ""),
+            instructions.buildICmpEQ(builder, instructions.buildAnd(builder, mode,
+                runtime.int16Type.constInt(FileMode.typeMask as ulong, false), ""),
+                runtime.int16Type.constInt(FileMode.regular as ulong, false), ""), "regular"),
+            regular, other);
+
+        builder.positionAtEnd(regular);
+        instructions.buildRet(builder, runtime.int32(WatchState.ready as int));
+
+        builder.positionAtEnd(other);
+    }
+    instructions.buildRet(builder, runtime.call(watch, [runtime.parameter(definition, 1),
+        descriptor, runtime.parameter(definition, 2), runtime.parameter(definition, 3)],
+        "state"));
+    return runtime.endDefinition(definition);
 }
 
 // i32 ens_stream_flush(ptr handle): 0 once everything written has reached the operating system, or

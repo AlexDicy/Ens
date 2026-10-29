@@ -1,0 +1,153 @@
+// The readiness poller each platform is given, held to the verifier from whichever host runs the
+// suite: the queue it waits on and how its wake reaches a wait, what a watch registers, and where a
+// wait finds each event's token.
+import @std.testing;
+import EmissionHost from support;
+import emit.childprocess;
+import emit.pollers;
+import emit.streams;
+
+// The module's text once one target's poller, its process and stream watches and the release of
+// a child are emitted.
+moduleText(string triple) -> string throws {
+    let host = new EmissionHost("pollers_{triple}");
+    host.retarget(triple);
+    let runtime = host.runtime;
+    let poller = runtime.call(pollers.createRuntime(runtime), [runtime.nullPointer()], "poller");
+    runtime.call(pollers.waitRuntime(runtime), [poller, runtime.nullPointer(), runtime.int64(8),
+        runtime.int64(-1), runtime.nullPointer()], "got");
+    runtime.call(pollers.wakeRuntime(runtime), [poller], "");
+    runtime.call(childprocess.watchRuntime(runtime), [runtime.nullPointer(), poller,
+        runtime.int32(1), runtime.int64(7), runtime.nullPointer()], "child");
+    runtime.call(streams.watchRuntime(runtime), [runtime.nullPointer(), poller, runtime.int64(9),
+        runtime.nullPointer()], "stream");
+    runtime.call(childprocess.releaseRuntime(runtime), [runtime.nullPointer()], "");
+    runtime.call(pollers.releaseRuntime(runtime), [poller], "");
+    string text = host.text();
+    try host.finish();
+    return text;
+}
+
+// One function's body, from its definition to the brace that closes it.
+bodyOf(string text, string name) -> string throws {
+    long start = text.indexOf("define internal {name}(");
+    try testing.assertTrue(start >= 0, "'{name}' was never defined: {text}");
+    string rest = text.substring(start, text.length);
+    long end = rest.indexOf("\n}");
+    try testing.assertTrue(end >= 0, "'{name}' was left unclosed: {rest}");
+    return rest.substring(0, end);
+}
+
+test "a macOS poller is a kqueue whose wake is a user event it triggers" {
+    string text = try moduleText("aarch64-apple-darwin23");
+    string create = try bodyOf(text, "ptr @ens_poller_create");
+    try testing.assertTrue(create.indexOf("call i32 @kqueue()") >= 0
+        && create.indexOf("store i16 -10, ptr") >= 0 && create.indexOf("store i16 33, ptr") >= 0,
+        "the queue is not made with a cleared user event: {create}");
+    string wake = try bodyOf(text, "void @ens_poller_wake");
+    try testing.assertTrue(wake.indexOf("store i16 -10, ptr") >= 0
+        && wake.indexOf("store i32 16777216, ptr") >= 0,
+        "a wake does not trigger the user event: {wake}");
+    string wait = try bodyOf(text, "i64 @ens_poller_wait");
+    try testing.assertTrue(wait.indexOf("[2048 x i8]") >= 0,
+        "a wait does not take its events in 32-byte entries: {wait}");
+    try testing.assertTrue(wait.indexOf("icmp eq i16 %filter, -10") >= 0,
+        "a wait does not leave the wake out of the tokens: {wait}");
+}
+
+test "a macOS watch registers a one-shot read or exit and reads the receipt's error" {
+    string text = try moduleText("aarch64-apple-darwin23");
+    string descriptor = try bodyOf(text, "i32 @ens_poller_watch_descriptor");
+    try testing.assertTrue(descriptor.indexOf("store i16 -1, ptr") >= 0
+        && descriptor.indexOf("store i16 81, ptr") >= 0,
+        "a descriptor is not watched for a one-shot read with a receipt: {descriptor}");
+    try testing.assertTrue(descriptor.indexOf("icmp eq i32 %number, 3") >= 0,
+        "a process already gone is not ready: {descriptor}");
+    string process = try bodyOf(text, "i32 @ens_poller_watch_process");
+    try testing.assertTrue(process.indexOf("store i16 -5, ptr") >= 0
+        && process.indexOf("store i32 -2147483648, ptr") >= 0,
+        "a process is not watched for its exit: {process}");
+    string stream = try bodyOf(text, "i32 @ens_stream_watch");
+    try testing.assertTrue(stream.indexOf("@fstat(") >= 0 && stream.indexOf("32768") >= 0,
+        "a regular file is not told apart from a pipe: {stream}");
+}
+
+test "a Linux poller is an epoll with an event descriptor under token 0" {
+    for (let triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]) {
+        string text = try moduleText(triple);
+        string create = try bodyOf(text, "ptr @ens_poller_create");
+        try testing.assertTrue(create.indexOf("call i32 @epoll_create1(i32 524288)") >= 0
+            && create.indexOf("call i32 @eventfd(i32 0, i32 526336)") >= 0,
+            "'{triple}' does not make the queue and the wake close-on-exec: {create}");
+        try testing.assertTrue(create.indexOf("@epoll_ctl(i32 %queue, i32 1, i32 %wake") >= 0,
+            "'{triple}' does not watch the wake: {create}");
+        string wake = try bodyOf(text, "void @ens_poller_wake");
+        try testing.assertTrue(wake.indexOf("@write(i32 %wake, ptr %one, i64 8)") >= 0,
+            "'{triple}' does not wake by writing the event descriptor: {wake}");
+        string wait = try bodyOf(text, "i64 @ens_poller_wait");
+        try testing.assertTrue(wait.indexOf("@epoll_wait(i32 %queue") >= 0
+            && wait.indexOf("@read(i32 %wake.descriptor, ptr %drained, i64 8)") >= 0,
+            "'{triple}' does not wait on the queue and drain the wake: {wait}");
+    }
+}
+
+// x86-64 packs 'struct epoll_event' into 12 bytes, so its token is four bytes in, where arm64
+// aligns it to eight; reading the other's offset would hand every wake the wrong token.
+test "a Linux event's token is where each architecture puts it" {
+    string x64 = try bodyOf(try moduleText("x86_64-unknown-linux-gnu"), "i64 @ens_poller_wait");
+    try testing.assertTrue(x64.indexOf("[768 x i8]") >= 0
+        && x64.indexOf("getelementptr i8, ptr %event, i64 4") >= 0,
+        "x86-64 does not read a token four bytes into a 12-byte event: {x64}");
+    string arm = try bodyOf(try moduleText("aarch64-unknown-linux-gnu"), "i64 @ens_poller_wait");
+    try testing.assertTrue(arm.indexOf("[1024 x i8]") >= 0
+        && arm.indexOf("getelementptr i8, ptr %event, i64 8") >= 0,
+        "arm64 does not read a token eight bytes into a 16-byte event: {arm}");
+}
+
+test "a Linux watch re-arms a one-shot registration and adds it the first time" {
+    string text = try moduleText("x86_64-unknown-linux-gnu");
+    string watch = try bodyOf(text, "i32 @ens_poller_watch_descriptor");
+    try testing.assertTrue(watch.indexOf("store i32 1073750017, ptr %event") >= 0,
+        "the descriptor is not watched once for bytes or a closed writer: {watch}");
+    try testing.assertTrue(watch.indexOf("@epoll_ctl(i32 %queue, i32 3,") >= 0
+        && watch.indexOf("@epoll_ctl(i32 %queue, i32 1,") >= 0,
+        "the watch does not modify first and add after: {watch}");
+    try testing.assertTrue(watch.indexOf("icmp eq i32 %number, 1") >= 0,
+        "a descriptor epoll refuses is not ready: {watch}");
+    string child = try bodyOf(text, "i32 @ens_process_watch");
+    try testing.assertTrue(child.indexOf("ret i32 2") >= 0,
+        "a child without a pidfd is not unwatchable: {child}");
+}
+
+test "a Windows poller is a completion port that armed waits post tokens to" {
+    string text = try moduleText("x86_64-pc-windows-msvc");
+    string create = try bodyOf(text, "ptr @ens_poller_create");
+    try testing.assertTrue(create.indexOf("@CreateIoCompletionPort(i64 -1, ptr null, i64 0, i32 1)")
+        >= 0, "the port is not one no file is bound to: {create}");
+    string wake = try bodyOf(text, "void @ens_poller_wake");
+    try testing.assertTrue(wake.indexOf("@PostQueuedCompletionStatus(ptr %port, i32 0, i64 0, ptr null)")
+        >= 0, "a wake does not post token 0: {wake}");
+    string wait = try bodyOf(text, "i64 @ens_poller_wait");
+    try testing.assertTrue(wait.indexOf("@GetQueuedCompletionStatusEx(") >= 0
+        && wait.indexOf("icmp eq i32 %why, 258") >= 0,
+        "a wait does not take completions or treat its bound passing as quiet: {wait}");
+    string arm = try bodyOf(text, "i32 @ens_poller_arm");
+    try testing.assertTrue(arm.indexOf("@CreateThreadpoolWait(ptr @ens_poller_signal, ptr %0") >= 0
+        && arm.indexOf("@SetThreadpoolWait(") >= 0,
+        "a watch does not arm a thread-pool wait whose callback posts: {arm}");
+    string signal = try bodyOf(text, "void @ens_poller_signal");
+    try testing.assertTrue(signal.indexOf("@PostQueuedCompletionStatus(ptr %port, i32 0, i64 %token")
+        >= 0, "the callback does not post the slot's token: {signal}");
+    string stream = try bodyOf(text, "i32 @ens_stream_watch");
+    try testing.assertTrue(stream.indexOf("ret i32 2") >= 0,
+        "a Windows stream is not unwatchable: {stream}");
+}
+
+test "a Windows child stops its watches before it closes what they wait on" {
+    string text = try moduleText("x86_64-pc-windows-msvc");
+    string disarm = try bodyOf(text, "void @ens_poller_disarm");
+    try testing.assertTrue(disarm.indexOf("@SetThreadpoolWait(ptr %waiter, ptr null, ptr null)") >= 0
+        && disarm.indexOf("@WaitForThreadpoolWaitCallbacks(ptr %waiter, i32 1)") >= 0
+        && disarm.indexOf("@CloseThreadpoolWait(ptr %waiter)") >= 0,
+        "a disarm does not stop, settle and free the wait: {disarm}");
+}

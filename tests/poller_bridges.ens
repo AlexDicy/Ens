@@ -1,0 +1,258 @@
+// @exit 0
+// @stdout woken 0
+// @stdout quiet 0
+// @stdout output 11
+// @stdout writer said done
+// @stdout ended 12
+// @stdout writer exited 0
+// @stdout collected 1
+// @stdout reader watching
+// @stdout reader read hello
+// @stdout released
+// The readiness bridges the compiler defines: a wake ends a wait with no tokens, a wait with a
+// bound ends with none once it passes, a watch of a child's output and of its end each return
+// their token once, a collected child is ready at once, and a watch of a piped standard input
+// returns once a line arrives, or is unwatchable where the system cannot watch it.
+import Path from @std.fs;
+import @std.environment;
+import @std.io;
+
+shared external type Poller;
+shared external type Child;
+external type CFile;
+
+external from libc {
+    ens_poller_create(out int error) -> Poller?;
+    ens_poller_wait(Poller poller, long[] tokens, long capacity, long millis,
+                    out int error) -> long;
+    ens_poller_wake(Poller poller);
+    ens_poller_release(Poller poller);
+    ens_process_watch(Child child, Poller poller, int event, long token, out int error) -> int;
+    ens_stream_watch(CFile handle, Poller poller, long token, out int error) -> int;
+    ens_standard_input() -> CFile;
+    ens_process_start(string program, byte[] argumentBlock, long argumentCount,
+                      string commandLine, byte[] environmentBlock, long environmentCount,
+                      long environmentBytes, int environmentGiven, string workingDirectory,
+                      int stdinMode, int stdoutMode, int stderrMode, out int error) -> Child?;
+    ens_process_read(Child child, int stream, byte[] buffer, long capacity,
+                     out long count) -> int;
+    ens_process_write(Child child, bytes data, long count, out long written) -> int;
+    ens_process_close_input(Child child) -> int;
+    ens_process_wait(Child child, out int code, out int signal) -> int;
+    ens_process_release(Child child);
+}
+
+final class Watch {
+    static const int watching = 0;
+    static const int ready = 1;
+    static const int unwatchable = 2;
+}
+
+final class Event {
+    static const int output = 1;
+    static const int ended = 3;
+}
+
+// Waits until the poller returns `token`, and reports whether it did rather than failing.
+awaitToken(Poller poller, long token) -> bool {
+    long[] tokens = new long[4];
+    while (true) {
+        int error = 0;
+        long got = ens_poller_wait(poller, tokens, tokens.length, -1, out error);
+        if (got < 0) {
+            print("wait failed with {error}");
+            return false;
+        }
+        for (long i = 0; i < got; i++) {
+            if (tokens[i] == token) {
+                return true;
+            }
+        }
+    }
+}
+
+// Waits for `event` of the child under `token`, as the watch's state says to.
+awaitEvent(Poller poller, Child child, int event, long token) -> bool {
+    int error = 0;
+    int state = ens_process_watch(child, poller, event, token, out error);
+    if (state == Watch.watching) {
+        return awaitToken(poller, token);
+    }
+    if (state == Watch.ready || state == Watch.unwatchable) {
+        return true;
+    }
+    print("watch failed with {error}");
+    return false;
+}
+
+// The child started from this program with `role` as its argument, its output piped and its input
+// piped when `piped` holds.
+startSelf(string role, bool piped) -> Child? {
+    Path? self = environment.executablePath();
+    if (self == null) {
+        return null;
+    }
+    string program = self.toString();
+    let block = argumentBlock([program, role]);
+    int error = 0;
+    return ens_process_start(program, block, 2, "\"{program}\" {role}", new byte[0], 0, 0, 0, "",
+        piped ? 1 : 0, 1, 0, out error);
+}
+
+argumentBlock(string[] values) -> byte[] {
+    long total = 0;
+    for (let value in values) {
+        total = total + value.length + 1;
+    }
+    byte[] block = new byte[total];
+    long at = 0;
+    for (let value in values) {
+        let data = value.toBytes();
+        for (long i = 0; i < data.length; i++) {
+            block[at] = data[i];
+            at++;
+        }
+        block[at] = 0;
+        at++;
+    }
+    return block;
+}
+
+// Everything the child writes to its output until it ends, read only once a watch says it can be.
+readOutput(Poller poller, Child child, long token) -> string? {
+    string text = "";
+    byte[] buffer = new byte[256];
+    while (true) {
+        if (!awaitEvent(poller, child, Event.output, token)) {
+            return null;
+        }
+        long count = 0;
+        if (ens_process_read(child, Event.output, buffer, buffer.length, out count) != 0) {
+            return null;
+        }
+        if (count == 0) {
+            return text;
+        }
+        text = text + string.fromBytesLossy(bytes.of(buffer.slice(0, count)));
+    }
+}
+
+watchWriter(Poller poller) -> bool {
+    Child? writer = startSelf("writer", false);
+    if (writer == null) {
+        print("the writer did not start");
+        return false;
+    }
+    if (!awaitEvent(poller, writer, Event.output, 11)) {
+        return false;
+    }
+    print("output 11");
+    string? said = readOutput(poller, writer, 11);
+    if (said == null) {
+        return false;
+    }
+    print("writer said {said.trim()}");
+    if (!awaitEvent(poller, writer, Event.ended, 12)) {
+        return false;
+    }
+    print("ended 12");
+    int code = 0;
+    int signal = 0;
+    int waited = ens_process_wait(writer, out code, out signal);
+    print("writer exited {code}");
+    int error = 0;
+    print("collected {ens_process_watch(writer, poller, Event.ended, 13, out error)}");
+    ens_process_release(writer);
+    return waited == 0;
+}
+
+watchReader(Poller poller) -> bool {
+    Child? reader = startSelf("reader", true);
+    if (reader == null) {
+        print("the reader did not start");
+        return false;
+    }
+    string seen = "";
+    byte[] buffer = new byte[256];
+    while (seen.indexOf("\n") < 0) {
+        if (!awaitEvent(poller, reader, Event.output, 21)) {
+            return false;
+        }
+        long count = 0;
+        if (ens_process_read(reader, Event.output, buffer, buffer.length, out count) != 0
+                || count == 0) {
+            print("the reader ended before it watched");
+            return false;
+        }
+        seen = seen + string.fromBytesLossy(bytes.of(buffer.slice(0, count)));
+    }
+    let line = "hello\n".toBytes();
+    long written = 0;
+    if (ens_process_write(reader, line, line.length, out written) != 0) {
+        return false;
+    }
+    let closed = ens_process_close_input(reader);
+    string? rest = readOutput(poller, reader, 21);
+    if (rest == null) {
+        return false;
+    }
+    for (let said in (seen + rest).trim().split("\n")) {
+        print("reader {said.trim()}");
+    }
+    int code = 0;
+    int signal = 0;
+    let waited = ens_process_wait(reader, out code, out signal);
+    ens_process_release(reader);
+    return code == 0;
+}
+
+// The reader's side: it watches its own standard input, says so, and reads the line once the
+// watch returns, or at once where the input cannot be watched.
+readInput() -> int throws {
+    int error = 0;
+    Poller? poller = ens_poller_create(out error);
+    if (poller == null) {
+        return 1;
+    }
+    int state = ens_stream_watch(ens_standard_input(), poller, 31, out error);
+    print("watching");
+    try io.flush();
+    if (state == Watch.watching && !awaitToken(poller, 31)) {
+        return 1;
+    }
+    if (state != Watch.watching && state != Watch.ready && state != Watch.unwatchable) {
+        print("watch failed with {error}");
+        return 1;
+    }
+    string? line = try io.in().readLine();
+    print("read {line ?? "nothing"}");
+    ens_poller_release(poller);
+    return 0;
+}
+
+main() -> int throws {
+    string[] arguments = environment.arguments();
+    if (arguments.length > 0 && arguments[0] == "writer") {
+        print("done");
+        return 0;
+    }
+    if (arguments.length > 0 && arguments[0] == "reader") {
+        return try readInput();
+    }
+    int error = 0;
+    Poller? poller = ens_poller_create(out error);
+    if (poller == null) {
+        print("no poller: error {error}");
+        return 1;
+    }
+    long[] tokens = new long[4];
+    ens_poller_wake(poller);
+    print("woken {ens_poller_wait(poller, tokens, tokens.length, -1, out error)}");
+    print("quiet {ens_poller_wait(poller, tokens, tokens.length, 5, out error)}");
+    if (!watchWriter(poller) || !watchReader(poller)) {
+        return 1;
+    }
+    ens_poller_release(poller);
+    print("released");
+    return 0;
+}

@@ -1,0 +1,779 @@
+// The readiness poller the task runtime parks waits over: a kqueue on macOS, an epoll on Linux and
+// an I/O completion port on Windows. A watch asks for one wake when one thing is ready, such as a
+// pipe holding bytes or a child that ended, under a token the caller picks, and the poller's wait
+// returns the tokens of the watches that fired. A watch fires once, and is made again to wait
+// again. Token 0 is the poller's own wake, which a wait returns nothing for.
+import Value from @ens.llvm.values;
+import BasicBlock from @ens.llvm.blocks;
+import @ens.llvm.instructions;
+import @ens.llvm.memory;
+import CompletionEntry from emit.nativeshapes;
+import ProcessCreation from emit.nativeshapes;
+import Epoll from emit.nativeshapes;
+import Kevent from emit.nativeshapes;
+import Timespec from emit.nativeshapes;
+import emit.nativeshapes;
+import Errno from emit.errorkinds;
+import Runtime from emit.runtime;
+import RuntimeDefinition from emit.runtime;
+import RuntimeFunction from emit.runtime;
+
+// What a watch reports: it is waiting and its token comes once; nothing needs a wait, so no token
+// comes and the caller goes ahead; the thing cannot be waited on this way, so the caller waits in a
+// call of its own; or it failed, with the system's number written.
+public enum WatchState {
+    watching = 0,
+    ready = 1,
+    unwatchable = 2,
+    failed = 3,
+}
+
+// The cell a poller is: the kqueue or epoll descriptor, or the completion port on Windows, and on
+// Linux the event descriptor a wake writes to.
+final class PollerCell {
+    protected static const long queue = 0;
+    protected static const long wake = 8;
+    protected static const long bytes = 16;
+}
+
+// Where a Windows watch keeps what its thread-pool callback posts: the wait object, made the first
+// time the watch is armed, the port and the token.
+public final class WatchSlot {
+    public static const long waiter = 0;
+    public static const long port = 8;
+    public static const long token = 16;
+    public static const long bytes = 24;
+}
+
+// The most events one wait takes off the queue; the rest stay for the next wait.
+final class Batch {
+    protected static const long events = 64;
+}
+
+// ptr ens_poller_create(ptr error): a poller with nothing watched, or null with the system's
+// number written to 'error'.
+public createRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.pointerType.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_poller_create", type);
+    if (known != null) {
+        return known;
+    }
+    let allocate = runtime.calloc();
+    let deallocate = runtime.free();
+    let definition = runtime.beginDefinition("ens_poller_create", type);
+    let builder = runtime.builder;
+    let error = runtime.parameter(definition, 0);
+    let noCell = runtime.block(definition, "create.no.cell");
+    let haveCell = runtime.block(definition, "create.have.cell");
+    let refused = runtime.block(definition, "create.refused");
+    let cell = runtime.call(allocate, [runtime.int64(1), runtime.int64(PollerCell.bytes)], "cell");
+    instructions.buildCondBr(builder, runtime.isNull(cell), noCell, haveCell);
+
+    builder.positionAtEnd(noCell);
+    memory.buildStore(builder, runtime.int32(Errno.outOfMemory), error);
+    instructions.buildRet(builder, runtime.nullPointer());
+
+    builder.positionAtEnd(haveCell);
+    let reason = memory.buildAlloca(builder, runtime.int32Type, "reason");
+    if (runtime.onWindows()) {
+        windowsOpen(runtime, definition, cell, reason, refused);
+    } else if (runtime.onDarwin()) {
+        darwinOpen(runtime, definition, cell, reason, refused);
+    } else {
+        linuxOpen(runtime, definition, cell, reason, refused);
+    }
+    instructions.buildRet(builder, cell);
+
+    builder.positionAtEnd(refused);
+    memory.buildStore(builder, memory.buildLoad(builder, runtime.int32Type, reason, ""), error);
+    runtime.call(deallocate, [cell], "");
+    instructions.buildRet(builder, runtime.nullPointer());
+    return runtime.endDefinition(definition);
+}
+
+windowsOpen(Runtime runtime, RuntimeDefinition definition, Value cell, Value reason,
+            BasicBlock refused) {
+    let builder = runtime.builder;
+    let opened = runtime.block(definition, "create.opened");
+    let port = runtime.call(createPortFunction(runtime), [runtime.int64(CompletionEntry.noFile),
+        runtime.nullPointer(), runtime.int64(0), runtime.int32(1)], "port");
+    memory.buildStore(builder, runtime.lastError(), reason);
+    instructions.buildCondBr(builder, runtime.isNull(port), refused, opened);
+
+    builder.positionAtEnd(opened);
+    memory.buildStore(builder, port, runtime.offsetPointer(cell, PollerCell.queue, ""));
+}
+
+// A kqueue with the user event a wake triggers, cleared each time a wait returns it.
+darwinOpen(Runtime runtime, RuntimeDefinition definition, Value cell, Value reason,
+           BasicBlock refused) {
+    let builder = runtime.builder;
+    let makeQueue = runtime.libc("kqueue", runtime.int32Type.functionType([]));
+    let opened = runtime.block(definition, "create.opened");
+    let registered = runtime.block(definition, "create.registered");
+    let unregistered = runtime.block(definition, "create.unregistered");
+    let queue = runtime.call(makeQueue, [], "queue");
+    memory.buildStore(builder, runtime.errnoValue(), reason);
+    instructions.buildCondBr(builder, instructions.buildICmpSLT(builder, queue, runtime.int32(0),
+        ""), refused, opened);
+
+    builder.positionAtEnd(opened);
+    let change = keventSlot(runtime, "change");
+    writeKevent(runtime, change, runtime.int64(0), Kevent.userFilter, Kevent.add | Kevent.clear, 0,
+        runtime.int64(0));
+    let changed = runtime.call(keventFunction(runtime), [queue, change, runtime.int32(1),
+        runtime.nullPointer(), runtime.int32(0), runtime.nullPointer()], "changed");
+    memory.buildStore(builder, runtime.errnoValue(), reason);
+    instructions.buildCondBr(builder, instructions.buildICmpSLT(builder, changed,
+        runtime.int32(0), ""), unregistered, registered);
+
+    builder.positionAtEnd(unregistered);
+    runtime.call(closeFunction(runtime), [queue], "");
+    instructions.buildBr(builder, refused);
+
+    builder.positionAtEnd(registered);
+    memory.buildStore(builder, queue, runtime.offsetPointer(cell, PollerCell.queue, ""));
+}
+
+// An epoll with an event descriptor watched under token 0, which a wake writes to.
+linuxOpen(Runtime runtime, RuntimeDefinition definition, Value cell, Value reason,
+          BasicBlock refused) {
+    let builder = runtime.builder;
+    let makeQueue = runtime.libc("epoll_create1",
+        runtime.int32Type.functionType([runtime.int32Type]));
+    let makeEvent = runtime.libc("eventfd",
+        runtime.int32Type.functionType([runtime.int32Type, runtime.int32Type]));
+    let opened = runtime.block(definition, "create.opened");
+    let evented = runtime.block(definition, "create.evented");
+    let noEvent = runtime.block(definition, "create.no.event");
+    let registered = runtime.block(definition, "create.registered");
+    let unregistered = runtime.block(definition, "create.unregistered");
+    let queue = runtime.call(makeQueue, [runtime.int32(Epoll.closeOnExec)], "queue");
+    memory.buildStore(builder, runtime.errnoValue(), reason);
+    instructions.buildCondBr(builder, instructions.buildICmpSLT(builder, queue, runtime.int32(0),
+        ""), refused, opened);
+
+    builder.positionAtEnd(opened);
+    let wake = runtime.call(makeEvent, [runtime.int32(0),
+        runtime.int32(Epoll.closeOnExec | Epoll.nonBlocking)], "wake");
+    memory.buildStore(builder, runtime.errnoValue(), reason);
+    instructions.buildCondBr(builder, instructions.buildICmpSLT(builder, wake, runtime.int32(0),
+        ""), noEvent, evented);
+
+    builder.positionAtEnd(noEvent);
+    runtime.call(closeFunction(runtime), [queue], "");
+    instructions.buildBr(builder, refused);
+
+    builder.positionAtEnd(evented);
+    let event = epollSlot(runtime, "event");
+    writeEpollEvent(runtime, event, Epoll.readable, runtime.int64(0));
+    let added = runtime.call(epollControlFunction(runtime), [queue,
+        runtime.int32(Epoll.addControl), wake, event], "added");
+    memory.buildStore(builder, runtime.errnoValue(), reason);
+    instructions.buildCondBr(builder, instructions.buildICmpSLT(builder, added, runtime.int32(0),
+        ""), unregistered, registered);
+
+    builder.positionAtEnd(unregistered);
+    runtime.call(closeFunction(runtime), [wake], "");
+    runtime.call(closeFunction(runtime), [queue], "");
+    instructions.buildBr(builder, refused);
+
+    builder.positionAtEnd(registered);
+    memory.buildStore(builder, queue, runtime.offsetPointer(cell, PollerCell.queue, ""));
+    memory.buildStore(builder, wake, runtime.offsetPointer(cell, PollerCell.wake, ""));
+}
+
+// i64 ens_poller_wait(ptr poller, ptr tokens, i64 capacity, i64 millis, ptr error): how many
+// tokens of fired watches were written to 'tokens', at most 'capacity', waiting up to 'millis' for
+// one, without bound when it is negative; or -1 with the system's number written to 'error'. A
+// wake, a signal or the bound passing returns 0, so a caller waits again for what it still needs.
+public waitRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int64Type.functionType([runtime.pointerType, runtime.pointerType,
+        runtime.int64Type, runtime.int64Type, runtime.pointerType]);
+    let known = runtime.existing("ens_poller_wait", type);
+    if (known != null) {
+        return known;
+    }
+    let definition = runtime.beginDefinition("ens_poller_wait", type);
+    let builder = runtime.builder;
+    let cell = runtime.parameter(definition, 0);
+    let tokens = runtime.parameter(definition, 1);
+    let capacity = runtime.parameter(definition, 2);
+    let millis = runtime.parameter(definition, 3);
+    let error = runtime.parameter(definition, 4);
+    let batch = instructions.buildTrunc(builder, instructions.buildSelect(builder,
+        instructions.buildICmpSGT(builder, capacity, runtime.int64(Batch.events), ""),
+        runtime.int64(Batch.events), capacity, ""), runtime.int32Type, "batch");
+    let shape = eventShape(runtime);
+    let events = memory.buildAlloca(builder,
+        runtime.int8Type.arrayType((shape.bytes * Batch.events) as ulong), "events");
+    let failed = runtime.block(definition, "wait.failed");
+    let quiet = runtime.block(definition, "wait.quiet");
+    let gathered = runtime.block(definition, "wait.gathered");
+    let reason = memory.buildAlloca(builder, runtime.int32Type, "reason");
+    let got = waitForEvents(runtime, definition, cell, events, batch, millis, reason, failed,
+        quiet);
+    instructions.buildBr(builder, gathered);
+
+    builder.positionAtEnd(gathered);
+    instructions.buildRet(builder, gatherTokens(runtime, definition, cell, events, got, tokens,
+        shape));
+
+    builder.positionAtEnd(quiet);
+    instructions.buildRet(builder, runtime.int64(0));
+
+    builder.positionAtEnd(failed);
+    memory.buildStore(builder, memory.buildLoad(builder, runtime.int32Type, reason, ""), error);
+    instructions.buildRet(builder, runtime.int64(-1));
+    return runtime.endDefinition(definition);
+}
+
+// The size of one event a wait takes off the queue, and where in it the token and, on macOS, the
+// filter are.
+final class EventShape {
+    protected long bytes;
+    protected long token;
+
+    protected constructor(this.bytes, this.token);
+}
+
+eventShape(Runtime runtime) -> EventShape {
+    if (runtime.onWindows()) {
+        return new EventShape(CompletionEntry.structBytes, CompletionEntry.key);
+    }
+    if (runtime.onDarwin()) {
+        return new EventShape(Kevent.structBytes, Kevent.userData);
+    }
+    let architecture = runtime.target.architecture();
+    return new EventShape(nativeshapes.epollEventBytes(architecture),
+        nativeshapes.epollTokenOffset(architecture));
+}
+
+// One wait on the queue: the number of events it took, going to 'quiet' when it took none because
+// the bound passed or a signal arrived, and to 'failed' with the reason kept when it was refused.
+waitForEvents(Runtime runtime, RuntimeDefinition definition, Value cell, Value events,
+              Value batch, Value millis, Value reason, BasicBlock failed, BasicBlock quiet)
+              -> Value {
+    let builder = runtime.builder;
+    let refused = runtime.block(definition, "wait.refused");
+    let took = runtime.block(definition, "wait.took");
+    let unbounded = instructions.buildICmpSLT(builder, millis, runtime.int64(0), "unbounded");
+    if (runtime.onWindows()) {
+        let removed = memory.buildAlloca(builder, runtime.int32Type, "removed");
+        memory.buildStore(builder, runtime.int32(0), removed);
+        let wait = runtime.libc("GetQueuedCompletionStatusEx", runtime.int32Type.functionType([
+            runtime.pointerType, runtime.pointerType, runtime.int32Type, runtime.pointerType,
+            runtime.int32Type, runtime.int32Type]));
+        let bound = instructions.buildSelect(builder, unbounded,
+            runtime.int32(ProcessCreation.infinite), boundedMillis(runtime, millis,
+                0xFFFFFFFE), "bound");
+        let woken = runtime.call(wait, [memory.buildLoad(builder, runtime.pointerType,
+            runtime.offsetPointer(cell, PollerCell.queue, ""), "port"), events, batch, removed,
+            bound, runtime.int32(0)], "woken");
+        let why = runtime.lastError();
+        memory.buildStore(builder, why, reason);
+        instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, woken,
+            runtime.int32(0), ""), refused, took);
+
+        builder.positionAtEnd(refused);
+        instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, why,
+            runtime.int32(CompletionEntry.timedOut), ""), quiet, failed);
+
+        builder.positionAtEnd(took);
+        return memory.buildLoad(builder, runtime.int32Type, removed, "got");
+    }
+    let queue = memory.buildLoad(builder, runtime.int32Type,
+        runtime.offsetPointer(cell, PollerCell.queue, ""), "queue");
+    Value got = runtime.int32(0);
+    if (runtime.onDarwin()) {
+        let timeout = memory.buildAlloca(builder,
+            runtime.int8Type.arrayType(Timespec.structBytes as ulong), "timeout");
+        memory.buildStore(builder, instructions.buildSDiv(builder, millis, runtime.int64(1000), ""),
+            runtime.offsetPointer(timeout, Timespec.seconds, ""));
+        memory.buildStore(builder, instructions.buildMul(builder, instructions.buildSRem(builder,
+            millis, runtime.int64(1000), ""), runtime.int64(1000000), ""),
+            runtime.offsetPointer(timeout, Timespec.nanoseconds, ""));
+        got = runtime.call(keventFunction(runtime), [queue, runtime.nullPointer(),
+            runtime.int32(0), events, batch, instructions.buildSelect(builder, unbounded,
+                runtime.nullPointer(), timeout, "")], "got");
+    } else {
+        let wait = runtime.libc("epoll_wait", runtime.int32Type.functionType([runtime.int32Type,
+            runtime.pointerType, runtime.int32Type, runtime.int32Type]));
+        got = runtime.call(wait, [queue, events, batch, instructions.buildSelect(builder,
+            unbounded, runtime.int32(-1), boundedMillis(runtime, millis, 0x7FFFFFFF), "")],
+            "got");
+    }
+    let why = runtime.errnoValue();
+    memory.buildStore(builder, why, reason);
+    instructions.buildCondBr(builder, instructions.buildICmpSLT(builder, got, runtime.int32(0),
+        ""), refused, took);
+
+    builder.positionAtEnd(refused);
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, why,
+        runtime.int32(Errno.interrupted), ""), quiet, failed);
+
+    builder.positionAtEnd(took);
+    return got;
+}
+
+// A non-negative 'millis' as the 32-bit bound a wait takes, at most 'largest'.
+boundedMillis(Runtime runtime, Value millis, long largest) -> Value {
+    let builder = runtime.builder;
+    return instructions.buildTrunc(builder, instructions.buildSelect(builder,
+        instructions.buildICmpSGT(builder, millis, runtime.int64(largest), ""),
+        runtime.int64(largest), millis, ""), runtime.int32Type, "bounded");
+}
+
+// Copies the token of each of the 'got' events into 'tokens', leaving out the wake, which on Linux
+// is also read off its descriptor so the next wait does not see it again. Returns how many it
+// copied.
+gatherTokens(Runtime runtime, RuntimeDefinition definition, Value cell, Value events, Value got,
+             Value tokens, EventShape shape) -> Value {
+    let builder = runtime.builder;
+    let index = memory.buildAlloca(builder, runtime.int32Type, "index");
+    let count = memory.buildAlloca(builder, runtime.int64Type, "count");
+    memory.buildStore(builder, runtime.int32(0), index);
+    memory.buildStore(builder, runtime.int64(0), count);
+    let test = runtime.block(definition, "gather.test");
+    let body = runtime.block(definition, "gather.body");
+    let keep = runtime.block(definition, "gather.keep");
+    let woken = runtime.block(definition, "gather.woken");
+    let next = runtime.block(definition, "gather.next");
+    let done = runtime.block(definition, "gather.done");
+    instructions.buildBr(builder, test);
+
+    builder.positionAtEnd(test);
+    let at = memory.buildLoad(builder, runtime.int32Type, index, "at");
+    instructions.buildCondBr(builder, instructions.buildICmpSLT(builder, at, got, ""), body, done);
+
+    builder.positionAtEnd(body);
+    let event = memory.buildGEP(builder, runtime.int8Type, events, [instructions.buildMul(builder,
+        instructions.buildSExt(builder, at, runtime.int64Type, ""), runtime.int64(shape.bytes),
+        "")], "event");
+    let token = memory.buildLoad(builder, runtime.int64Type,
+        runtime.offsetPointer(event, shape.token, ""), "token");
+    Value wake = instructions.buildICmpEQ(builder, token, runtime.int64(0), "wake");
+    if (runtime.onDarwin()) {
+        wake = instructions.buildICmpEQ(builder, memory.buildLoad(builder, runtime.int16Type,
+            runtime.offsetPointer(event, Kevent.filter, ""), "filter"),
+            runtime.int16Type.constInt(Kevent.userFilter as ulong, true), "wake");
+    }
+    instructions.buildCondBr(builder, wake, woken, keep);
+
+    builder.positionAtEnd(keep);
+    let kept = memory.buildLoad(builder, runtime.int64Type, count, "kept");
+    memory.buildStore(builder, token, memory.buildGEP(builder, runtime.int64Type, tokens, [kept],
+        "slot"));
+    memory.buildStore(builder, instructions.buildAdd(builder, kept, runtime.int64(1), ""), count);
+    instructions.buildBr(builder, next);
+
+    builder.positionAtEnd(woken);
+    if (!runtime.onWindows() && !runtime.onDarwin()) {
+        let drained = memory.buildAlloca(builder, runtime.int64Type, "drained");
+        runtime.call(readFunction(runtime), [memory.buildLoad(builder, runtime.int32Type,
+            runtime.offsetPointer(cell, PollerCell.wake, ""), "wake.descriptor"), drained,
+            runtime.int64(8)], "");
+    }
+    instructions.buildBr(builder, next);
+
+    builder.positionAtEnd(next);
+    memory.buildStore(builder, instructions.buildAdd(builder, at, runtime.int32(1), ""), index);
+    instructions.buildBr(builder, test);
+
+    builder.positionAtEnd(done);
+    return memory.buildLoad(builder, runtime.int64Type, count, "gathered");
+}
+
+// void ens_poller_wake(ptr poller): makes a wait in progress, or the next one, return at once.
+public wakeRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.voidType.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_poller_wake", type);
+    if (known != null) {
+        return known;
+    }
+    let definition = runtime.beginDefinition("ens_poller_wake", type);
+    let builder = runtime.builder;
+    let cell = runtime.parameter(definition, 0);
+    if (runtime.onWindows()) {
+        runtime.call(postFunction(runtime), [memory.buildLoad(builder, runtime.pointerType,
+            runtime.offsetPointer(cell, PollerCell.queue, ""), "port"), runtime.int32(0),
+            runtime.int64(0), runtime.nullPointer()], "");
+    } else if (runtime.onDarwin()) {
+        let change = keventSlot(runtime, "change");
+        writeKevent(runtime, change, runtime.int64(0), Kevent.userFilter, 0, Kevent.triggerNote,
+            runtime.int64(0));
+        runtime.call(keventFunction(runtime), [memory.buildLoad(builder, runtime.int32Type,
+            runtime.offsetPointer(cell, PollerCell.queue, ""), "queue"), change, runtime.int32(1),
+            runtime.nullPointer(), runtime.int32(0), runtime.nullPointer()], "");
+    } else {
+        let write = runtime.libc("write", runtime.int64Type.functionType([runtime.int32Type,
+            runtime.pointerType, runtime.int64Type]));
+        let one = memory.buildAlloca(builder, runtime.int64Type, "one");
+        memory.buildStore(builder, runtime.int64(1), one);
+        runtime.call(write, [memory.buildLoad(builder, runtime.int32Type,
+            runtime.offsetPointer(cell, PollerCell.wake, ""), "wake"), one, runtime.int64(8)], "");
+    }
+    instructions.buildRetVoid(builder);
+    return runtime.endDefinition(definition);
+}
+
+// void ens_poller_release(ptr poller): closes the poller. Nothing may wait on it or watch with it
+// afterwards.
+public releaseRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.voidType.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_poller_release", type);
+    if (known != null) {
+        return known;
+    }
+    let deallocate = runtime.free();
+    let definition = runtime.beginDefinition("ens_poller_release", type);
+    let builder = runtime.builder;
+    let cell = runtime.parameter(definition, 0);
+    if (runtime.onWindows()) {
+        let closeHandle = runtime.libc("CloseHandle",
+            runtime.int32Type.functionType([runtime.pointerType]));
+        runtime.call(closeHandle, [memory.buildLoad(builder, runtime.pointerType,
+            runtime.offsetPointer(cell, PollerCell.queue, ""), "port")], "");
+    } else {
+        runtime.call(closeFunction(runtime), [memory.buildLoad(builder, runtime.int32Type,
+            runtime.offsetPointer(cell, PollerCell.queue, ""), "queue")], "");
+        if (!runtime.onDarwin()) {
+            runtime.call(closeFunction(runtime), [memory.buildLoad(builder, runtime.int32Type,
+                runtime.offsetPointer(cell, PollerCell.wake, ""), "wake")], "");
+        }
+    }
+    runtime.call(deallocate, [cell], "");
+    instructions.buildRetVoid(builder);
+    return runtime.endDefinition(definition);
+}
+
+// i32 ens_poller_watch_descriptor(ptr poller, i32 descriptor, i64 token, ptr error): one wake under
+// 'token', which must not be 0, once the descriptor has bytes to read or has reached its end. A
+// descriptor whose reads never wait, such as a regular file's on Linux, reports ready, and one the
+// system cannot watch, such as a device's on macOS, unwatchable. POSIX only.
+public watchDescriptorRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int32Type.functionType([runtime.pointerType, runtime.int32Type,
+        runtime.int64Type, runtime.pointerType]);
+    let known = runtime.existing("ens_poller_watch_descriptor", type);
+    if (known != null) {
+        return known;
+    }
+    let definition = runtime.beginDefinition("ens_poller_watch_descriptor", type);
+    let builder = runtime.builder;
+    let cell = runtime.parameter(definition, 0);
+    let descriptor = runtime.parameter(definition, 1);
+    let token = runtime.parameter(definition, 2);
+    let error = runtime.parameter(definition, 3);
+    if (runtime.onDarwin()) {
+        darwinWatch(runtime, definition, cell, instructions.buildSExt(builder, descriptor,
+            runtime.int64Type, "ident"), Kevent.readFilter, 0, token, error);
+    } else {
+        linuxWatch(runtime, definition, cell, descriptor, token, error);
+    }
+    return runtime.endDefinition(definition);
+}
+
+// i32 ens_poller_watch_process(ptr poller, i32 pid, i64 token, ptr error): one wake under 'token'
+// once the process has ended; a process that has ended already reports ready. macOS only, since
+// Linux watches a pidfd as a descriptor.
+public watchProcessRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int32Type.functionType([runtime.pointerType, runtime.int32Type,
+        runtime.int64Type, runtime.pointerType]);
+    let known = runtime.existing("ens_poller_watch_process", type);
+    if (known != null) {
+        return known;
+    }
+    let definition = runtime.beginDefinition("ens_poller_watch_process", type);
+    let builder = runtime.builder;
+    darwinWatch(runtime, definition, runtime.parameter(definition, 0),
+        instructions.buildSExt(builder, runtime.parameter(definition, 1), runtime.int64Type,
+            "ident"), Kevent.processFilter, Kevent.exitNote, runtime.parameter(definition, 2),
+        runtime.parameter(definition, 3));
+    return runtime.endDefinition(definition);
+}
+
+// Registers one one-shot kevent and asks for its receipt, which carries the registration's own
+// error: none is watching, a process already gone is ready, a descriptor kqueue has no filter for,
+// such as a device's, is unwatchable, and anything else failed.
+darwinWatch(Runtime runtime, RuntimeDefinition definition, Value cell, Value ident, long filter,
+            long filterFlags, Value token, Value error) {
+    let builder = runtime.builder;
+    let refused = runtime.block(definition, "watch.refused");
+    let answered = runtime.block(definition, "watch.answered");
+    let watching = runtime.block(definition, "watch.watching");
+    let declined = runtime.block(definition, "watch.declined");
+    let gone = runtime.block(definition, "watch.gone");
+    let failed = runtime.block(definition, "watch.failed");
+    let change = keventSlot(runtime, "change");
+    let receipt = keventSlot(runtime, "receipt");
+    writeKevent(runtime, change, ident, filter, Kevent.add | Kevent.oneShot | Kevent.receipt,
+        filterFlags, token);
+    let got = runtime.call(keventFunction(runtime), [memory.buildLoad(builder, runtime.int32Type,
+        runtime.offsetPointer(cell, PollerCell.queue, ""), "queue"), change, runtime.int32(1),
+        receipt, runtime.int32(1), runtime.nullPointer()], "got");
+    let why = runtime.errnoValue();
+    instructions.buildCondBr(builder, instructions.buildICmpSLT(builder, got, runtime.int32(0),
+        ""), refused, answered);
+
+    builder.positionAtEnd(refused);
+    memory.buildStore(builder, why, error);
+    instructions.buildRet(builder, runtime.int32(WatchState.failed as int));
+
+    builder.positionAtEnd(answered);
+    let number = instructions.buildTrunc(builder, memory.buildLoad(builder, runtime.int64Type,
+        runtime.offsetPointer(receipt, Kevent.data, ""), "data"), runtime.int32Type, "number");
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, number, runtime.int32(0),
+        ""), watching, declined);
+
+    builder.positionAtEnd(watching);
+    instructions.buildRet(builder, runtime.int32(WatchState.watching as int));
+
+    builder.positionAtEnd(declined);
+    let refusing = runtime.block(definition, "watch.refusing");
+    let unsupported = runtime.block(definition, "watch.unsupported");
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, number,
+        runtime.int32(Errno.noSuchProcess), ""), gone, refusing);
+
+    builder.positionAtEnd(refusing);
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, number,
+        runtime.int32(Errno.invalidArgument), ""), unsupported, failed);
+
+    builder.positionAtEnd(gone);
+    instructions.buildRet(builder, runtime.int32(WatchState.ready as int));
+
+    builder.positionAtEnd(unsupported);
+    instructions.buildRet(builder, runtime.int32(WatchState.unwatchable as int));
+
+    builder.positionAtEnd(failed);
+    memory.buildStore(builder, number, error);
+    instructions.buildRet(builder, runtime.int32(WatchState.failed as int));
+}
+
+// Re-arms the descriptor's one-shot registration, adding it the first time. Linux refuses to watch
+// a descriptor whose reads never wait, which is ready instead.
+linuxWatch(Runtime runtime, RuntimeDefinition definition, Value cell, Value descriptor,
+           Value token, Value error) {
+    let builder = runtime.builder;
+    let watching = runtime.block(definition, "watch.watching");
+    let unmodified = runtime.block(definition, "watch.unmodified");
+    let adding = runtime.block(definition, "watch.adding");
+    let unadded = runtime.block(definition, "watch.unadded");
+    let ready = runtime.block(definition, "watch.ready");
+    let failed = runtime.block(definition, "watch.failed");
+    let event = epollSlot(runtime, "event");
+    writeEpollEvent(runtime, event, Epoll.readable | Epoll.peerClosed | Epoll.oneShot, token);
+    let reason = memory.buildAlloca(builder, runtime.int32Type, "reason");
+    let queue = memory.buildLoad(builder, runtime.int32Type,
+        runtime.offsetPointer(cell, PollerCell.queue, ""), "queue");
+    let control = epollControlFunction(runtime);
+    let modified = runtime.call(control, [queue, runtime.int32(Epoll.modifyControl), descriptor,
+        event], "modified");
+    let why = runtime.errnoValue();
+    memory.buildStore(builder, why, reason);
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, modified,
+        runtime.int32(0), ""), watching, unmodified);
+
+    builder.positionAtEnd(unmodified);
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, why,
+        runtime.int32(Errno.noEntry), ""), adding, unadded);
+
+    builder.positionAtEnd(adding);
+    let added = runtime.call(control, [queue, runtime.int32(Epoll.addControl), descriptor, event],
+        "added");
+    memory.buildStore(builder, runtime.errnoValue(), reason);
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, added, runtime.int32(0),
+        ""), watching, unadded);
+
+    builder.positionAtEnd(unadded);
+    let number = memory.buildLoad(builder, runtime.int32Type, reason, "number");
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, number,
+        runtime.int32(Errno.notOwner), ""), ready, failed);
+
+    builder.positionAtEnd(watching);
+    instructions.buildRet(builder, runtime.int32(WatchState.watching as int));
+
+    builder.positionAtEnd(ready);
+    instructions.buildRet(builder, runtime.int32(WatchState.ready as int));
+
+    builder.positionAtEnd(failed);
+    memory.buildStore(builder, number, error);
+    instructions.buildRet(builder, runtime.int32(WatchState.failed as int));
+}
+
+// i32 ens_poller_arm(ptr slot, ptr poller, ptr handle, i64 token, ptr error): one wake under
+// 'token' once the handle is signaled, through a thread-pool wait that posts the token to the
+// poller's port. The slot keeps the wait object between watches and must stay where it is until
+// ens_poller_disarm. Windows only.
+public armRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType,
+        runtime.pointerType, runtime.int64Type, runtime.pointerType]);
+    let known = runtime.existing("ens_poller_arm", type);
+    if (known != null) {
+        return known;
+    }
+    let signal = signalRuntime(runtime);
+    let create = runtime.libc("CreateThreadpoolWait", runtime.pointerType.functionType([
+        runtime.pointerType, runtime.pointerType, runtime.pointerType]));
+    let set = setWaitFunction(runtime);
+    let definition = runtime.beginDefinition("ens_poller_arm", type);
+    let builder = runtime.builder;
+    let slot = runtime.parameter(definition, 0);
+    let cell = runtime.parameter(definition, 1);
+    let handle = runtime.parameter(definition, 2);
+    let token = runtime.parameter(definition, 3);
+    let error = runtime.parameter(definition, 4);
+    let make = runtime.block(definition, "arm.make");
+    let made = runtime.block(definition, "arm.made");
+    let refused = runtime.block(definition, "arm.refused");
+    let arm = runtime.block(definition, "arm.set");
+    let waiterSlot = runtime.offsetPointer(slot, WatchSlot.waiter, "waiter.slot");
+    let existing = memory.buildLoad(builder, runtime.pointerType, waiterSlot, "existing");
+    instructions.buildCondBr(builder, runtime.isNull(existing), make, arm);
+
+    builder.positionAtEnd(make);
+    let waiter = runtime.call(create, [signal.function, slot, runtime.nullPointer()], "waiter");
+    let why = runtime.lastError();
+    instructions.buildCondBr(builder, runtime.isNull(waiter), refused, made);
+
+    builder.positionAtEnd(refused);
+    memory.buildStore(builder, why, error);
+    instructions.buildRet(builder, runtime.int32(WatchState.failed as int));
+
+    builder.positionAtEnd(made);
+    memory.buildStore(builder, waiter, waiterSlot);
+    instructions.buildBr(builder, arm);
+
+    builder.positionAtEnd(arm);
+    memory.buildStore(builder, memory.buildLoad(builder, runtime.pointerType,
+        runtime.offsetPointer(cell, PollerCell.queue, ""), "port"),
+        runtime.offsetPointer(slot, WatchSlot.port, ""));
+    memory.buildStore(builder, token, runtime.offsetPointer(slot, WatchSlot.token, ""));
+    runtime.call(set, [memory.buildLoad(builder, runtime.pointerType, waiterSlot, "armed"), handle,
+        runtime.nullPointer()], "");
+    instructions.buildRet(builder, runtime.int32(WatchState.watching as int));
+    return runtime.endDefinition(definition);
+}
+
+// void ens_poller_disarm(ptr slot): stops the slot's wait, waits for a callback already running,
+// and frees the wait object, so the handle it watched may be closed. A slot never armed is left
+// alone. Windows only.
+public disarmRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.voidType.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_poller_disarm", type);
+    if (known != null) {
+        return known;
+    }
+    let set = setWaitFunction(runtime);
+    let settle = runtime.libc("WaitForThreadpoolWaitCallbacks", runtime.voidType.functionType([
+        runtime.pointerType, runtime.int32Type]));
+    let close = runtime.libc("CloseThreadpoolWait",
+        runtime.voidType.functionType([runtime.pointerType]));
+    let definition = runtime.beginDefinition("ens_poller_disarm", type);
+    let builder = runtime.builder;
+    let slot = runtime.parameter(definition, 0);
+    let armed = runtime.block(definition, "disarm.armed");
+    let done = runtime.block(definition, "disarm.done");
+    let waiterSlot = runtime.offsetPointer(slot, WatchSlot.waiter, "waiter.slot");
+    let waiter = memory.buildLoad(builder, runtime.pointerType, waiterSlot, "waiter");
+    instructions.buildCondBr(builder, runtime.isNull(waiter), done, armed);
+
+    builder.positionAtEnd(armed);
+    runtime.call(set, [waiter, runtime.nullPointer(), runtime.nullPointer()], "");
+    runtime.call(settle, [waiter, runtime.int32(1)], "");
+    runtime.call(close, [waiter], "");
+    memory.buildStore(builder, runtime.nullPointer(), waiterSlot);
+    instructions.buildBr(builder, done);
+
+    builder.positionAtEnd(done);
+    instructions.buildRetVoid(builder);
+    return runtime.endDefinition(definition);
+}
+
+// The thread-pool callback an armed wait runs once its handle is signaled: it posts the slot's
+// token to the slot's port, which is what a poller's wait returns.
+signalRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.voidType.functionType([runtime.pointerType, runtime.pointerType,
+        runtime.pointerType, runtime.int32Type]);
+    let known = runtime.existing("ens_poller_signal", type);
+    if (known != null) {
+        return known;
+    }
+    let post = postFunction(runtime);
+    let definition = runtime.beginDefinition("ens_poller_signal", type);
+    let builder = runtime.builder;
+    let slot = runtime.parameter(definition, 1);
+    runtime.call(post, [memory.buildLoad(builder, runtime.pointerType,
+        runtime.offsetPointer(slot, WatchSlot.port, ""), "port"), runtime.int32(0),
+        memory.buildLoad(builder, runtime.int64Type,
+            runtime.offsetPointer(slot, WatchSlot.token, ""), "token"), runtime.nullPointer()], "");
+    instructions.buildRetVoid(builder);
+    return runtime.endDefinition(definition);
+}
+
+keventSlot(Runtime runtime, string name) -> Value {
+    return memory.buildAlloca(runtime.builder,
+        runtime.int8Type.arrayType(Kevent.structBytes as ulong), name);
+}
+
+writeKevent(Runtime runtime, Value entry, Value ident, long filter, long flags, long filterFlags,
+            Value token) {
+    let builder = runtime.builder;
+    memory.buildStore(builder, ident, runtime.offsetPointer(entry, Kevent.ident, ""));
+    memory.buildStore(builder, runtime.int16Type.constInt(filter as ulong, true),
+        runtime.offsetPointer(entry, Kevent.filter, ""));
+    memory.buildStore(builder, runtime.int16Type.constInt(flags as ulong, false),
+        runtime.offsetPointer(entry, Kevent.flags, ""));
+    memory.buildStore(builder, runtime.int32(filterFlags),
+        runtime.offsetPointer(entry, Kevent.filterFlags, ""));
+    memory.buildStore(builder, runtime.int64(0), runtime.offsetPointer(entry, Kevent.data, ""));
+    memory.buildStore(builder, token, runtime.offsetPointer(entry, Kevent.userData, ""));
+}
+
+epollSlot(Runtime runtime, string name) -> Value {
+    let size = nativeshapes.epollEventBytes(runtime.target.architecture());
+    return memory.buildAlloca(runtime.builder, runtime.int8Type.arrayType(size as ulong), name);
+}
+
+writeEpollEvent(Runtime runtime, Value entry, long events, Value token) {
+    let builder = runtime.builder;
+    memory.buildStore(builder, runtime.int32(events), entry);
+    memory.buildStore(builder, token, runtime.offsetPointer(entry,
+        nativeshapes.epollTokenOffset(runtime.target.architecture()), ""));
+}
+
+keventFunction(Runtime runtime) -> RuntimeFunction {
+    return runtime.libc("kevent", runtime.int32Type.functionType([runtime.int32Type,
+        runtime.pointerType, runtime.int32Type, runtime.pointerType, runtime.int32Type,
+        runtime.pointerType]));
+}
+
+epollControlFunction(Runtime runtime) -> RuntimeFunction {
+    return runtime.libc("epoll_ctl", runtime.int32Type.functionType([runtime.int32Type,
+        runtime.int32Type, runtime.int32Type, runtime.pointerType]));
+}
+
+closeFunction(Runtime runtime) -> RuntimeFunction {
+    return runtime.libc("close", runtime.int32Type.functionType([runtime.int32Type]));
+}
+
+readFunction(Runtime runtime) -> RuntimeFunction {
+    return runtime.libc("read", runtime.int64Type.functionType([runtime.int32Type,
+        runtime.pointerType, runtime.int64Type]));
+}
+
+// CreateIoCompletionPort, its file handle taken as the integer INVALID_HANDLE_VALUE is, since the
+// poller makes a port no file is bound to.
+createPortFunction(Runtime runtime) -> RuntimeFunction {
+    return runtime.libc("CreateIoCompletionPort", runtime.pointerType.functionType([
+        runtime.int64Type, runtime.pointerType, runtime.int64Type, runtime.int32Type]));
+}
+
+postFunction(Runtime runtime) -> RuntimeFunction {
+    return runtime.libc("PostQueuedCompletionStatus", runtime.int32Type.functionType([
+        runtime.pointerType, runtime.int32Type, runtime.int64Type, runtime.pointerType]));
+}
+
+setWaitFunction(Runtime runtime) -> RuntimeFunction {
+    return runtime.libc("SetThreadpoolWait", runtime.voidType.functionType([runtime.pointerType,
+        runtime.pointerType, runtime.pointerType]));
+}
