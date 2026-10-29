@@ -1,13 +1,18 @@
 // The program a test run actually runs, ordinary Ens written out of what discovery found. A
-// description is spliced in as the literal it was written as, so nothing needs escaping again. Each
-// result is printed the moment its test finishes, so a run that stops partway has printed every
-// result so far.
+// description is spliced in as the literal it was written as, so nothing needs escaping again.
+// Several tests run at the same time, on as many tasks as the run was given jobs, each taking the
+// next test nobody has started, and every line the runner writes about a test is marked with the test's place in
+// the run, so the command reading it can put the results back in order whatever order they
+// finished in.
 import StringBuilder from @std.text.stringbuilder;
 import List from @std.collections.list;
+import Map from @std.collections.map;
 import FileLoader from @ens.sema.support.loader;
 import Path from @std.fs;
 import FileError from @ens.sema.support.loader;
+import @std.text.parse;
 import DiscoveredTest from testing.discovery;
+import report;
 
 export final class Runner {
     // Not a file on disk. It enters the module graph over the tree the tests were read from, which
@@ -16,9 +21,12 @@ export final class Runner {
 
     export static const string modulePath = "$ens_test_runner";
 
-    // How many tests one group function runs. Counting thousands of passes in one function makes a
-    // chain of additions as long as the suite, which the optimizer walks recursively and which a
-    // thread's stack does not hold on every system.
+    // What starts every line the runner writes about a test. A test's own output does not start
+    // with it, so the two are told apart line by line.
+    export static const string marker = "$ens_test_runner ";
+
+    // How many tests one dispatch function chooses between, so no function's switch grows with
+    // the suite.
     export static const long groupSize = 64;
 }
 
@@ -26,19 +34,24 @@ export final class Runner {
 export source(DiscoveredTest[] tests) -> string {
     let out = new StringBuilder();
     appendImports(out, tests);
-    appendFlush(out);
+    appendReporting(out);
     for (long i = 0; i < tests.length; i++) {
         appendTest(out, tests[i], i);
     }
+    appendDispatch(out, tests.length);
     appendEntry(out, tests.length);
     return out.toString();
 }
 
-// One import per module, written once however many of its tests are running, over the two the
-// runner itself prints each result as it happens rather than when a buffer fills.
+// One import per module, written once however many of its tests are running, over the ones the
+// runner itself uses.
 appendImports(StringBuilder out, DiscoveredTest[] tests) {
     out.append("import @std.io;\n");
     out.append("import IoError from @std.io.streams;\n");
+    out.append("import @std.environment;\n");
+    out.append("import @std.tasks;\n");
+    out.append("import Atomic from @std.tasks;\n");
+    out.append("import @std.text.parse;\n");
     string last = "";
     for (let one in tests) {
         if (one.modulePath() == last) {
@@ -50,68 +63,114 @@ appendImports(StringBuilder out, DiscoveredTest[] tests) {
     out.append("\n");
 }
 
-// The runner's own flush, named as the synthesized declarations are so no test module can collide
-// with it. A standard output that will not take the results is dropped, because a run reports
-// through its exit code and the lines it managed to write.
-appendFlush(StringBuilder out) {
+// The runner's own reporting, named as the synthesized declarations are so no test module can
+// collide with it. Each event is one print, so its lines reach the output together, and is flushed
+// at once, because a result still held in a buffer is not one anyone can read. A standard output
+// that will not take them is dropped, because a run reports through its exit code and the lines it
+// managed to write.
+appendReporting(StringBuilder out) {
     out.append("$flush() \{\n");
     out.append("    try io.flush();\n");
     out.append("\} catch (IoError ignored) \{\n");
     out.append("\}\n\n");
+    out.append("$started(long position) \{\n");
+    out.append("    print(\"{Runner.marker}start \{position\}\");\n");
+    out.append("    $flush();\n");
+    out.append("\}\n\n");
+    out.append("$finished(long position, string result, bool passed) \{\n");
+    out.append("    string written = \"\";\n");
+    out.append("    for (let line in result.lines()) \{\n");
+    out.append("        written = written + \"{Runner.marker}line \{position\} \{line\}\\n\";\n");
+    out.append("    \}\n");
+    out.append("    string verdict = passed ? \"pass\" : \"fail\";\n");
+    out.append("    print(written + \"{Runner.marker}\{verdict\} \{position\}\");\n");
+    out.append("    $flush();\n");
+    out.append("\}\n\n");
 }
 
-// One test: run it, print that it passed, and return true; or catch what it threw, print that it
-// failed with the message and the frames that led there, and return false.
+// One test: run it and report that it passed, or catch what it threw and report that it failed,
+// with the message and the frames that led there. Returns whether it passed.
 appendTest(StringBuilder out, DiscoveredTest test, long position) {
     out.append("$run{position}() -> bool \{\n");
+    out.append("    $started({position});\n");
     out.append("    try {aliasOf(test.modulePath())}.$test{test.index()}();\n");
-    out.append("    print(\"PASS \" + {test.literal()});\n");
+    out.append("    $finished({position}, \"PASS \" + {test.literal()}, true);\n");
     out.append("    return true;\n");
     out.append("\} catch (Error thrown) \{\n");
-    out.append("    print(\"FAIL \" + {test.literal()} + \": \" + thrown.message);\n");
+    out.append("    string result = \"FAIL \" + {test.literal()} + \": \" + thrown.message;\n");
     out.append("    for (let frame in thrown.stackFrames()) \{\n");
     out.append("        if (frame.file == \"{Runner.fileName}\") \{\n");
     out.append("            break;\n");
     out.append("        \}\n");
-    out.append("        print(\"  at \" + frame.function + \" (\" + frame.file + \":\" "
-        + "+ frame.line + \")\");\n");
+    out.append("        result = result + \"\\n  at \" + frame.function + \" (\" + frame.file + "
+        + "\":\" + frame.line + \")\";\n");
     out.append("    \}\n");
+    out.append("    $finished({position}, result, false);\n");
     out.append("    return false;\n");
     out.append("\}\n\n");
 }
 
-// The entry point: every test in turn, then how many of them passed. All passing is a run that
-// worked; anything less is a run that failed. Each result is printed before the next test starts,
-// because a result still held in a buffer is not a result anyone can read.
-appendEntry(StringBuilder out, long total) {
+// The test at a place in the run, chosen in two steps, its group and then the test, so no switch
+// has more arms than a group has tests.
+appendDispatch(StringBuilder out, long total) {
     long groups = (total + Runner.groupSize - 1) / Runner.groupSize;
     for (long group = 0; group < groups; group++) {
-        out.append("$group{group}() -> int \{\n");
-        out.append("    int passed = 0;\n");
+        out.append("$group{group}(long position) -> bool \{\n");
+        out.append("    return switch (position) \{\n");
         long end = (group + 1) * Runner.groupSize;
         if (end > total) {
             end = total;
         }
         for (long i = group * Runner.groupSize; i < end; i++) {
-            out.append("    if ($run{i}()) \{\n        passed = passed + 1;\n    \}\n");
-            out.append("    $flush();\n");
+            out.append("        {i} -> $run{i}(),\n");
         }
-        out.append("    return passed;\n");
+        out.append("        default -> false,\n");
+        out.append("    \};\n");
         out.append("\}\n\n");
     }
-    out.append("main() -> int \{\n");
-    out.append("    (() -> int)[] groups = [");
+    out.append("$run(long position) -> bool \{\n");
+    out.append("    return switch (position / {Runner.groupSize}) \{\n");
     for (long group = 0; group < groups; group++) {
-        if (group > 0) {
-            out.append(", ");
-        }
-        out.append("() -> $group{group}()");
+        out.append("        {group} -> $group{group}(position),\n");
     }
-    out.append("];\n");
-    out.append("    int passed = 0;\n");
-    out.append("    for (let group in groups) \{\n        passed = passed + group();\n    \}\n");
-    out.append("    print(\"\{passed\}/{total} tests passed\");\n");
-    out.append("    if (passed == {total}) \{\n        return 0;\n    \}\n");
+    out.append("        default -> false,\n");
+    out.append("    \};\n");
+    out.append("\}\n\n");
+}
+
+// The entry point: as many workers as the run has jobs, each running the next test nobody has
+// started until none are left, then how many of them passed. All passing is a run that worked;
+// anything less is a run that failed. The number of jobs is the program's first argument.
+appendEntry(StringBuilder out, long total) {
+    out.append("$work(Atomic<long> next, Atomic<long> passed) \{\n");
+    out.append("    long position = next.increment() - 1;\n");
+    out.append("    while (position < {total}) \{\n");
+    out.append("        if ($run(position)) \{\n");
+    out.append("            passed.increment();\n");
+    out.append("        \}\n");
+    out.append("        position = next.increment() - 1;\n");
+    out.append("    \}\n");
+    out.append("\}\n\n");
+    out.append("$jobs() -> long \{\n");
+    out.append("    string[] given = environment.arguments();\n");
+    out.append("    long? jobs = given.length > 0 ? parse.parseLong(given[0]) : null;\n");
+    out.append("    if (jobs == null || jobs < 1) \{\n");
+    out.append("        return 1;\n");
+    out.append("    \}\n");
+    out.append("    return jobs;\n");
+    out.append("\}\n\n");
+    out.append("main() -> int \{\n");
+    out.append("    long jobs = $jobs();\n");
+    out.append("    let next = new Atomic<long>(0);\n");
+    out.append("    let passed = new Atomic<long>(0);\n");
+    out.append("    tasks.scope((scope) -> \{\n");
+    out.append("        for (long worker = 0; worker < jobs && worker < {total}; worker++) \{\n");
+    out.append("            scope.launch(() -> $work(next, passed));\n");
+    out.append("        \}\n");
+    out.append("    \});\n");
+    out.append("    long count = passed.read();\n");
+    out.append("    print(\"\{count\}/{total} tests passed\");\n");
+    out.append("    if (count == {total}) \{\n        return 0;\n    \}\n");
     out.append("    return 1;\n");
     out.append("\}\n");
 }
@@ -202,41 +261,182 @@ export final class RunnerOutcome {
     }
 }
 
-// Whether the line is the result `test` prints, which is how a reader of the output knows that test
-// has finished. The text is exactly what appendTest writes, and a line is only ever offered against
-// the one test whose turn it is, so a test printing something of its own is not mistaken for a result.
-export reportsResult(string line, DiscoveredTest test) -> bool {
-    return line == "PASS " + test.description() || line.startsWith("FAIL " + test.description() + ": ");
+// The runner's output read line by line: what to show for each line, in the order it is to be
+// shown, and which tests have started and finished. A test's results are held until every test
+// before it has finished, so they come out in the order the tests were given whatever order they
+// finished in, while a line a test printed of its own is shown as it arrives.
+export final class RunnerOutput {
+    DiscoveredTest[] tests;
+    bool[] begun;
+    bool[] ended;
+    bool[] succeeded;
+    Map<long, List<string>> held;
+    long shownThrough;
+
+    export constructor(DiscoveredTest[] tests) {
+        this.tests = tests;
+        this.begun = new bool[tests.length];
+        this.ended = new bool[tests.length];
+        this.succeeded = new bool[tests.length];
+        this.held = new Map<long, List<string>>();
+        this.shownThrough = 0;
+    }
+
+    // The lines to show now that `line` arrived.
+    export accept(string line) -> string[] {
+        if (!line.startsWith(Runner.marker)) {
+            return [line];
+        }
+        string event = line.substring(Runner.marker.length, line.length);
+        long space = event.indexOf(" ");
+        if (space < 0) {
+            return [line];
+        }
+        string kind = event.substring(0, space);
+        string rest = event.substring(space + 1, event.length);
+        long numberEnd = rest.indexOf(" ");
+        string number = numberEnd < 0 ? rest : rest.substring(0, numberEnd);
+        long? parsed = parse.parseLong(number);
+        if (parsed == null || parsed < 0 || parsed >= this.tests.length) {
+            return [line];
+        }
+        long position = parsed;
+        switch (kind) {
+            "start" -> {
+                this.begun[position] = true;
+            }
+            "line" -> {
+                this.heldFor(position).push(numberEnd < 0 ? ""
+                    : rest.substring(numberEnd + 1, rest.length));
+            }
+            "pass", "fail" -> {
+                this.ended[position] = true;
+                this.succeeded[position] = kind == "pass";
+                return this.inOrder();
+            }
+            default -> {
+                return [line];
+            }
+        }
+        return [];
+    }
+
+    // The results still held once the runner has ended: those of the tests that finished after a
+    // test before them that never did, in the order the tests were given.
+    export remaining() -> string[] {
+        let shown = new List<string>();
+        for (long i = this.shownThrough; i < this.tests.length; i++) {
+            if (this.ended[i]) {
+                this.show(i, shown);
+            }
+        }
+        this.shownThrough = this.tests.length;
+        return shown.toArray();
+    }
+
+    // How many tests have reported a result.
+    export finished() -> long {
+        long count = 0;
+        for (let one in this.ended) {
+            if (one) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    // How many of them passed.
+    export passed() -> long {
+        long count = 0;
+        for (long i = 0; i < this.tests.length; i++) {
+            if (this.ended[i] && this.succeeded[i]) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    // The tests that started and have not reported a result, in the order they were given.
+    export running() -> DiscoveredTest[] {
+        let found = new List<DiscoveredTest>();
+        for (long i = 0; i < this.tests.length; i++) {
+            if (this.begun[i] && !this.ended[i]) {
+                found.push(this.tests[i]);
+            }
+        }
+        return found.toArray();
+    }
+
+    // The results of every finished test no unfinished test comes before, which have not been
+    // shown yet.
+    inOrder() -> string[] {
+        let shown = new List<string>();
+        while (this.shownThrough < this.tests.length && this.ended[this.shownThrough]) {
+            this.show(this.shownThrough, shown);
+            this.shownThrough++;
+        }
+        return shown.toArray();
+    }
+
+    show(long position, List<string> shown) {
+        let lines = this.held.get(position);
+        if (lines == null) {
+            return;
+        }
+        for (let line in lines) {
+            shown.push(line);
+        }
+        this.held.remove(position);
+    }
+
+    heldFor(long position) -> List<string> {
+        let lines = this.held.get(position);
+        if (lines != null) {
+            return lines;
+        }
+        let created = new List<string>();
+        this.held.set(position, created);
+        return created;
+    }
 }
 
-// Whether that result line reports a pass. It is only ever called on a line reportsResult has
-// already matched, so the two readings of one line cannot disagree about which test it belongs to.
-export reportsPass(string line, DiscoveredTest test) -> bool {
-    return line == "PASS " + test.description();
-}
-
-// What the code the runner ended with means, given how many of `tests` reported a result before it
-// ended. It ends with 0 when every test passed and 1 when some failed, having printed every result;
-// anything else, a 0 or a 1 before every result arrived included, means it stopped partway, on a
-// panic, an uncaught exception, an exit or a crash, and the test it stopped in is the one after the
-// last result that arrived. Running that test alone is suggested only when other tests ran with it.
-export outcomeOf(int runnerExit, DiscoveredTest[] tests, long finished) -> RunnerOutcome {
-    bool everyResultIn = finished == tests.length;
+// What the code the runner ended with means, given what it reported. It ends with 0 when every
+// test passed and 1 when some failed, having reported every result; anything else, a 0 or a 1
+// before every result arrived included, means it stopped partway, on a panic, an uncaught
+// exception, an exit or a crash, in one of the tests that had started and not finished.
+export outcomeOf(int runnerExit, DiscoveredTest[] tests, RunnerOutput output) -> RunnerOutcome {
+    bool everyResultIn = output.finished() == tests.length;
     if (runnerExit == 0 && everyResultIn) {
         return new RunnerOutcome(0, "");
     }
     if (runnerExit == 1 && everyResultIn) {
         return new RunnerOutcome(1, "");
     }
-    if (finished < 0 || finished >= tests.length) {
+    if (everyResultIn) {
         return new RunnerOutcome(2, "the test program ended with code {runnerExit} after all of "
             + "its tests had reported a result, so the failure is outside the tests");
     }
-    string stopped = tests[finished].description();
-    string message = "the test program stopped with code {runnerExit} while running '{stopped}'";
-    if (tests.length > 1) {
-        message = message + ". Run that test alone with 'ens test --filter \"{stopped}\"' to see "
-            + "its output";
+    DiscoveredTest[] running = output.running();
+    if (running.length == 0) {
+        return new RunnerOutcome(2, "the test program stopped with code {runnerExit} when no "
+            + "test was running, after {output.finished()} of {tests.length} had reported a "
+            + "result, so the failure is outside the tests");
     }
-    return new RunnerOutcome(2, message);
+    if (running.length == 1) {
+        string stopped = running[0].description();
+        string message = "the test program stopped with code {runnerExit} while running "
+            + "'{stopped}'";
+        if (tests.length > 1) {
+            message = message + ". Run that test alone with 'ens test --filter \"{stopped}\"' to "
+                + "see its output";
+        }
+        return new RunnerOutcome(2, message);
+    }
+    let names = new List<string>();
+    for (let one in running) {
+        names.push(one.description());
+    }
+    return new RunnerOutcome(2, "the test program stopped with code {runnerExit} while "
+        + report.quotedNames(names.toArray()) + " were running at the same time, so one of them "
+        + "stopped it. Run the tests one at a time with '--jobs 1' to see which");
 }

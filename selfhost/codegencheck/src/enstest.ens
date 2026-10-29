@@ -15,9 +15,12 @@ import TestPlan from @ens.build.testing.discovery;
 import @ens.build.testing.discovery;
 import Runner from @ens.build.testing.runner;
 import RunnerOverlay from @ens.build.testing.runner;
+import RunnerOutput from @ens.build.testing.runner;
 import @ens.build.testing.runner;
 import @ens.build.sources;
 import @ens.host.childexit;
+import @std.environment;
+import @std.text.parse;
 import Manifest from manifest;
 import Fixture from manifest;
 import Directives from directives;
@@ -69,10 +72,10 @@ public verify(Manifest manifest, Environment environment, Fixture fixture, Direc
         return "the test build failed: " + built.problem;
     }
 
-    let played = try play(build.executablePath(manifest, prefix), plan.tests());
-    let outcome = runner.outcomeOf(played.code, plan.tests(), played.finished);
+    let played = try play(build.executablePath(manifest, prefix), plan.tests(), asked.jobs);
+    let outcome = runner.outcomeOf(played.code, plan.tests(), played.output);
     return directives.compareRun(parsed, outcome.exitCode(),
-        accounted(built.explanation) + played.output, reported(outcome.failure()));
+        accounted(built.explanation) + played.text, reported(outcome.failure()));
 } catch (ProcessError e) {
     return e.message;
 }
@@ -87,35 +90,39 @@ accounted(string[] explanation) -> string {
     return gathered.toString();
 }
 
-// What playing a test run came to: everything the runner wrote, its results before what it wrote
-// to the error stream, and how many results had arrived when it ended.
+// What playing a test run came to: what the command would show, its results before what the
+// suite wrote to the error stream, and the runner's output as the command read it.
 class PlayedRun {
-    protected string output;
-    protected long finished;
+    protected string text;
+    protected RunnerOutput output;
     protected int code;
 
-    protected constructor(this.output, this.finished, this.code);
+    protected constructor(this.text, this.output, this.code);
 }
 
-// Runs the built suite and gathers what the command would show: the runner's results, then what a
-// test wrote to the error stream, which is the order the command passes the two streams on in. The
-// results are counted the way the command counts them, so a run that ended early names the same test.
-play(string suite, DiscoveredTest[] tests) -> PlayedRun throws {
-    let ran = try process.run(paths.native(suite), [], captureOutput: true);
+// Runs the built suite on `jobs` tasks and gathers what the command would show: the runner's
+// results in order, then what a test wrote to the error stream, which is the order the command
+// passes the two streams on in. The output is read the way the command reads it, so a run that
+// ended early names the same tests.
+play(string suite, DiscoveredTest[] tests, long jobs) -> PlayedRun throws {
+    let ran = try process.run(paths.native(suite), ["{jobs}"], captureOutput: true);
     let gathered = new StringBuilder();
-    long finished = 0;
+    let output = new RunnerOutput(tests);
     for (let line in linesOf(ran.stdout)) {
-        gathered.append(line);
-        gathered.append("\n");
-        if (finished < tests.length && runner.reportsResult(line, tests[finished])) {
-            finished = finished + 1;
+        for (let shown in output.accept(line)) {
+            gathered.append(shown);
+            gathered.append("\n");
         }
+    }
+    for (let shown in output.remaining()) {
+        gathered.append(shown);
+        gathered.append("\n");
     }
     for (let line in linesOf(ran.stderr)) {
         gathered.append(line);
         gathered.append("\n");
     }
-    return new PlayedRun(gathered.toString(), finished, childexit.exitCodeOf(ran.status));
+    return new PlayedRun(gathered.toString(), output, childexit.exitCodeOf(ran.status));
 }
 
 // The lines one stream held, with no line at all for a stream that held nothing.
@@ -144,20 +151,22 @@ seedsOf(TestPlan plan) -> string[] {
 }
 
 // What the command line requested: a filter, a tests folder, the account of what the optimizer
-// elided, or a token none of those.
+// elided, how many tests run at the same time, or a token none of those.
 class Arguments {
     protected string filter;
     protected Path testsRoot;
     protected bool explainArc;
+    protected long jobs;
     protected string problem;
 
-    protected constructor(this.filter, this.testsRoot, this.explainArc, this.problem);
+    protected constructor(this.filter, this.testsRoot, this.explainArc, this.jobs, this.problem);
 }
 
 readArguments(string[] arguments, Path sourceRoot) -> Arguments {
     string filter = "";
     Path testsRoot = Path("");
     bool explainArc = false;
+    long jobs = environment.processorCount();
     long next = 0;
     while (next < arguments.length) {
         string argument = arguments[next];
@@ -170,12 +179,16 @@ readArguments(string[] arguments, Path sourceRoot) -> Arguments {
         } else if (argument == "--explain-arc") {
             explainArc = true;
             next = next + 1;
+        } else if (argument == "--jobs" && next + 1 < arguments.length
+                && (parse.parseLong(arguments[next + 1]) ?? 0) >= 1) {
+            jobs = parse.parseLong(arguments[next + 1]) ?? 1;
+            next = next + 2;
         } else {
-            return new Arguments("", Path(""), false,
+            return new Arguments("", Path(""), false, 1,
                 "unsupported '@ens-test' argument '{argument}'");
         }
     }
-    return new Arguments(filter, testsRoot, explainArc, "");
+    return new Arguments(filter, testsRoot, explainArc, jobs, "");
 }
 
 // A line the command writes on its error stream.
