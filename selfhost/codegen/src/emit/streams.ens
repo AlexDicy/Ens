@@ -49,8 +49,10 @@ public writeRuntime(Runtime runtime) -> RuntimeFunction {
 
 // i32 ens_stream_read(ptr handle, ptr buffer, i64 capacity, ptr count): 0 with `count` holding what
 // arrived, which is 0 once the stream has ended, or the library's own number where nothing arrived
-// because the stream failed. A read that got some of what it requested is not a failure, so the
-// bytes are returned and the stream is read again.
+// because the stream failed. The stream's descriptor is read once, so a pipe or a terminal returns
+// what it holds rather than waiting for `capacity` bytes, and the stream is read again for more. A
+// read a signal interrupted is made again. The C library's buffer is never read through, which
+// holds because a stream is opened to be read or to be written, never both.
 public readRuntime(Runtime runtime) -> RuntimeFunction {
     let type = runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType,
         runtime.int64Type, runtime.pointerType]);
@@ -58,36 +60,72 @@ public readRuntime(Runtime runtime) -> RuntimeFunction {
     if (known != null) {
         return known;
     }
-    let read = runtime.libc("fread", runtime.int64Type.functionType([runtime.pointerType,
-        runtime.int64Type, runtime.int64Type, runtime.pointerType]));
-    let failed = runtime.libc("ferror", runtime.int32Type.functionType([runtime.pointerType]));
     let definition = runtime.beginDefinition("ens_stream_read", type);
     let builder = runtime.builder;
     let handle = runtime.parameter(definition, 0);
-    let arrived = runtime.call(read, [runtime.parameter(definition, 1), runtime.int64(1),
-        runtime.parameter(definition, 2), handle], "arrived");
-    memory.buildStore(builder, arrived, runtime.parameter(definition, 3));
-    let none = runtime.block(definition, "read.none");
+    let buffer = runtime.parameter(definition, 1);
+    let capacity = runtime.parameter(definition, 2);
+    let countSlot = runtime.parameter(definition, 3);
+    let attempt = runtime.block(definition, "read.attempt");
     let some = runtime.block(definition, "read.some");
-    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, arrived, runtime.int64(0),
-        "none"), none, some);
+    let failed = runtime.block(definition, "read.failed");
+    let again = runtime.block(definition, "read.again");
+    let broken = runtime.block(definition, "read.broken");
+    let descriptor = runtime.call(descriptorFunction(runtime), [handle], "descriptor");
+    instructions.buildBr(builder, attempt);
+
+    builder.positionAtEnd(attempt);
+    let arrived = readOnce(runtime, descriptor, buffer, capacity);
+    instructions.buildCondBr(builder, instructions.buildICmpSLT(builder, arrived,
+        runtime.int64(0), "failed"), failed, some);
 
     builder.positionAtEnd(some);
+    memory.buildStore(builder, arrived, countSlot);
     instructions.buildRet(builder, runtime.int32(0));
 
-    // Nothing arrived, which is the end of the stream unless the library also raised its flag.
-    builder.positionAtEnd(none);
-    let ended = runtime.block(definition, "read.ended");
-    let broken = runtime.block(definition, "read.broken");
-    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder,
-        runtime.call(failed, [handle], "failed"), runtime.int32(0), "ended"), ended, broken);
+    builder.positionAtEnd(failed);
+    let why = runtime.errnoValue();
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, why,
+        runtime.int32(Interrupted.number as int), "interrupted"), again, broken);
 
-    builder.positionAtEnd(ended);
-    instructions.buildRet(builder, runtime.int32(0));
+    builder.positionAtEnd(again);
+    instructions.buildBr(builder, attempt);
 
     builder.positionAtEnd(broken);
+    memory.buildStore(builder, runtime.int64(0), countSlot);
     instructions.buildRet(builder, reason(runtime));
     return runtime.endDefinition(definition);
+}
+
+// The C library's descriptor under a stream.
+descriptorFunction(Runtime runtime) -> RuntimeFunction {
+    let name = runtime.onWindows() ? "_fileno" : "fileno";
+    return runtime.libc(name, runtime.int32Type.functionType([runtime.pointerType]));
+}
+
+// One read of the descriptor into the buffer: the bytes that arrived, 0 at the end, or a negative
+// count where the read failed. Windows reads at most the largest count its 'unsigned int' holds.
+readOnce(Runtime runtime, Value descriptor, Value buffer, Value capacity) -> Value {
+    let builder = runtime.builder;
+    if (runtime.onWindows()) {
+        let read = runtime.libc("_read", runtime.int32Type.functionType([runtime.int32Type,
+            runtime.pointerType, runtime.int32Type]));
+        let bounded = instructions.buildSelect(builder, instructions.buildICmpSGT(builder,
+            capacity, runtime.int64(0x7FFFFFFF), ""), runtime.int64(0x7FFFFFFF), capacity,
+            "bounded");
+        let arrived = runtime.call(read, [descriptor, buffer,
+            instructions.buildTrunc(builder, bounded, runtime.int32Type, "")], "arrived");
+        return instructions.buildSExt(builder, arrived, runtime.int64Type, "arrived.wide");
+    }
+    let read = runtime.libc("read", runtime.int64Type.functionType([runtime.int32Type,
+        runtime.pointerType, runtime.int64Type]));
+    return runtime.call(read, [descriptor, buffer, capacity], "arrived");
+}
+
+// The number a read a signal interrupted fails with, which every POSIX target this compiler builds
+// for numbers the same. The Windows library never reports it from a read.
+final class Interrupted {
+    static const long number = 4;
 }
 
 // i32 ens_stream_flush(ptr handle): 0 once everything written has reached the operating system, or
