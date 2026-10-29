@@ -1,0 +1,247 @@
+// How a task waits for another to wake it. A waiter stands in a list for one wait, and waking it
+// once is all it takes: a second wake, from a deadline or a cancel that lost the race, does
+// nothing. A task on a context parks, leaving its worker to run others, and is queued to run again
+// when woken; a thread without a context, the program's main thread, a dedicated task's or one a
+// library made, sleeps on a lock of its own. Deadlines for parked tasks are kept by one timer
+// thread that sleeps until the nearest.
+import Atomic from @std.tasks;
+import TaskControl from @std.tasks;
+import List from @std.collections.list;
+import ThreadLock from @std.system;
+import @std.system;
+
+export shared final class Waiter {
+    const Atomic<bool> woken;
+    const TaskControl? task;
+    const ThreadLock? bed;
+
+    // A waiter for `task` when it runs on a context, and for the calling thread otherwise.
+    public constructor(TaskControl? task) {
+        this.woken = new Atomic<bool>(false);
+        ThreadLock? bed = null;
+        if (task == null) {
+            bed = system.createLock();
+        }
+        this.task = task;
+        this.bed = bed;
+    }
+
+    // Wakes the waiter, and returns whether this call was the one that did; later calls do
+    // nothing.
+    public wake() -> bool {
+        if (!this.woken.compareAndSet(false, true)) {
+            return false;
+        }
+        let task = this.task;
+        if (task != null) {
+            task.unpark();
+            return true;
+        }
+        let bed = this.bed;
+        if (bed != null) {
+            system.acquireLock(bed);
+            system.wakeLockWaiters(bed);
+            system.releaseLock(bed);
+        }
+        return true;
+    }
+
+    public isWoken() -> bool {
+        return this.woken.read();
+    }
+
+    // Waits until woken, or until `deadline` on the monotonic clock has passed when it is not
+    // negative. A task parks; a thread sleeps.
+    public await(long deadline) {
+        let task = this.task;
+        if (task != null) {
+            if (deadline >= 0) {
+                Clockwork.timers.wakeAt(deadline, this);
+            }
+            task.park();
+            return;
+        }
+        let bed = this.bed;
+        if (bed == null) {
+            return;
+        }
+        system.acquireLock(bed);
+        while (!this.woken.read()) {
+            long left = -1;
+            if (deadline >= 0) {
+                left = deadline - system.monotonicMillis();
+                if (left <= 0) {
+                    break;
+                }
+            }
+            system.waitOnLock(bed, left);
+        }
+        system.releaseLock(bed);
+    }
+
+    destructor() {
+        let bed = this.bed;
+        if (bed != null) {
+            system.destroyLock(bed);
+        }
+    }
+}
+
+// The waiters of one condition, in the order they arrived, guarded by the lock of the monitor they
+// wait under.
+export shared final class WaitList {
+    List<Waiter> waiters;
+
+    public constructor() {
+        this.waiters = new List<Waiter>();
+    }
+
+    public add(Waiter waiter) {
+        this.waiters.push(waiter);
+    }
+
+    public remove(Waiter waiter) {
+        let removed = this.waiters.remove(waiter);
+    }
+
+    // Wakes the waiter that has waited longest and is not woken already.
+    public wakeOne() {
+        while (!this.waiters.isEmpty()) {
+            if (this.waiters.removeAt(0).wake()) {
+                return;
+            }
+        }
+    }
+
+    public wakeAll() {
+        let waiting = this.waiters;
+        this.waiters = new List<Waiter>();
+        for (let waiter in waiting) {
+            let woke = waiter.wake();
+        }
+    }
+}
+
+// The timers, made the first time a parked task waits with a deadline.
+public final class Clockwork {
+    public lazy const Timers timers = new Timers();
+}
+
+// Deadlines in order, and the thread that sleeps until the nearest and then wakes its waiter or
+// runs its action.
+export shared final class Timers {
+    const ThreadLock lock;
+    List<Timer> heap;
+
+    protected constructor() {
+        this.lock = system.createLock();
+        this.heap = new List<Timer>();
+        let thread = system.startThread(() -> this.run());
+    }
+
+    // Wakes `waiter` once `deadline` on the monotonic clock has passed.
+    public wakeAt(long deadline, Waiter waiter) {
+        this.schedule(new Timer(deadline, waiter, null));
+    }
+
+    // Runs `action` on the timer thread once `deadline` has passed; it must not wait.
+    public runAt(long deadline, (shared () -> void) action) {
+        this.schedule(new Timer(deadline, null, action));
+    }
+
+    schedule(Timer timer) {
+        system.acquireLock(this.lock);
+        this.heap.push(timer);
+        this.siftUp(this.heap.length() - 1);
+        if (this.heap.get(0) == timer) {
+            system.wakeLockWaiters(this.lock);
+        }
+        system.releaseLock(this.lock);
+    }
+
+    run() {
+        while (true) {
+            system.acquireLock(this.lock);
+            while (this.heap.isEmpty()) {
+                system.waitOnLock(this.lock, -1);
+            }
+            let next = this.heap.get(0);
+            long left = next.deadline - system.monotonicMillis();
+            if (left > 0) {
+                system.waitOnLock(this.lock, left);
+                system.releaseLock(this.lock);
+                continue;
+            }
+            this.popTop();
+            system.releaseLock(this.lock);
+            next.fire();
+        }
+    }
+
+    popTop() {
+        let last = this.heap.pop();
+        if (!this.heap.isEmpty()) {
+            this.heap.set(0, last);
+            this.siftDown(0);
+        }
+    }
+
+    siftUp(long index) {
+        long at = index;
+        while (at > 0) {
+            long parent = (at - 1) / 2;
+            if (this.heap.get(parent).deadline <= this.heap.get(at).deadline) {
+                return;
+            }
+            this.swap(parent, at);
+            at = parent;
+        }
+    }
+
+    siftDown(long index) {
+        long at = index;
+        long length = this.heap.length();
+        while (true) {
+            long left = at * 2 + 1;
+            long right = left + 1;
+            long smallest = at;
+            if (left < length && this.heap.get(left).deadline < this.heap.get(smallest).deadline) {
+                smallest = left;
+            }
+            if (right < length
+                    && this.heap.get(right).deadline < this.heap.get(smallest).deadline) {
+                smallest = right;
+            }
+            if (smallest == at) {
+                return;
+            }
+            this.swap(at, smallest);
+            at = smallest;
+        }
+    }
+
+    swap(long first, long second) {
+        let held = this.heap.get(first);
+        this.heap.set(first, this.heap.get(second));
+        this.heap.set(second, held);
+    }
+}
+
+shared final class Timer {
+    const long deadline;
+    const Waiter? waiter;
+    const (shared () -> void)? action;
+
+    protected constructor(this.deadline, this.waiter, this.action);
+
+    protected fire() {
+        let waiter = this.waiter;
+        if (waiter != null) {
+            let woke = waiter.wake();
+        }
+        let action = this.action;
+        if (action != null) {
+            action();
+        }
+    }
+}

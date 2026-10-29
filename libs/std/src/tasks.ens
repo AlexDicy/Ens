@@ -1,14 +1,21 @@
 // Tasks, and the types for sharing state between them. Every operation on these classes is
-// thread-safe, so any number of tasks can hold the same instance. Each task runs on a thread of its
-// own.
+// thread-safe, so any number of tasks can hold the same instance. Tasks run over the pool of
+// threads in @std.tasks.scheduler, each on a stack of its own, and a task that waits leaves its
+// thread to the others until it is woken.
 import RawArray from @std.collections.rawarray;
 import Iterable from @std.collections.iterator;
 import Iterator from @std.collections.iterator;
 import List from @std.collections.list;
 import Map from @std.collections.map;
+import Context from @std.system;
 import NativeThread from @std.system;
+import RecordSlot from @std.system;
 import ThreadLock from @std.system;
 import @std.system;
+import Pool from @std.tasks.scheduler;
+import Clockwork from @std.tasks.waiting;
+import Waiter from @std.tasks.waiting;
+import WaitList from @std.tasks.waiting;
 
 // A value that tasks read and replace without a lock. The compiler turns 'read', 'write' and
 // 'compareAndSet' into the processor's atomic instructions, so the bodies below never run.
@@ -72,11 +79,13 @@ export shared final class Atomic<shared T> {
 // it never leaves the lock.
 export shared final class Mutex<T> {
     const Monitor guard;
+    const WaitList free;
     T value;
     long holder;
 
     export constructor(this.value) {
         this.guard = new Monitor();
+        this.free = new WaitList();
         this.holder = 0;
     }
 
@@ -115,12 +124,12 @@ export shared final class Mutex<T> {
     }
 
     enter() throws Cancelled {
-        long caller = system.threadToken();
+        long caller = system.taskToken();
         this.guard.enter();
         if (this.holder == caller) {
             this.guard.leave();
             string tried = "tried";
-            let control = Registry.running.current();
+            let control = Registry.current();
             if (control != null) {
                 let site = startSite(control.startedAt);
                 if (site != null) {
@@ -131,7 +140,7 @@ export shared final class Mutex<T> {
                 + "lock, which would wait for ever. Use the value that body was given instead");
         }
         while (this.holder != 0) {
-            if (!this.guard.waitUnlessCancelled(-1)) {
+            if (!this.guard.waitUnlessCancelled(this.free, -1)) {
                 this.guard.leave();
                 throw new Cancelled();
             }
@@ -143,7 +152,7 @@ export shared final class Mutex<T> {
     leave() {
         this.guard.enter();
         this.holder = 0;
-        this.guard.wakeAll();
+        this.free.wakeOne();
         this.guard.leave();
     }
 }
@@ -236,10 +245,15 @@ final class ChannelIterator<shared T> implements Iterator<T> {
     }
 }
 
-// The state both ends of a channel share: a ring buffer of values not yet received, and the lock
-// that guards every change to it.
+// The state both ends of a channel share: a ring buffer of values not yet received, the lock that
+// guards every change to it, and the tasks waiting for a value, for room, and for the receipt of
+// the value a send with no capacity handed over. Each wait wakes only the tasks it concerns, so a
+// channel with many waiting tasks costs each send one wake.
 shared final class ChannelState<shared T> {
     const Monitor lock;
+    const WaitList receivers;
+    const WaitList room;
+    const WaitList receipt;
     const long capacity;
     RawArray<T> slots;
     long head;
@@ -251,6 +265,9 @@ shared final class ChannelState<shared T> {
 
     protected constructor(this.capacity) {
         this.lock = new Monitor();
+        this.receivers = new WaitList();
+        this.room = new WaitList();
+        this.receipt = new WaitList();
         this.slots = RawArray<T>.allocate(this.capacity < 1 ? 1 : this.capacity);
         this.head = 0;
         this.count = 0;
@@ -263,7 +280,7 @@ shared final class ChannelState<shared T> {
     protected put(T value) throws ChannelClosed, Cancelled {
         this.lock.enter();
         while (!this.receiverReleased && this.count == this.slots.length()) {
-            if (!this.lock.waitUnlessCancelled(-1)) {
+            if (!this.lock.waitUnlessCancelled(this.room, -1)) {
                 this.lock.leave();
                 throw new Cancelled();
             }
@@ -275,10 +292,10 @@ shared final class ChannelState<shared T> {
         this.slots.write((this.head + this.count) % this.slots.length(), value);
         this.count++;
         long position = this.received + this.count;
-        this.lock.wakeAll();
+        this.receivers.wakeOne();
         if (this.capacity == 0) {
             while (!this.receiverReleased && this.received < position) {
-                if (!this.lock.waitUnlessCancelled(-1) && this.received < position) {
+                if (!this.lock.waitUnlessCancelled(this.receipt, -1) && this.received < position) {
                     this.withdraw();
                     throw new Cancelled();
                 }
@@ -296,7 +313,7 @@ shared final class ChannelState<shared T> {
     withdraw() {
         this.slots.clear(this.head);
         this.count--;
-        this.lock.wakeAll();
+        this.room.wakeOne();
         this.lock.leave();
     }
 
@@ -331,15 +348,16 @@ shared final class ChannelState<shared T> {
                 }
             }
             if (!cancellable) {
-                this.lock.wait(left);
-            } else if (!this.lock.waitUnlessCancelled(left)) {
+                this.lock.wait(this.receivers, left);
+            } else if (!this.lock.waitUnlessCancelled(this.receivers, left)) {
                 return false;
             }
         }
         return true;
     }
 
-    // Takes the value at the head, or null when there is none, and releases the lock.
+    // Takes the value at the head, or null when there is none, and releases the lock. The sender
+    // of a handed-over value is told of its receipt, and one sender waiting for room is given it.
     removeHead() -> T? {
         if (this.count == 0) {
             this.lock.leave();
@@ -350,7 +368,8 @@ shared final class ChannelState<shared T> {
         this.head = (this.head + 1) % this.slots.length();
         this.count--;
         this.received++;
-        this.lock.wakeAll();
+        this.receipt.wakeAll();
+        this.room.wakeOne();
         this.lock.leave();
         return value;
     }
@@ -377,14 +396,17 @@ shared final class ChannelState<shared T> {
     protected releaseSender() {
         this.lock.enter();
         this.senders--;
-        this.lock.wakeAll();
+        if (this.senders == 0) {
+            this.receivers.wakeAll();
+        }
         this.lock.leave();
     }
 
     protected releaseReceiver() {
         this.lock.enter();
         this.receiverReleased = true;
-        this.lock.wakeAll();
+        this.room.wakeAll();
+        this.receipt.wakeAll();
         this.lock.leave();
     }
 }
@@ -407,7 +429,7 @@ export scope<R, E: Error>(((TaskScope) -> R throws E) body) -> R throws E {
 // Returns whether the calling task was asked to stop, by its own 'cancel', by a scope it belongs to,
 // or by the task that started that scope.
 export isCancelled() -> bool {
-    let control = Registry.running.current();
+    let control = Registry.current();
     return control != null && control.isCancelled();
 }
 
@@ -426,17 +448,25 @@ export sleep(long millis) throws Cancelled {
         return;
     }
     long deadline = system.monotonicMillis() + millis;
-    let alarm = new Monitor();
-    alarm.enter();
-    long left = millis;
-    while (left > 0) {
-        if (!alarm.waitUnlessCancelled(left)) {
-            alarm.leave();
+    let control = Registry.current();
+    while (system.monotonicMillis() < deadline) {
+        if (control == null) {
+            new Waiter(null).await(deadline);
+            continue;
+        }
+        if (control.isCancelled()) {
             throw new Cancelled();
         }
-        left = deadline - system.monotonicMillis();
+        let waiter = control.waiter();
+        control.block(waiter);
+        if (!control.isCancelled()) {
+            waiter.await(deadline);
+        }
+        control.unblock();
+        if (control.isCancelled()) {
+            throw new Cancelled();
+        }
     }
-    alarm.leave();
 }
 
 // How urgently the system runs the thread of a task started with 'startDedicated'. A system that
@@ -459,7 +489,7 @@ export shared final class TaskScope {
     const ScopeState state;
 
     export constructor() {
-        this.state = new ScopeState(Registry.running.current());
+        this.state = new ScopeState(Registry.current());
     }
 
     // Starts `body` on another task at once and returns the task without waiting for it.
@@ -467,12 +497,10 @@ export shared final class TaskScope {
         let control = new TaskControl(this.state, system.captureTrace(8));
         let outcome = new TaskOutcome<T, E>(this.state.record(control.startedAt));
         this.state.begin(control, () -> {
-            Registry.running.enter(control);
             outcome.complete(body, control);
             if (outcome.threw()) {
                 this.state.cancel();
             }
-            Registry.running.leave();
         });
         return new Task<(() -> T throws E)>(control, outcome);
     }
@@ -481,11 +509,15 @@ export shared final class TaskScope {
     // `priority`, for a loop that must not share a thread, such as audio or rendering.
     export startDedicated<T, E: Error>(TaskPriority priority, (shared () -> T throws E) body)
             -> Task<(() -> T throws E)> {
-        int level = priority as int;
-        return this.start(() -> {
-            system.raiseThreadPriority(level);
-            return try body();
+        let control = new TaskControl(this.state, system.captureTrace(8));
+        let outcome = new TaskOutcome<T, E>(this.state.record(control.startedAt));
+        this.state.beginDedicated(control, priority as int, () -> {
+            outcome.complete(body, control);
+            if (outcome.threw()) {
+                this.state.cancel();
+            }
         });
+        return new Task<(() -> T throws E)>(control, outcome);
     }
 
     // Starts `body`, which returns nothing, on another task, for work nobody waits for. The body
@@ -493,11 +525,7 @@ export shared final class TaskScope {
     // nothing cancelled, it aborts the program.
     export launch((shared () -> void throws Cancelled) body) {
         let control = new TaskControl(this.state, system.captureTrace(8));
-        this.state.begin(control, () -> {
-            Registry.running.enter(control);
-            runLaunched(body, control);
-            Registry.running.leave();
-        });
+        this.state.begin(control, () -> runLaunched(body, control));
     }
 
     // Asks every task in the scope to stop.
@@ -539,7 +567,7 @@ export shared final class Task<shared () -> T throws E> {
     // task that awaits a task waiting for it, directly or through others, aborts the program
     // instead of waiting for ever, and a task cancelled while it waits throws 'Cancelled'.
     export await() -> T throws E, Cancelled {
-        let waiting = Registry.running.current();
+        let waiting = Registry.current();
         waiting?.startAwaiting(this.control);
         return try this.outcome.take(waiting);
     }
@@ -550,58 +578,98 @@ export shared final class Task<shared () -> T throws E> {
     }
 }
 
-// Which task runs on each thread, so a body can ask whether its task was asked to stop.
+// Which task runs on the calling thread: the one its worker runs when the thread is the pool's,
+// the one registered under the thread's token when the thread is a dedicated task's, and none
+// otherwise.
 final class Registry {
-    protected lazy const RunningTasks running = new RunningTasks();
+    protected lazy const DedicatedTasks dedicated = new DedicatedTasks();
+    protected lazy const Atomic<long> tokens = new Atomic<long>(0);
+
+    // The task running on the calling thread, or null outside every task.
+    protected static current() -> TaskControl? {
+        if (system.readThreadSlot(RecordSlot.worker) != 0) {
+            return Pool.scheduler.currentWorker()?.running();
+        }
+        if (system.readThreadSlot(RecordSlot.task) == 0) {
+            return null;
+        }
+        return Registry.dedicated.current();
+    }
+
+    // A token no two tasks share, and never zero.
+    protected static nextToken() -> long {
+        return Registry.tokens.increment();
+    }
 }
 
-shared final class RunningTasks {
+// The tasks running on threads of their own, by the token their thread carries.
+shared final class DedicatedTasks {
     const ThreadLock lock;
-    Map<long, TaskControl> byThread;
+    Map<long, TaskControl> byToken;
 
     protected constructor() {
         this.lock = system.createLock();
-        this.byThread = new Map<long, TaskControl>();
+        this.byToken = new Map<long, TaskControl>();
     }
 
     protected enter(TaskControl control) {
         system.acquireLock(this.lock);
-        this.byThread.set(system.threadToken(), control);
+        this.byToken.set(control.token, control);
         system.releaseLock(this.lock);
+        system.writeThreadSlot(RecordSlot.task, control.token);
     }
 
-    protected leave() {
+    protected leave(TaskControl control) {
+        system.writeThreadSlot(RecordSlot.task, 0);
         system.acquireLock(this.lock);
-        let removed = this.byThread.remove(system.threadToken());
+        let removed = this.byToken.remove(control.token);
         system.releaseLock(this.lock);
     }
 
-    // The task running on the calling thread, or null outside every task.
     protected current() -> TaskControl? {
         system.acquireLock(this.lock);
-        let control = this.byThread.get(system.threadToken());
+        let control = this.byToken.get(system.readThreadSlot(RecordSlot.task));
         system.releaseLock(this.lock);
         return control;
     }
 }
 
+// What a task's waiter and its worker agree on about a park: the task is running, it is parked, or
+// it was woken before it finished parking and runs on at once.
+final class ParkState {
+    protected static const long running = 0;
+    protected static const long parked = 1;
+    protected static const long wakePending = 2;
+}
+
 // Whether one task was asked to stop, the scope it belongs to, what it is waiting on, and the
-// scopes it started, whose tasks a cancel of this one wakes as well.
-shared final class TaskControl {
+// scopes it started, whose tasks a cancel of this one wakes as well; and, for the scheduler, the
+// body the task runs, the context it runs on, and whether it has parked or ended.
+export shared final class TaskControl {
     const ScopeState scope;
-    const long[] startedAt;
+    protected const long[] startedAt;
+    public const long token;
     const Atomic<bool> cancelled;
     const Atomic<TaskControl?> awaiting;
+    public const Atomic<bool> finished;
+    const Atomic<long> parkState;
     const ThreadLock lock;
-    Monitor? blockedOn;
+    Waiter? blockedOn;
     List<ScopeState> scopes;
+    public (shared () -> void)? body;
+    public Context? context;
 
     protected constructor(this.scope, this.startedAt) {
+        this.token = Registry.nextToken();
         this.cancelled = new Atomic<bool>(false);
         this.awaiting = new Atomic<TaskControl?>(null);
+        this.finished = new Atomic<bool>(false);
+        this.parkState = new Atomic<long>(ParkState.running);
         this.lock = system.createLock();
         this.blockedOn = null;
         this.scopes = new List<ScopeState>();
+        this.body = null;
+        this.context = null;
     }
 
     // Records that this task waits for `target`, and aborts the program when `target` waits for
@@ -633,10 +701,19 @@ shared final class TaskControl {
         return this.cancelled.read() || this.scope.isCancelled();
     }
 
-    // Records that the task waits on `monitor`, which the task holds.
-    protected block(Monitor monitor) {
+    // A waiter for this task: one that parks it when it runs on the pool, one that puts its thread
+    // to sleep when it has a thread of its own.
+    protected waiter() -> Waiter {
+        if (this.body == null) {
+            return new Waiter(null);
+        }
+        return new Waiter(this);
+    }
+
+    // Records that the task waits on `waiter`.
+    protected block(Waiter waiter) {
         system.acquireLock(this.lock);
-        this.blockedOn = monitor;
+        this.blockedOn = waiter;
         system.releaseLock(this.lock);
     }
 
@@ -662,16 +739,54 @@ shared final class TaskControl {
     // them checks again whether it was cancelled.
     protected wake() {
         system.acquireLock(this.lock);
-        let monitor = this.blockedOn;
+        let waiter = this.blockedOn;
         let started = this.scopes.toArray();
         system.releaseLock(this.lock);
-        if (monitor != null) {
-            monitor.enter();
-            monitor.wakeAll();
-            monitor.leave();
+        if (waiter != null) {
+            let woke = waiter.wake();
         }
         for (let scope in started) {
             scope.wakeTasks();
+        }
+    }
+
+    // Leaves the task's context for its worker's until the task is queued and run again. Only the
+    // task itself calls this, on its own context.
+    public park() {
+        let context = this.context;
+        let worker = Pool.scheduler.currentWorker();
+        if (context == null || worker == null) {
+            panic("Internal: a task parked off its context");
+        }
+        system.switchContext(context, worker.homeContext());
+    }
+
+    // What the worker does once the task has left its context without ending: records the park,
+    // or runs the task on at once when a wake arrived first.
+    public completePark() {
+        if (this.parkState.compareAndSet(ParkState.running, ParkState.parked)) {
+            return;
+        }
+        this.parkState.write(ParkState.running);
+        Pool.scheduler.makeRunnable(this);
+    }
+
+    // Queues the task to run again, or notes the wake for a park that is still under way.
+    public unpark() {
+        while (true) {
+            long state = this.parkState.read();
+            if (state == ParkState.parked) {
+                if (this.parkState.compareAndSet(ParkState.parked, ParkState.running)) {
+                    Pool.scheduler.makeRunnable(this);
+                    return;
+                }
+            } else if (state == ParkState.running) {
+                if (this.parkState.compareAndSet(ParkState.running, ParkState.wakePending)) {
+                    return;
+                }
+            } else {
+                return;
+            }
         }
     }
 
@@ -680,8 +795,8 @@ shared final class TaskControl {
     }
 }
 
-// A lock that tasks wait on until another task wakes them. A task cancelled while it waits on one
-// is woken, which is why the task keeps a reference to it for as long as it waits.
+// A lock that tasks wait under, each on one of its wait lists, until another task wakes them. A task
+// cancelled while it waits is woken through the waiter it keeps for as long as it waits.
 shared final class Monitor {
     const ThreadLock lock;
 
@@ -697,31 +812,42 @@ shared final class Monitor {
         system.releaseLock(this.lock);
     }
 
-    protected wakeAll() {
-        system.wakeLockWaiters(this.lock);
-    }
-
-    // Waits, with the monitor held, until it is woken or `millis` milliseconds pass, with no limit
-    // when `millis` is negative.
-    protected wait(long millis) {
-        system.waitOnLock(this.lock, millis);
+    // Waits, with the monitor held, on `list` until woken or `millis` milliseconds pass, with no
+    // limit when `millis` is negative. The monitor is held again on return.
+    protected wait(WaitList list, long millis) {
+        let control = Registry.current();
+        let waiter = control == null ? new Waiter(null) : control.waiter();
+        this.waitWith(waiter, list, millis);
     }
 
     // Like 'wait', but returns false, without waiting or as soon as it is woken, when the calling
     // task is cancelled.
-    protected waitUnlessCancelled(long millis) -> bool {
-        let control = Registry.running.current();
+    protected waitUnlessCancelled(WaitList list, long millis) -> bool {
+        let control = Registry.current();
         if (control == null) {
-            this.wait(millis);
+            this.wait(list, millis);
             return true;
         }
-        control.block(this);
+        let waiter = control.waiter();
+        control.block(waiter);
         bool waiting = !control.isCancelled();
         if (waiting) {
-            this.wait(millis);
+            this.waitWith(waiter, list, millis);
         }
         control.unblock();
         return waiting && !control.isCancelled();
+    }
+
+    waitWith(Waiter waiter, WaitList list, long millis) {
+        long deadline = -1;
+        if (millis >= 0) {
+            deadline = system.monotonicMillis() + millis;
+        }
+        list.add(waiter);
+        this.leave();
+        waiter.await(deadline);
+        this.enter();
+        list.remove(waiter);
     }
 
     destructor() {
@@ -839,6 +965,7 @@ final class Kept<T> {
 // What one task's body returned or threw, once it has finished.
 shared final class TaskOutcome<T, E: Error> {
     const Monitor lock;
+    const WaitList awaiters;
     const FailureRecord record;
     Kept<T>? result;
     E? failure;
@@ -847,6 +974,7 @@ shared final class TaskOutcome<T, E: Error> {
 
     protected constructor(this.record) {
         this.lock = new Monitor();
+        this.awaiters = new WaitList();
         this.result = null;
         this.failure = null;
         this.done = false;
@@ -861,7 +989,7 @@ shared final class TaskOutcome<T, E: Error> {
         this.lock.enter();
         this.result = new Kept<T>(value);
         this.done = true;
-        this.lock.wakeAll();
+        this.awaiters.wakeAll();
         this.lock.leave();
     } catch (E thrown) {
         this.lock.enter();
@@ -870,7 +998,7 @@ shared final class TaskOutcome<T, E: Error> {
         if (!stoppedAsAsked(thrown, control)) {
             this.record.fail(thrown);
         }
-        this.lock.wakeAll();
+        this.awaiters.wakeAll();
         this.lock.leave();
     }
 
@@ -883,7 +1011,7 @@ shared final class TaskOutcome<T, E: Error> {
     protected take(TaskControl? waiting) -> T throws E, Cancelled {
         this.lock.enter();
         while (!this.done) {
-            if (!this.lock.waitUnlessCancelled(-1)) {
+            if (!this.lock.waitUnlessCancelled(this.awaiters, -1)) {
                 this.lock.leave();
                 waiting?.stopAwaiting();
                 throw new Cancelled();
@@ -930,13 +1058,13 @@ shared final class TaskOutcome<T, E: Error> {
     }
 }
 
-// The tasks of one scope: the threads still to be waited for, whether the scope was asked to stop,
-// and whether it has ended.
+// The tasks of one scope: those still running, the threads of its dedicated tasks, whether the
+// scope was asked to stop, and whether it has ended.
 shared final class ScopeState {
-    const ThreadLock lock;
+    const Monitor lock;
+    const WaitList emptied;
     const TaskControl? owner;
     List<NativeThread> threads;
-    List<NativeThread> timers;
     List<FailureRecord> records;
     Map<long, TaskControl> running;
     long started;
@@ -944,9 +1072,9 @@ shared final class ScopeState {
     bool ended;
 
     protected constructor(this.owner) {
-        this.lock = system.createLock();
+        this.lock = new Monitor();
+        this.emptied = new WaitList();
         this.threads = new List<NativeThread>();
-        this.timers = new List<NativeThread>();
         this.records = new List<FailureRecord>();
         this.running = new Map<long, TaskControl>();
         this.started = 0;
@@ -960,116 +1088,130 @@ shared final class ScopeState {
 
     protected record(long[] startedAt) -> FailureRecord {
         let created = new FailureRecord(startedAt);
-        system.acquireLock(this.lock);
+        this.lock.enter();
         this.records.push(created);
-        system.releaseLock(this.lock);
+        this.lock.leave();
         return created;
     }
 
-    // Starts `work` for the task `control` controls on a thread of its own.
+    // Starts `work` for the task `control` controls on the pool.
     protected begin(TaskControl control, (shared () -> void) work) {
-        system.acquireLock(this.lock);
+        long task = this.admit(control);
+        control.body = () -> {
+            work();
+            this.finish(task);
+            control.finished.write(true);
+        };
+        Pool.scheduler.makeRunnable(control);
+    }
+
+    // Starts `work` for the task `control` controls on a thread of its own at `priority`.
+    protected beginDedicated(TaskControl control, int priority, (shared () -> void) work) {
+        long task = this.admit(control);
+        this.lock.enter();
+        this.threads.push(system.startThread(() -> {
+            system.raiseThreadPriority(priority);
+            Registry.dedicated.enter(control);
+            work();
+            Registry.dedicated.leave(control);
+            this.finish(task);
+        }));
+        this.lock.leave();
+    }
+
+    // Counts a task in, and panics when the scope has ended.
+    admit(TaskControl control) -> long {
+        this.lock.enter();
         if (this.ended) {
-            system.releaseLock(this.lock);
+            this.lock.leave();
             panic("tried to start a task in a scope that has ended. Start it while the scope's body "
                 + "runs, or in a scope that is still open");
         }
         long task = this.started;
         this.started++;
         this.running.set(task, control);
-        this.threads.push(system.startThread(() -> {
-            work();
-            this.finish(task);
-        }));
-        system.releaseLock(this.lock);
+        this.lock.leave();
+        return task;
     }
 
     finish(long task) {
-        system.acquireLock(this.lock);
+        this.lock.enter();
         let removed = this.running.remove(task);
-        system.releaseLock(this.lock);
+        if (this.running.isEmpty()) {
+            this.emptied.wakeAll();
+        }
+        this.lock.leave();
     }
 
     protected cancel() {
-        system.acquireLock(this.lock);
+        this.lock.enter();
         this.cancelled = true;
-        system.releaseLock(this.lock);
+        this.lock.leave();
         this.wakeTasks();
     }
 
     // Wakes every task of the scope from the wait it is in.
     protected wakeTasks() {
         let controls = new List<TaskControl>();
-        system.acquireLock(this.lock);
+        this.lock.enter();
         controls.pushAll(this.running.values());
-        system.releaseLock(this.lock);
+        this.lock.leave();
         for (let control in controls) {
             control.wake();
         }
     }
 
     protected isCancelled() -> bool {
-        system.acquireLock(this.lock);
+        this.lock.enter();
         bool asked = this.cancelled;
-        system.releaseLock(this.lock);
+        this.lock.leave();
         let started = this.owner;
         return asked || (started != null && started.isCancelled());
     }
 
-    // Starts a timer that cancels the scope at the deadline, or ends with the scope if that is first.
+    // Sets a timer that cancels the scope at the deadline, unless the scope has ended by then.
     protected cancelAfter(long millis) {
         long deadline = system.monotonicMillis() + millis;
-        system.acquireLock(this.lock);
+        this.lock.enter();
         if (this.ended) {
-            system.releaseLock(this.lock);
+            this.lock.leave();
             panic("tried to set a deadline on a scope that has ended. Call 'cancelAfter' while the "
                 + "scope's body runs");
         }
-        this.timers.push(system.startThread(() -> this.cancelAt(deadline)));
-        system.releaseLock(this.lock);
+        this.lock.leave();
+        Clockwork.timers.runAt(deadline, () -> this.cancelIfOpen());
     }
 
-    cancelAt(long deadline) {
-        system.acquireLock(this.lock);
-        long left = deadline - system.monotonicMillis();
-        while (!this.ended && left > 0) {
-            system.waitOnLock(this.lock, left);
-            left = deadline - system.monotonicMillis();
-        }
-        bool due = !this.ended;
-        system.releaseLock(this.lock);
-        if (due) {
+    cancelIfOpen() {
+        this.lock.enter();
+        bool open = !this.ended;
+        this.lock.leave();
+        if (open) {
             this.cancel();
         }
     }
 
     // Waits for every task the scope started, including any they start meanwhile, then ends the
-    // scope and its timers. When `reporting` is set, a task that threw and that nothing awaited
-    // aborts the program here.
+    // scope. When `reporting` is set, a task that threw and that nothing awaited aborts the program
+    // here.
     protected end(bool reporting) {
-        while (true) {
-            system.acquireLock(this.lock);
-            if (this.threads.isEmpty()) {
-                this.ended = true;
-                system.wakeLockWaiters(this.lock);
-                system.releaseLock(this.lock);
-                break;
-            }
-            let thread = this.threads.pop();
-            system.releaseLock(this.lock);
-            system.joinThread(thread);
+        this.lock.enter();
+        while (!this.running.isEmpty()) {
+            this.lock.wait(this.emptied, -1);
         }
-        while (!this.timers.isEmpty()) {
-            system.joinThread(this.timers.pop());
+        this.ended = true;
+        let threads = this.threads;
+        this.threads = new List<NativeThread>();
+        let finished = this.records;
+        this.records = new List<FailureRecord>();
+        this.lock.leave();
+        for (let thread in threads) {
+            system.joinThread(thread);
         }
         let parent = this.owner;
         if (parent != null) {
             parent.disown(this);
         }
-        system.acquireLock(this.lock);
-        let finished = this.records;
-        this.records = new List<FailureRecord>();
-        system.releaseLock(this.lock);
         if (reporting) {
             for (let record in finished) {
                 if (record.unhandled()) {
@@ -1077,9 +1219,5 @@ shared final class ScopeState {
                 }
             }
         }
-    }
-
-    destructor() {
-        system.destroyLock(this.lock);
     }
 }

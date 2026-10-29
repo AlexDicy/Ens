@@ -1,0 +1,488 @@
+// The pool of threads every task runs over. A processor holds a queue of tasks ready to run and the
+// contexts tasks left free; a worker is a thread that holds one processor at a time, runs the tasks
+// of its queue, takes from the global queue when that is empty and steals from another processor
+// when both are. A task leaves its worker only when it waits or ends, and resumes on whichever
+// worker takes it next. The pool starts with the first task a program starts and has as many
+// processors as the program has to run on. A supervisor thread ticks beside the workers and hands
+// the processor of a worker that has been inside one call for a whole tick to another thread, so a
+// call that blocks in the system stops no other task.
+import Atomic from @std.tasks;
+import TaskControl from @std.tasks;
+import FrozenList from @std.collections.frozen;
+import List from @std.collections.list;
+import RawArray from @std.collections.rawarray;
+import Context from @std.system;
+import RecordSlot from @std.system;
+import ThreadLock from @std.system;
+import ThreadRecord from @std.system;
+import @std.environment;
+import @std.system;
+
+// The pool, made the first time a task is started.
+public final class Pool {
+    public lazy const Scheduler scheduler = new Scheduler();
+}
+
+final class Sizes {
+    // What every task's stack reserves, as a thread's does, so a task recurses as deeply as 'main'.
+    protected static const long stackBytes = 8388608;
+    // The contexts a processor keeps for its next tasks rather than giving their stacks back.
+    protected static const long keptContexts = 64;
+    // How long the supervisor sleeps between ticks: the shortest while something happened, growing
+    // to the longest while nothing does.
+    protected static const long shortestTickMillis = 1;
+    protected static const long longestTickMillis = 10;
+    // The ticks a call lasts before its processor is taken although nothing waits for one.
+    protected static const long patientTicks = 10;
+}
+
+public shared final class Scheduler {
+    const ThreadLock lock;
+    const FrozenList<Processor> processors;
+    const Atomic<FrozenList<Worker>> workers;
+    const List<Worker> idle;
+    const TaskQueue global;
+
+    protected constructor() {
+        this.lock = system.createLock();
+        long count = environment.processorCount();
+        let made = new List<Processor>();
+        for (long i = 0; i < count; i++) {
+            made.push(new Processor(i));
+        }
+        this.processors = made.frozen();
+        this.workers = new Atomic<FrozenList<Worker>>(new List<Worker>().frozen());
+        this.idle = new List<Worker>();
+        this.global = new TaskQueue();
+        for (long i = 0; i < count; i++) {
+            this.addWorker();
+        }
+        let supervisor = system.startThread(() -> this.supervise());
+    }
+
+    // The worker running the calling thread, or null on the program's main thread, a dedicated
+    // task's thread or a thread a library made.
+    public currentWorker() -> Worker? {
+        long slot = system.readThreadSlot(RecordSlot.worker);
+        if (slot == 0) {
+            return null;
+        }
+        return this.workers.read().get(slot - 1);
+    }
+
+    // Queues a task that can run: on the calling worker's processor when it holds one, on the
+    // global queue otherwise. An idle worker is woken when more than one task waits on the
+    // processor, since the worker itself runs the first once its current task leaves, and always
+    // for the global queue.
+    public makeRunnable(TaskControl task) {
+        let processor = this.currentWorker()?.heldProcessor();
+        if (processor != null) {
+            if (processor.queue.push(task) > 1) {
+                this.wakeIdle();
+            }
+            return;
+        }
+        let queued = this.global.push(task);
+        this.wakeIdle();
+    }
+
+    // Starts a worker thread and returns it.
+    addWorker() -> Worker {
+        system.acquireLock(this.lock);
+        let current = this.workers.read();
+        let worker = new Worker(this, current.length());
+        let grown = new List<Worker>();
+        for (let existing in current) {
+            grown.push(existing);
+        }
+        grown.push(worker);
+        this.workers.write(grown.frozen());
+        system.releaseLock(this.lock);
+        let thread = system.startThread(() -> worker.run());
+        return worker;
+    }
+
+    // A processor nothing holds, now held by `worker`, or null when every processor is held.
+    protected freeProcessor(Worker worker) -> Processor? {
+        for (let processor in this.processors) {
+            if (processor.owner.compareAndSet(0, worker.index + 1)) {
+                return processor;
+            }
+        }
+        return null;
+    }
+
+    // Moves half of another processor's queue to `own` and returns the first of them, or null when
+    // no other processor has a task. The search starts after `own`, so the processors are not all
+    // robbing the same one.
+    protected steal(Processor own) -> TaskControl? {
+        long count = this.processors.length();
+        for (long step = 1; step < count; step++) {
+            let victim = this.processors.get((own.index + step) % count);
+            let taken = victim.queue.moveHalfInto(own.queue);
+            if (taken != null) {
+                return taken;
+            }
+        }
+        return null;
+    }
+
+    protected takeGlobal() -> TaskControl? {
+        return this.global.pop();
+    }
+
+    // Records a worker as idle, before it looks a last time and sleeps.
+    protected registerIdle(Worker worker) {
+        system.acquireLock(this.lock);
+        this.idle.push(worker);
+        system.releaseLock(this.lock);
+    }
+
+    protected unregisterIdle(Worker worker) {
+        system.acquireLock(this.lock);
+        let removed = this.idle.remove(worker);
+        system.releaseLock(this.lock);
+    }
+
+    // Wakes one idle worker, if there is one.
+    wakeIdle() {
+        let sleeping = this.popIdle();
+        if (sleeping != null) {
+            sleeping.wake();
+        }
+    }
+
+    popIdle() -> Worker? {
+        system.acquireLock(this.lock);
+        Worker? sleeping = null;
+        if (!this.idle.isEmpty()) {
+            sleeping = this.idle.pop();
+        }
+        system.releaseLock(this.lock);
+        return sleeping;
+    }
+
+    // Ticks, and hands the processor of every worker stuck in a call to another thread.
+    supervise() {
+        let clock = system.createLock();
+        long pause = Sizes.shortestTickMillis;
+        while (true) {
+            long tick = system.advanceMonitorTick();
+            bool busy = false;
+            for (let worker in this.workers.read()) {
+                let record = worker.record;
+                if (record == null) {
+                    continue;
+                }
+                long since = system.readRecordSlot(record, RecordSlot.call);
+                if (since == 0) {
+                    continue;
+                }
+                busy = true;
+                if (since <= tick - 2) {
+                    this.handOff(worker, since <= tick - Sizes.patientTicks);
+                }
+            }
+            if (busy) {
+                pause = Sizes.shortestTickMillis;
+            } else if (pause < Sizes.longestTickMillis) {
+                pause = pause * 2;
+                if (pause > Sizes.longestTickMillis) {
+                    pause = Sizes.longestTickMillis;
+                }
+            }
+            system.acquireLock(clock);
+            system.waitOnLock(clock, pause);
+            system.releaseLock(clock);
+        }
+    }
+
+    // Takes the processor from a worker inside a long call when a task waits for it, or when the
+    // call has lasted long enough that one may soon, and sees that another thread runs it.
+    handOff(Worker worker, bool patient) {
+        let processor = worker.processor.read();
+        if (processor == null) {
+            return;
+        }
+        if (!patient && processor.queue.length() == 0 && this.global.length() == 0) {
+            return;
+        }
+        if (!processor.owner.compareAndSet(worker.index + 1, 0)) {
+            return;
+        }
+        let sleeping = this.popIdle();
+        if (sleeping != null) {
+            sleeping.wake();
+            return;
+        }
+        let started = this.addWorker();
+    }
+}
+
+// A queue of tasks ready to run and the contexts tasks left free, held by one worker at a time.
+public shared final class Processor {
+    protected const long index;
+    protected const TaskQueue queue;
+    protected const Atomic<long> owner;
+    const ThreadLock lock;
+    List<Context> kept;
+
+    protected constructor(this.index) {
+        this.queue = new TaskQueue();
+        this.owner = new Atomic<long>(0);
+        this.lock = system.createLock();
+        this.kept = new List<Context>();
+    }
+
+    // A context a task left, or null when none is kept.
+    protected takeContext() -> Context? {
+        system.acquireLock(this.lock);
+        Context? context = null;
+        if (!this.kept.isEmpty()) {
+            context = this.kept.pop();
+        }
+        system.releaseLock(this.lock);
+        return context;
+    }
+
+    // Keeps a context a task left for the next one, or gives its stack back when enough are kept.
+    protected keepContext(Context context) {
+        system.acquireLock(this.lock);
+        bool full = this.kept.length() >= Sizes.keptContexts;
+        if (!full) {
+            this.kept.push(context);
+        }
+        system.releaseLock(this.lock);
+        if (full) {
+            system.releaseContext(context);
+        }
+    }
+}
+
+// A thread of the pool.
+public shared final class Worker {
+    const Scheduler scheduler;
+    protected const long index;
+    const ThreadLock lock;
+    protected const Atomic<Processor?> processor;
+    Context? home;
+    protected ThreadRecord? record;
+    TaskControl? current;
+    bool woken;
+
+    protected constructor(this.scheduler, this.index) {
+        this.lock = system.createLock();
+        this.processor = new Atomic<Processor?>(null);
+        this.home = null;
+        this.record = null;
+        this.current = null;
+        this.woken = false;
+    }
+
+    // The task running on this worker, or null between tasks.
+    public running() -> TaskControl? {
+        return this.current;
+    }
+
+    // The thread's own context, which a task switches to when it parks.
+    public homeContext() -> Context {
+        let home = this.home;
+        if (home == null) {
+            panic("Internal: a task parked on a worker that has not started");
+        }
+        return home;
+    }
+
+    // The processor this worker holds, or null once the supervisor has taken it away.
+    protected heldProcessor() -> Processor? {
+        let held = this.processor.read();
+        if (held == null) {
+            return null;
+        }
+        if (held.owner.read() != this.index + 1) {
+            this.processor.write(null);
+            return null;
+        }
+        return held;
+    }
+
+    protected run() {
+        this.home = system.adoptContext();
+        this.record = system.threadRecord();
+        system.writeThreadSlot(RecordSlot.worker, this.index + 1);
+        while (true) {
+            this.execute(this.nextTask());
+        }
+    }
+
+    // The next task to run, found on this worker's processor, the global queue or another
+    // processor, with the worker sleeping until one appears.
+    nextTask() -> TaskControl {
+        while (true) {
+            let processor = this.heldProcessor() ?? this.acquireProcessor();
+            if (processor == null) {
+                this.scheduler.registerIdle(this);
+                this.sleep();
+                continue;
+            }
+            let found = this.lookFor(processor);
+            if (found != null) {
+                return found;
+            }
+            this.scheduler.registerIdle(this);
+            let late = this.lookFor(processor);
+            if (late != null) {
+                this.scheduler.unregisterIdle(this);
+                return late;
+            }
+            this.sleep();
+        }
+    }
+
+    acquireProcessor() -> Processor? {
+        let taken = this.scheduler.freeProcessor(this);
+        this.processor.write(taken);
+        return taken;
+    }
+
+    lookFor(Processor processor) -> TaskControl? {
+        return processor.queue.pop() ?? this.scheduler.takeGlobal() ?? this.scheduler.steal(processor);
+    }
+
+    // Runs a task until it parks or ends.
+    execute(TaskControl task) {
+        let context = task.context ?? this.contextFor(task);
+        this.current = task;
+        system.writeThreadSlot(RecordSlot.task, task.token);
+        system.switchContext(this.homeContext(), context);
+        system.writeThreadSlot(RecordSlot.task, 0);
+        this.current = null;
+        if (task.finished.read()) {
+            task.context = null;
+            task.body = null;
+            let processor = this.heldProcessor();
+            if (processor != null) {
+                processor.keepContext(context);
+            } else {
+                system.releaseContext(context);
+            }
+            return;
+        }
+        task.completePark();
+    }
+
+    // A context for a task that never ran: one its processor kept, or a new one, given the body.
+    contextFor(TaskControl task) -> Context {
+        let body = task.body;
+        if (body == null) {
+            panic("Internal: a task without a body was queued to run");
+        }
+        let context = this.heldProcessor()?.takeContext() ?? system.createContext(Sizes.stackBytes);
+        system.setContextBody(context, body);
+        task.context = context;
+        return context;
+    }
+
+    // Sleeps until woken.
+    sleep() {
+        system.acquireLock(this.lock);
+        while (!this.woken) {
+            system.waitOnLock(this.lock, -1);
+        }
+        this.woken = false;
+        system.releaseLock(this.lock);
+    }
+
+    protected wake() {
+        system.acquireLock(this.lock);
+        this.woken = true;
+        system.wakeLockWaiters(this.lock);
+        system.releaseLock(this.lock);
+    }
+}
+
+// A first-in, first-out queue of tasks under a lock, as a ring that grows when it is full.
+public shared final class TaskQueue {
+    const ThreadLock lock;
+    RawArray<TaskControl> slots;
+    long head;
+    long count;
+
+    public constructor() {
+        this.lock = system.createLock();
+        this.slots = RawArray<TaskControl>.allocate(16);
+        this.head = 0;
+        this.count = 0;
+    }
+
+    // Adds a task at the back and returns how many the queue holds.
+    public push(TaskControl task) -> long {
+        system.acquireLock(this.lock);
+        if (this.count == this.slots.length()) {
+            this.grow();
+        }
+        this.slots.write((this.head + this.count) % this.slots.length(), task);
+        this.count++;
+        long queued = this.count;
+        system.releaseLock(this.lock);
+        return queued;
+    }
+
+    public pop() -> TaskControl? {
+        system.acquireLock(this.lock);
+        let task = this.popHeld();
+        system.releaseLock(this.lock);
+        return task;
+    }
+
+    public length() -> long {
+        system.acquireLock(this.lock);
+        long queued = this.count;
+        system.releaseLock(this.lock);
+        return queued;
+    }
+
+    // Moves half of this queue, rounded up, to `into`, and returns the first task moved, which
+    // `into` does not receive, or null when this queue is empty.
+    public moveHalfInto(TaskQueue into) -> TaskControl? {
+        system.acquireLock(this.lock);
+        long moving = (this.count + 1) / 2;
+        let moved = new List<TaskControl>();
+        for (long i = 0; i < moving; i++) {
+            let task = this.popHeld();
+            if (task != null) {
+                moved.push(task);
+            }
+        }
+        system.releaseLock(this.lock);
+        if (moved.isEmpty()) {
+            return null;
+        }
+        for (long i = 1; i < moved.length(); i++) {
+            let queued = into.push(moved.get(i));
+        }
+        return moved.get(0);
+    }
+
+    popHeld() -> TaskControl? {
+        if (this.count == 0) {
+            return null;
+        }
+        let task = this.slots.read(this.head);
+        this.slots.clear(this.head);
+        this.head = (this.head + 1) % this.slots.length();
+        this.count--;
+        return task;
+    }
+
+    grow() {
+        let wider = RawArray<TaskControl>.allocate(this.slots.length() * 2);
+        for (long i = 0; i < this.count; i++) {
+            long from = (this.head + i) % this.slots.length();
+            wider.write(i, this.slots.read(from));
+            this.slots.clear(from);
+        }
+        this.slots = wider;
+        this.head = 0;
+    }
+}
