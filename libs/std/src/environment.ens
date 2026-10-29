@@ -1,10 +1,12 @@
 // What surrounds the running program, which is the variables it was given, the arguments it was
 // started with, and where it runs.
 import Path from @std.fs;
+import FileSystemError from @std.fs.error;
 import List from @std.collections.list;
 import Map from @std.collections.map;
 import Platform from @std.platform;
 import @std.system;
+import @std.text.parse;
 
 // The system this program was built for, which was fixed when it was compiled and cannot change
 // while it runs.
@@ -25,6 +27,87 @@ export arguments() -> string[] {
 // The path of the running program itself, or null when the operating system would not report it.
 export executablePath() -> Path? {
     return pathFrom((buffer, capacity) -> system.executablePathInto(buffer, capacity));
+}
+
+// How many processors this program can run on, and at least one: those the system lets its
+// threads use, and fewer when a Linux control group pays it for less processor time than that. It
+// is counted the first time it is asked for, and the same count is returned from then on.
+export processorCount() -> long {
+    return Processors.available;
+}
+
+final class Processors {
+    protected lazy const long available = countedProcessors();
+}
+
+countedProcessors() -> long {
+    long allowed = system.processorCount();
+    if (platform() != Platform.Linux) {
+        return allowed;
+    }
+    long? paid = controlGroupProcessors();
+    if (paid != null && paid < allowed) {
+        return paid;
+    }
+    return allowed;
+}
+
+// The processors the tightest CPU quota pays for, among the program's control group and every
+// group above it, or null when none of them sets one. Only the unified hierarchy of version 2 is
+// read; a system still on version 1 counts as unlimited.
+controlGroupProcessors() -> long? {
+    string? member = unifiedGroup(try Path("/proc/self/cgroup").readText());
+    if (member == null) {
+        return null;
+    }
+    Path root = Path("/sys/fs/cgroup");
+    Path? folder = member == "/" ? root : Path(root.toString() + member);
+    long? tightest = null;
+    while (folder != null) {
+        long? paid = quotaIn(folder);
+        if (paid != null && (tightest == null || paid < tightest)) {
+            tightest = paid;
+        }
+        if (folder == root) {
+            break;
+        }
+        folder = folder.parent();
+    }
+    return tightest;
+} catch (FileSystemError unreadable) {
+    return null;
+}
+
+quotaIn(Path folder) -> long? {
+    return quotaProcessors(try folder.join("cpu.max").readText());
+} catch (FileSystemError unset) {
+    return null;
+}
+
+// The group a '/proc/self/cgroup' text places the program in within the unified hierarchy, written
+// from that hierarchy's root, or null when the text names none.
+public unifiedGroup(string listed) -> string? {
+    for (let line in listed.lines()) {
+        if (line.startsWith("0::")) {
+            return line.substring(3, line.length).trimEnd();
+        }
+    }
+    return null;
+}
+
+// The processors one 'cpu.max' text pays for, its quota over its period rounded up, or null when
+// its quota is 'max'.
+public quotaProcessors(string cpuMax) -> long? {
+    string[] fields = cpuMax.trim().split(" ");
+    if (fields.length != 2) {
+        return null;
+    }
+    long? quota = parse.parseLong(fields[0]);
+    long? period = parse.parseLong(fields[1]);
+    if (quota == null || period == null || quota <= 0 || period <= 0) {
+        return null;
+    }
+    return (quota + period - 1) / period;
 }
 
 // The directory the program was started in, or "." when the operating system would not report it.
