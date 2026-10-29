@@ -1,0 +1,97 @@
+// The context bridges each platform is given, held to the verifier from whichever host runs the
+// suite. On macOS and Linux a context maps a stack of its own under a guard and switches through
+// the module's own assembly; on Windows it is a fiber and switches through the system's call.
+import @std.testing;
+import @ens.llvm.target;
+import Architecture from @ens.target.triple;
+import EmissionHost from support;
+import emit.contexts;
+
+// The module's text once one target's adopt, create, switch and release bridges are emitted.
+moduleText(string triple) -> string throws {
+    let host = new EmissionHost("contexts_{triple}");
+    host.retarget(triple);
+    let runtime = host.runtime;
+    runtime.call(contexts.adoptRuntime(runtime), [], "home");
+    runtime.call(contexts.createRuntime(runtime), [runtime.int64(8388608), runtime.nullPointer()],
+        "cell");
+    runtime.call(contexts.switchRuntime(runtime), [runtime.nullPointer(), runtime.nullPointer()],
+        "");
+    runtime.call(contexts.releaseRuntime(runtime), [runtime.nullPointer()], "");
+    string text = host.text();
+    try host.finish();
+    return text;
+}
+
+test "a POSIX context maps its stack under a guard and switches through the module's assembly" {
+    for (let triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
+            "aarch64-apple-darwin23"]) {
+        string text = try moduleText(triple);
+        bool darwin = triple.indexOf("apple") >= 0;
+        string flags = darwin ? "i32 4162" : "i32 147490";
+        try testing.assertTrue(text.indexOf("@mmap(ptr null, i64 %total, i32 3, {flags}, i32 -1, i64 0)")
+            >= 0, "'{triple}' does not map the stack with its system's flags: {text}");
+        try testing.assertTrue(text.indexOf("@mprotect(ptr %base, i64 65536, i32 0)") >= 0,
+            "'{triple}' leaves the stack without a guard: {text}");
+        try testing.assertTrue(text.indexOf("@munmap(ptr %base, i64 %bytes)") >= 0,
+            "'{triple}' does not unmap a released stack: {text}");
+        string swap = darwin ? "_ens_context_swap:" : "ens_context_swap:";
+        try testing.assertTrue(text.indexOf("module asm") >= 0 && text.indexOf(swap) >= 0,
+            "'{triple}' has no switch in its assembly: {text}");
+        try testing.assertTrue(text.indexOf("store ptr @ens_context_trampoline, ptr") >= 0
+            && text.indexOf("store ptr @ens_context_entry, ptr") >= 0,
+            "'{triple}' does not hand the first frame the trampoline and the entry: {text}");
+        try testing.assertTrue(text.indexOf("Fiber") < 0,
+            "'{triple}' reaches a fiber call: {text}");
+    }
+}
+
+test "a Windows context is a fiber the system switches" {
+    string text = try moduleText("x86_64-pc-windows-msvc");
+    try testing.assertTrue(text.indexOf("@CreateFiberEx(i64 0, i64 %0, i32 1, ptr @ens_context_entry, ptr %cell)")
+        >= 0, "Windows does not make the fiber on the context's stack: {text}");
+    try testing.assertTrue(text.indexOf("@ConvertThreadToFiberEx(ptr null, i32 1)") >= 0,
+        "Windows does not adopt the thread as a fiber: {text}");
+    try testing.assertTrue(text.indexOf("@SwitchToFiber(ptr %fiber)") >= 0,
+        "Windows does not switch through the system: {text}");
+    try testing.assertTrue(text.indexOf("@DeleteFiber(ptr %fiber)") >= 0
+        && text.indexOf("@ConvertFiberToThread()") >= 0,
+        "Windows does not release a fiber or give the thread its stack back: {text}");
+    try testing.assertTrue(text.indexOf("mmap") < 0 && text.indexOf("ens_context_swap") < 0,
+        "Windows reaches the POSIX stack or the assembly switch: {text}");
+}
+
+test "the assembly for each processor saves the registers a call keeps and ends the stack walk" {
+    string arm64Darwin = contexts.assemblyFor(Architecture.Arm64, true);
+    try testing.assertTrue(arm64Darwin.indexOf("_ens_context_swap:\n") >= 0
+        && arm64Darwin.indexOf("_ens_context_trampoline:\n") >= 0,
+        "macOS symbols carry no underscore: {arm64Darwin}");
+    try testing.assertTrue(arm64Darwin.indexOf(".type") < 0 && arm64Darwin.indexOf(".size") < 0,
+        "macOS is given ELF directives: {arm64Darwin}");
+    string arm64Linux = contexts.assemblyFor(Architecture.Arm64, false);
+    try testing.assertTrue(arm64Linux.indexOf(".type ens_context_swap, %function") >= 0
+        && arm64Linux.indexOf(".size ens_context_trampoline, .-ens_context_trampoline") >= 0,
+        "Linux arm64 lacks its symbol kinds and sizes: {arm64Linux}");
+    for (let text in [arm64Darwin, arm64Linux]) {
+        try testing.assertTrue(text.indexOf("stp x19, x20, [sp, #0]") >= 0
+            && text.indexOf("stp x29, x30, [sp, #80]") >= 0
+            && text.indexOf("stp d14, d15, [sp, #144]") >= 0
+            && text.indexOf("ldp d14, d15, [sp, #144]") >= 0,
+            "arm64 does not save and restore every callee-saved register: {text}");
+        try testing.assertTrue(text.indexOf(".cfi_undefined x30") >= 0
+            && text.indexOf("blr x20") >= 0 && text.indexOf("mov x0, x19") >= 0,
+            "the arm64 trampoline does not call the entry with the cell under an ended walk: {text}");
+    }
+    string x64 = contexts.assemblyFor(Architecture.X64, false);
+    for (let register in ["%rbp", "%rbx", "%r12", "%r13", "%r14", "%r15"]) {
+        try testing.assertTrue(x64.indexOf("pushq {register}") >= 0
+            && x64.indexOf("popq {register}") >= 0,
+            "x86-64 does not save and restore {register}: {x64}");
+    }
+    try testing.assertTrue(x64.indexOf("movq %rsp, (%rdi)") >= 0
+        && x64.indexOf("movq %rsi, %rsp") >= 0,
+        "x86-64 does not store the old stack and load the new: {x64}");
+    try testing.assertTrue(x64.indexOf(".cfi_undefined %rip") >= 0
+        && x64.indexOf("movq %rbx, %rdi") >= 0 && x64.indexOf("callq *%r12") >= 0,
+        "the x86-64 trampoline does not call the entry with the cell under an ended walk: {x64}");
+}

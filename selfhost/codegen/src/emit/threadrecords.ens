@@ -1,0 +1,407 @@
+// The record a thread keeps for the task runtime, in slots the standard library reads and writes by
+// number: the task running on the thread, the monitor tick at which the call it is inside began,
+// and which worker the thread is. The record lives in the thread-local storage the system
+// provides, under one key the first thread to ask makes, and a thread that never asked has none,
+// which tells a thread the runtime started from one a foreign library made. Code generation writes
+// the call slot around every call that may block in the system, which is what lets the monitor hand
+// a stuck thread's work to another thread.
+import TypeRef from @ens.llvm.types;
+import Value from @ens.llvm.values;
+import @ens.llvm.globals;
+import @ens.llvm.instructions;
+import @ens.llvm.memory;
+import Linkage from @ens.llvm.globals;
+import AtomicOrdering from @ens.llvm.memory;
+import Runtime from emit.runtime;
+import RuntimeFunction from emit.runtime;
+import emit.clock;
+import emit.threads;
+
+// The slots, eight bytes each, and what a key's state word says.
+final class ThreadRecord {
+    protected static const long task = 0;
+    protected static const long call = 1;
+    protected static const long slotBytes = 8;
+    protected static const long bytes = 32;
+}
+
+final class KeyState {
+    protected static const long none = 0;
+    protected static const long making = 1;
+    protected static const long ready = 2;
+    protected static const long pauseMillis = 1;
+    // TLS_OUT_OF_INDEXES, what TlsAlloc returns when Windows has no slot left.
+    protected static const long noWindowsSlot = 0xFFFFFFFF;
+}
+
+// ptr ens_thread_record(): the calling thread's record, made the first time it is asked for, or
+// null when there is no memory for it.
+public recordRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.pointerType.functionType([]);
+    let known = runtime.existing("ens_thread_record", type);
+    if (known != null) {
+        return known;
+    }
+    let key = keyRuntime(runtime);
+    let allocate = runtime.calloc();
+    let definition = runtime.beginDefinition("ens_thread_record", type);
+    let builder = runtime.builder;
+    let missing = runtime.block(definition, "record.missing");
+    let made = runtime.block(definition, "record.made");
+    let present = runtime.block(definition, "record.present");
+    let keyValue = runtime.call(key, [], "key");
+    let found = getSpecific(runtime, keyValue);
+    instructions.buildCondBr(builder, runtime.isNull(found), missing, present);
+
+    builder.positionAtEnd(present);
+    instructions.buildRet(builder, found);
+
+    builder.positionAtEnd(missing);
+    let fresh = runtime.call(allocate, [runtime.int64(1), runtime.int64(ThreadRecord.bytes)],
+        "made");
+    instructions.buildCondBr(builder, runtime.isNull(fresh), present, made);
+
+    builder.positionAtEnd(made);
+    setSpecific(runtime, keyValue, fresh);
+    instructions.buildRet(builder, fresh);
+    return runtime.endDefinition(definition);
+}
+
+// ptr ens_thread_record_existing(): the calling thread's record, or null when it never asked for
+// one. Nothing is made, so a program that starts no task never touches the system's storage.
+public existingRecordRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.pointerType.functionType([]);
+    let known = runtime.existing("ens_thread_record_existing", type);
+    if (known != null) {
+        return known;
+    }
+    let state = keyStateGlobal(runtime);
+    let keySlot = keyGlobal(runtime);
+    let definition = runtime.beginDefinition("ens_thread_record_existing", type);
+    let builder = runtime.builder;
+    let none = runtime.block(definition, "existing.none");
+    let keyed = runtime.block(definition, "existing.keyed");
+    let ready = runtime.loadCount(state, AtomicOrdering.acquire);
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, ready,
+        runtime.int64(KeyState.ready), "ready"), keyed, none);
+
+    builder.positionAtEnd(none);
+    instructions.buildRet(builder, runtime.nullPointer());
+
+    builder.positionAtEnd(keyed);
+    instructions.buildRet(builder, getSpecific(runtime,
+        memory.buildLoad(builder, runtime.int64Type, keySlot, "key")));
+    return runtime.endDefinition(definition);
+}
+
+// i64 ens_thread_record_read(i64 slot): the slot of the calling thread's record, and 0 when it
+// has none.
+public readRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int64Type.functionType([runtime.int64Type]);
+    let known = runtime.existing("ens_thread_record_read", type);
+    if (known != null) {
+        return known;
+    }
+    let existing = existingRecordRuntime(runtime);
+    let definition = runtime.beginDefinition("ens_thread_record_read", type);
+    let builder = runtime.builder;
+    let slot = runtime.parameter(definition, 0);
+    let none = runtime.block(definition, "read.none");
+    let present = runtime.block(definition, "read.present");
+    let record = runtime.call(existing, [], "record");
+    instructions.buildCondBr(builder, runtime.isNull(record), none, present);
+
+    builder.positionAtEnd(none);
+    instructions.buildRet(builder, runtime.int64(0));
+
+    builder.positionAtEnd(present);
+    instructions.buildRet(builder, loadSlot(runtime, record, slot));
+    return runtime.endDefinition(definition);
+}
+
+// void ens_thread_record_write(i64 slot, i64 value): writes the slot of the calling thread's
+// record, making the record first when the thread has none.
+public writeRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.voidType.functionType([runtime.int64Type, runtime.int64Type]);
+    let known = runtime.existing("ens_thread_record_write", type);
+    if (known != null) {
+        return known;
+    }
+    let record = recordRuntime(runtime);
+    let definition = runtime.beginDefinition("ens_thread_record_write", type);
+    let builder = runtime.builder;
+    let slot = runtime.parameter(definition, 0);
+    let value = runtime.parameter(definition, 1);
+    let none = runtime.block(definition, "write.none");
+    let present = runtime.block(definition, "write.present");
+    let found = runtime.call(record, [], "record");
+    instructions.buildCondBr(builder, runtime.isNull(found), none, present);
+
+    builder.positionAtEnd(none);
+    instructions.buildRetVoid(builder);
+
+    builder.positionAtEnd(present);
+    storeSlot(runtime, found, slot, value);
+    instructions.buildRetVoid(builder);
+    return runtime.endDefinition(definition);
+}
+
+// i64 ens_record_read(ptr record, i64 slot): the slot of any thread's record, for the monitor.
+public recordReadRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int64Type.functionType([runtime.pointerType, runtime.int64Type]);
+    let known = runtime.existing("ens_record_read", type);
+    if (known != null) {
+        return known;
+    }
+    let definition = runtime.beginDefinition("ens_record_read", type);
+    instructions.buildRet(runtime.builder, loadSlot(runtime, runtime.parameter(definition, 0),
+        runtime.parameter(definition, 1)));
+    return runtime.endDefinition(definition);
+}
+
+// i64 ens_task_token(): a number no two running tasks share, and never zero: the task the calling
+// thread runs, or the thread itself when it runs none.
+public taskTokenRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int64Type.functionType([]);
+    let known = runtime.existing("ens_task_token", type);
+    if (known != null) {
+        return known;
+    }
+    let existing = existingRecordRuntime(runtime);
+    let definition = runtime.beginDefinition("ens_task_token", type);
+    let builder = runtime.builder;
+    let ownThread = runtime.block(definition, "token.thread");
+    let recorded = runtime.block(definition, "token.recorded");
+    let record = runtime.call(existing, [], "record");
+    instructions.buildCondBr(builder, runtime.isNull(record), ownThread, recorded);
+
+    builder.positionAtEnd(recorded);
+    let task = loadSlot(runtime, record, runtime.int64(ThreadRecord.task));
+    let taskless = runtime.block(definition, "token.taskless");
+    let tasked = runtime.block(definition, "token.tasked");
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, task, runtime.int64(0),
+        "no.task"), taskless, tasked);
+
+    builder.positionAtEnd(tasked);
+    instructions.buildRet(builder, task);
+
+    builder.positionAtEnd(taskless);
+    instructions.buildBr(builder, ownThread);
+
+    builder.positionAtEnd(ownThread);
+    instructions.buildRet(builder, threads.threadToken(runtime));
+    return runtime.endDefinition(definition);
+}
+
+// i64 ens_monitor_tick_advance(): moves the monitor's tick on by one and returns the new tick,
+// which is never zero.
+public tickAdvanceRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int64Type.functionType([]);
+    let known = runtime.existing("ens_monitor_tick_advance", type);
+    if (known != null) {
+        return known;
+    }
+    let tick = tickGlobal(runtime);
+    let definition = runtime.beginDefinition("ens_monitor_tick_advance", type);
+    let builder = runtime.builder;
+    let previous = memory.buildAtomicAdd(builder, tick, runtime.int64(1),
+        AtomicOrdering.acquireRelease);
+    instructions.buildRet(builder, instructions.buildAdd(builder, previous, runtime.int64(1),
+        "tick"));
+    return runtime.endDefinition(definition);
+}
+
+// ptr ens_call_enter(): marks the calling thread as inside a call that may block, with the
+// monitor's current tick, and returns its record for the matching leave; null when the thread has
+// no record, so a thread outside the runtime costs nothing more than the check.
+public callEnterRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.pointerType.functionType([]);
+    let known = runtime.existing("ens_call_enter", type);
+    if (known != null) {
+        return known;
+    }
+    let existing = existingRecordRuntime(runtime);
+    let tick = tickGlobal(runtime);
+    let definition = runtime.beginDefinition("ens_call_enter", type);
+    let builder = runtime.builder;
+    let none = runtime.block(definition, "enter.none");
+    let present = runtime.block(definition, "enter.present");
+    let record = runtime.call(existing, [], "record");
+    instructions.buildCondBr(builder, runtime.isNull(record), none, present);
+
+    builder.positionAtEnd(none);
+    instructions.buildRet(builder, runtime.nullPointer());
+
+    builder.positionAtEnd(present);
+    storeSlot(runtime, record, runtime.int64(ThreadRecord.call),
+        runtime.loadCount(tick, AtomicOrdering.monotonic));
+    instructions.buildRet(builder, record);
+    return runtime.endDefinition(definition);
+}
+
+// void ens_call_leave(ptr record): clears the call mark 'ens_call_enter' set, given what it
+// returned.
+public callLeaveRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.voidType.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_call_leave", type);
+    if (known != null) {
+        return known;
+    }
+    let definition = runtime.beginDefinition("ens_call_leave", type);
+    let builder = runtime.builder;
+    let record = runtime.parameter(definition, 0);
+    let none = runtime.block(definition, "leave.none");
+    let present = runtime.block(definition, "leave.present");
+    instructions.buildCondBr(builder, runtime.isNull(record), none, present);
+
+    builder.positionAtEnd(none);
+    instructions.buildRetVoid(builder);
+
+    builder.positionAtEnd(present);
+    storeSlot(runtime, record, runtime.int64(ThreadRecord.call), runtime.int64(0));
+    instructions.buildRetVoid(builder);
+    return runtime.endDefinition(definition);
+}
+
+// i64 ens_thread_key(): the key every record is kept under, made by the first thread to ask while
+// the others wait for it.
+keyRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int64Type.functionType([]);
+    let known = runtime.existing("ens_thread_key", type);
+    if (known != null) {
+        return known;
+    }
+    let state = keyStateGlobal(runtime);
+    let keySlot = keyGlobal(runtime);
+    let sleep = clock.sleepMillisRuntime(runtime);
+    let definition = runtime.beginDefinition("ens_thread_key", type);
+    let builder = runtime.builder;
+    let look = runtime.block(definition, "key.look");
+    let ready = runtime.block(definition, "key.ready");
+    let claim = runtime.block(definition, "key.claim");
+    let make = runtime.block(definition, "key.make");
+    let pause = runtime.block(definition, "key.pause");
+    instructions.buildBr(builder, look);
+
+    builder.positionAtEnd(look);
+    let current = runtime.loadCount(state, AtomicOrdering.acquire);
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, current,
+        runtime.int64(KeyState.ready), "is.ready"), ready, claim);
+
+    builder.positionAtEnd(ready);
+    instructions.buildRet(builder, memory.buildLoad(builder, runtime.int64Type, keySlot, "key"));
+
+    builder.positionAtEnd(claim);
+    let exchanged = memory.buildAtomicCompareExchange(builder, state,
+        runtime.int64(KeyState.none), runtime.int64(KeyState.making),
+        AtomicOrdering.acquireRelease, AtomicOrdering.acquire);
+    instructions.buildCondBr(builder, instructions.buildExtractValue(builder, exchanged, 1, "won"),
+        make, pause);
+
+    builder.positionAtEnd(make);
+    makeKey(runtime, keySlot);
+    let made = memory.buildStore(builder, runtime.int64(KeyState.ready), state);
+    memory.setOrdering(made, AtomicOrdering.release);
+    memory.setAlignment(made, 8);
+    instructions.buildBr(builder, look);
+
+    builder.positionAtEnd(pause);
+    runtime.call(sleep, [runtime.int64(KeyState.pauseMillis)], "");
+    instructions.buildBr(builder, look);
+    return runtime.endDefinition(definition);
+}
+
+// Makes the system's thread-local key and writes it into the eight-byte slot, which was zero, so
+// a system whose key is four bytes wide leaves the rest zero.
+makeKey(Runtime runtime, Value keySlot) {
+    if (runtime.onWindows()) {
+        let allocate = runtime.libc("TlsAlloc", runtime.int32Type.functionType([]));
+        let index = runtime.call(allocate, [], "index");
+        memory.buildStore(runtime.builder, instructions.buildZExt(runtime.builder, index,
+            runtime.int64Type, "key"), keySlot);
+        return;
+    }
+    let create = runtime.libc("pthread_key_create",
+        runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType]));
+    runtime.call(create, [keySlot, runtime.free().function], "");
+}
+
+// The record the system keeps under the key for the calling thread, or null.
+getSpecific(Runtime runtime, Value key) -> Value {
+    if (runtime.onWindows()) {
+        let get = runtime.libc("TlsGetValue",
+            runtime.pointerType.functionType([runtime.int32Type]));
+        return runtime.call(get, [narrowKey(runtime, key, "key.get")], "record");
+    }
+    let get = runtime.libc("pthread_getspecific",
+        runtime.pointerType.functionType([keyType(runtime)]));
+    return runtime.call(get, [narrowKey(runtime, key, "key.get")], "record");
+}
+
+setSpecific(Runtime runtime, Value key, Value record) {
+    if (runtime.onWindows()) {
+        let set = runtime.libc("TlsSetValue",
+            runtime.int32Type.functionType([runtime.int32Type, runtime.pointerType]));
+        runtime.call(set, [narrowKey(runtime, key, "key.set"), record], "");
+        return;
+    }
+    let set = runtime.libc("pthread_setspecific",
+        runtime.int32Type.functionType([keyType(runtime), runtime.pointerType]));
+    runtime.call(set, [narrowKey(runtime, key, "key.set"), record], "");
+}
+
+// A key is four bytes wide everywhere but on macOS, where it is eight.
+keyType(Runtime runtime) -> TypeRef {
+    if (runtime.onDarwin()) {
+        return runtime.int64Type;
+    }
+    return runtime.int32Type;
+}
+
+narrowKey(Runtime runtime, Value key, string name) -> Value {
+    if (runtime.onDarwin()) {
+        return key;
+    }
+    return instructions.buildTrunc(runtime.builder, key, runtime.int32Type, name);
+}
+
+loadSlot(Runtime runtime, Value record, Value slot) -> Value {
+    let at = memory.buildGEP(runtime.builder, runtime.int64Type, record, [slot], "slot");
+    return runtime.loadCount(at, AtomicOrdering.monotonic);
+}
+
+storeSlot(Runtime runtime, Value record, Value slot, Value value) {
+    let at = memory.buildGEP(runtime.builder, runtime.int64Type, record, [slot], "slot");
+    let store = memory.buildStore(runtime.builder, value, at);
+    memory.setOrdering(store, AtomicOrdering.monotonic);
+    memory.setAlignment(store, 8);
+}
+
+keyStateGlobal(Runtime runtime) -> Value {
+    return sharedGlobal(runtime, "ens_thread_key_state");
+}
+
+keyGlobal(Runtime runtime) -> Value {
+    return sharedGlobal(runtime, "ens_thread_key");
+}
+
+tickGlobal(Runtime runtime) -> Value {
+    return sharedGlobal(runtime, "ens_monitor_tick");
+}
+
+// A zero-initialized word every module of the program defines alike and the linker keeps one of,
+// since a key and a tick are the whole program's.
+sharedGlobal(Runtime runtime, string name) -> Value {
+    let found = globals.getNamedGlobal(runtime.module, name);
+    if (found != null) {
+        return found;
+    }
+    let added = globals.addGlobal(runtime.module, runtime.int64Type, name);
+    globals.setInitializer(added, runtime.int64(0));
+    globals.setLinkage(added, Linkage.linkOnceOdrSymbol);
+    globals.setAlignment(added, 8);
+    if (!runtime.onDarwin()) {
+        globals.setComdat(added, runtime.module.comdat(name));
+    }
+    return added;
+}

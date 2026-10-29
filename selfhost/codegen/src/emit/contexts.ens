@@ -1,0 +1,513 @@
+// Execution contexts, which the task runtime schedules tasks over: a stack of its own, the
+// registers that resume it, and the switch from one to another on a thread. A context runs the
+// '() -> void' function value it was last given and, when that returns, switches back to the
+// context that resumed it and waits for the next body, so one stack serves task after task. On
+// macOS and Linux the switch is assembly in the module, saving the callee-saved registers on the
+// stack it leaves and loading them from the stack it enters; on Windows a context is a fiber, whose
+// switch also moves the stack bounds the system's stack walker reads.
+import Architecture from @ens.target.triple;
+import TypeRef from @ens.llvm.types;
+import Value from @ens.llvm.values;
+import @ens.llvm.instructions;
+import @ens.llvm.memory;
+import Runtime from emit.runtime;
+import RuntimeFunction from emit.runtime;
+
+// The cell a context is: the stack pointer saved when it last left, or the fiber on Windows; the
+// body it runs next; the context that resumed it last; and the stack it owns, which an adopted
+// thread's context has none of.
+final class ContextCell {
+    protected static const long saved = 0;
+    protected static const long body = 8;
+    protected static const long resumedBy = 16;
+    protected static const long stackBase = 24;
+    protected static const long stackBytes = 32;
+    protected static const long bytes = 40;
+}
+
+// The frame a new stack starts with, which the first switch into it returns through: the registers
+// the switch restores, holding the cell and the entry function in the two the trampoline reads,
+// and the trampoline as the return address.
+final class FirstFrame {
+    protected static const long arm64Bytes = 160;
+    protected static const long arm64Cell = 0;
+    protected static const long arm64Entry = 8;
+    protected static const long arm64Return = 88;
+    protected static const long x64Bytes = 56;
+    protected static const long x64Entry = 24;
+    protected static const long x64Cell = 32;
+    protected static const long x64Return = 48;
+}
+
+// How a stack is mapped: readable and writable above a guard of inaccessible pages, with the
+// system told not to reserve memory for pages never touched.
+final class StackMapping {
+    protected static const long guardBytes = 65536;
+    protected static const long readWrite = 3;
+    protected static const long inaccessible = 0;
+    // MAP_PRIVATE, MAP_ANONYMOUS, MAP_NORESERVE and MAP_STACK.
+    protected static const long linuxFlags = 0x24022;
+    // MAP_PRIVATE, MAP_ANON and MAP_NORESERVE.
+    protected static const long darwinFlags = 0x1042;
+    protected static const long noMemory = 12;
+}
+
+final class Fibers {
+    // FIBER_FLAG_FLOAT_SWITCH, so a switch carries the floating-point state across.
+    protected static const long floatSwitch = 1;
+}
+
+// ptr ens_context_adopt(): the calling thread's own stack as a context, so the thread can switch
+// to others and be switched back to, or null when there is no memory for it or, on Windows, the
+// thread is a fiber already.
+public adoptRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.pointerType.functionType([]);
+    let known = runtime.existing("ens_context_adopt", type);
+    if (known != null) {
+        return known;
+    }
+    let allocate = runtime.calloc();
+    let definition = runtime.beginDefinition("ens_context_adopt", type);
+    let builder = runtime.builder;
+    let cell = runtime.call(allocate, [runtime.int64(1), runtime.int64(ContextCell.bytes)], "cell");
+    if (!runtime.onWindows()) {
+        instructions.buildRet(builder, cell);
+        return runtime.endDefinition(definition);
+    }
+    let convert = runtime.libc("ConvertThreadToFiberEx",
+        runtime.pointerType.functionType([runtime.pointerType, runtime.int32Type]));
+    let deallocate = runtime.free();
+    let noCell = runtime.block(definition, "adopt.no.cell");
+    let haveCell = runtime.block(definition, "adopt.have.cell");
+    let refused = runtime.block(definition, "adopt.refused");
+    let adopted = runtime.block(definition, "adopt.adopted");
+    instructions.buildCondBr(builder, runtime.isNull(cell), noCell, haveCell);
+
+    builder.positionAtEnd(noCell);
+    instructions.buildRet(builder, runtime.nullPointer());
+
+    builder.positionAtEnd(haveCell);
+    let fiber = runtime.call(convert, [runtime.nullPointer(), runtime.int32(Fibers.floatSwitch)],
+        "fiber");
+    instructions.buildCondBr(builder, runtime.isNull(fiber), refused, adopted);
+
+    builder.positionAtEnd(refused);
+    runtime.call(deallocate, [cell], "");
+    instructions.buildRet(builder, runtime.nullPointer());
+
+    builder.positionAtEnd(adopted);
+    memory.buildStore(builder, fiber, runtime.offsetPointer(cell, ContextCell.saved, ""));
+    instructions.buildRet(builder, cell);
+    return runtime.endDefinition(definition);
+}
+
+// ptr ens_context_create(i64 stackBytes, ptr error): a context with a stack of 'stackBytes', a
+// multiple of the page size, which the first switch into it starts running the body it was given;
+// or null with the system's error number written to 'error' when the stack could not be made.
+public createRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.pointerType.functionType([runtime.int64Type, runtime.pointerType]);
+    let known = runtime.existing("ens_context_create", type);
+    if (known != null) {
+        return known;
+    }
+    let entry = entryRuntime(runtime);
+    if (runtime.onWindows()) {
+        return windowsCreate(runtime, type, entry);
+    }
+    return posixCreate(runtime, type, entry);
+}
+
+posixCreate(Runtime runtime, TypeRef type, RuntimeFunction entry) -> RuntimeFunction {
+    let allocate = runtime.calloc();
+    let deallocate = runtime.free();
+    let map = runtime.libc("mmap", runtime.pointerType.functionType([runtime.pointerType,
+        runtime.int64Type, runtime.int32Type, runtime.int32Type, runtime.int32Type,
+        runtime.int64Type]));
+    let protect = runtime.libc("mprotect", runtime.int32Type.functionType([runtime.pointerType,
+        runtime.int64Type, runtime.int32Type]));
+    let trampoline = trampolineFunction(runtime);
+    long flags = StackMapping.linuxFlags;
+    if (runtime.onDarwin()) {
+        flags = StackMapping.darwinFlags;
+    }
+    let frame = frameLayout(runtime);
+    let definition = runtime.beginDefinition("ens_context_create", type);
+    let builder = runtime.builder;
+    let stackBytes = runtime.parameter(definition, 0);
+    let error = runtime.parameter(definition, 1);
+    let noCell = runtime.block(definition, "create.no.cell");
+    let haveCell = runtime.block(definition, "create.have.cell");
+    let unmapped = runtime.block(definition, "create.unmapped");
+    let mapped = runtime.block(definition, "create.mapped");
+    let cell = runtime.call(allocate, [runtime.int64(1), runtime.int64(ContextCell.bytes)], "cell");
+    instructions.buildCondBr(builder, runtime.isNull(cell), noCell, haveCell);
+
+    builder.positionAtEnd(noCell);
+    memory.buildStore(builder, runtime.int32(StackMapping.noMemory), error);
+    instructions.buildRet(builder, runtime.nullPointer());
+
+    builder.positionAtEnd(haveCell);
+    let total = instructions.buildAdd(builder, stackBytes,
+        runtime.int64(StackMapping.guardBytes), "total");
+    let base = runtime.call(map, [runtime.nullPointer(), total,
+        runtime.int32(StackMapping.readWrite), runtime.int32(flags), runtime.int32(-1),
+        runtime.int64(0)], "base");
+    let failed = instructions.buildICmpEQ(builder,
+        instructions.buildPtrToInt(builder, base, runtime.int64Type, ""), runtime.int64(-1),
+        "failed");
+    instructions.buildCondBr(builder, failed, unmapped, mapped);
+
+    builder.positionAtEnd(unmapped);
+    memory.buildStore(builder, runtime.errnoValue(), error);
+    runtime.call(deallocate, [cell], "");
+    instructions.buildRet(builder, runtime.nullPointer());
+
+    builder.positionAtEnd(mapped);
+    runtime.call(protect, [base, runtime.int64(StackMapping.guardBytes),
+        runtime.int32(StackMapping.inaccessible)], "");
+    let top = memory.buildGEP(builder, runtime.int8Type, base, [total], "top");
+    let first = memory.buildGEP(builder, runtime.int8Type, top, [runtime.int64(-frame.bytes)],
+        "frame");
+    memory.buildMemSet(builder, first, runtime.int8(0), runtime.int64(frame.bytes), 8);
+    memory.buildStore(builder, cell, runtime.offsetPointer(first, frame.cell, ""));
+    memory.buildStore(builder, entry.function, runtime.offsetPointer(first, frame.entry, ""));
+    memory.buildStore(builder, trampoline.function,
+        runtime.offsetPointer(first, frame.returnAddress, ""));
+    memory.buildStore(builder, first, runtime.offsetPointer(cell, ContextCell.saved, ""));
+    memory.buildStore(builder, base, runtime.offsetPointer(cell, ContextCell.stackBase, ""));
+    memory.buildStore(builder, total, runtime.offsetPointer(cell, ContextCell.stackBytes, ""));
+    memory.buildStore(builder, runtime.int32(0), error);
+    instructions.buildRet(builder, cell);
+    return runtime.endDefinition(definition);
+}
+
+windowsCreate(Runtime runtime, TypeRef type, RuntimeFunction entry) -> RuntimeFunction {
+    let allocate = runtime.calloc();
+    let deallocate = runtime.free();
+    let create = runtime.libc("CreateFiberEx", runtime.pointerType.functionType([
+        runtime.int64Type, runtime.int64Type, runtime.int32Type, runtime.pointerType,
+        runtime.pointerType]));
+    let definition = runtime.beginDefinition("ens_context_create", type);
+    let builder = runtime.builder;
+    let stackBytes = runtime.parameter(definition, 0);
+    let error = runtime.parameter(definition, 1);
+    let noCell = runtime.block(definition, "create.no.cell");
+    let haveCell = runtime.block(definition, "create.have.cell");
+    let refused = runtime.block(definition, "create.refused");
+    let created = runtime.block(definition, "create.created");
+    let cell = runtime.call(allocate, [runtime.int64(1), runtime.int64(ContextCell.bytes)], "cell");
+    instructions.buildCondBr(builder, runtime.isNull(cell), noCell, haveCell);
+
+    builder.positionAtEnd(noCell);
+    memory.buildStore(builder, runtime.int32(StackMapping.noMemory), error);
+    instructions.buildRet(builder, runtime.nullPointer());
+
+    builder.positionAtEnd(haveCell);
+    let fiber = runtime.call(create, [runtime.int64(0), stackBytes,
+        runtime.int32(Fibers.floatSwitch), entry.function, cell], "fiber");
+    instructions.buildCondBr(builder, runtime.isNull(fiber), refused, created);
+
+    builder.positionAtEnd(refused);
+    memory.buildStore(builder, runtime.lastError(), error);
+    runtime.call(deallocate, [cell], "");
+    instructions.buildRet(builder, runtime.nullPointer());
+
+    builder.positionAtEnd(created);
+    memory.buildStore(builder, fiber, runtime.offsetPointer(cell, ContextCell.saved, ""));
+    memory.buildStore(builder, stackBytes, runtime.offsetPointer(cell, ContextCell.stackBytes, ""));
+    memory.buildStore(builder, runtime.int32(0), error);
+    instructions.buildRet(builder, cell);
+    return runtime.endDefinition(definition);
+}
+
+// void ens_context_set_body(ptr context, ptr body): the '() -> void' function value the context
+// runs when it is next switched to after being made or after its body returned. The reference
+// is kept until the body has run.
+public setBodyRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.voidType.functionType([runtime.pointerType, runtime.pointerType]);
+    let known = runtime.existing("ens_context_set_body", type);
+    if (known != null) {
+        return known;
+    }
+    let retain = runtime.retain();
+    let definition = runtime.beginDefinition("ens_context_set_body", type);
+    let cell = runtime.parameter(definition, 0);
+    let body = runtime.parameter(definition, 1);
+    runtime.call(retain, [body], "");
+    memory.buildStore(runtime.builder, body, runtime.offsetPointer(cell, ContextCell.body, ""));
+    instructions.buildRetVoid(runtime.builder);
+    return runtime.endDefinition(definition);
+}
+
+// void ens_context_switch(ptr from, ptr to): leaves the calling context 'from', which must be the
+// one running, and resumes 'to' where it last left, or at its body if it never ran. Returns when
+// another context switches back to 'from'.
+public switchRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.voidType.functionType([runtime.pointerType, runtime.pointerType]);
+    let known = runtime.existing("ens_context_switch", type);
+    if (known != null) {
+        return known;
+    }
+    if (runtime.onWindows()) {
+        let switchFiber = runtime.libc("SwitchToFiber",
+            runtime.voidType.functionType([runtime.pointerType]));
+        let definition = runtime.beginDefinition("ens_context_switch", type);
+        let builder = runtime.builder;
+        let from = runtime.parameter(definition, 0);
+        let to = runtime.parameter(definition, 1);
+        memory.buildStore(builder, from, runtime.offsetPointer(to, ContextCell.resumedBy, ""));
+        let fiber = memory.buildLoad(builder, runtime.pointerType,
+            runtime.offsetPointer(to, ContextCell.saved, ""), "fiber");
+        runtime.call(switchFiber, [fiber], "");
+        instructions.buildRetVoid(builder);
+        return runtime.endDefinition(definition);
+    }
+    let swap = swapFunction(runtime);
+    let definition = runtime.beginDefinition("ens_context_switch", type);
+    let builder = runtime.builder;
+    let from = runtime.parameter(definition, 0);
+    let to = runtime.parameter(definition, 1);
+    memory.buildStore(builder, from, runtime.offsetPointer(to, ContextCell.resumedBy, ""));
+    let resumed = memory.buildLoad(builder, runtime.pointerType,
+        runtime.offsetPointer(to, ContextCell.saved, ""), "resumed");
+    runtime.call(swap, [runtime.offsetPointer(from, ContextCell.saved, "saved.slot"), resumed], "");
+    instructions.buildRetVoid(builder);
+    return runtime.endDefinition(definition);
+}
+
+// void ens_context_release(ptr context): frees a context that is not running and will not be
+// switched to again, with the stack it owns; an adopted thread's context gives the thread its
+// stack back.
+public releaseRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.voidType.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_context_release", type);
+    if (known != null) {
+        return known;
+    }
+    let deallocate = runtime.free();
+    if (runtime.onWindows()) {
+        let deleteFiber = runtime.libc("DeleteFiber",
+            runtime.voidType.functionType([runtime.pointerType]));
+        let convertBack = runtime.libc("ConvertFiberToThread",
+            runtime.int32Type.functionType([]));
+        let definition = runtime.beginDefinition("ens_context_release", type);
+        let builder = runtime.builder;
+        let cell = runtime.parameter(definition, 0);
+        let owned = runtime.block(definition, "release.owned");
+        let adopted = runtime.block(definition, "release.adopted");
+        let done = runtime.block(definition, "release.done");
+        let bytes = memory.buildLoad(builder, runtime.int64Type,
+            runtime.offsetPointer(cell, ContextCell.stackBytes, ""), "bytes");
+        instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, bytes,
+            runtime.int64(0), "adopted"), adopted, owned);
+
+        builder.positionAtEnd(owned);
+        runtime.call(deleteFiber, [memory.buildLoad(builder, runtime.pointerType,
+            runtime.offsetPointer(cell, ContextCell.saved, ""), "fiber")], "");
+        instructions.buildBr(builder, done);
+
+        builder.positionAtEnd(adopted);
+        runtime.call(convertBack, [], "");
+        instructions.buildBr(builder, done);
+
+        builder.positionAtEnd(done);
+        runtime.call(deallocate, [cell], "");
+        instructions.buildRetVoid(builder);
+        return runtime.endDefinition(definition);
+    }
+    let unmap = runtime.libc("munmap",
+        runtime.int32Type.functionType([runtime.pointerType, runtime.int64Type]));
+    let definition = runtime.beginDefinition("ens_context_release", type);
+    let builder = runtime.builder;
+    let cell = runtime.parameter(definition, 0);
+    let owned = runtime.block(definition, "release.owned");
+    let done = runtime.block(definition, "release.done");
+    let base = memory.buildLoad(builder, runtime.pointerType,
+        runtime.offsetPointer(cell, ContextCell.stackBase, ""), "base");
+    instructions.buildCondBr(builder, runtime.isNull(base), done, owned);
+
+    builder.positionAtEnd(owned);
+    runtime.call(unmap, [base, memory.buildLoad(builder, runtime.int64Type,
+        runtime.offsetPointer(cell, ContextCell.stackBytes, ""), "bytes")], "");
+    instructions.buildBr(builder, done);
+
+    builder.positionAtEnd(done);
+    runtime.call(deallocate, [cell], "");
+    instructions.buildRetVoid(builder);
+    return runtime.endDefinition(definition);
+}
+
+// What a context runs: its body, released once it returns, then the switch back to the context
+// that resumed it, and the next body when it is switched to again. On Windows this is the fiber's
+// own start routine; elsewhere the trampoline calls it with the cell.
+entryRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.voidType.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_context_entry", type);
+    if (known != null) {
+        return known;
+    }
+    let release = runtime.release();
+    let switching = switchRuntime(runtime);
+    let definition = runtime.beginDefinition("ens_context_entry", type);
+    let builder = runtime.builder;
+    let cell = runtime.parameter(definition, 0);
+    let next = runtime.block(definition, "entry.body");
+    instructions.buildBr(builder, next);
+
+    builder.positionAtEnd(next);
+    let bodySlot = runtime.offsetPointer(cell, ContextCell.body, "body.slot");
+    let body = memory.buildLoad(builder, runtime.pointerType, bodySlot, "body");
+    let code = memory.buildLoad(builder, runtime.pointerType, body, "code");
+    instructions.buildCall(builder, runtime.voidType.functionType([runtime.pointerType]), code,
+        [body], "");
+    runtime.call(release, [body], "");
+    memory.buildStore(builder, runtime.nullPointer(), bodySlot);
+    let resumedBy = memory.buildLoad(builder, runtime.pointerType,
+        runtime.offsetPointer(cell, ContextCell.resumedBy, ""), "resumed.by");
+    runtime.call(switching, [cell, resumedBy], "");
+    instructions.buildBr(builder, next);
+    return runtime.endDefinition(definition);
+}
+
+// Where the first frame of a new stack keeps the cell, the entry function and the return address
+// on the target's processor.
+final class FrameLayout {
+    protected const long bytes;
+    protected const long cell;
+    protected const long entry;
+    protected const long returnAddress;
+
+    protected constructor(this.bytes, this.cell, this.entry, this.returnAddress);
+}
+
+frameLayout(Runtime runtime) -> FrameLayout {
+    return switch (runtime.target.architecture()) {
+        Architecture.X64 -> new FrameLayout(FirstFrame.x64Bytes, FirstFrame.x64Cell,
+            FirstFrame.x64Entry, FirstFrame.x64Return),
+        Architecture.Arm64 -> new FrameLayout(FirstFrame.arm64Bytes, FirstFrame.arm64Cell,
+            FirstFrame.arm64Entry, FirstFrame.arm64Return),
+    };
+}
+
+// void ens_context_swap(ptr savedSlot, ptr resumed): the switch itself, written in assembly for
+// the target's processor and added to the module with the first reference. It is local to the
+// module, as every runtime function is, so each object carries its own copy.
+swapFunction(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.voidType.functionType([runtime.pointerType, runtime.pointerType]);
+    let known = runtime.existing("ens_context_swap", type);
+    if (known != null) {
+        return known;
+    }
+    runtime.module.appendModuleInlineAsm(assemblyFor(runtime.target.architecture(),
+        runtime.onDarwin()));
+    return runtime.libc("ens_context_swap", type);
+}
+
+trampolineFunction(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.voidType.functionType([]);
+    let known = runtime.existing("ens_context_trampoline", type);
+    if (known != null) {
+        return known;
+    }
+    swapFunction(runtime);
+    return runtime.libc("ens_context_trampoline", type);
+}
+
+// The switch and the trampoline for one processor. The switch pushes the registers a call must
+// preserve, stores the stack pointer where its first argument points, loads the one its second
+// argument is, and pops the registers that stack saved. The trampoline is where the first switch
+// into a new stack returns: it passes the cell to the entry function held in the other register
+// the frame set, and marks the return address undefined so a stack walk ends here.
+public assemblyFor(Architecture architecture, bool darwin) -> string {
+    string prefix = darwin ? "_" : "";
+    string swap = prefix + "ens_context_swap";
+    string trampoline = prefix + "ens_context_trampoline";
+    return switch (architecture) {
+        Architecture.X64 -> "\t.text\n"
+            + "\t.p2align 4\n"
+            + typeDirective(swap, "@function", darwin)
+            + "{swap}:\n"
+            + "\tpushq %rbp\n"
+            + "\tpushq %rbx\n"
+            + "\tpushq %r12\n"
+            + "\tpushq %r13\n"
+            + "\tpushq %r14\n"
+            + "\tpushq %r15\n"
+            + "\tmovq %rsp, (%rdi)\n"
+            + "\tmovq %rsi, %rsp\n"
+            + "\tpopq %r15\n"
+            + "\tpopq %r14\n"
+            + "\tpopq %r13\n"
+            + "\tpopq %r12\n"
+            + "\tpopq %rbx\n"
+            + "\tpopq %rbp\n"
+            + "\tretq\n"
+            + sizeDirective(swap, darwin)
+            + "\t.p2align 4\n"
+            + typeDirective(trampoline, "@function", darwin)
+            + "{trampoline}:\n"
+            + "\t.cfi_startproc\n"
+            + "\t.cfi_undefined %rip\n"
+            + "\tmovq %rbx, %rdi\n"
+            + "\tcallq *%r12\n"
+            + "\tud2\n"
+            + "\t.cfi_endproc\n"
+            + sizeDirective(trampoline, darwin),
+        Architecture.Arm64 -> "\t.text\n"
+            + "\t.p2align 2\n"
+            + typeDirective(swap, "%function", darwin)
+            + "{swap}:\n"
+            + "\tsub sp, sp, #160\n"
+            + "\tstp x19, x20, [sp, #0]\n"
+            + "\tstp x21, x22, [sp, #16]\n"
+            + "\tstp x23, x24, [sp, #32]\n"
+            + "\tstp x25, x26, [sp, #48]\n"
+            + "\tstp x27, x28, [sp, #64]\n"
+            + "\tstp x29, x30, [sp, #80]\n"
+            + "\tstp d8, d9, [sp, #96]\n"
+            + "\tstp d10, d11, [sp, #112]\n"
+            + "\tstp d12, d13, [sp, #128]\n"
+            + "\tstp d14, d15, [sp, #144]\n"
+            + "\tmov x9, sp\n"
+            + "\tstr x9, [x0]\n"
+            + "\tmov sp, x1\n"
+            + "\tldp x19, x20, [sp, #0]\n"
+            + "\tldp x21, x22, [sp, #16]\n"
+            + "\tldp x23, x24, [sp, #32]\n"
+            + "\tldp x25, x26, [sp, #48]\n"
+            + "\tldp x27, x28, [sp, #64]\n"
+            + "\tldp x29, x30, [sp, #80]\n"
+            + "\tldp d8, d9, [sp, #96]\n"
+            + "\tldp d10, d11, [sp, #112]\n"
+            + "\tldp d12, d13, [sp, #128]\n"
+            + "\tldp d14, d15, [sp, #144]\n"
+            + "\tadd sp, sp, #160\n"
+            + "\tret\n"
+            + sizeDirective(swap, darwin)
+            + "\t.p2align 2\n"
+            + typeDirective(trampoline, "%function", darwin)
+            + "{trampoline}:\n"
+            + "\t.cfi_startproc\n"
+            + "\t.cfi_undefined x30\n"
+            + "\tmov x0, x19\n"
+            + "\tblr x20\n"
+            + "\tbrk #0\n"
+            + "\t.cfi_endproc\n"
+            + sizeDirective(trampoline, darwin),
+    };
+}
+
+// ELF marks a symbol's kind and size; Mach-O has neither directive.
+typeDirective(string symbol, string kind, bool darwin) -> string {
+    if (darwin) {
+        return "";
+    }
+    return "\t.type {symbol}, {kind}\n";
+}
+
+sizeDirective(string symbol, bool darwin) -> string {
+    if (darwin) {
+        return "";
+    }
+    return "\t.size {symbol}, .-{symbol}\n";
+}

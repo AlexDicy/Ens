@@ -1428,6 +1428,8 @@ task("test")
                     stderr = "at main (exc_main_unhandled.ens:10)"},
                 {fixture = "tasks_runtime", rc = 0, stdout = pinnedStdout("tasks_runtime"),
                     stderr = ""},
+                {fixture = "context_bridges", rc = 0, stdout = pinnedStdout("context_bridges"),
+                    stderr = ""},
             }
             local allowed = {["libc.so.6"] = true, ["libm.so.6"] = true,
                 ["libgcc_s.so.1"] = true}
@@ -1520,6 +1522,8 @@ task("test")
                 {fixture = "exc_main_unhandled", rc = 1, stdout = "",
                     stderr = "at main (exc_main_unhandled.ens:10)"},
                 {fixture = "tasks_runtime", rc = 0, stdout = pinnedStdout("tasks_runtime"),
+                    stderr = ""},
+                {fixture = "context_bridges", rc = 0, stdout = pinnedStdout("context_bridges"),
                     stderr = ""},
             }
             -- the DLLs every Windows has: the system's own, and the C runtime it ships with
@@ -1647,6 +1651,9 @@ task("test")
                     {label = "tasks_runtime", argv = {"build",
                         path.join(tests_dir, "tasks_runtime.ens"), "--target", target.triple,
                         "--no-link", "--objects", path.join(folder, "tasks_runtime")}},
+                    {label = "context_bridges", argv = {"build",
+                        path.join(tests_dir, "context_bridges.ens"), "--target", target.triple,
+                        "--no-link", "--objects", path.join(folder, "context_bridges")}},
                 }
                 local compiled = true
                 for _, build in ipairs(builds) do
