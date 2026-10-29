@@ -1,0 +1,544 @@
+// The reader a Windows console is read through. A line-mode read of a console waits for Enter and
+// cannot be ended early without losing the line, so a read runs on a thread-pool work item, keeps
+// what it read in the reader, and posts the watch's token to the poller's port. A task that stops
+// waiting leaves the read running, and the next read takes the line it brings. The reader converts
+// the console's UTF-16 to UTF-8 and ends the stream at a line that is Ctrl+Z alone. A console exists
+// on Windows alone, so elsewhere no reader is ever opened.
+import Value from @ens.llvm.values;
+import @ens.llvm.instructions;
+import @ens.llvm.memory;
+import Win32Error from emit.errorkinds;
+import WatchState from emit.pollers;
+import emit.pollers;
+import Runtime from emit.runtime;
+import RuntimeFunction from emit.runtime;
+import Unnamed from emit.streams;
+import emit.filesystem.windows;
+import emit.threads;
+import emit.widetext;
+
+// Where a reader keeps its state: the lock and its condition first, where the lock bridges find
+// them, then the console, the bytes held between 'start' and 'end', what the next read reports when
+// none are held, the watch a read in progress posts to, a high surrogate the last read ended on, and
+// the bytes themselves.
+final class ConsoleCell {
+    static const long lock = 0;
+    static const long handle = 16;
+    static const long start = 24;
+    static const long end = 32;
+    static const long pending = 40;
+    static const long released = 44;
+    static const long ended = 48;
+    static const long failure = 52;
+    static const long port = 56;
+    static const long token = 64;
+    static const long carried = 72;
+    static const long held = 80;
+    static const long bytes = 12376;
+}
+
+// The most units one read of the console takes, and the bytes they and a carried surrogate can
+// become, at three each.
+final class ConsoleRead {
+    static const long units = 4096;
+    static const long heldBytes = 12291;
+}
+
+// The UTF-16 units a line of Ctrl+Z alone is read as.
+final class EndOfStream {
+    static const long control = 0x1A;
+    static const long carriageReturn = 0x0D;
+    static const long lineFeed = 0x0A;
+}
+
+// ptr ens_console_open(ptr stream, ptr error): a reader for a stream whose handle is a console, or
+// null with 'error' 0 when it is not one, so the stream is read with ens_stream_read, or null with
+// the system's number when the reader could not be made.
+public openRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.pointerType.functionType([runtime.pointerType, runtime.pointerType]);
+    let known = runtime.existing("ens_console_open", type);
+    if (known != null) {
+        return known;
+    }
+    if (!runtime.onWindows()) {
+        let definition = runtime.beginDefinition("ens_console_open", type);
+        memory.buildStore(runtime.builder, runtime.int32(0), runtime.parameter(definition, 1));
+        instructions.buildRet(runtime.builder, runtime.nullPointer());
+        return runtime.endDefinition(definition);
+    }
+    let consoleMode = runtime.libc("GetConsoleMode",
+        runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType]));
+    let allocate = runtime.calloc();
+    let definition = runtime.beginDefinition("ens_console_open", type);
+    let builder = runtime.builder;
+    let error = runtime.parameter(definition, 1);
+    let consoleBlock = runtime.block(definition, "open.console");
+    let otherBlock = runtime.block(definition, "open.other");
+    let madeBlock = runtime.block(definition, "open.made");
+    let noMemoryBlock = runtime.block(definition, "open.no.memory");
+    let handle = windows.streamHandle(runtime, runtime.parameter(definition, 0));
+    let mode = memory.buildAlloca(builder, runtime.int32Type, "mode");
+    instructions.buildCondBr(builder, instructions.buildICmpNE(builder,
+        runtime.call(consoleMode, [handle, mode], "console"), runtime.int32(0), ""),
+        consoleBlock, otherBlock);
+
+    builder.positionAtEnd(consoleBlock);
+    let cell = runtime.call(allocate, [runtime.int64(1), runtime.int64(ConsoleCell.bytes)], "cell");
+    instructions.buildCondBr(builder, runtime.isNull(cell), noMemoryBlock, madeBlock);
+
+    builder.positionAtEnd(madeBlock);
+    memory.buildStore(builder, handle, runtime.offsetPointer(cell, ConsoleCell.handle, ""));
+    instructions.buildRet(builder, cell);
+
+    builder.positionAtEnd(noMemoryBlock);
+    memory.buildStore(builder, runtime.int32(Win32Error.notEnoughMemory), error);
+    instructions.buildRet(builder, runtime.nullPointer());
+
+    builder.positionAtEnd(otherBlock);
+    memory.buildStore(builder, runtime.int32(0), error);
+    instructions.buildRet(builder, runtime.nullPointer());
+    return runtime.endDefinition(definition);
+}
+
+// i32 ens_console_watch(ptr reader, ptr poller, i64 token, ptr error): ready when the reader holds
+// bytes, an end or a failure for the next read, and otherwise watching, with one wake under 'token'
+// once a read brings one. A read already in progress posts this token in place of an earlier one.
+// A read that could not be started fails with the system's number written to 'error'.
+public watchRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType,
+        runtime.int64Type, runtime.pointerType]);
+    let known = runtime.existing("ens_console_watch", type);
+    if (known != null) {
+        return known;
+    }
+    if (!runtime.onWindows()) {
+        let definition = runtime.beginDefinition("ens_console_watch", type);
+        instructions.buildRet(runtime.builder, runtime.int32(WatchState.unwatchable as int));
+        return runtime.endDefinition(definition);
+    }
+    let submit = runtime.libc("TrySubmitThreadpoolCallback", runtime.int32Type.functionType([
+        runtime.pointerType, runtime.pointerType, runtime.pointerType]));
+    let acquire = threads.acquireRuntime(runtime);
+    let release = threads.releaseRuntime(runtime);
+    let ready = readyRuntime(runtime);
+    let definition = runtime.beginDefinition("ens_console_watch", type);
+    let builder = runtime.builder;
+    let cell = runtime.parameter(definition, 0);
+    let poller = runtime.parameter(definition, 1);
+    let readyBlock = runtime.block(definition, "watch.ready");
+    let armBlock = runtime.block(definition, "watch.arm");
+    let pendingBlock = runtime.block(definition, "watch.pending");
+    let submitBlock = runtime.block(definition, "watch.submit");
+    let watchingBlock = runtime.block(definition, "watch.watching");
+    let unsubmittedBlock = runtime.block(definition, "watch.unsubmitted");
+    runtime.call(acquire, [cell], "");
+    instructions.buildCondBr(builder, holdsReport(runtime, cell), readyBlock, armBlock);
+
+    builder.positionAtEnd(readyBlock);
+    runtime.call(release, [cell], "");
+    instructions.buildRet(builder, runtime.int32(WatchState.ready as int));
+
+    builder.positionAtEnd(armBlock);
+    memory.buildStore(builder, pollers.portOf(runtime, poller),
+        runtime.offsetPointer(cell, ConsoleCell.port, ""));
+    memory.buildStore(builder, runtime.parameter(definition, 2),
+        runtime.offsetPointer(cell, ConsoleCell.token, ""));
+    instructions.buildCondBr(builder, flagSet(runtime, cell, ConsoleCell.pending, "pending"),
+        pendingBlock, submitBlock);
+
+    builder.positionAtEnd(pendingBlock);
+    runtime.call(release, [cell], "");
+    instructions.buildRet(builder, runtime.int32(WatchState.watching as int));
+
+    builder.positionAtEnd(submitBlock);
+    setFlag(runtime, cell, ConsoleCell.pending, 1);
+    runtime.call(release, [cell], "");
+    let submitted = runtime.call(submit, [ready.function, cell, runtime.nullPointer()],
+        "submitted");
+    let why = runtime.lastError();
+    instructions.buildCondBr(builder, instructions.buildICmpNE(builder, submitted,
+        runtime.int32(0), ""), watchingBlock, unsubmittedBlock);
+
+    builder.positionAtEnd(watchingBlock);
+    instructions.buildRet(builder, runtime.int32(WatchState.watching as int));
+
+    builder.positionAtEnd(unsubmittedBlock);
+    runtime.call(acquire, [cell], "");
+    setFlag(runtime, cell, ConsoleCell.pending, 0);
+    memory.buildStore(builder, runtime.int64(0), runtime.offsetPointer(cell, ConsoleCell.token,
+        ""));
+    runtime.call(release, [cell], "");
+    memory.buildStore(builder, why, runtime.parameter(definition, 3));
+    instructions.buildRet(builder, runtime.int32(WatchState.failed as int));
+    return runtime.endDefinition(definition);
+}
+
+// void ens_console_unwatch(ptr reader): a read in progress posts no token when it ends. The read
+// goes on, and the next read takes what it brings.
+public unwatchRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.voidType.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_console_unwatch", type);
+    if (known != null) {
+        return known;
+    }
+    if (!runtime.onWindows()) {
+        let definition = runtime.beginDefinition("ens_console_unwatch", type);
+        instructions.buildRetVoid(runtime.builder);
+        return runtime.endDefinition(definition);
+    }
+    let acquire = threads.acquireRuntime(runtime);
+    let release = threads.releaseRuntime(runtime);
+    let definition = runtime.beginDefinition("ens_console_unwatch", type);
+    let builder = runtime.builder;
+    let cell = runtime.parameter(definition, 0);
+    runtime.call(acquire, [cell], "");
+    memory.buildStore(builder, runtime.int64(0), runtime.offsetPointer(cell, ConsoleCell.token,
+        ""));
+    runtime.call(release, [cell], "");
+    instructions.buildRetVoid(builder);
+    return runtime.endDefinition(definition);
+}
+
+// i32 ens_console_read(ptr reader, ptr buffer, i64 capacity, ptr count): 0 with 'count' holding up
+// to 'capacity' of the bytes the reader holds, or 0 with 'count' 0 once a line of Ctrl+Z alone has
+// ended the stream, or the system's number for a read that failed. A reader holding nothing waits
+// for the read in progress, or reads the console itself.
+public readRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.int32Type.functionType([runtime.pointerType, runtime.pointerType,
+        runtime.int64Type, runtime.pointerType]);
+    let known = runtime.existing("ens_console_read", type);
+    if (known != null) {
+        return known;
+    }
+    if (!runtime.onWindows()) {
+        let definition = runtime.beginDefinition("ens_console_read", type);
+        memory.buildStore(runtime.builder, runtime.int64(0), runtime.parameter(definition, 3));
+        instructions.buildRet(runtime.builder, runtime.int32(Unnamed.failure as int));
+        return runtime.endDefinition(definition);
+    }
+    let acquire = threads.acquireRuntime(runtime);
+    let release = threads.releaseRuntime(runtime);
+    let wait = threads.waitRuntime(runtime);
+    let copy = runtime.memcpy();
+    let fill = fillRuntime(runtime);
+    let definition = runtime.beginDefinition("ens_console_read", type);
+    let builder = runtime.builder;
+    let cell = runtime.parameter(definition, 0);
+    let buffer = runtime.parameter(definition, 1);
+    let capacity = runtime.parameter(definition, 2);
+    let countSlot = runtime.parameter(definition, 3);
+    let checkBlock = runtime.block(definition, "read.check");
+    let waitBlock = runtime.block(definition, "read.wait");
+    let lookBlock = runtime.block(definition, "read.look");
+    let copyBlock = runtime.block(definition, "read.copy");
+    let emptyBlock = runtime.block(definition, "read.empty");
+    let endedBlock = runtime.block(definition, "read.ended");
+    let unendedBlock = runtime.block(definition, "read.unended");
+    let failedBlock = runtime.block(definition, "read.failed");
+    let fillBlock = runtime.block(definition, "read.fill");
+    runtime.call(acquire, [cell], "");
+    instructions.buildBr(builder, checkBlock);
+
+    builder.positionAtEnd(checkBlock);
+    instructions.buildCondBr(builder, flagSet(runtime, cell, ConsoleCell.pending, "pending"),
+        waitBlock, lookBlock);
+
+    builder.positionAtEnd(waitBlock);
+    runtime.call(wait, [cell, runtime.int64(-1)], "");
+    instructions.buildBr(builder, checkBlock);
+
+    builder.positionAtEnd(lookBlock);
+    let startSlot = runtime.offsetPointer(cell, ConsoleCell.start, "start.slot");
+    let start = memory.buildLoad(builder, runtime.int64Type, startSlot, "start");
+    let end = memory.buildLoad(builder, runtime.int64Type,
+        runtime.offsetPointer(cell, ConsoleCell.end, ""), "end");
+    instructions.buildCondBr(builder, instructions.buildICmpSLT(builder, start, end, "holds"),
+        copyBlock, emptyBlock);
+
+    builder.positionAtEnd(copyBlock);
+    let available = instructions.buildSub(builder, end, start, "available");
+    let taken = instructions.buildSelect(builder, instructions.buildICmpSLT(builder, capacity,
+        available, ""), capacity, available, "taken");
+    runtime.call(copy, [buffer, memory.buildGEP(builder, runtime.int8Type,
+        runtime.offsetPointer(cell, ConsoleCell.held, ""), [start], "from"), taken], "");
+    memory.buildStore(builder, instructions.buildAdd(builder, start, taken, ""), startSlot);
+    runtime.call(release, [cell], "");
+    memory.buildStore(builder, taken, countSlot);
+    instructions.buildRet(builder, runtime.int32(0));
+
+    builder.positionAtEnd(emptyBlock);
+    instructions.buildCondBr(builder, flagSet(runtime, cell, ConsoleCell.ended, "ended"),
+        endedBlock, unendedBlock);
+
+    builder.positionAtEnd(endedBlock);
+    setFlag(runtime, cell, ConsoleCell.ended, 0);
+    runtime.call(release, [cell], "");
+    memory.buildStore(builder, runtime.int64(0), countSlot);
+    instructions.buildRet(builder, runtime.int32(0));
+
+    builder.positionAtEnd(unendedBlock);
+    let failureSlot = runtime.offsetPointer(cell, ConsoleCell.failure, "failure.slot");
+    let failure = memory.buildLoad(builder, runtime.int32Type, failureSlot, "failure");
+    instructions.buildCondBr(builder, instructions.buildICmpNE(builder, failure, runtime.int32(0),
+        ""), failedBlock, fillBlock);
+
+    builder.positionAtEnd(failedBlock);
+    memory.buildStore(builder, runtime.int32(0), failureSlot);
+    runtime.call(release, [cell], "");
+    memory.buildStore(builder, runtime.int64(0), countSlot);
+    instructions.buildRet(builder, failure);
+
+    builder.positionAtEnd(fillBlock);
+    setFlag(runtime, cell, ConsoleCell.pending, 1);
+    runtime.call(release, [cell], "");
+    runtime.call(fill, [cell], "");
+    runtime.call(acquire, [cell], "");
+    instructions.buildBr(builder, checkBlock);
+    return runtime.endDefinition(definition);
+}
+
+// void ens_console_release(ptr reader): frees the reader, or, while a read is in progress, leaves
+// it to that read to free once it ends. Nothing may use the reader afterwards.
+public releaseRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.voidType.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_console_release", type);
+    if (known != null) {
+        return known;
+    }
+    if (!runtime.onWindows()) {
+        let definition = runtime.beginDefinition("ens_console_release", type);
+        instructions.buildRetVoid(runtime.builder);
+        return runtime.endDefinition(definition);
+    }
+    let acquire = threads.acquireRuntime(runtime);
+    let release = threads.releaseRuntime(runtime);
+    let deallocate = runtime.free();
+    let definition = runtime.beginDefinition("ens_console_release", type);
+    let builder = runtime.builder;
+    let cell = runtime.parameter(definition, 0);
+    let pendingBlock = runtime.block(definition, "release.pending");
+    let idleBlock = runtime.block(definition, "release.idle");
+    runtime.call(acquire, [cell], "");
+    instructions.buildCondBr(builder, flagSet(runtime, cell, ConsoleCell.pending, "pending"),
+        pendingBlock, idleBlock);
+
+    builder.positionAtEnd(pendingBlock);
+    setFlag(runtime, cell, ConsoleCell.released, 1);
+    runtime.call(release, [cell], "");
+    instructions.buildRetVoid(builder);
+
+    builder.positionAtEnd(idleBlock);
+    runtime.call(release, [cell], "");
+    runtime.call(deallocate, [cell], "");
+    instructions.buildRetVoid(builder);
+    return runtime.endDefinition(definition);
+}
+
+// The thread-pool work item a watch submits, which reads the console once.
+readyRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.voidType.functionType([runtime.pointerType, runtime.pointerType]);
+    let known = runtime.existing("ens_console_ready", type);
+    if (known != null) {
+        return known;
+    }
+    let fill = fillRuntime(runtime);
+    let definition = runtime.beginDefinition("ens_console_ready", type);
+    runtime.call(fill, [runtime.parameter(definition, 1)], "");
+    instructions.buildRetVoid(runtime.builder);
+    return runtime.endDefinition(definition);
+}
+
+// One read of the console by the reader's one read in progress, made without the lock, into bytes
+// nothing else touches until the read is no longer in progress. A read the console ends with
+// nothing, which is what Ctrl+C does under a control handler, is made again, as is one that brought
+// only half a surrogate pair. Under the lock, the read then leaves its bytes, end or failure, is no
+// longer in progress, posts the watch's token, and wakes a read waiting for it, or frees the reader
+// released while it ran.
+fillRuntime(Runtime runtime) -> RuntimeFunction {
+    let type = runtime.voidType.functionType([runtime.pointerType]);
+    let known = runtime.existing("ens_console_fill", type);
+    if (known != null) {
+        return known;
+    }
+    let readConsole = runtime.libc("ReadConsoleW", runtime.int32Type.functionType([
+        runtime.pointerType, runtime.pointerType, runtime.int32Type, runtime.pointerType,
+        runtime.pointerType]));
+    let setLastError = runtime.libc("SetLastError",
+        runtime.voidType.functionType([runtime.int32Type]));
+    let narrow = widetext.narrowFunction(runtime);
+    let post = pollers.postFunction(runtime);
+    let acquire = threads.acquireRuntime(runtime);
+    let release = threads.releaseRuntime(runtime);
+    let notify = threads.notifyAllRuntime(runtime);
+    let deallocate = runtime.free();
+    let definition = runtime.beginDefinition("ens_console_fill", type);
+    let builder = runtime.builder;
+    let cell = runtime.parameter(definition, 0);
+    let attemptBlock = runtime.block(definition, "fill.attempt");
+    let succeededBlock = runtime.block(definition, "fill.succeeded");
+    let emptyBlock = runtime.block(definition, "fill.empty");
+    let refusedBlock = runtime.block(definition, "fill.refused");
+    let convertBlock = runtime.block(definition, "fill.convert");
+    let lineBlock = runtime.block(definition, "fill.line");
+    let narrowBlock = runtime.block(definition, "fill.narrow");
+    let narrowedBlock = runtime.block(definition, "fill.narrowed");
+    let unconvertedBlock = runtime.block(definition, "fill.unconverted");
+    let endBlock = runtime.block(definition, "fill.end");
+    let settleBlock = runtime.block(definition, "fill.settle");
+    let discardBlock = runtime.block(definition, "fill.discard");
+    let deliverBlock = runtime.block(definition, "fill.deliver");
+    let postBlock = runtime.block(definition, "fill.post");
+    let wakeBlock = runtime.block(definition, "fill.wake");
+    let wide = memory.buildAlloca(builder,
+        runtime.int16Type.arrayType((ConsoleRead.units + 1) as ulong), "wide");
+    let got = memory.buildAlloca(builder, runtime.int32Type, "got");
+    let carriedSlot = runtime.offsetPointer(cell, ConsoleCell.carried, "carried.slot");
+    let handle = memory.buildLoad(builder, runtime.pointerType,
+        runtime.offsetPointer(cell, ConsoleCell.handle, ""), "handle");
+    let held = runtime.offsetPointer(cell, ConsoleCell.held, "held");
+    let failureSlot = runtime.offsetPointer(cell, ConsoleCell.failure, "failure.slot");
+    instructions.buildBr(builder, attemptBlock);
+
+    builder.positionAtEnd(attemptBlock);
+    let carried = memory.buildLoad(builder, runtime.int16Type, carriedSlot, "carried");
+    memory.buildStore(builder, carried, wide);
+    let offset = instructions.buildSelect(builder, instructions.buildICmpNE(builder, carried,
+        unit(runtime, 0), ""), runtime.int32(1), runtime.int32(0), "offset");
+    runtime.call(setLastError, [runtime.int32(0)], "");
+    memory.buildStore(builder, runtime.int32(0), got);
+    let read = runtime.call(readConsole, [handle, memory.buildGEP(builder, runtime.int16Type, wide,
+        [instructions.buildZExt(builder, offset, runtime.int64Type, "")], "destination"),
+        runtime.int32(ConsoleRead.units), got, runtime.nullPointer()], "read");
+    let why = runtime.lastError();
+    let count = memory.buildLoad(builder, runtime.int32Type, got, "count");
+    instructions.buildCondBr(builder, instructions.buildICmpNE(builder, read, runtime.int32(0), ""),
+        succeededBlock, refusedBlock);
+
+    builder.positionAtEnd(succeededBlock);
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, count, runtime.int32(0),
+        ""), emptyBlock, convertBlock);
+
+    builder.positionAtEnd(emptyBlock);
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, why,
+        runtime.int32(Win32Error.operationAborted), ""), attemptBlock, endBlock);
+
+    builder.positionAtEnd(refusedBlock);
+    runtime.call(acquire, [cell], "");
+    memory.buildStore(builder, why, failureSlot);
+    instructions.buildBr(builder, settleBlock);
+
+    builder.positionAtEnd(convertBlock);
+    let total = instructions.buildAdd(builder, offset, count, "total");
+    let last = memory.buildLoad(builder, runtime.int16Type, memory.buildGEP(builder,
+        runtime.int16Type, wide, [instructions.buildZExt(builder, instructions.buildSub(builder,
+            total, runtime.int32(1), ""), runtime.int64Type, "")], ""), "last");
+    let high = instructions.buildICmpEQ(builder, instructions.buildAnd(builder, last,
+        unit(runtime, 0xFC00), ""), unit(runtime, 0xD800), "high");
+    memory.buildStore(builder, instructions.buildSelect(builder, high, last, unit(runtime, 0), ""),
+        carriedSlot);
+    let kept = instructions.buildSelect(builder, high, instructions.buildSub(builder, total,
+        runtime.int32(1), ""), total, "kept");
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, kept, runtime.int32(0), ""),
+        attemptBlock, lineBlock);
+
+    builder.positionAtEnd(lineBlock);
+    instructions.buildCondBr(builder, endsTheStream(runtime, wide, kept), endBlock, narrowBlock);
+
+    builder.positionAtEnd(narrowBlock);
+    let bytes = runtime.call(narrow, [widetext.utf8CodePage(runtime), runtime.int32(0), wide, kept,
+        held, runtime.int32(ConsoleRead.heldBytes), runtime.nullPointer(), runtime.nullPointer()],
+        "bytes");
+    let unconverted = runtime.lastError();
+    instructions.buildCondBr(builder, instructions.buildICmpSGT(builder, bytes, runtime.int32(0),
+        ""), narrowedBlock, unconvertedBlock);
+
+    builder.positionAtEnd(narrowedBlock);
+    runtime.call(acquire, [cell], "");
+    memory.buildStore(builder, runtime.int64(0), runtime.offsetPointer(cell, ConsoleCell.start,
+        ""));
+    memory.buildStore(builder, instructions.buildSExt(builder, bytes, runtime.int64Type, ""),
+        runtime.offsetPointer(cell, ConsoleCell.end, ""));
+    instructions.buildBr(builder, settleBlock);
+
+    builder.positionAtEnd(unconvertedBlock);
+    runtime.call(acquire, [cell], "");
+    memory.buildStore(builder, unconverted, failureSlot);
+    instructions.buildBr(builder, settleBlock);
+
+    builder.positionAtEnd(endBlock);
+    runtime.call(acquire, [cell], "");
+    setFlag(runtime, cell, ConsoleCell.ended, 1);
+    instructions.buildBr(builder, settleBlock);
+
+    builder.positionAtEnd(settleBlock);
+    setFlag(runtime, cell, ConsoleCell.pending, 0);
+    instructions.buildCondBr(builder, flagSet(runtime, cell, ConsoleCell.released, "released"),
+        discardBlock, deliverBlock);
+
+    builder.positionAtEnd(discardBlock);
+    runtime.call(release, [cell], "");
+    runtime.call(deallocate, [cell], "");
+    instructions.buildRetVoid(builder);
+
+    builder.positionAtEnd(deliverBlock);
+    let tokenSlot = runtime.offsetPointer(cell, ConsoleCell.token, "token.slot");
+    let token = memory.buildLoad(builder, runtime.int64Type, tokenSlot, "token");
+    instructions.buildCondBr(builder, instructions.buildICmpNE(builder, token, runtime.int64(0),
+        ""), postBlock, wakeBlock);
+
+    builder.positionAtEnd(postBlock);
+    memory.buildStore(builder, runtime.int64(0), tokenSlot);
+    runtime.call(post, [memory.buildLoad(builder, runtime.pointerType,
+        runtime.offsetPointer(cell, ConsoleCell.port, ""), "port"), runtime.int32(0), token,
+        runtime.nullPointer()], "");
+    instructions.buildBr(builder, wakeBlock);
+
+    builder.positionAtEnd(wakeBlock);
+    runtime.call(notify, [cell], "");
+    runtime.call(release, [cell], "");
+    instructions.buildRetVoid(builder);
+    return runtime.endDefinition(definition);
+}
+
+// Whether the 'kept' units read are Ctrl+Z, a carriage return and a line feed, which is a line of
+// Ctrl+Z alone.
+endsTheStream(Runtime runtime, Value wide, Value kept) -> Value {
+    let builder = runtime.builder;
+    Value matches = instructions.buildICmpEQ(builder, kept, runtime.int32(3), "three");
+    let expected = [EndOfStream.control, EndOfStream.carriageReturn, EndOfStream.lineFeed];
+    let names = ["control", "return", "feed"];
+    for (long index = 0; index < expected.length; index++) {
+        let found = memory.buildLoad(builder, runtime.int16Type, memory.buildGEP(builder,
+            runtime.int16Type, wide, [runtime.int64(index)], ""), names[index]);
+        matches = instructions.buildAnd(builder, matches, instructions.buildICmpEQ(builder, found,
+            unit(runtime, expected[index]), ""), "");
+    }
+    return matches;
+}
+
+// Whether the reader, whose lock the caller holds, has bytes, an end or a failure to report.
+holdsReport(Runtime runtime, Value cell) -> Value {
+    let builder = runtime.builder;
+    let holds = instructions.buildICmpSLT(builder, memory.buildLoad(builder, runtime.int64Type,
+        runtime.offsetPointer(cell, ConsoleCell.start, ""), "start"), memory.buildLoad(builder,
+        runtime.int64Type, runtime.offsetPointer(cell, ConsoleCell.end, ""), "end"), "holds");
+    let failed = instructions.buildICmpNE(builder, memory.buildLoad(builder, runtime.int32Type,
+        runtime.offsetPointer(cell, ConsoleCell.failure, ""), "failure"), runtime.int32(0), "");
+    return instructions.buildOr(builder, instructions.buildOr(builder, holds,
+        flagSet(runtime, cell, ConsoleCell.ended, "ended"), ""), failed, "report");
+}
+
+flagSet(Runtime runtime, Value cell, long offset, string name) -> Value {
+    let builder = runtime.builder;
+    return instructions.buildICmpNE(builder, memory.buildLoad(builder, runtime.int32Type,
+        runtime.offsetPointer(cell, offset, ""), name), runtime.int32(0), "");
+}
+
+setFlag(Runtime runtime, Value cell, long offset, long value) {
+    memory.buildStore(runtime.builder, runtime.int32(value),
+        runtime.offsetPointer(cell, offset, ""));
+}
+
+unit(Runtime runtime, long value) -> Value {
+    return runtime.int16Type.constInt(value as ulong, false);
+}

@@ -1,0 +1,135 @@
+// The console reader, held to the verifier from whichever host runs the suite: on Windows, where a
+// read runs on a work item, keeps its line in the reader and posts the watch's token, and on the
+// other targets, where no reader is ever opened.
+import @std.testing;
+import @ens.llvm.target;
+import EmissionHost from support;
+import emit.console;
+import emit.pollers;
+
+// The module's text once one target's reader is opened, watched, unwatched, read and released.
+moduleText(string triple) -> string throws {
+    let host = new EmissionHost("console_{triple}");
+    host.retarget(triple);
+    let runtime = host.runtime;
+    let poller = runtime.call(pollers.createRuntime(runtime), [runtime.nullPointer()], "poller");
+    let reader = runtime.call(console.openRuntime(runtime), [runtime.nullPointer(),
+        runtime.nullPointer()], "reader");
+    runtime.call(console.watchRuntime(runtime), [reader, poller, runtime.int64(5),
+        runtime.nullPointer()], "state");
+    runtime.call(console.unwatchRuntime(runtime), [reader], "");
+    runtime.call(console.readRuntime(runtime), [reader, runtime.nullPointer(), runtime.int64(64),
+        runtime.nullPointer()], "code");
+    runtime.call(console.releaseRuntime(runtime), [reader], "");
+    string text = host.text();
+    try host.finish();
+    return text;
+}
+
+// One function's body, from its definition to the brace that closes it.
+bodyOf(string text, string name) -> string throws {
+    long start = text.indexOf("define internal {name}(");
+    try testing.assertTrue(start >= 0, "'{name}' was never defined: {text}");
+    string rest = text.substring(start, text.length);
+    long end = rest.indexOf("\n}");
+    try testing.assertTrue(end >= 0, "'{name}' was left unclosed: {rest}");
+    return rest.substring(0, end);
+}
+
+windowsTriples() -> string[] {
+    return ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"];
+}
+
+test "a Windows reader is opened for a console alone" {
+    for (let triple in windowsTriples()) {
+        string open = try bodyOf(try moduleText(triple), "ptr @ens_console_open");
+        try testing.assertTrue(open.indexOf("@GetConsoleMode(ptr %handle, ptr %mode)") >= 0,
+            "'{triple}' does not tell a console from another handle: {open}");
+        try testing.assertTrue(open.indexOf("@calloc(i64 1, i64 12376)") >= 0,
+            "'{triple}' does not make the reader with room for a whole read: {open}");
+        try testing.assertTrue(open.indexOf("store i32 0, ptr %1") >= 0
+            && open.indexOf("store i32 8, ptr %1") >= 0,
+            "'{triple}' does not tell another handle from a reader it could not make: {open}");
+    }
+}
+
+test "a Windows watch is ready with something held and otherwise starts one read" {
+    for (let triple in windowsTriples()) {
+        string watch = try bodyOf(try moduleText(triple), "i32 @ens_console_watch");
+        try testing.assertTrue(watch.indexOf("ret i32 1") >= 0 && watch.indexOf("ret i32 0") >= 0,
+            "'{triple}' is never ready or never watching: {watch}");
+        try testing.assertTrue(watch.indexOf("@TrySubmitThreadpoolCallback(ptr @ens_console_ready")
+            >= 0, "'{triple}' does not read on a work item: {watch}");
+        try testing.assertTrue(watch.indexOf("%pending") >= 0,
+            "'{triple}' would start a second read beside one in progress: {watch}");
+    }
+}
+
+// Every read goes through one body, which a read with nothing held runs on its own thread and a
+// work item runs on the pool, so what it does to the units is pinned once for both.
+test "a Windows read converts a line and keeps half a surrogate pair for the next" {
+    for (let triple in windowsTriples()) {
+        string text = try moduleText(triple);
+        string ready = try bodyOf(text, "void @ens_console_ready");
+        try testing.assertTrue(ready.indexOf("call void @ens_console_fill(ptr %1)") >= 0,
+            "'{triple}' does not read in the work item: {ready}");
+        string fill = try bodyOf(text, "void @ens_console_fill");
+        try testing.assertTrue(fill.indexOf("[4097 x i16]") >= 0
+            && fill.indexOf("i32 4096, ptr %got, ptr null)") >= 0,
+            "'{triple}' does not read at most 4096 units after a carried one: {fill}");
+        try testing.assertTrue(fill.indexOf("and i16 %last, -1024") >= 0
+            && fill.indexOf("-10240") >= 0,
+            "'{triple}' does not keep a high surrogate for the next read: {fill}");
+        try testing.assertTrue(fill.indexOf("@WideCharToMultiByte(i32 65001, i32 0, ptr %wide") >= 0
+            && fill.indexOf("i32 12291, ptr null, ptr null)") >= 0,
+            "'{triple}' does not convert what it read to UTF-8 within the reader: {fill}");
+    }
+}
+
+test "a Windows read ends the stream at Ctrl+Z alone and reads again after Ctrl+C" {
+    string fill = try bodyOf(try moduleText("x86_64-pc-windows-msvc"), "void @ens_console_fill");
+    try testing.assertTrue(fill.indexOf("icmp eq i32 %kept, 3") >= 0
+        && fill.indexOf("icmp eq i16 %control, 26") >= 0
+        && fill.indexOf("icmp eq i16 %return, 13") >= 0
+        && fill.indexOf("icmp eq i16 %feed, 10") >= 0,
+        "a line of Ctrl+Z alone does not end the stream: {fill}");
+    try testing.assertTrue(fill.indexOf("icmp eq i32 %why, 995") >= 0,
+        "a read the console ended with nothing is not made again: {fill}");
+    try testing.assertTrue(fill.indexOf("call void @SetLastError(i32 0)") >= 0,
+        "a read that succeeds is told apart by a number an earlier call left: {fill}");
+}
+
+// A read that ends posts the token once and wakes a read waiting for it, and a reader released
+// while its read ran is freed by that read.
+test "a Windows read posts its watch's token and frees a reader released meanwhile" {
+    let text = try moduleText("x86_64-pc-windows-msvc");
+    string fill = try bodyOf(text, "void @ens_console_fill");
+    try testing.assertTrue(fill.indexOf("@PostQueuedCompletionStatus(ptr %port, i32 0, i64 %token")
+        >= 0, "a read does not post the watch's token: {fill}");
+    try testing.assertTrue(fill.indexOf("call void @ens_lock_notify_all(ptr %0)") >= 0,
+        "a read does not wake one that waits for it: {fill}");
+    try testing.assertTrue(fill.indexOf("%released") >= 0 && fill.indexOf("call void @free(") >= 0,
+        "a reader released during its read is never freed: {fill}");
+    string read = try bodyOf(text, "i32 @ens_console_read");
+    try testing.assertTrue(read.indexOf("call void @ens_lock_wait(ptr %0, i64 -1)") >= 0
+        && read.indexOf("call void @ens_console_fill(ptr %0)") >= 0,
+        "a read neither waits for the read in progress nor reads itself: {read}");
+    string unwatch = try bodyOf(text, "void @ens_console_unwatch");
+    try testing.assertTrue(unwatch.indexOf("store i64 0, ptr") >= 0,
+        "an unwatch leaves the token to be posted: {unwatch}");
+}
+
+test "no reader is opened where there is no console" {
+    for (let triple in [target.hostTargetTriple(), "x86_64-unknown-linux-gnu",
+            "aarch64-apple-darwin23"]) {
+        if (triple.indexOf("windows") >= 0) {
+            continue;
+        }
+        let text = try moduleText(triple);
+        string open = try bodyOf(text, "ptr @ens_console_open");
+        try testing.assertTrue(open.indexOf("store i32 0, ptr %1") >= 0
+            && open.indexOf("ret ptr null") >= 0, "'{triple}' opens a reader: {open}");
+        try testing.assertTrue(text.indexOf("ReadConsoleW") < 0,
+            "'{triple}' reaches for a console: {text}");
+    }
+}
