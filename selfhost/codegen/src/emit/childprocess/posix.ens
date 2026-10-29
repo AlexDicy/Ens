@@ -21,6 +21,7 @@ import Timespec from emit.nativeshapes;
 import WaitStatus from emit.nativeshapes;
 import emit.nativeshapes;
 import Errno from emit.errorkinds;
+import ChildEvent from emit.childprocess;
 import PosixChild from emit.childprocess;
 import StartCause from emit.errorkinds;
 import emit.filesystem.posix;
@@ -30,6 +31,8 @@ import Runtime from emit.runtime;
 import RuntimeDefinition from emit.runtime;
 import RuntimeFunction from emit.runtime;
 import emit.system;
+import WatchState from emit.pollers;
+import emit.pollers;
 
 // The slots of the descriptor table a start fills, two per pipe, in the order pipe writes them.
 final class PipeEnds {
@@ -697,6 +700,81 @@ public posixRelease(Runtime runtime, TypeRef type) -> RuntimeFunction {
     builder.positionAtEnd(freeBlock);
     runtime.call(release, [block], "");
     instructions.buildRetVoid(builder);
+    return runtime.endDefinition(definition);
+}
+
+// A watch of a pipe registers its descriptor, and a watch of the child's end its pidfd on Linux
+// and its process on macOS.
+public posixWatch(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let watchDescriptor = pollers.watchDescriptorRuntime(runtime);
+    RuntimeFunction? watchProcess = null;
+    if (runtime.onDarwin()) {
+        watchProcess = pollers.watchProcessRuntime(runtime);
+    }
+    let definition = runtime.beginDefinition("ens_process_watch", type);
+    let builder = runtime.builder;
+    let block = runtime.parameter(definition, 0);
+    let poller = runtime.parameter(definition, 1);
+    let event = runtime.parameter(definition, 2);
+    let token = runtime.parameter(definition, 3);
+    let error = runtime.parameter(definition, 4);
+    let streamBlock = runtime.block(definition, "watch.stream");
+    let pipeBlock = runtime.block(definition, "watch.pipe");
+    let endBlock = runtime.block(definition, "watch.end");
+    let runningBlock = runtime.block(definition, "watch.running");
+    let readyBlock = runtime.block(definition, "watch.ready");
+    let unknownBlock = runtime.block(definition, "watch.unknown");
+    let known = instructions.buildOr(builder, isStream(runtime, event, ChildStream.output),
+        isStream(runtime, event, ChildStream.errors), "stream");
+    instructions.buildCondBr(builder, known, streamBlock, endBlock);
+
+    builder.positionAtEnd(streamBlock);
+    let descriptor = streamDescriptor(runtime, block, event);
+    let live = instructions.buildAnd(builder,
+        instructions.buildICmpSGE(builder, descriptor, runtime.int32(0), ""),
+        instructions.buildICmpEQ(builder, memory.buildLoad(builder, runtime.int32Type,
+            streamEndedSlot(runtime, block, event), ""), runtime.int32(0), ""), "live");
+    instructions.buildCondBr(builder, live, pipeBlock, readyBlock);
+
+    builder.positionAtEnd(pipeBlock);
+    instructions.buildRet(builder, runtime.call(watchDescriptor, [poller, descriptor, token,
+        error], "state"));
+
+    builder.positionAtEnd(endBlock);
+    let collected = instructions.buildICmpNE(builder,
+        childprocess.loadField(runtime, block, PosixChild.reaped), runtime.int32(0), "collected");
+    instructions.buildCondBr(builder, isStream(runtime, event, ChildEvent.ended), runningBlock,
+        unknownBlock);
+
+    builder.positionAtEnd(runningBlock);
+    let unwatchedBlock = runtime.block(definition, "watch.unwatched");
+    let processBlock = runtime.block(definition, "watch.process");
+    instructions.buildCondBr(builder, collected, readyBlock, processBlock);
+
+    builder.positionAtEnd(processBlock);
+    if (watchProcess != null) {
+        instructions.buildRet(builder, runtime.call(watchProcess, [poller,
+            childprocess.loadField(runtime, block, PosixChild.pid), token, error], "state"));
+    } else {
+        let pidDescriptor = childprocess.loadField(runtime, block, PosixChild.pidDescriptor);
+        let pidBlock = runtime.block(definition, "watch.pidfd");
+        instructions.buildCondBr(builder, instructions.buildICmpSLT(builder, pidDescriptor,
+            runtime.int32(0), ""), unwatchedBlock, pidBlock);
+
+        builder.positionAtEnd(pidBlock);
+        instructions.buildRet(builder, runtime.call(watchDescriptor, [poller, pidDescriptor,
+            token, error], "state"));
+    }
+
+    builder.positionAtEnd(unwatchedBlock);
+    instructions.buildRet(builder, runtime.int32(WatchState.unwatchable as int));
+
+    builder.positionAtEnd(readyBlock);
+    instructions.buildRet(builder, runtime.int32(WatchState.ready as int));
+
+    builder.positionAtEnd(unknownBlock);
+    memory.buildStore(builder, runtime.int32(Errno.invalidArgument), error);
+    instructions.buildRet(builder, runtime.int32(WatchState.failed as int));
     return runtime.endDefinition(definition);
 }
 

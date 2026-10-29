@@ -22,6 +22,7 @@ import StdioMode from emit.nativeshapes;
 import Win32Error from emit.errorkinds;
 import Win32 from emit.filesystem.windows;
 import emit.filesystem.windows;
+import ChildEvent from emit.childprocess;
 import OutputRecord from emit.childprocess;
 import StartCause from emit.errorkinds;
 import WindowsChild from emit.childprocess;
@@ -30,6 +31,8 @@ import Runtime from emit.runtime;
 import RuntimeDefinition from emit.runtime;
 import RuntimeFunction from emit.runtime;
 import emit.widetext;
+import WatchState from emit.pollers;
+import emit.pollers;
 
 // What a failed CreateProcessW that reported `refused` failed on. The working directory is checked
 // first, because Windows reports a missing one, and one that is a file, with the numbers it gives a
@@ -683,9 +686,15 @@ public windowsKill(Runtime runtime, TypeRef type) -> RuntimeFunction {
 
 public windowsRelease(Runtime runtime, TypeRef type) -> RuntimeFunction {
     let release = runtime.free();
+    let disarm = pollers.disarmRuntime(runtime);
     let definition = runtime.beginDefinition("ens_process_release", type);
     let builder = runtime.builder;
     let block = runtime.parameter(definition, 0);
+    runtime.call(disarm, [runtime.offsetPointer(recordAt(runtime, block, WindowsChild.output),
+        OutputRecord.watch, "")], "");
+    runtime.call(disarm, [runtime.offsetPointer(recordAt(runtime, block, WindowsChild.errors),
+        OutputRecord.watch, "")], "");
+    runtime.call(disarm, [childprocess.childField(runtime, block, WindowsChild.endWatch)], "");
     releaseRecord(runtime, definition, recordAt(runtime, block, WindowsChild.output),
         "release.output");
     releaseRecord(runtime, definition, recordAt(runtime, block, WindowsChild.errors),
@@ -696,6 +705,82 @@ public windowsRelease(Runtime runtime, TypeRef type) -> RuntimeFunction {
         WindowsChild.process), "release.process");
     runtime.call(release, [block], "");
     instructions.buildRetVoid(builder);
+    return runtime.endDefinition(definition);
+}
+
+// A watch of a pipe first makes sure a read is in flight on it, as a poll does, and then waits on
+// the event that read signals; a watch of the child's end waits on the process. A pipe that already
+// holds bytes, has lost its writer or refused a read is ready, since its read returns at once.
+public windowsWatch(Runtime runtime, TypeRef type) -> RuntimeFunction {
+    let arm = pollers.armRuntime(runtime);
+    let definition = runtime.beginDefinition("ens_process_watch", type);
+    let builder = runtime.builder;
+    let block = runtime.parameter(definition, 0);
+    let poller = runtime.parameter(definition, 1);
+    let event = runtime.parameter(definition, 2);
+    let token = runtime.parameter(definition, 3);
+    let error = runtime.parameter(definition, 4);
+    let streamBlock = runtime.block(definition, "watch.stream");
+    let liveBlock = runtime.block(definition, "watch.live");
+    let issueBlock = runtime.block(definition, "watch.issue");
+    let armBlock = runtime.block(definition, "watch.arm");
+    let endBlock = runtime.block(definition, "watch.end");
+    let processBlock = runtime.block(definition, "watch.process");
+    let runningBlock = runtime.block(definition, "watch.running");
+    let readyBlock = runtime.block(definition, "watch.ready");
+    let unknownBlock = runtime.block(definition, "watch.unknown");
+    instructions.buildCondBr(builder, knownStream(runtime, event), streamBlock, endBlock);
+
+    builder.positionAtEnd(streamBlock);
+    let record = streamRecord(runtime, block, event);
+    let pipe = memory.buildLoad(builder, runtime.pointerType,
+        runtime.offsetPointer(record, OutputRecord.pipe, ""), "pipe");
+    let waiting = instructions.buildAnd(builder, instructions.buildAnd(builder,
+        instructions.buildNot(builder, runtime.isNull(pipe), ""),
+        instructions.buildICmpEQ(builder, loadRecordField(runtime, record, OutputRecord.ended),
+            runtime.int32(0), ""), ""), instructions.buildAnd(builder,
+        instructions.buildICmpEQ(builder, loadRecordField(runtime, record, OutputRecord.closed),
+            runtime.int32(0), ""),
+        instructions.buildICmpSLE(builder, loadRecordField(runtime, record, OutputRecord.filled),
+            loadRecordField(runtime, record, OutputRecord.consumed), ""), ""), "waiting");
+    instructions.buildCondBr(builder, waiting, liveBlock, readyBlock);
+
+    builder.positionAtEnd(liveBlock);
+    instructions.buildCondBr(builder, instructions.buildICmpNE(builder,
+        loadRecordField(runtime, record, OutputRecord.pending), runtime.int32(0), ""), armBlock,
+        issueBlock);
+
+    builder.positionAtEnd(issueBlock);
+    let issued = issueRead(runtime, record);
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, issued, runtime.int32(0),
+        ""), armBlock, readyBlock);
+
+    builder.positionAtEnd(armBlock);
+    instructions.buildRet(builder, runtime.call(arm, [runtime.offsetPointer(record,
+        OutputRecord.watch, "watch.slot"), poller, memory.buildLoad(builder, runtime.pointerType,
+        runtime.offsetPointer(record, OutputRecord.event, ""), "event"), token, error], "state"));
+
+    builder.positionAtEnd(endBlock);
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, event,
+        runtime.int32(ChildEvent.ended), ""), processBlock, unknownBlock);
+
+    builder.positionAtEnd(processBlock);
+    instructions.buildCondBr(builder, instructions.buildICmpNE(builder,
+        childprocess.loadField(runtime, block, WindowsChild.reaped), runtime.int32(0), ""),
+        readyBlock, runningBlock);
+
+    builder.positionAtEnd(runningBlock);
+    instructions.buildRet(builder, runtime.call(arm, [childprocess.childField(runtime, block,
+        WindowsChild.endWatch), poller, memory.buildLoad(builder, runtime.pointerType,
+        childprocess.childField(runtime, block, WindowsChild.process), "process"), token, error],
+        "state"));
+
+    builder.positionAtEnd(readyBlock);
+    instructions.buildRet(builder, runtime.int32(WatchState.ready as int));
+
+    builder.positionAtEnd(unknownBlock);
+    memory.buildStore(builder, runtime.int32(Win32Error.invalidParameter), error);
+    instructions.buildRet(builder, runtime.int32(WatchState.failed as int));
     return runtime.endDefinition(definition);
 }
 
