@@ -200,8 +200,8 @@ When neither overload is more specific, the call is a compile error that lists t
 Overloads that are not visible from the call site lose to visible ones; visibility is only an error when no visible overload matches.
 Named arguments participate in selection: an overload is only considered when every named argument names one of its parameters.
 A subclass may add a new overload of an inherited method name; `override` still requires the exact signature of the method it replaces.
-External functions cannot be overloaded, and neither can generic methods.
-A generic function shares its name only with declarations that take a different number of arguments, counting the arguments a default leaves out, so the number of arguments a call passes picks it before any argument's type is read.
+External functions cannot be overloaded.
+A generic function or method shares its name only with declarations that take a different number of arguments, counting the arguments a default leaves out, so the number of arguments a call passes picks it before any argument's type is read; for a method, the methods of its base classes count too.
 
 ```ens
 calculateArea(Rectangle rectangle) -> uint {
@@ -491,7 +491,7 @@ Classes, structs, and functions may be generic: they declare type parameters in 
 A type-parameter list names at least one type parameter, so an empty `<>` is an error.
 A method may declare type parameters of its own, as in `mapped<R>((T) -> R transform) -> Cell<R>`, and a call infers them from its arguments the way a generic function's call does, or writes them after the method's name, as in `cell.mapped<string>(describe)`.
 A static method writes its own type arguments after its name and its type's after the type, as in `Cell<int>.wrapped<string>(text)`.
-A generic method is a separate method for each list of type arguments, so it cannot be `override` or `abstract`, no subclass can override it, and it shares its name with no other method of its type or of a base class.
+A generic method is a separate method for each list of type arguments, so it cannot be `override` or `abstract`, no subclass can override it, and it shares its name only with methods of its type or of a base class that take a different number of arguments.
 A constructor and an interface method declare no type parameters of their own.
 A name in a member's list that matches one of its type's parameters restates that parameter instead, as described under conditional members below.
 A type parameter takes its name for the whole of the declaration that introduces it, so that name is the parameter in a bound, in a member's signature, in a field or parameter default, and in a body alike.
