@@ -6,8 +6,12 @@ import IoError from @std.io.streams;
 import Reader from @std.io.streams;
 import Writer from @std.io.streams;
 import CFile from @std.system;
-import ThreadLock from @std.system;
+import ConsoleReader from @std.system;
 import @std.system;
+import Cancelled from @std.tasks;
+import EventEnd from @std.tasks;
+import TurnLock from @std.tasks;
+import @std.tasks;
 
 // Standard output, buffered, so a line written here reaches the operating system once that buffer
 // fills or something flushes it.
@@ -39,11 +43,11 @@ final class Standard {
 // Standard input, read through one buffer. Any task may read it, and tasks that read it at the same
 // time take turns, each read or line whole.
 export shared final class StandardInput implements Reader {
-    const ThreadLock lock;
+    const TurnLock turn;
     const BufferedReader buffered;
 
     protected constructor() {
-        this.lock = system.createLock();
+        this.turn = new TurnLock();
         this.buffered = new BufferedReader(new HandleReader(system.standardInput(),
             "standard input"));
     }
@@ -51,47 +55,49 @@ export shared final class StandardInput implements Reader {
     // Bytes out of the buffer, refilling it first when it is empty, and 0 only at the end of the
     // stream.
     export override read(byte[] buffer) -> long throws IoError {
-        system.acquireLock(this.lock);
-        long count = try this.buffered.read(buffer);
-        system.releaseLock(this.lock);
-        return count;
-    } catch (IoError failure) {
-        system.releaseLock(this.lock);
-        rethrow;
+        return try this.inTurn(() -> {
+            return try this.buffered.read(buffer);
+        });
     }
 
     // The next line without its ending, or null once the stream has ended. A carriage return
     // before the newline belongs to the ending, and a last line without one is a line of its own.
     export readLine() -> string? throws IoError {
-        system.acquireLock(this.lock);
-        let line = try this.buffered.readLine();
-        system.releaseLock(this.lock);
-        return line;
-    } catch (IoError failure) {
-        system.releaseLock(this.lock);
-        rethrow;
+        return try this.inTurn(() -> {
+            return try this.buffered.readLine();
+        });
     }
 
     // Everything left in the stream, as bytes.
     export readAll() -> bytes throws IoError {
-        system.acquireLock(this.lock);
-        bytes all = try this.buffered.readAll();
-        system.releaseLock(this.lock);
-        return all;
-    } catch (IoError failure) {
-        system.releaseLock(this.lock);
-        rethrow;
+        return try this.inTurn(() -> {
+            return try this.buffered.readAll();
+        });
     }
 
     // Everything left in the stream, as text. Bytes that do not spell UTF-8 are refused, since
     // text in Ens is always valid UTF-8.
     export readAllText() -> string throws IoError {
-        system.acquireLock(this.lock);
-        string all = try this.buffered.readAllText();
-        system.releaseLock(this.lock);
-        return all;
+        return try this.inTurn(() -> {
+            return try this.buffered.readAllText();
+        });
+    }
+
+    // Runs `body` once the tasks reading before this one are done, and lets the next one read
+    // after it. A task cancelled while it waits for its turn reads nothing.
+    inTurn<R>((() -> R throws IoError) body) -> R throws IoError {
+        try this.turn.enter();
+        return try this.holding(body);
+    } catch (Cancelled cancelled) {
+        throw streams.cancelled("read standard input");
+    }
+
+    holding<R>((() -> R throws IoError) body) -> R throws IoError {
+        R result = try body();
+        this.turn.leave();
+        return result;
     } catch (IoError failure) {
-        system.releaseLock(this.lock);
+        this.turn.leave();
         rethrow;
     }
 }
@@ -144,17 +150,48 @@ flushOutput() {
 } catch (IoError ignored) {
 }
 
-// Bytes from one of the C library's own handles, as many as have arrived.
+// Bytes from one of the C library's own handles, as many as have arrived. A read waits for them
+// parked on the poller where the stream can be watched, so a cancel ends it. A console on Windows
+// is read through its reader, whose read outlives a cancel so the line it brings is kept for the
+// next read.
 final class HandleReader implements Reader {
     const CFile handle;
+    const ConsoleReader? console;
     const string stream;
 
-    protected constructor(this.handle, this.stream);
+    protected constructor(CFile handle, string stream) {
+        this.handle = handle;
+        this.console = system.openConsole(handle);
+        this.stream = stream;
+    }
 
     protected override read(byte[] buffer) -> long throws IoError {
+        let console = this.console;
+        if (console != null) {
+            return try this.readConsole(console, buffer);
+        }
+        let waited = tasks.awaitEvent((poller, token) -> system.watchStream(this.handle, poller,
+            token));
+        if (waited.end == EventEnd.Cancelled) {
+            throw streams.cancelled("read {this.stream}");
+        }
         let read = system.readFromHandle(this.handle, buffer);
         if (read.code != 0) {
             throw streams.failure("read {this.stream}", read.code);
+        }
+        return read.count;
+    }
+
+    readConsole(ConsoleReader console, byte[] buffer) -> long throws IoError {
+        let waited = tasks.awaitEvent((poller, token) -> system.watchConsole(console, poller,
+            token));
+        if (waited.end == EventEnd.Cancelled) {
+            system.unwatchConsole(console);
+            throw streams.cancelled("read {this.stream}");
+        }
+        let read = system.readConsole(console, buffer);
+        if (read.code != 0) {
+            throw streams.win32Failure("read {this.stream}", read.code);
         }
         return read.count;
     }

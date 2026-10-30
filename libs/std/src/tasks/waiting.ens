@@ -2,11 +2,13 @@
 // once is all it takes: a second wake, from a deadline or a cancel that lost the race, does
 // nothing. A task on a context parks, leaving its worker to run others, and is queued to run again
 // when woken; a thread without a context, the program's main thread, a dedicated task's or one a
-// library made, sleeps on a lock of its own. Deadlines for parked tasks are kept by one timer
-// thread that sleeps until the nearest.
+// library made, sleeps on a lock of its own. Deadlines for parked tasks, and waits for a stream or a
+// child, are kept by one thread that waits on the readiness poller until the nearest deadline.
 import Atomic from @std.tasks;
 import TaskControl from @std.tasks;
 import List from @std.collections.list;
+import Map from @std.collections.map;
+import Poller from @std.system;
 import ThreadLock from @std.system;
 import @std.system;
 
@@ -56,7 +58,7 @@ export shared final class Waiter {
         let task = this.task;
         if (task != null) {
             if (deadline >= 0) {
-                Clockwork.timers.wakeAt(deadline, this);
+                Clockwork.events.wakeAt(deadline, this);
             }
             task.park();
             return;
@@ -122,20 +124,27 @@ export shared final class WaitList {
     }
 }
 
-// The timers, made the first time a parked task waits with a deadline.
+// The events thread, made the first time a parked task waits with a deadline or for a stream.
 public final class Clockwork {
-    public lazy const Timers timers = new Timers();
+    public lazy const Events events = new Events();
 }
 
-// Deadlines in order, and the thread that sleeps until the nearest and then wakes its waiter or
-// runs its action.
-export shared final class Timers {
+// Deadlines in order, the waiters of watched streams and children by the token each was watched
+// under, and the thread that waits on the poller until the nearest deadline, then wakes the waiters
+// of the deadlines that passed and of the tokens that fired, and runs the actions that were due.
+export shared final class Events {
     const ThreadLock lock;
+    public const Poller poller;
     List<Timer> heap;
+    Map<long, Waiter> watched;
+    long lastToken;
 
     protected constructor() {
         this.lock = system.createLock();
+        this.poller = system.createPoller();
         this.heap = new List<Timer>();
+        this.watched = new Map<long, Waiter>();
+        this.lastToken = 0;
         let thread = system.startThread(() -> this.run());
     }
 
@@ -144,38 +153,86 @@ export shared final class Timers {
         this.schedule(new Timer(deadline, waiter, null));
     }
 
-    // Runs `action` on the timer thread once `deadline` has passed; it must not wait.
+    // Runs `action` on the events thread once `deadline` has passed; it must not wait.
     public runAt(long deadline, (shared () -> void) action) {
         this.schedule(new Timer(deadline, null, action));
+    }
+
+    // A token no other watch holds, which wakes `waiter` when the poller returns it.
+    public enlist(Waiter waiter) -> long {
+        system.acquireLock(this.lock);
+        this.lastToken = this.lastToken + 1;
+        long token = this.lastToken;
+        this.watched.set(token, waiter);
+        system.releaseLock(this.lock);
+        return token;
+    }
+
+    // Forgets the token, so the poller returning it later wakes nothing.
+    public discharge(long token) {
+        system.acquireLock(this.lock);
+        let removed = this.watched.remove(token);
+        system.releaseLock(this.lock);
     }
 
     schedule(Timer timer) {
         system.acquireLock(this.lock);
         this.heap.push(timer);
         this.siftUp(this.heap.length() - 1);
-        if (this.heap.get(0) == timer) {
-            system.wakeLockWaiters(this.lock);
-        }
+        bool nearest = this.heap.get(0) == timer;
         system.releaseLock(this.lock);
+        if (nearest) {
+            system.wakePoller(this.poller);
+        }
     }
 
     run() {
+        long[] tokens = new long[64];
         while (true) {
+            long got = system.waitOnPoller(this.poller, tokens, this.untilNearest());
+            let woken = new List<Waiter>();
             system.acquireLock(this.lock);
-            while (this.heap.isEmpty()) {
-                system.waitOnLock(this.lock, -1);
+            for (long i = 0; i < got; i++) {
+                Waiter? waiter = this.watched.get(tokens[i]);
+                if (waiter != null) {
+                    let removed = this.watched.remove(tokens[i]);
+                    woken.push(waiter);
+                }
             }
-            let next = this.heap.get(0);
-            long left = next.deadline - system.monotonicMillis();
-            if (left > 0) {
-                system.waitOnLock(this.lock, left);
-                system.releaseLock(this.lock);
-                continue;
-            }
-            this.popTop();
+            let due = this.takeDue();
             system.releaseLock(this.lock);
-            next.fire();
+            for (let waiter in woken) {
+                let woke = waiter.wake();
+            }
+            for (let timer in due) {
+                timer.fire();
+            }
         }
+    }
+
+    // How long the poller may wait before the nearest deadline, or -1 with none.
+    untilNearest() -> long {
+        system.acquireLock(this.lock);
+        long left = -1;
+        if (!this.heap.isEmpty()) {
+            left = this.heap.get(0).deadline - system.monotonicMillis();
+            if (left < 0) {
+                left = 0;
+            }
+        }
+        system.releaseLock(this.lock);
+        return left;
+    }
+
+    // The timers whose deadlines have passed, taken off the heap.
+    takeDue() -> List<Timer> {
+        let due = new List<Timer>();
+        long now = system.monotonicMillis();
+        while (!this.heap.isEmpty() && this.heap.get(0).deadline <= now) {
+            due.push(this.heap.get(0));
+            this.popTop();
+        }
+        return due;
     }
 
     popTop() {
