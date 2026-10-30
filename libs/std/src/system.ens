@@ -15,6 +15,12 @@ public external type NativeThread;
 public shared external type Context;
 // The record a thread keeps for the task scheduler, read by the supervisor from another thread.
 public shared external type ThreadRecord;
+// The readiness poller: a kqueue, an epoll or a completion port, which one thread waits on while
+// any thread watches with it.
+public shared external type Poller;
+// What a console standard input on Windows is read through: one read at a time runs on a work
+// item, and a line it brings waits in the reader for the next read.
+public shared external type ConsoleReader;
 
 // The compiler defines the 'ens_' bridges wherever they are referenced. The bridge that starts a
 // program takes the arguments twice over: a POSIX target builds an argument vector out of the NUL
@@ -95,6 +101,17 @@ external from libc {
     ens_monitor_tick_advance() -> long;
     ens_capture_trace(int maxDepth) -> long[];
     ens_trace_frames(long[] addresses) -> StackFrame[];
+    ens_poller_create(out int error) -> Poller?;
+    ens_poller_wait(Poller poller, long[] tokens, long capacity, long millis,
+                    out int error) -> long;
+    ens_poller_wake(Poller poller);
+    ens_process_watch(Child child, Poller poller, int event, long token, out int error) -> int;
+    ens_stream_watch(CFile handle, Poller poller, long token, out int error) -> int;
+    ens_console_open(CFile stream, out int error) -> ConsoleReader?;
+    ens_console_watch(ConsoleReader reader, Poller poller, long token, out int error) -> int;
+    ens_console_unwatch(ConsoleReader reader);
+    ens_console_read(ConsoleReader reader, byte[] buffer, long capacity, out long count) -> int;
+    ens_io_win32_kind(int code) -> int;
 }
 
 // The three streams every process is born with, and the calls over one of their handles. All of
@@ -664,3 +681,98 @@ public traceFrames(long[] addresses) -> StackFrame[] {
     return ens_trace_frames(addresses);
 }
 
+
+// What a watch reports: its token comes once the event happens; nothing needs a wait; the event
+// cannot be watched, so the call that follows waits in the system; or the watch failed.
+public enum WatchState {
+    watching = 0,
+    ready = 1,
+    unwatchable = 2,
+    failed = 3,
+}
+
+public struct NativeWatch {
+    public const WatchState state;
+    public const int code;
+}
+
+// A poller, or a panic when the system has none to give, since nothing can wait without one.
+public createPoller() -> Poller {
+    int error = 0;
+    Poller? poller = ens_poller_create(out error);
+    if (poller == null) {
+        panic("could not prepare to wait for streams and timers: the system refused with error "
+            + "number {error}");
+    }
+    return poller;
+}
+
+// The tokens of the watches that fired, waiting up to `millis` for one, or without bound when it
+// is negative. A wake, a signal or the bound passing returns none.
+public waitOnPoller(Poller poller, long[] tokens, long millis) -> long {
+    int error = 0;
+    long got = ens_poller_wait(poller, tokens, tokens.length, millis, out error);
+    if (got < 0) {
+        panic("could not wait for streams and timers: the system refused with error number "
+            + "{error}");
+    }
+    return got;
+}
+
+// Makes a wait on the poller in progress, or the next one, return at once.
+public wakePoller(Poller poller) {
+    ens_poller_wake(poller);
+}
+
+// Watches the child's `event`, 1 for bytes on its output, 2 on its errors and 3 for its end, under
+// `token`, which must not be 0.
+public watchProcess(Child child, Poller poller, int event, long token) -> NativeWatch {
+    int code = 0;
+    int state = ens_process_watch(child, poller, event, token, out code);
+    return watchOf(state, code);
+}
+
+// Watches the stream for bytes or its end under `token`, which must not be 0.
+public watchStream(CFile handle, Poller poller, long token) -> NativeWatch {
+    int code = 0;
+    int state = ens_stream_watch(handle, poller, token, out code);
+    return watchOf(state, code);
+}
+
+watchOf(int state, int code) -> NativeWatch {
+    NativeWatch watch = {state: (state as? WatchState) ?? WatchState.failed, code: code};
+    return watch;
+}
+
+// The reader of a console standard input, or null for every other stream, which is read as it is.
+// A reader the system could not make leaves the stream to be read as it is as well.
+public openConsole(CFile stream) -> ConsoleReader? {
+    int error = 0;
+    return ens_console_open(stream, out error);
+}
+
+// Watches the console for the next read's bytes under `token`, which must not be 0.
+public watchConsole(ConsoleReader reader, Poller poller, long token) -> NativeWatch {
+    int code = 0;
+    int state = ens_console_watch(reader, poller, token, out code);
+    return watchOf(state, code);
+}
+
+// Stops the read in progress from posting its token; the read goes on for the next reader.
+public unwatchConsole(ConsoleReader reader) {
+    ens_console_unwatch(reader);
+}
+
+// Bytes the console brought, waiting for the read in progress when the reader holds none, and a
+// count of 0 once a line of Ctrl+Z alone ends the stream. A failure is a Win32 number.
+public readConsole(ConsoleReader reader, byte[] buffer) -> NativeCount {
+    long count = 0;
+    int code = ens_console_read(reader, buffer, buffer.length, out count);
+    NativeCount result = {code: code, count: count};
+    return result;
+}
+
+// The ordinal the stream error table gives a Win32 number, which a console read fails with.
+public win32ErrorKind(int code) -> int {
+    return ens_io_win32_kind(code);
+}

@@ -2198,7 +2198,7 @@ What `print` writes is buffered, so a line it wrote may still be inside the prog
 A panic therefore never loses what was printed before it.
 `io.flush()` is that same guarantee on demand, for an order that only the program itself relies on.
 
-A stream that fails raises an `IoError` from `@std.io.streams`, whose `kind` is the condition a program acts on: `Closed` for a stream that is no longer open, `Interrupted` for a call the system cut short before it moved anything, and `Other` for what the message alone describes.
+A stream that fails raises an `IoError` from `@std.io.streams`, whose `kind` is the condition a program acts on: `Closed` for a stream that is no longer open, `Interrupted` for a call the system cut short before it moved anything, `Cancelled` for a read the task making it was cancelled during, and `Other` for what the message alone describes.
 Beside the kind, `nativeError` carries the number the system itself reported, which a program logs rather than acts on.
 It is the C library's `errno` wherever the failing call was the C library's, which is every stream but a child's pipes; a child's pipes are the system's own, so a write to one reports a Win32 number on Windows and an `errno` everywhere else.
 It is `0` where no call to the system was made, as it is for bytes that spell no character.
@@ -2526,7 +2526,8 @@ A task stops when it is asked to and when it chooses to: cancellation is coopera
 The first task in a scope to throw, other than with the `Cancelled` it was asked for, marks the scope cancelled as well, so the others stop wasting work, while the scope still waits for every one of them before the error reaches whoever awaits it.
 A task reads `tasks.isCancelled()` to learn that it was asked to stop, and `tasks.checkCancelled()` throws `Cancelled` when it was, so a loop writes `try tasks.checkCancelled();` once per iteration, and its body's throws list, and so its task's type, then say that the task can be cut short.
 A call that waits, for a channel, a lock, another task or the clock, declares `Cancelled`: in a cancelled task it throws `Cancelled` instead of waiting, and a task cancelled while it waits is woken to throw it at once.
-A read from a stream ends early in a cancelled task by throwing the `IoError` it declares anyway, with a `Cancelled` as its cause.
+A read from a stream ends early in a cancelled task by throwing the `IoError` it declares anyway, of kind `Cancelled` and with a `Cancelled` as its cause.
+A read waiting for a pipe, a terminal or a child's output parks its task, so it holds no thread while it waits; a read of a regular file goes ahead, since it never waits for anything to arrive.
 A `for` loop over a channel goes on waiting in a cancelled task, because cancelling the tasks that send to it releases their senders, and the loop then ends as the channel closes.
 A task whose body neither checks nor waits runs to its end, and its type shows that it cannot be cut short.
 Two tasks that await each other, and a task that locks a `Mutex` it already holds, could wait for ever, so each aborts the program naming the lines that started the tasks instead.

@@ -8,9 +8,12 @@ import Iterator from @std.collections.iterator;
 import List from @std.collections.list;
 import Map from @std.collections.map;
 import Context from @std.system;
+import NativeWatch from @std.system;
 import NativeThread from @std.system;
+import Poller from @std.system;
 import RecordSlot from @std.system;
 import ThreadLock from @std.system;
+import WatchState from @std.system;
 import @std.system;
 import Pool from @std.tasks.scheduler;
 import Clockwork from @std.tasks.waiting;
@@ -78,15 +81,11 @@ export shared final class Atomic<shared T> {
 // A value that tasks change one at a time. The value itself does not need to be shareable, because
 // it never leaves the lock.
 export shared final class Mutex<T> {
-    const Monitor guard;
-    const WaitList free;
+    const TurnLock turn;
     T value;
-    long holder;
 
     export constructor(this.value) {
-        this.guard = new Monitor();
-        this.free = new WaitList();
-        this.holder = 0;
+        this.turn = new TurnLock();
     }
 
     // Waits until no other task holds the lock, then runs `body` with the value and returns its
@@ -108,26 +107,23 @@ export shared final class Mutex<T> {
 
     holding<shared R, E: Error>((shared (T) -> R throws E) body) -> R throws E {
         R result = try body(this.value);
-        this.leave();
+        this.turn.leave();
         return result;
     } catch (E failure) {
-        this.leave();
+        this.turn.leave();
         rethrow;
     }
 
     replacing<E: Error>((shared (T) -> T throws E) body) throws E {
         this.value = try body(this.value);
-        this.leave();
+        this.turn.leave();
     } catch (E failure) {
-        this.leave();
+        this.turn.leave();
         rethrow;
     }
 
     enter() throws Cancelled {
-        long caller = system.taskToken();
-        this.guard.enter();
-        if (this.holder == caller) {
-            this.guard.leave();
+        if (this.turn.heldByCaller()) {
             string tried = "tried";
             let control = Registry.current();
             if (control != null) {
@@ -139,6 +135,36 @@ export shared final class Mutex<T> {
             panic("{tried} to lock a mutex inside a body this task is already running under its "
                 + "lock, which would wait for ever. Use the value that body was given instead");
         }
+        try this.turn.enter();
+    }
+}
+
+// One task at a time: the others wait their turn in the order they came, parked when they run on
+// the pool, and a task cancelled while it waits stops waiting.
+public shared final class TurnLock {
+    const Monitor guard;
+    const WaitList free;
+    long holder;
+
+    public constructor() {
+        this.guard = new Monitor();
+        this.free = new WaitList();
+        this.holder = 0;
+    }
+
+    // Whether the calling task holds the lock.
+    public heldByCaller() -> bool {
+        this.guard.enter();
+        bool held = this.holder == system.taskToken();
+        this.guard.leave();
+        return held;
+    }
+
+    // Waits until no other task holds the lock and takes it, or throws 'Cancelled' without it when
+    // the calling task is cancelled while it waits.
+    public enter() throws Cancelled {
+        long caller = system.taskToken();
+        this.guard.enter();
         while (this.holder != 0) {
             if (!this.guard.waitUnlessCancelled(this.free, -1)) {
                 this.guard.leave();
@@ -149,7 +175,7 @@ export shared final class Mutex<T> {
         this.guard.leave();
     }
 
-    leave() {
+    public leave() {
         this.guard.enter();
         this.holder = 0;
         this.free.wakeOne();
@@ -438,6 +464,69 @@ export checkCancelled() throws Cancelled {
     if (isCancelled()) {
         throw new Cancelled();
     }
+}
+
+// How a wait for a stream or a child ended: the event happened, or needs no wait; it cannot be
+// watched, so the call that follows waits in the system; the calling task was cancelled; or the
+// watch failed, with the system's number.
+public enum EventEnd {
+    Arrived,
+    Unwatched,
+    Cancelled,
+    Failed,
+}
+
+public struct EventWait {
+    public const EventEnd end;
+    public const int code;
+}
+
+// Waits for the event `watch` registers, handing it the poller and the token to register it
+// under, so a task parks rather than holding its thread, and a cancel ends the wait. A task
+// already cancelled does not register at all.
+public awaitEvent(((Poller, long) -> NativeWatch) watch) -> EventWait {
+    let control = Registry.current();
+    if (control != null && control.isCancelled()) {
+        return eventEnd(EventEnd.Cancelled, 0);
+    }
+    let events = Clockwork.events;
+    let waiter = control == null ? new Waiter(null) : control.waiter();
+    long token = events.enlist(waiter);
+    let watched = watch(events.poller, token);
+    switch (watched.state) {
+        WatchState.watching -> { },
+        WatchState.ready -> {
+            events.discharge(token);
+            return eventEnd(EventEnd.Arrived, 0);
+        },
+        WatchState.unwatchable -> {
+            events.discharge(token);
+            return eventEnd(EventEnd.Unwatched, 0);
+        },
+        WatchState.failed -> {
+            events.discharge(token);
+            return eventEnd(EventEnd.Failed, watched.code);
+        },
+    }
+    if (control == null) {
+        waiter.await(-1);
+        return eventEnd(EventEnd.Arrived, 0);
+    }
+    control.block(waiter);
+    if (!control.isCancelled()) {
+        waiter.await(-1);
+    }
+    control.unblock();
+    if (control.isCancelled()) {
+        events.discharge(token);
+        return eventEnd(EventEnd.Cancelled, 0);
+    }
+    return eventEnd(EventEnd.Arrived, 0);
+}
+
+eventEnd(EventEnd end, int code) -> EventWait {
+    EventWait wait = {end: end, code: code};
+    return wait;
 }
 
 // Blocks the calling task until the monotonic clock has advanced by `millis` milliseconds. The wait
@@ -1179,7 +1268,7 @@ shared final class ScopeState {
                 + "scope's body runs");
         }
         this.lock.leave();
-        Clockwork.timers.runAt(deadline, () -> this.cancelIfOpen());
+        Clockwork.events.runAt(deadline, () -> this.cancelIfOpen());
     }
 
     cancelIfOpen() {
