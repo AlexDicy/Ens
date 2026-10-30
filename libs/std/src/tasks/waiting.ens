@@ -6,6 +6,7 @@
 // child, are kept by one thread that waits on the readiness poller until the nearest deadline.
 import Atomic from @std.tasks;
 import TaskControl from @std.tasks;
+import Deque from @std.collections.deque;
 import List from @std.collections.list;
 import Map from @std.collections.map;
 import Poller from @std.system;
@@ -14,12 +15,14 @@ import @std.system;
 
 export shared final class Waiter {
     const Atomic<bool> woken;
+    protected long queued;
     const TaskControl? task;
     const ThreadLock? bed;
 
     // A waiter for `task` when it runs on a context, and for the calling thread otherwise.
     public constructor(TaskControl? task) {
         this.woken = new Atomic<bool>(false);
+        this.queued = Queued.no;
         ThreadLock? bed = null;
         if (task == null) {
             bed = system.createLock();
@@ -89,27 +92,47 @@ export shared final class Waiter {
     }
 }
 
+// Where a waiter stands in its wait list: out of it, waiting in it, or still in it after its wait
+// ended some other way, to be passed over and swept out.
+final class Queued {
+    protected static const long no = 0;
+    protected static const long waiting = 1;
+    protected static const long abandoned = 2;
+}
+
 // The waiters of one condition, in the order they arrived, guarded by the lock of the monitor they
-// wait under.
+// wait under. A waiter whose wait ends by a deadline or a cancel stays where it stands until it
+// reaches the front or the abandoned ones are half the list, so leaving costs the same as waking.
 export shared final class WaitList {
-    List<Waiter> waiters;
+    Deque<Waiter> waiters;
+    long abandoned;
 
     public constructor() {
-        this.waiters = new List<Waiter>();
+        this.waiters = new Deque<Waiter>();
+        this.abandoned = 0;
     }
 
     public add(Waiter waiter) {
-        this.waiters.push(waiter);
+        waiter.queued = Queued.waiting;
+        this.waiters.pushBack(waiter);
     }
 
     public remove(Waiter waiter) {
-        let removed = this.waiters.remove(waiter);
+        if (waiter.queued != Queued.waiting) {
+            return;
+        }
+        waiter.queued = Queued.abandoned;
+        this.abandoned = this.abandoned + 1;
+        if (this.abandoned * 2 > this.waiters.length()) {
+            this.sweep();
+        }
     }
 
     // Wakes the waiter that has waited longest and is not woken already.
     public wakeOne() {
         while (!this.waiters.isEmpty()) {
-            if (this.waiters.removeAt(0).wake()) {
+            let waiter = this.waiters.popFront();
+            if (this.leave(waiter) && waiter.wake()) {
                 return;
             }
         }
@@ -117,10 +140,36 @@ export shared final class WaitList {
 
     public wakeAll() {
         let waiting = this.waiters;
-        this.waiters = new List<Waiter>();
+        this.waiters = new Deque<Waiter>();
         for (let waiter in waiting) {
-            let woke = waiter.wake();
+            if (this.leave(waiter)) {
+                let woke = waiter.wake();
+            }
         }
+    }
+
+    // Takes `waiter` out of the list's count, and returns whether it was still waiting.
+    leave(Waiter waiter) -> bool {
+        if (waiter.queued == Queued.abandoned) {
+            this.abandoned = this.abandoned - 1;
+            waiter.queued = Queued.no;
+            return false;
+        }
+        waiter.queued = Queued.no;
+        return true;
+    }
+
+    sweep() {
+        let kept = new Deque<Waiter>();
+        for (let waiter in this.waiters) {
+            if (waiter.queued == Queued.waiting) {
+                kept.pushBack(waiter);
+            } else {
+                waiter.queued = Queued.no;
+            }
+        }
+        this.waiters = kept;
+        this.abandoned = 0;
     }
 }
 

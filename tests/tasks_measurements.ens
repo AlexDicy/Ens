@@ -1,0 +1,196 @@
+// @exit 0
+// @stdout start 100 tasks: sum 4950
+// @stdout launch 100 tasks: total 450
+// @stdout parked 100 tasks: released 100
+// @stdout pingpong 100 rounds with main
+// @stdout pingpong 100 rounds between tasks
+// @stdout blocked 100 tasks: total 450 beside 2 sleeping children
+// The programs the task runtime's start cost, memory per parked task, handoff and behavior under
+// blocking are measured with, each run here at a small size. A scenario and a size as arguments
+// run that one alone, for timing the whole process: 'start 10000' starts tasks that return at
+// once and awaits each, 'launch 100000' launches short computing tasks, 'parked 100000' parks
+// tasks on one channel and releases them with one send each, 'pingpong 100000' and 'relay 100000'
+// pass a value back and forth from main and between two tasks, and 'blocked 1000' runs short tasks
+// while one task per processor waits for a child that sleeps for half a second.
+import @std.tasks;
+import Atomic from @std.tasks;
+import Cancelled from @std.tasks;
+import Channel from @std.tasks;
+import ChannelClosed from @std.tasks;
+import Sender from @std.tasks;
+import Task from @std.tasks;
+import List from @std.collections.list;
+import Path from @std.fs;
+import @std.environment;
+import ProcessError from @std.process;
+import @std.process;
+import @std.text.parse;
+
+spin(long seed) -> long {
+    long value = seed;
+    for (int i = 0; i < 100; i++) {
+        value = (value * 31 + 7) % 1000003;
+    }
+    return value % 10;
+}
+
+startTasks(long count) -> string throws Cancelled {
+    long sum = try tasks.scope((scope) -> {
+        let handles = new List<Task<() -> long>>();
+        for (long i = 0; i < count; i++) {
+            handles.push(scope.start(() -> i));
+        }
+        long total = 0;
+        for (let handle in handles) {
+            total = total + try handle.await();
+        }
+        return total;
+    });
+    return "start {count} tasks: sum {sum}";
+}
+
+launchTasks(long count) -> string {
+    let total = new Atomic<long>(0);
+    tasks.scope((scope) -> {
+        for (long i = 0; i < count; i++) {
+            scope.launch(() -> {
+                total.add(spin(i));
+            });
+        }
+    });
+    return "launch {count} tasks: total {total.read()}";
+}
+
+parkTasks(long count) -> string throws Cancelled, ChannelClosed {
+    let gate = new Channel<long>(0);
+    let sender = gate.sender();
+    let waiting = new Atomic<long>(0);
+    let released = new Atomic<long>(0);
+    try tasks.scope((scope) -> {
+        for (long i = 0; i < count; i++) {
+            scope.launch(() -> {
+                waiting.increment();
+                if (try gate.receive() != null) {
+                    released.increment();
+                }
+            });
+        }
+        while (waiting.read() < count) {
+            try tasks.sleep(1);
+        }
+        for (long i = 0; i < count; i++) {
+            try sender.send(i);
+        }
+    });
+    return "parked {count} tasks: released {released.read()}";
+}
+
+echo(Channel<long> ping, Sender<long> pong, long rounds) throws Cancelled {
+    for (long i = 0; i < rounds; i++) {
+        let value = try ping.receive();
+        try pong.send(value ?? 0);
+    }
+} catch (ChannelClosed closed) {
+    print("closed early");
+}
+
+drive(Sender<long> ping, Channel<long> pong, long rounds) throws Cancelled {
+    for (long i = 0; i < rounds; i++) {
+        try ping.send(i);
+        let value = try pong.receive();
+    }
+} catch (ChannelClosed closed) {
+    print("closed early");
+}
+
+pingpong(long rounds, bool fromMain) -> string throws Cancelled {
+    let ping = new Channel<long>(0);
+    let pong = new Channel<long>(0);
+    let pingSender = ping.sender();
+    let pongSender = pong.sender();
+    try tasks.scope((scope) -> {
+        scope.launch(() -> try echo(ping, pongSender, rounds));
+        if (fromMain) {
+            try drive(pingSender, pong, rounds);
+        } else {
+            scope.launch(() -> try drive(pingSender, pong, rounds));
+        }
+    });
+    if (fromMain) {
+        return "pingpong {rounds} rounds with main";
+    }
+    return "pingpong {rounds} rounds between tasks";
+}
+
+napChild(Path self, long millis) -> int throws ProcessError {
+    let ran = try process.run(self, ["nap", "{millis}"]);
+    return ran.status.code;
+}
+
+blockedTasks(Path self, long count, long children, long napMillis) -> string
+        throws Cancelled, ProcessError {
+    let total = new Atomic<long>(0);
+    let slept = new Atomic<long>(0);
+    try tasks.scope((scope) -> {
+        let naps = new List<Task<(() -> int throws ProcessError)>>();
+        for (long i = 0; i < children; i++) {
+            naps.push(scope.start(() -> try napChild(self, napMillis)));
+        }
+        for (long i = 0; i < count; i++) {
+            scope.launch(() -> {
+                total.add(spin(i));
+            });
+        }
+        for (let nap in naps) {
+            if (try nap.await() == 0) {
+                slept.increment();
+            }
+        }
+    });
+    return "blocked {count} tasks: total {total.read()} beside {slept.read()} sleeping children";
+}
+
+scenario(Path self, string name, long size) -> string? throws Cancelled, ChannelClosed,
+        ProcessError {
+    return switch (name) {
+        "start" -> try startTasks(size),
+        "launch" -> launchTasks(size),
+        "parked" -> try parkTasks(size),
+        "pingpong" -> try pingpong(size, true),
+        "relay" -> try pingpong(size, false),
+        "blocked" -> try blockedTasks(self, size, environment.processorCount(), 500),
+        default -> null,
+    };
+}
+
+main() -> int throws Cancelled, ChannelClosed {
+    Path? self = environment.executablePath();
+    if (self == null) {
+        eprint("tasks_measurements: this system would not report the path of this program");
+        return 1;
+    }
+    string[] arguments = environment.arguments();
+    if (arguments.length == 2 && arguments[0] == "nap") {
+        try tasks.sleep(parse.parseLong(arguments[1]) ?? 0);
+        return 0;
+    }
+    if (arguments.length == 2) {
+        string? done = try scenario(self, arguments[0], parse.parseLong(arguments[1]) ?? 0);
+        if (done == null) {
+            eprint("tasks_measurements: there is no scenario '{arguments[0]}'");
+            return 1;
+        }
+        print(done);
+        return 0;
+    }
+    print(try startTasks(100));
+    print(launchTasks(100));
+    print(try parkTasks(100));
+    print(try pingpong(100, true));
+    print(try pingpong(100, false));
+    print(try blockedTasks(self, 100, 2, 20));
+    return 0;
+} catch (ProcessError e) {
+    eprint("tasks_measurements: {e.message}");
+    return 1;
+}
