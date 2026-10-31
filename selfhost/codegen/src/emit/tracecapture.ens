@@ -8,6 +8,7 @@ import @ens.llvm.globals;
 import @ens.llvm.instructions;
 import @ens.llvm.memory;
 import Runtime from emit.runtime;
+import RuntimeFunction from emit.runtime;
 import emit.traceruntime;
 import emit.traceshapes;
 
@@ -31,7 +32,9 @@ public defineCapture(Runtime runtime) {
 
     Value walked;
     long skip = 0;
-    if (runtime.onWindows()) {
+    if (runtime.onDarwin()) {
+        walked = walkFrameChain(runtime, capture, buffer, clamped);
+    } else if (runtime.onWindows()) {
         // USHORT RtlCaptureStackBackTrace(ULONG skip, ULONG count, PVOID* out, PULONG hash):
         // skipping one frame drops this function's own.
         let rtl = runtime.libc("RtlCaptureStackBackTrace",
@@ -112,6 +115,62 @@ public defineCapture(Runtime runtime) {
     memory.buildStore(builder, memory.buildLoad(builder, runtime.int64Type, kept, ""), trace);
     instructions.buildRet(builder, trace);
     traceruntime.finishBody(runtime, saved);
+}
+
+// Fills `buffer` with at most `depth` return addresses read along the frame chain, starting with
+// the one this function returns to, and returns how many it read. macOS keeps the chain in every
+// function that calls another, its own libraries included, so each frame record holds the record
+// of the caller and the return address into it; the walk ends at a record of zero, or at one that
+// is not above the last or not aligned the way a record is.
+walkFrameChain(Runtime runtime, RuntimeFunction function, Value buffer, Value depth) -> Value {
+    let builder = runtime.builder;
+    let frameAddress = runtime.libc("llvm.frameaddress.p0",
+        runtime.pointerType.functionType([runtime.int32Type]));
+    let record = memory.buildAlloca(builder, runtime.pointerType, "record");
+    let count = memory.buildAlloca(builder, runtime.int64Type, "count");
+    memory.buildStore(builder, runtime.call(frameAddress, [runtime.int32(0)], "own"), record);
+    memory.buildStore(builder, runtime.int64(0), count);
+    let limit = instructions.buildSExt(builder, depth, runtime.int64Type, "limit");
+
+    let test = traceruntime.block(runtime, function, "chain.test");
+    let body = traceruntime.block(runtime, function, "chain.body");
+    let next = traceruntime.block(runtime, function, "chain.next");
+    let done = traceruntime.block(runtime, function, "chain.done");
+    instructions.buildBr(builder, test);
+
+    builder.positionAtEnd(test);
+    let filled = memory.buildLoad(builder, runtime.int64Type, count, "filled");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLT(builder, filled, limit, ""), body, done);
+
+    builder.positionAtEnd(body);
+    let current = memory.buildLoad(builder, runtime.pointerType, record, "current");
+    let returnAddress = memory.buildLoad(builder, runtime.int64Type,
+        memory.buildGEP(builder, runtime.int64Type, current, [runtime.int64(1)], ""), "return");
+    // A return address signed for pointer authentication carries the signature above the 47
+    // bits a macOS address has.
+    let stripped = instructions.buildAnd(builder, returnAddress,
+        runtime.int64(140737488355327), "stripped");
+    memory.buildStore(builder, stripped,
+        memory.buildGEP(builder, runtime.int64Type, buffer, [filled], ""));
+    memory.buildStore(builder, instructions.buildAdd(builder, filled, runtime.int64(1), ""),
+        count);
+    let caller = memory.buildLoad(builder, runtime.pointerType, current, "caller");
+    let callerAt = instructions.buildPtrToInt(builder, caller, runtime.int64Type, "caller.at");
+    let currentAt = instructions.buildPtrToInt(builder, current, runtime.int64Type, "current.at");
+    let above = instructions.buildICmpUGT(builder, callerAt, currentAt, "above");
+    let aligned = instructions.buildICmpEQ(builder,
+        instructions.buildAnd(builder, callerAt, runtime.int64(15), ""), runtime.int64(0),
+        "aligned");
+    instructions.buildCondBr(builder, instructions.buildAnd(builder, above, aligned, ""), next,
+        done);
+
+    builder.positionAtEnd(next);
+    memory.buildStore(builder, caller, record);
+    instructions.buildBr(builder, test);
+
+    builder.positionAtEnd(done);
+    return memory.buildLoad(builder, runtime.int64Type, count, "walked");
 }
 
 // The _Unwind_Backtrace callback: stores each frame's instruction pointer until the buffer is
