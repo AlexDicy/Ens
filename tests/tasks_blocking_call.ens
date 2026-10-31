@@ -1,0 +1,79 @@
+// @exit 0
+// @stdout every worker blocked in a call: true
+// @stdout released by a task that ran beside them: true
+// A task blocked inside a foreign call does not keep the tasks queued behind it from running.
+// Every worker and the main thread wait inside a foreign call for a task that is started only
+// once they all wait, so it runs only after its processor is handed to another thread.
+import @std.tasks;
+import Atomic from @std.tasks;
+import @std.environment;
+
+shared external type NativeLock;
+
+external from libc {
+    ens_lock_create() -> NativeLock?;
+    ens_lock_acquire(NativeLock lock);
+    ens_lock_release(NativeLock lock);
+    ens_lock_wait(NativeLock lock, long millis);
+    ens_lock_notify_all(NativeLock lock);
+}
+
+shared final class Gate {
+    const NativeLock lock;
+    const Atomic<long> waiting;
+    const Atomic<bool> open;
+
+    constructor(this.lock) {
+        this.waiting = new Atomic<long>(0);
+        this.open = new Atomic<bool>(false);
+    }
+
+    waitUntilOpen() {
+        ens_lock_acquire(this.lock);
+        this.waiting.increment();
+        ens_lock_notify_all(this.lock);
+        while (!this.open.read()) {
+            ens_lock_wait(this.lock, -1);
+        }
+        ens_lock_release(this.lock);
+    }
+
+    waitForWaiting(long count) {
+        ens_lock_acquire(this.lock);
+        while (this.waiting.read() < count) {
+            ens_lock_wait(this.lock, -1);
+        }
+        ens_lock_release(this.lock);
+    }
+
+    openUp() {
+        ens_lock_acquire(this.lock);
+        this.open.write(true);
+        ens_lock_notify_all(this.lock);
+        ens_lock_release(this.lock);
+    }
+}
+
+main() -> int {
+    let lock = ens_lock_create();
+    if (lock == null) {
+        return 1;
+    }
+    let gate = new Gate(lock);
+    long workers = environment.processorCount();
+    let opener = new Atomic<bool>(false);
+    tasks.scope((scope) -> {
+        for (long i = 0; i < workers; i++) {
+            scope.launch(() -> gate.waitUntilOpen());
+        }
+        gate.waitForWaiting(workers);
+        print("every worker blocked in a call: {gate.waiting.read() == workers}");
+        scope.launch(() -> {
+            opener.write(true);
+            gate.openUp();
+        });
+        gate.waitUntilOpen();
+    });
+    print("released by a task that ran beside them: {opener.read()}");
+    return 0;
+}
