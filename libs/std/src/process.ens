@@ -22,6 +22,8 @@ import ChildStarts from @std.process.starts;
 import Child from @std.system;
 import NativeChild from @std.system;
 import NativeCount from @std.system;
+import NativeWatch from @std.system;
+import Poller from @std.system;
 import Platform from @std.platform;
 import @std.system;
 import EventEnd from @std.tasks;
@@ -164,6 +166,8 @@ export final class ChildProcess {
     const Child child;
     const string program;
     const bool outputMerged;
+    const bool outputPiped;
+    const bool errorsPiped;
     BufferedReader? outputReader;
     BufferedReader? errorsReader;
     Writer? inputWriter;
@@ -173,10 +177,12 @@ export final class ChildProcess {
 
     // Each stream's wrapper is made on first use, so a run whose streams are inherited pays for
     // none of them.
-    protected constructor(Child child, string program, bool outputMerged) {
+    protected constructor(Child child, string program, int outputMode, int errorsMode) {
         this.child = child;
         this.program = program;
-        this.outputMerged = outputMerged;
+        this.outputMerged = errorsMode == StreamMode.merged;
+        this.outputPiped = outputMode == StreamMode.pipe;
+        this.errorsPiped = errorsMode == StreamMode.pipe;
         this.outputReader = null;
         this.errorsReader = null;
         this.inputWriter = null;
@@ -361,8 +367,51 @@ export final class ChildProcess {
     }
 
     // The mask of what can be done without waiting, queried with a bound of `millis` or without one
-    // when it is negative.
+    // when it is negative. A task waits parked on the poller, watching each pipe it has not read to
+    // its end and the child's end, so its thread runs other tasks meanwhile.
     protected poll(long millis) -> int throws ProcessError {
+        long deadline = millis < 0 ? -1 : system.monotonicMillis() + millis;
+        while (true) {
+            int ready = try this.pollFor(0);
+            if (ready != 0 || millis == 0) {
+                return ready;
+            }
+            long remaining = deadline < 0 ? -1 : deadline - system.monotonicMillis();
+            if (deadline >= 0 && remaining <= 0) {
+                return 0;
+            }
+            let waited = tasks.awaitEvents(this.watches(), deadline);
+            switch (waited.end) {
+                EventEnd.Arrived -> { },
+                EventEnd.Unwatched, EventEnd.Cancelled -> {
+                    return try this.pollFor(remaining);
+                },
+                EventEnd.Failed -> {
+                    throw new ProcessError("could not wait for '{this.program}': the system "
+                        + "reported error {waited.code}", ErrorKind.Other, this.program,
+                        waited.code);
+                },
+            }
+        }
+    }
+
+    // The events a wait for the child watches: each pipe not read to its end, and the child's end.
+    watches() -> ((Poller, long) -> NativeWatch)[] {
+        let watching = new List<((Poller, long) -> NativeWatch)>();
+        if (this.outputPiped && !this.outputDrained) {
+            watching.push((poller, token) -> system.watchProcess(this.child, poller,
+                Stream.output, token));
+        }
+        if (this.errorsPiped && !this.errorsDrained) {
+            watching.push((poller, token) -> system.watchProcess(this.child, poller,
+                Stream.errors, token));
+        }
+        watching.push((poller, token) -> system.watchProcess(this.child, poller, Stream.ended,
+            token));
+        return watching.toArray();
+    }
+
+    pollFor(long millis) -> int throws ProcessError {
         let polled = system.processPoll(this.child, millis);
         if (polled.code != 0) {
             throw new ProcessError("could not wait for '{this.program}': the system reported "
@@ -506,6 +555,7 @@ final class StreamMode {
 final class Stream {
     protected static const int output = 1;
     protected static const int errors = 2;
+    protected static const int ended = 3;
 }
 
 // The name a message gives one of the child's output streams.
@@ -612,7 +662,7 @@ completed(Invocation invocation, Path? workingDirectory, Environment? given, boo
     }
     let child = try start(invocation, workingDirectory, given, StreamMode.inherit,
         StreamMode.inherit, StreamMode.inherit);
-    ExitStatus status = try child.collect();
+    ExitStatus status = try child.wait();
     return {status: status, stdout: "", stderr: ""};
 }
 
@@ -646,7 +696,7 @@ start(Invocation invocation, Path? workingDirectory, Environment? given, int std
             given != null, directory, stdinMode, stdoutMode, stderrMode));
         Child? child = started.child;
         if (child != null) {
-            return new ChildProcess(child, invocation.program, stderrMode == StreamMode.merged);
+            return new ChildProcess(child, invocation.program, stdoutMode, stderrMode);
         }
         let failure = failedStart(invocation.program, path, directory, started.code);
         if (!triesNextPath(started.code)) {
@@ -700,7 +750,7 @@ captured(ChildProcess child) -> CommandOutput throws ProcessError {
             let status = try child.collect();
         }
     }
-    ExitStatus status = try child.collect();
+    ExitStatus status = try child.wait();
     return {status: status, stdout: string.fromBytesLossy(output.toBytes()),
         stderr: string.fromBytesLossy(errors.toBytes())};
 }

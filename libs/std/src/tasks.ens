@@ -538,6 +538,14 @@ public struct EventWait {
 // under, so a task parks rather than holding its thread, and a cancel ends the wait. A task
 // already cancelled does not register at all.
 public awaitEvent(((Poller, long) -> NativeWatch) watch) -> EventWait {
+    return awaitEvents([watch], -1);
+}
+
+// Waits like 'awaitEvent' for the first of the events `watches` register, all under one token, or
+// until `deadline` on the monotonic clock has passed when it is not negative, which also ends as
+// Arrived. It ends as Unwatched only when none of them can be watched, and as Failed when one
+// fails.
+public awaitEvents(((Poller, long) -> NativeWatch)[] watches, long deadline) -> EventWait {
     let control = Registry.current();
     if (control != null && control.isCancelled()) {
         return eventEnd(EventEnd.Cancelled, 0);
@@ -545,33 +553,40 @@ public awaitEvent(((Poller, long) -> NativeWatch) watch) -> EventWait {
     let events = Clockwork.events;
     let waiter = control == null ? new Waiter(null) : control.waiter();
     long token = events.enlist(waiter);
-    let watched = watch(events.poller, token);
-    switch (watched.state) {
-        WatchState.watching -> { },
-        WatchState.ready -> {
-            events.discharge(token);
-            return eventEnd(EventEnd.Arrived, 0);
-        },
-        WatchState.unwatchable -> {
-            events.discharge(token);
-            return eventEnd(EventEnd.Unwatched, 0);
-        },
-        WatchState.failed -> {
-            events.discharge(token);
-            return eventEnd(EventEnd.Failed, watched.code);
-        },
+    bool watching = false;
+    for (let watch in watches) {
+        let watched = watch(events.poller, token);
+        switch (watched.state) {
+            WatchState.watching -> {
+                watching = true;
+            },
+            WatchState.ready -> {
+                events.discharge(token);
+                return eventEnd(EventEnd.Arrived, 0);
+            },
+            WatchState.unwatchable -> { },
+            WatchState.failed -> {
+                events.discharge(token);
+                return eventEnd(EventEnd.Failed, watched.code);
+            },
+        }
+    }
+    if (!watching) {
+        events.discharge(token);
+        return eventEnd(EventEnd.Unwatched, 0);
     }
     if (control == null) {
-        waiter.await(-1);
+        waiter.await(deadline);
+        events.discharge(token);
         return eventEnd(EventEnd.Arrived, 0);
     }
     control.block(waiter);
     if (!control.isCancelled()) {
-        waiter.await(-1);
+        waiter.await(deadline);
     }
     control.unblock();
+    events.discharge(token);
     if (control.isCancelled()) {
-        events.discharge(token);
         return eventEnd(EventEnd.Cancelled, 0);
     }
     return eventEnd(EventEnd.Arrived, 0);
