@@ -16,6 +16,11 @@ import @std.system;
 import @std.parallel;
 import @std.tasks;
 import Cancelled from @std.tasks;
+import Atomic from @std.tasks;
+import Channel from @std.tasks;
+import ChannelClosed from @std.tasks;
+import Sender from @std.tasks;
+import Pool from @std.tasks.scheduler;
 import IoError from @std.io.streams;
 import Flood from process.support;
 import process.support;
@@ -207,6 +212,54 @@ test "the standard error of a child with merged output has ended before anything
     try testing.assertTrue(status.succeeded(), "the child ended with code {status.code}");
     try testing.assertTrue(try child.stderr().readLine() == null, "the merged standard error "
         + "gave a line after the child ended");
+}
+
+// A task waiting for a child parks, so its worker runs other tasks. Were the wait held in the
+// system, the pool would start a worker for each one stuck in it, about four for every processor
+// here; tests beside this one may start a few for their own calls, never one for each processor.
+// Every child is started before the count is taken, since a start is a call of its own that a
+// loaded machine can keep long enough for the pool to hand its processor on.
+test "tasks waiting for their children leave their workers to other tasks" {
+    long count = environment.processorCount() * 4;
+    let spawned = new Channel<long>(count);
+    let released = new Channel<long>(count);
+    let before = new Atomic<long>(0);
+    try tasks.scope((scope) -> {
+        for (long i = 0; i < count; i++) {
+            let reporting = spawned.sender();
+            scope.launch(() -> try napChild(reporting, released));
+        }
+        for (long i = 0; i < count; i++) {
+            long? one = try spawned.receive();
+        }
+        before.write(Pool.scheduler.workerCount());
+        let release = released.sender();
+        for (long i = 0; i < count; i++) {
+            try release.send(1);
+        }
+    });
+    long started = Pool.scheduler.workerCount() - before.read();
+    try testing.assertTrue(started < environment.processorCount(),
+        "the pool started {started} workers for tasks waiting on children");
+}
+
+// Starts a child that sleeps, says so, and waits for the child once it is released.
+napChild(Sender<long> spawned, Channel<long> released) throws Cancelled {
+    let child = sleeper();
+    try spawned.send(1);
+    long? go = try released.receive();
+    if (child != null) {
+        let ended = try child.wait();
+    }
+} catch (ChannelClosed closed) {
+} catch (ProcessError failure) {
+}
+
+sleeper() -> ChildProcess? {
+    return try process.spawn(support.interpreter(), support.scriptArguments("sleep 2",
+        "ping -n 3 127.0.0.1 >nul"));
+} catch (ProcessError failure) {
+    return null;
 }
 
 // The bound belongs to the clock rather than to one call of it, since the system may return a
