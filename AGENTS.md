@@ -267,6 +267,6 @@ Open work is tracked as GitHub issues on `AlexDicy/Ens`, never in a file in the 
   Search open and closed issues for a fragment of the text first (`gh issue list --state all --search "..."`), and comment on a match instead of filing a second one.
   A text that reports a symptom whose fix is known is a workaround, not a change to land.
 - A commit subject that fixes an issue says `fixes #N` wherever it reads naturally, as in `Report a struct value cycle once, fixes #N`.
-  GitHub closes the issue when the commit is pushed, so agents never close one.
+  GitHub closes the issue when the commit is pushed, so agents do not need to close it manually.
 - Before committing, rerun the repros of the open issues that quote a text the change edits.
   One that the change fixes and a test pins joins the subject; one whose output changed gets a comment with the new output and the local commit hash.
