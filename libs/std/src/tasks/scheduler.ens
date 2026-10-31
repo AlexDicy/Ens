@@ -3,11 +3,13 @@
 // of its queue, takes from the global queue when that is empty and steals from another processor
 // when both are. A task leaves its worker only when it waits or ends, and resumes on whichever
 // worker takes it next. The pool starts with the first task a program starts and has as many
-// processors as the program has to run on. A supervisor thread ticks beside the workers and hands
-// the processor of a worker that has been inside one call for a whole tick to another thread, so a
-// call that blocks in the system stops no other task.
+// processors as the program has to run on, and one more the main thread runs tasks from while
+// 'main' waits. A supervisor thread ticks beside the workers and hands the processor of a worker
+// that has been inside one call for a whole tick to another thread, so a call that blocks in the
+// system stops no other task.
 import Atomic from @std.tasks;
 import TaskControl from @std.tasks;
+import Waiter from @std.tasks.waiting;
 import FrozenList from @std.collections.frozen;
 import List from @std.collections.list;
 import RawArray from @std.collections.rawarray;
@@ -21,6 +23,16 @@ import @std.system;
 // The pool, made the first time a task is started.
 public final class Pool {
     public lazy const Scheduler scheduler = new Scheduler();
+    protected lazy const Atomic<bool> started = new Atomic<bool>(false);
+
+    // The main thread's worker, when the calling thread is the main thread and the pool has
+    // started.
+    public static mainWorker() -> Worker? {
+        if (!Pool.started.read() || !system.isMainThread()) {
+            return null;
+        }
+        return Pool.scheduler.main;
+    }
 }
 
 final class Sizes {
@@ -42,6 +54,7 @@ public shared final class Scheduler {
     const Atomic<FrozenList<Worker>> workers;
     const List<Worker> idle;
     const TaskQueue global;
+    protected Worker? main;
 
     protected constructor() {
         this.lock = system.createLock();
@@ -50,18 +63,32 @@ public shared final class Scheduler {
         for (long i = 0; i < count; i++) {
             made.push(new Processor(i));
         }
+        let reserved = new Processor(count);
+        reserved.owner.write(Scheduler.mainIndex + 1);
+        made.push(reserved);
         this.processors = made.frozen();
         this.workers = new Atomic<FrozenList<Worker>>(new List<Worker>().frozen());
         this.idle = new List<Worker>();
         this.global = new TaskQueue();
+        this.main = null;
+        let main = new Worker(this, Scheduler.mainIndex);
+        main.processor.write(reserved);
+        let first = new List<Worker>();
+        first.push(main);
+        this.workers.write(first.frozen());
+        this.main = main;
         for (long i = 0; i < count; i++) {
             this.addWorker();
         }
         let supervisor = system.startThread(() -> this.supervise());
+        Pool.started.write(true);
     }
 
-    // The worker running the calling thread, or null on the program's main thread, a dedicated
-    // task's thread or a thread a library made.
+    // The index of the main thread's worker, the first one made.
+    protected static const long mainIndex = 0;
+
+    // The worker running the calling thread, or null on a dedicated task's thread, a thread a
+    // library made, and the main thread until it first waits.
     public currentWorker() -> Worker? {
         long slot = system.readThreadSlot(RecordSlot.worker);
         if (slot == 0) {
@@ -73,7 +100,8 @@ public shared final class Scheduler {
     // Queues a task that can run: on the calling worker's processor when it holds one, on the
     // global queue otherwise. An idle worker is woken when more than one task waits on the
     // processor, since the worker itself runs the first once its current task leaves, and always
-    // for the global queue.
+    // for the global queue. The main thread runs the tasks it queued when 'main' next waits, and the
+    // supervisor gives one that waited a whole tick to another worker.
     public makeRunnable(TaskControl task) {
         let processor = this.currentWorker()?.heldProcessor();
         if (processor != null) {
@@ -162,10 +190,12 @@ public shared final class Scheduler {
         return sleeping;
     }
 
-    // Ticks, and hands the processor of every worker stuck in a call to another thread.
+    // Ticks, hands the processor of every worker stuck in a call to another thread, and wakes a
+    // worker for the tasks queued for the main thread when they waited a whole tick.
     supervise() {
         let clock = system.createLock();
         long pause = Sizes.shortestTickMillis;
+        long mainQueued = 0;
         while (true) {
             long tick = system.advanceMonitorTick();
             bool busy = false;
@@ -179,10 +209,18 @@ public shared final class Scheduler {
                     continue;
                 }
                 busy = true;
-                if (since <= tick - 2) {
+                if (since <= tick - 2 && worker.index != Scheduler.mainIndex) {
                     this.handOff(worker, since <= tick - Sizes.patientTicks);
                 }
             }
+            long queued = this.mainQueueLength();
+            if (queued > 0) {
+                busy = true;
+                if (mainQueued > 0) {
+                    this.wakeIdle();
+                }
+            }
+            mainQueued = queued;
             if (busy) {
                 pause = Sizes.shortestTickMillis;
             } else if (pause < Sizes.longestTickMillis) {
@@ -216,6 +254,14 @@ public shared final class Scheduler {
             return;
         }
         let started = this.addWorker();
+    }
+
+    mainQueueLength() -> long {
+        let processor = this.main?.heldProcessor();
+        if (processor == null) {
+            return 0;
+        }
+        return processor.queue.length();
     }
 }
 
@@ -307,12 +353,37 @@ public shared final class Worker {
     }
 
     protected run() {
-        this.home = system.adoptContext();
-        this.record = system.threadRecord();
-        system.writeThreadSlot(RecordSlot.worker, this.index + 1);
+        this.adoptThread();
         while (true) {
             this.execute(this.nextTask());
         }
+    }
+
+    // Runs tasks on the main thread while `waiter` waits, taking them from the main thread's
+    // processor, the global queue and other processors, until the waiter is woken or `deadline`
+    // passes on the monotonic clock when it is not negative.
+    public serveUntil(Waiter waiter, long deadline) {
+        if (this.home == null) {
+            this.adoptThread();
+        }
+        let processor = this.processor.read();
+        if (processor == null) {
+            panic("Internal: the main thread's worker holds no processor");
+        }
+        while (!waiter.isWoken()) {
+            let task = this.lookFor(processor);
+            if (task != null) {
+                this.execute(task);
+            } else if (!this.sleepUntil(waiter, deadline)) {
+                break;
+            }
+        }
+    }
+
+    adoptThread() {
+        this.home = system.adoptContext();
+        this.record = system.threadRecord();
+        system.writeThreadSlot(RecordSlot.worker, this.index + 1);
     }
 
     // The next task to run, found on this worker's processor, the global queue or another
@@ -393,7 +464,28 @@ public shared final class Worker {
         system.releaseLock(this.lock);
     }
 
-    protected wake() {
+    // Sleeps until woken or until `waiter` is, and returns false instead once `deadline` has
+    // passed.
+    sleepUntil(Waiter waiter, long deadline) -> bool {
+        system.acquireLock(this.lock);
+        bool due = false;
+        while (!this.woken && !waiter.isWoken()) {
+            long left = -1;
+            if (deadline >= 0) {
+                left = deadline - system.monotonicMillis();
+                if (left <= 0) {
+                    due = true;
+                    break;
+                }
+            }
+            system.waitOnLock(this.lock, left);
+        }
+        this.woken = false;
+        system.releaseLock(this.lock);
+        return !due;
+    }
+
+    public wake() {
         system.acquireLock(this.lock);
         this.woken = true;
         system.wakeLockWaiters(this.lock);
