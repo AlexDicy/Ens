@@ -19,10 +19,12 @@ import StartCondition from @std.process.reasons;
 import StartPart from @std.process.reasons;
 import @std.process.reasons;
 import Child from @std.system;
+import NativeChild from @std.system;
 import NativeCount from @std.system;
 import Platform from @std.platform;
 import @std.system;
 import EventEnd from @std.tasks;
+import SharedLock from @std.tasks;
 import @std.tasks;
 
 // What starting or driving a program could not do. `kind` is the condition a program acts on, and
@@ -639,9 +641,9 @@ start(Invocation invocation, Path? workingDirectory, Environment? given, int std
     byte[] argumentBlock = blocks.argumentBlock(vector.toArray());
     ProcessError? refused = null;
     for (let path in invocation.paths) {
-        let started = system.processStart(path, argumentBlock, vector.length(),
-            invocation.commandLine, environmentBlock, variables.length, given != null, directory,
-            stdinMode, stdoutMode, stderrMode);
+        let started = Starts.attempt(() -> system.processStart(path, argumentBlock,
+            vector.length(), invocation.commandLine, environmentBlock, variables.length,
+            given != null, directory, stdinMode, stdoutMode, stderrMode));
         Child? child = started.child;
         if (child != null) {
             return new ChildProcess(child, invocation.program, stderrMode == StreamMode.merged);
@@ -658,6 +660,29 @@ start(Invocation invocation, Path? workingDirectory, Environment? given, int std
         throw refused;
     }
     throw notOnPath(invocation.program);
+}
+
+// Every start this process makes. A child holds a copy of each file this process had open when
+// the child was made, until it runs its program, so a program file this process has just written
+// and closed can still be open for writing in a child another task is starting. A start refused
+// for that reason is tried once more alone, after every other start has finished, so the refusal
+// is reported only when the file is still open somewhere.
+final class Starts {
+    protected lazy const SharedLock gate = new SharedLock();
+
+    protected static attempt((() -> NativeChild) start) -> NativeChild {
+        Starts.gate.enterShared();
+        let started = start();
+        Starts.gate.leaveShared();
+        if (started.child != null
+                || reasons.conditionOf(started.code) != StartCondition.FileBeingWritten) {
+            return started;
+        }
+        Starts.gate.enterAlone();
+        let again = start();
+        Starts.gate.leaveAlone();
+        return again;
+    }
 }
 
 // Both output streams read to their ends together, so the child never waits on a full pipe while
@@ -739,6 +764,7 @@ public kindOf(StartCondition condition) -> ErrorKind {
         StartCondition.PermissionDenied -> ErrorKind.PermissionDenied,
         StartCondition.OutOfMemory, StartCondition.ProgramFileLimit,
             StartCondition.SystemFileLimit, StartCondition.ProcessLimit,
-            StartCondition.SystemResources, StartCondition.Other -> ErrorKind.Other,
+            StartCondition.SystemResources, StartCondition.FileBeingWritten,
+            StartCondition.Other -> ErrorKind.Other,
     };
 }
