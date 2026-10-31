@@ -556,6 +556,19 @@ task("test")
             return ((io.readfile(logpath) or ""):gsub("[\r\n]+$", ""))
         end
 
+        -- how long ago an os.mclock() reading was: "437ms" under half a second, "17s", "2m 5s".
+        local function elapsedSince(started)
+            local milliseconds = os.mclock() - started
+            if milliseconds < 500 then
+                return string.format("%dms", math.floor(milliseconds + 0.5))
+            end
+            local seconds = math.floor(milliseconds / 1000 + 0.5)
+            if seconds < 60 then
+                return string.format("%ds", seconds)
+            end
+            return string.format("%dm %ds", math.floor(seconds / 60), seconds % 60)
+        end
+
         -- the name a @platform directive gives the host running the suite.
         local function hostPlatform()
             if is_host("windows") then return "windows" end
@@ -1068,13 +1081,10 @@ task("test")
             -- fixture stays hermetic here too.
             env.ENS_TEST_FROMCSTRING_PRESENT = "hermetic"
             env.ENS_TEST_FROMCSTRING_ABSENT = nil
-            local started = os.mclock()
             local run_rc = execMerged(harness_exe, {manifest}, log, {envs = env})
-            local seconds = (os.mclock() - started) / 1000.0
             local out = captured(log)
             if run_rc == 0 then
-                return {name = name, ok = true,
-                    note = string.format("-O%s, %.0fs", job.optimization, seconds)}
+                return {name = name, ok = true, note = "-O" .. job.optimization}
             end
             return {name = name, ok = false,
                 short = string.format("harness exit %s", tostring(run_rc)),
@@ -1182,11 +1192,11 @@ task("test")
 
             local env = linkEnvironment()
 
-            local seconds = {}
+            local stageTimes = {}
             local function staged(stage, program, argv, produced)
                 local started = os.mclock()
                 local rc = execMerged(program, argv, log, {envs = env})
-                table.insert(seconds, (os.mclock() - started) / 1000.0)
+                table.insert(stageTimes, elapsedSince(started))
                 if rc ~= 0 or not os.isfile(produced) then
                     return string.format("%s failed (exit %s)\n%s", stage, tostring(rc),
                         (io.readfile(log) or ""):gsub("[\r\n]+$", ""))
@@ -1318,9 +1328,9 @@ task("test")
                     full = string.format("%s: '%s' is linked with --strip, but it defines %d "
                         .. "symbols llvm-nm lists, the first '%s'", name, boot2, #kept, kept[1])}
             end
-            local note = string.format("stages %.0fs/%.0fs; fixpoint over %d modules, "
-                .. "%.1f MB; executables identical", seconds[1] or 0, seconds[2] or 0,
-                #names2, total_bytes / (1024 * 1024))
+            local note = string.format("stages %s/%s; fixpoint over %d modules, %.1f MB; "
+                .. "executables identical", stageTimes[1], stageTimes[2], #names2,
+                total_bytes / (1024 * 1024))
             return {name = name, ok = true, note = note}
         end
 
@@ -4132,7 +4142,7 @@ main() -> int {
         print(string.format("Building the compiler with the pinned %s seed...", seed_host))
         local host_started = os.mclock()
         buildHostCompiler()
-        print(string.format("Compiler built in %.0fs", (os.mclock() - host_started) / 1000.0))
+        print("Compiler built in " .. elapsedSince(host_started))
 
         -- worker count: ENS_TEST_JOBS override, else one per cpu, capped at the test count.
         local njob = tonumber(os.getenv("ENS_TEST_JOBS"))
@@ -4146,13 +4156,15 @@ main() -> int {
 
         local results = {}
         runjobs("run-tests", function (index)
+            local started = os.mclock()
             local r = run_one(jobs[index])
+            local elapsed = elapsedSince(started)
             results[index] = r
             if r.ok then
-                print(string.format("\27[32mPASS\27[0m %s%s", r.name,
+                print(string.format("\27[32mPASS\27[0m %s (%s)%s", r.name, elapsed,
                     r.note and (" (" .. r.note .. ")") or ""))
             else
-                print(string.format("\27[31mFAIL\27[0m %s - %s", r.name, r.short))
+                print(string.format("\27[31mFAIL\27[0m %s (%s) - %s", r.name, elapsed, r.short))
             end
         end, {total = #jobs, comax = njob})
 
