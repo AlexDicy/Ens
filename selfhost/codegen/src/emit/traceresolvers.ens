@@ -1,21 +1,355 @@
 // The two resolvers behind every trace, one from a captured call address to the symbol entry of
-// the function containing it and one to the marked call site whose line it belongs to. Both scan
-// the registered chunks for the greatest recorded start at or below the address, with no index.
+// the function containing it and one to the marked call site whose line it belongs to. Both find
+// the greatest recorded start at or below the address. The address resolver searches an index of
+// every function start, sorted once on first use, since every task start and every throw resolves
+// several addresses; the line resolver, which only a printed trace uses, scans the chunks.
+import AtomicOrdering from @ens.llvm.memory;
 import Linkage from @ens.llvm.globals;
 import @ens.llvm.globals;
 import @ens.llvm.instructions;
 import @ens.llvm.memory;
 import Value from @ens.llvm.values;
+import TypeRef from @ens.llvm.types;
 import Runtime from emit.runtime;
 import RuntimeFunction from emit.runtime;
 import emit.traceruntime;
 import emit.traceshapes;
 
+// Whether the index is there to search, and the size of one of its pairs: a function's start and
+// its symbol entry, or null for a function no entry records.
+final class IndexState {
+    protected static const long none = 0;
+    protected static const long building = 1;
+    protected static const long ready = 2;
+    protected static const long failed = 3;
+    protected static const long pairBytes = 16;
+}
+
 // ptr ens_resolve_addr(i64 addr): the symbol entry with the greatest function start at or below
 // the address, or null when no registered function covers it. An address past the start of a
 // function no entry records, such as a runtime routine, belongs to that function, so it is null too.
+// The first call builds the index; a call while another thread builds it, or after the index could
+// not be made, scans the chunks instead.
 public defineResolveAddress(Runtime runtime) {
+    let scan = defineScan(runtime);
+    let build = defineBuildIndex(runtime);
     let resolver = runtime.libc("ens_resolve_addr",
+        runtime.pointerType.functionType([runtime.int64Type]));
+    globals.setLinkage(resolver.function, Linkage.internalSymbol);
+    let saved = traceruntime.beginExportedBody(runtime, resolver);
+    let builder = runtime.builder;
+    let address = globals.getParam(resolver.function, 0);
+    let state = indexStateGlobal(runtime);
+    let unbuilt = traceruntime.block(runtime, resolver, "index.unbuilt");
+    let claim = traceruntime.block(runtime, resolver, "index.claim");
+    let make = traceruntime.block(runtime, resolver, "index.make");
+    let search = traceruntime.block(runtime, resolver, "index.search");
+    let scanning = traceruntime.block(runtime, resolver, "index.scan");
+    let current = runtime.loadCount(state, AtomicOrdering.acquire);
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, current,
+        runtime.int64(IndexState.ready), "ready"), search, unbuilt);
+
+    builder.positionAtEnd(unbuilt);
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, current,
+        runtime.int64(IndexState.none), "none"), claim, scanning);
+
+    builder.positionAtEnd(claim);
+    let exchanged = memory.buildAtomicCompareExchange(builder, state,
+        runtime.int64(IndexState.none), runtime.int64(IndexState.building),
+        AtomicOrdering.acquireRelease, AtomicOrdering.acquire);
+    instructions.buildCondBr(builder, instructions.buildExtractValue(builder, exchanged, 1, "won"),
+        make, scanning);
+
+    builder.positionAtEnd(make);
+    let built = runtime.call(build, [], "built");
+    instructions.buildCondBr(builder, instructions.buildICmpNE(builder, built, runtime.int32(0),
+        ""), search, scanning);
+
+    builder.positionAtEnd(scanning);
+    instructions.buildRet(builder, runtime.call(scan, [address], "scanned"));
+
+    builder.positionAtEnd(search);
+    instructions.buildRet(builder, searchIndex(runtime, resolver, address));
+    traceruntime.finishBody(runtime, saved);
+}
+
+// The binary search over the index: the pair with the greatest start at or below the address, and
+// its entry, which is null when that function is one no entry records.
+searchIndex(Runtime runtime, RuntimeFunction resolver, Value address) -> Value {
+    let builder = runtime.builder;
+    let pairType = indexPairType(runtime);
+    let pairs = memory.buildLoad(builder, runtime.pointerType, indexGlobal(runtime), "pairs");
+    let count = memory.buildLoad(builder, runtime.int64Type, indexCountGlobal(runtime), "count");
+    let low = memory.buildAlloca(builder, runtime.int64Type, "low");
+    let high = memory.buildAlloca(builder, runtime.int64Type, "high");
+    memory.buildStore(builder, runtime.int64(0), low);
+    memory.buildStore(builder, count, high);
+    let test = traceruntime.block(runtime, resolver, "search.test");
+    let body = traceruntime.block(runtime, resolver, "search.body");
+    let above = traceruntime.block(runtime, resolver, "search.above");
+    let below = traceruntime.block(runtime, resolver, "search.below");
+    let found = traceruntime.block(runtime, resolver, "search.found");
+    let none = traceruntime.block(runtime, resolver, "search.none");
+    let hit = traceruntime.block(runtime, resolver, "search.hit");
+    instructions.buildBr(builder, test);
+
+    builder.positionAtEnd(test);
+    let from = memory.buildLoad(builder, runtime.int64Type, low, "from");
+    let to = memory.buildLoad(builder, runtime.int64Type, high, "to");
+    instructions.buildCondBr(builder, instructions.buildICmpULT(builder, from, to, ""), body,
+        found);
+
+    builder.positionAtEnd(body);
+    let middle = instructions.buildLShr(builder, instructions.buildAdd(builder, from, to, ""),
+        runtime.int64(1), "middle");
+    let start = memory.buildLoad(builder, runtime.int64Type,
+        memory.buildStructGEP(builder, pairType,
+            memory.buildGEP(builder, pairType, pairs, [middle], ""), 0, ""), "start");
+    instructions.buildCondBr(builder, instructions.buildICmpULE(builder, start, address, ""),
+        below, above);
+
+    builder.positionAtEnd(below);
+    memory.buildStore(builder, instructions.buildAdd(builder, middle, runtime.int64(1), ""), low);
+    instructions.buildBr(builder, test);
+
+    builder.positionAtEnd(above);
+    memory.buildStore(builder, middle, high);
+    instructions.buildBr(builder, test);
+
+    builder.positionAtEnd(found);
+    let after = memory.buildLoad(builder, runtime.int64Type, low, "after");
+    instructions.buildCondBr(builder, instructions.buildICmpEQ(builder, after, runtime.int64(0),
+        ""), none, hit);
+
+    builder.positionAtEnd(none);
+    instructions.buildRet(builder, runtime.nullPointer());
+
+    builder.positionAtEnd(hit);
+    let pair = memory.buildGEP(builder, pairType, pairs,
+        [instructions.buildSub(builder, after, runtime.int64(1), "")], "pair");
+    return memory.buildLoad(builder, runtime.pointerType,
+        memory.buildStructGEP(builder, pairType, pair, 1, ""), "entry");
+}
+
+// i32 ens_trace_index_build(): gathers every function start of every registered chunk into the
+// index, sorts it by start, and marks it ready, returning 1; marks it failed and returns 0 when there
+// is no memory for it.
+defineBuildIndex(Runtime runtime) -> RuntimeFunction {
+    let order = defineIndexOrder(runtime);
+    let build = runtime.libc("ens_trace_index_build", runtime.int32Type.functionType([]));
+    globals.setLinkage(build.function, Linkage.internalSymbol);
+    let saved = traceruntime.beginExportedBody(runtime, build);
+    let builder = runtime.builder;
+    let chunkShape = traceshapes.chunkType(runtime);
+    let entryType = traceshapes.symbolEntryType(runtime);
+    let pairType = indexPairType(runtime);
+    let state = indexStateGlobal(runtime);
+    let total = memory.buildAlloca(builder, runtime.int64Type, "total");
+    let filled = memory.buildAlloca(builder, runtime.int64Type, "filled");
+    let cursor = memory.buildAlloca(builder, runtime.pointerType, "chunk");
+    let index = memory.buildAlloca(builder, runtime.int64Type, "i");
+    memory.buildStore(builder, runtime.int64(0), total);
+    memory.buildStore(builder, memory.buildLoad(builder, runtime.pointerType,
+        traceruntime.head(runtime), "head"), cursor);
+
+    let countTest = traceruntime.block(runtime, build, "count.test");
+    let countBody = traceruntime.block(runtime, build, "count.body");
+    let allocate = traceruntime.block(runtime, build, "allocate");
+    let failed = traceruntime.block(runtime, build, "failed");
+    let fill = traceruntime.block(runtime, build, "fill");
+    let chunkTest = traceruntime.block(runtime, build, "chunk.test");
+    let chunkBody = traceruntime.block(runtime, build, "chunk.body");
+    let entryTest = traceruntime.block(runtime, build, "entry.test");
+    let entryBody = traceruntime.block(runtime, build, "entry.body");
+    let innerFirst = traceruntime.block(runtime, build, "inner.first");
+    let innerTest = traceruntime.block(runtime, build, "inner.test");
+    let innerBody = traceruntime.block(runtime, build, "inner.body");
+    let chunkNext = traceruntime.block(runtime, build, "chunk.next");
+    let sort = traceruntime.block(runtime, build, "sort");
+    instructions.buildBr(builder, countTest);
+
+    builder.positionAtEnd(countTest);
+    let counting = memory.buildLoad(builder, runtime.pointerType, cursor, "counting");
+    instructions.buildCondBr(builder, runtime.isNull(counting), allocate, countBody);
+
+    builder.positionAtEnd(countBody);
+    let recorded = memory.buildLoad(builder, runtime.int64Type,
+        memory.buildStructGEP(builder, chunkShape, counting, 2, ""), "recorded");
+    let unrecorded = memory.buildLoad(builder, runtime.int64Type,
+        memory.buildStructGEP(builder, chunkShape, counting, 6, ""), "unrecorded");
+    memory.buildStore(builder, instructions.buildAdd(builder,
+        memory.buildLoad(builder, runtime.int64Type, total, ""),
+        instructions.buildAdd(builder, recorded, unrecorded, ""), ""), total);
+    memory.buildStore(builder, memory.buildLoad(builder, runtime.pointerType,
+        memory.buildStructGEP(builder, chunkShape, counting, 0, ""), "next"), cursor);
+    instructions.buildBr(builder, countTest);
+
+    builder.positionAtEnd(allocate);
+    let size = memory.buildLoad(builder, runtime.int64Type, total, "size");
+    let pairs = runtime.call(runtime.malloc(), [instructions.buildMul(builder, size,
+        runtime.int64(IndexState.pairBytes), "")], "pairs");
+    instructions.buildCondBr(builder, runtime.isNull(pairs), failed, fill);
+
+    builder.positionAtEnd(failed);
+    let gaveUp = memory.buildStore(builder, runtime.int64(IndexState.failed), state);
+    memory.setOrdering(gaveUp, AtomicOrdering.release);
+    memory.setAlignment(gaveUp, 8);
+    instructions.buildRet(builder, runtime.int32(0));
+
+    builder.positionAtEnd(fill);
+    memory.buildStore(builder, runtime.int64(0), filled);
+    memory.buildStore(builder, memory.buildLoad(builder, runtime.pointerType,
+        traceruntime.head(runtime), "head"), cursor);
+    instructions.buildBr(builder, chunkTest);
+
+    builder.positionAtEnd(chunkTest);
+    let chunk = memory.buildLoad(builder, runtime.pointerType, cursor, "chunk.cur");
+    instructions.buildCondBr(builder, runtime.isNull(chunk), sort, chunkBody);
+
+    builder.positionAtEnd(chunkBody);
+    let entries = memory.buildLoad(builder, runtime.pointerType,
+        memory.buildStructGEP(builder, chunkShape, chunk, 1, ""), "entries");
+    let entryCount = memory.buildLoad(builder, runtime.int64Type,
+        memory.buildStructGEP(builder, chunkShape, chunk, 2, ""), "entry.count");
+    memory.buildStore(builder, runtime.int64(0), index);
+    instructions.buildBr(builder, entryTest);
+
+    builder.positionAtEnd(entryTest);
+    let position = memory.buildLoad(builder, runtime.int64Type, index, "i.cur");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLT(builder, position, entryCount, ""), entryBody, innerFirst);
+
+    builder.positionAtEnd(entryBody);
+    let entry = memory.buildGEP(builder, entryType, entries, [position], "entry");
+    let start = instructions.buildPtrToInt(builder,
+        memory.buildLoad(builder, runtime.pointerType,
+            memory.buildStructGEP(builder, entryType, entry, 0, ""), "fn"),
+        runtime.int64Type, "start");
+    storePair(runtime, pairs, filled, start, entry);
+    memory.buildStore(builder, instructions.buildAdd(builder, position, runtime.int64(1), ""),
+        index);
+    instructions.buildBr(builder, entryTest);
+
+    builder.positionAtEnd(innerFirst);
+    let inners = memory.buildLoad(builder, runtime.pointerType,
+        memory.buildStructGEP(builder, chunkShape, chunk, 5, ""), "inners");
+    let innerCount = memory.buildLoad(builder, runtime.int64Type,
+        memory.buildStructGEP(builder, chunkShape, chunk, 6, ""), "inner.count");
+    memory.buildStore(builder, runtime.int64(0), index);
+    instructions.buildBr(builder, innerTest);
+
+    builder.positionAtEnd(innerTest);
+    let innerPosition = memory.buildLoad(builder, runtime.int64Type, index, "j.cur");
+    instructions.buildCondBr(builder,
+        instructions.buildICmpSLT(builder, innerPosition, innerCount, ""), innerBody, chunkNext);
+
+    builder.positionAtEnd(innerBody);
+    let inner = instructions.buildPtrToInt(builder,
+        memory.buildLoad(builder, runtime.pointerType,
+            memory.buildGEP(builder, runtime.pointerType, inners, [innerPosition], ""), "inner"),
+        runtime.int64Type, "inner.at");
+    storePair(runtime, pairs, filled, inner, runtime.nullPointer());
+    memory.buildStore(builder, instructions.buildAdd(builder, innerPosition, runtime.int64(1),
+        ""), index);
+    instructions.buildBr(builder, innerTest);
+
+    builder.positionAtEnd(chunkNext);
+    memory.buildStore(builder, memory.buildLoad(builder, runtime.pointerType,
+        memory.buildStructGEP(builder, chunkShape, chunk, 0, ""), "next"), cursor);
+    instructions.buildBr(builder, chunkTest);
+
+    builder.positionAtEnd(sort);
+    let qsort = runtime.libc("qsort", runtime.voidType.functionType([runtime.pointerType,
+        runtime.int64Type, runtime.int64Type, runtime.pointerType]));
+    runtime.call(qsort, [pairs, size, runtime.int64(IndexState.pairBytes), order.function], "");
+    memory.buildStore(builder, pairs, indexGlobal(runtime));
+    memory.buildStore(builder, size, indexCountGlobal(runtime));
+    let published = memory.buildStore(builder, runtime.int64(IndexState.ready), state);
+    memory.setOrdering(published, AtomicOrdering.release);
+    memory.setAlignment(published, 8);
+    instructions.buildRet(builder, runtime.int32(1));
+    traceruntime.finishBody(runtime, saved);
+    return build;
+}
+
+// Writes one pair at the next free place of the index and counts it.
+storePair(Runtime runtime, Value pairs, Value filled, Value start, Value entry) {
+    let builder = runtime.builder;
+    let pairType = indexPairType(runtime);
+    let slot = memory.buildLoad(builder, runtime.int64Type, filled, "slot");
+    let pair = memory.buildGEP(builder, pairType, pairs, [slot], "pair");
+    memory.buildStore(builder, start, memory.buildStructGEP(builder, pairType, pair, 0, ""));
+    memory.buildStore(builder, entry, memory.buildStructGEP(builder, pairType, pair, 1, ""));
+    memory.buildStore(builder, instructions.buildAdd(builder, slot, runtime.int64(1), ""), filled);
+}
+
+// i32 ens_trace_index_order(ptr a, ptr b): qsort's comparison, by start, and of two pairs at one
+// start the one no entry records first, so the search, which takes the last pair at or below an
+// address, prefers the recorded one as the scan does.
+defineIndexOrder(Runtime runtime) -> RuntimeFunction {
+    let order = runtime.libc("ens_trace_index_order", runtime.int32Type.functionType([
+        runtime.pointerType, runtime.pointerType]));
+    globals.setLinkage(order.function, Linkage.internalSymbol);
+    let saved = traceruntime.beginExportedBody(runtime, order);
+    let builder = runtime.builder;
+    let pairType = indexPairType(runtime);
+    let first = globals.getParam(order.function, 0);
+    let second = globals.getParam(order.function, 1);
+    let firstStart = memory.buildLoad(builder, runtime.int64Type,
+        memory.buildStructGEP(builder, pairType, first, 0, ""), "first.start");
+    let secondStart = memory.buildLoad(builder, runtime.int64Type,
+        memory.buildStructGEP(builder, pairType, second, 0, ""), "second.start");
+    let firstRank = instructions.buildZExt(builder, instructions.buildICmpNE(builder,
+        memory.buildLoad(builder, runtime.pointerType,
+            memory.buildStructGEP(builder, pairType, first, 1, ""), ""),
+        runtime.nullPointer(), ""), runtime.int32Type, "first.rank");
+    let secondRank = instructions.buildZExt(builder, instructions.buildICmpNE(builder,
+        memory.buildLoad(builder, runtime.pointerType,
+            memory.buildStructGEP(builder, pairType, second, 1, ""), ""),
+        runtime.nullPointer(), ""), runtime.int32Type, "second.rank");
+    let byRank = instructions.buildSub(builder, firstRank, secondRank, "by.rank");
+    let later = instructions.buildSelect(builder,
+        instructions.buildICmpUGT(builder, firstStart, secondStart, ""), runtime.int32(1),
+        byRank, "");
+    instructions.buildRet(builder, instructions.buildSelect(builder,
+        instructions.buildICmpULT(builder, firstStart, secondStart, ""), runtime.int32(-1),
+        later, ""));
+    traceruntime.finishBody(runtime, saved);
+    return order;
+}
+
+indexPairType(Runtime runtime) -> TypeRef {
+    return runtime.context.structType([runtime.int64Type, runtime.pointerType], false);
+}
+
+indexStateGlobal(Runtime runtime) -> Value {
+    return internalGlobal(runtime, "ens_trace_index_state", runtime.int64Type,
+        runtime.int64(IndexState.none));
+}
+
+indexGlobal(Runtime runtime) -> Value {
+    return internalGlobal(runtime, "ens_trace_index", runtime.pointerType, runtime.nullPointer());
+}
+
+indexCountGlobal(Runtime runtime) -> Value {
+    return internalGlobal(runtime, "ens_trace_index_count", runtime.int64Type, runtime.int64(0));
+}
+
+internalGlobal(Runtime runtime, string name, TypeRef type, Value initial) -> Value {
+    let existing = globals.getNamedGlobal(runtime.module, name);
+    if (existing != null) {
+        return existing;
+    }
+    let created = globals.addGlobal(runtime.module, type, name);
+    globals.setInitializer(created, initial);
+    globals.setLinkage(created, Linkage.internalSymbol);
+    return created;
+}
+
+// ptr ens_resolve_addr_scan(i64 addr): the same answer as 'ens_resolve_addr', found by scanning
+// every registered chunk.
+defineScan(Runtime runtime) -> RuntimeFunction {
+    let resolver = runtime.libc("ens_resolve_addr_scan",
         runtime.pointerType.functionType([runtime.int64Type]));
     globals.setLinkage(resolver.function, Linkage.internalSymbol);
     let saved = traceruntime.beginExportedBody(runtime, resolver);
@@ -135,6 +469,7 @@ public defineResolveAddress(Runtime runtime) {
     instructions.buildRet(builder, instructions.buildSelect(builder, insideInner,
         runtime.nullPointer(), memory.buildLoad(builder, runtime.pointerType, best, ""), ""));
     traceruntime.finishBody(runtime, saved);
+    return resolver;
 }
 
 // ptr ens_resolve_lineentry(i64 addr, i64 start, ptr chunk): the line marker with the greatest
