@@ -32,9 +32,9 @@ test "the runner imports each module once and calls every test by its place in t
     try assertContains(source, "    $started(2);\n");
     try assertContains(source, "    $finished(2, \"PASS \" + \"third\", true);\n");
     try assertContains(source, "        2 -> $run2(),\n");
-    try assertContains(source, "    while (position < 3) \{\n");
-    try assertContains(source, "print(\"\{count\}/3 tests passed\");");
-    try assertContains(source, "if (count == 3) \{");
+    try assertContains(source, "        for (long position = 0; position < 3; position++) \{\n");
+    try testing.assertTrue(source.indexOf("tests passed") < 0,
+        "the runner prints a summary of its own: {source}");
 }
 
 // Every line about a test carries the marker and the test's place, the lines of one event go out
@@ -66,19 +66,40 @@ test "the runner dispatches to a test through its group" {
         + "        64 -> $run64(),\n        default -> false,\n");
     try assertContains(source, "    return switch (position / 64) \{\n        0 -> $group0(position),\n"
         + "        1 -> $group1(position),\n        default -> false,\n");
-    try assertContains(source, "print(\"\{count\}/65 tests passed\");");
 }
 
-// The workers take the next test nobody has started, as many of them as the run was given jobs
-// and never more than there are tests.
+// The workers take the next test of the order nobody has started, as many of them as the run was
+// given jobs and never more than there are tests to run.
 test "the runner starts one worker per job, each taking the next test" {
     let tests = try discovered("runner-jobs", "test \"first\" \{ \}\n\ntest \"second\" \{ \}\n");
     string source = runner.source(tests);
-    try assertContains(source, "    long position = next.increment() - 1;\n");
+    try assertContains(source, "    long taken = next.increment() - 1;\n");
+    try assertContains(source, "        if ($run(order.get(taken))) \{\n");
     try assertContains(source, "    long? jobs = given.length > 0 ? parse.parseLong(given[0]) : null;\n");
     try assertContains(source,
-        "        for (long worker = 0; worker < jobs && worker < 2; worker++) \{\n"
-        + "            scope.launch(() -> $work(next, passed));\n");
+        "        for (long worker = 0; worker < jobs && worker < order.length(); worker++) \{\n"
+        + "            scope.launch(() -> $work(order, next, passed));\n");
+    try assertContains(source, "    if (passed.read() == order.length()) \{\n        return 0;\n");
+}
+
+// The tests to run follow the number of jobs, each a place or a range of them, and a run given
+// none runs every test.
+test "the runner runs the places it is given, and every test when given none" {
+    let tests = try discovered("runner-order", "test \"first\" \{ \}\n\ntest \"second\" \{ \}\n");
+    string source = runner.source(tests);
+    try assertContains(source, "    if (given.length < 2) \{\n"
+        + "        for (long position = 0; position < 2; position++) \{\n");
+    try assertContains(source, "        long dash = given[i].indexOf(\"-\");\n");
+    try assertContains(source, "            for (long position = first; position <= last; "
+        + "position++) \{\n");
+}
+
+test "the places to run are written as ranges where they run on" {
+    try assertArguments(runner.positionArguments([0, 1, 2, 3]), ["0-3"]);
+    try assertArguments(runner.positionArguments([4]), ["4"]);
+    try assertArguments(runner.positionArguments([1, 2, 5, 7, 8, 9]), ["1-2", "5", "7-9"]);
+    long[] none = [];
+    try assertArguments(runner.positionArguments(none), []);
 }
 
 test "the runner uses nothing outside the language" {
@@ -108,8 +129,7 @@ test "the runner with no tests still compiles to a program that passes" {
     DiscoveredTest[] none = [];
     string source = runner.source(none);
     try assertContains(source, "main() -> int \{");
-    try assertContains(source, "print(\"\{count\}/0 tests passed\");");
-    try assertContains(source, "if (count == 0) \{");
+    try assertContains(source, "        for (long position = 0; position < 0; position++) \{\n");
 }
 
 test "the overlay covers the runner and passes everything else on" {
@@ -134,77 +154,80 @@ test "the overlay covers the runner and passes everything else on" {
     try testing.assertEqual((try overlay.filesUnder(Path("/elsewhere"))).length, 0L);
 }
 
-test "the code the runner ends with reports what happened to the run" {
-    let tests = try discovered("outcome", "test \"first\" \{ \}\n\ntest \"second\" \{ \}\n");
-    let done = outputOf(tests, ["start 0", "line 0 PASS first", "pass 0", "start 1",
-        "line 1 PASS second", "pass 1"]);
-    try testing.assertEqual(runner.outcomeOf(0, tests, done).exitCode(), 0);
-    try testing.assertEqual(runner.outcomeOf(0, tests, done).failure(), "");
-    try testing.assertEqual(runner.outcomeOf(1, tests, done).exitCode(), 1);
-    try testing.assertEqual(runner.outcomeOf(1, tests, done).failure(), "");
-
-    let partway = outputOf(tests, ["start 0", "start 1", "line 0 PASS first", "pass 0"]);
-    let crashed = runner.outcomeOf(-1073741819, tests, partway);
-    try testing.assertEqual(crashed.exitCode(), 2);
-    try testing.assertEqual(crashed.failure(), "the test program stopped with code -1073741819 "
-        + "while running 'second'. Run that test alone with 'ens test --filter \"second\"' to see "
-        + "its output");
-}
-
-// A runner that ends with 0 or 1 before every result is in did not reach its own count, so the
-// code is a stop like any other and names the test it stopped in.
-test "a run that ends with 0 or 1 before every result arrived names the test it stopped in" {
-    let tests = try discovered("outcome-early", "test \"first\" \{ \}\n\ntest \"second\" \{ \}\n");
-    let first = outputOf(tests, ["start 0"]);
-    for (int code in [0, 1]) {
-        let silent = runner.outcomeOf(code, tests, first);
-        try testing.assertEqual(silent.exitCode(), 2);
-        try testing.assertEqual(silent.failure(), "the test program stopped with code {code} "
-            + "while running 'first'. Run that test alone with 'ens test --filter \"first\"' to "
-            + "see its output");
+test "a runner ends as one that reported its results only with 0 or 1" {
+    try testing.assertTrue(runner.endedWithResults(0), "every test passed");
+    try testing.assertTrue(runner.endedWithResults(1), "some test failed");
+    for (int code in [2, 3, 134, -1073741819]) {
+        try testing.assertFalse(runner.endedWithResults(code), "code {code}");
     }
 }
 
-// Several tests were running when the program stopped, and any of them could have stopped it, so
-// the stop names all of them and how to find which.
-test "a run that stopped while several tests ran names each of them" {
-    let tests = try discovered("outcome-several",
+test "a stop after every result or between tests is reported as outside the tests" {
+    let tests = try discovered("outcome-outside", "test \"first\" \{ \}\n\ntest \"second\" \{ \}\n");
+    let done = outputOf(tests, ["start 0", "line 0 PASS first", "pass 0", "start 1",
+        "line 1 PASS second", "pass 1"]);
+    try testing.assertEqual(runner.stoppedOutsideTests(3, done, true), "the test program ended "
+        + "with code 3 after all of its tests had reported a result, so the failure is outside "
+        + "the tests");
+    let between = outputOf(tests, ["start 0", "line 0 PASS first", "pass 0"]);
+    try testing.assertEqual(runner.stoppedOutsideTests(1, between, false), "the test program "
+        + "stopped with code 1 when no test was running, after 1 of 2 had reported a result, so "
+        + "the failure is outside the tests");
+}
+
+// The tests that were running as the program stopped each finished alone, so the stop is named
+// with them and with the fact that it needs them together.
+test "a stop that no test repeats alone names the tests that were running" {
+    let tests = try discovered("outcome-together",
         "test \"first\" \{ \}\n\ntest \"second\" \{ \}\n\ntest \"third\" \{ \}\n");
-    let stopped = runner.outcomeOf(1, tests, outputOf(tests, ["start 0", "start 1", "start 2",
-        "line 1 PASS second", "pass 1"]));
-    try testing.assertEqual(stopped.exitCode(), 2);
-    try testing.assertEqual(stopped.failure(), "the test program stopped with code 1 while "
-        + "'first' and 'third' were running at the same time, so one of them stopped it. Run the "
-        + "tests one at a time with '--jobs 1' to see which");
+    try testing.assertEqual(runner.stoppedOnlyTogether(134, [tests[0], tests[2]]), "the test "
+        + "program stopped with code 134 while 'first' and 'third' were running at the same time, "
+        + "and each of them finished when run alone, so the stop happens only when they run "
+        + "together");
+    try testing.assertEqual(runner.stoppedOnlyTogether(3, [tests[1]]), "the test program stopped "
+        + "with code 3 while running 'second', and that test finished when run alone, so the stop "
+        + "happens only when it runs beside other tests");
 }
 
-// With one test in the run there is nothing to run it apart from, so the stop names it and ends.
-test "a run of one test that stopped names the test without suggesting running it alone" {
-    let tests = try discovered("outcome-one", "test \"only\" \{ \}\n");
-    let stopped = runner.outcomeOf(1, tests, outputOf(tests, ["start 0"]));
-    try testing.assertEqual(stopped.exitCode(), 2);
-    try testing.assertEqual(stopped.failure(),
-        "the test program stopped with code 1 while running 'only'");
+// A test that ended its program alone fails with the last panic's message and the frames up to the
+// runner's, and with the code when the program printed no panic.
+test "a test that ended its program alone fails with its panic" {
+    let tests = try discovered("outcome-panic", "test \"first\" \{ \}\n");
+    string[] errors = ["a line of its own", "panic: boom", "  at helper (alpha_test.ens:4)",
+        "  at \"first\" (alpha_test.ens:8, inlined)", "  at $run0 ($ens_test_runner.ens:48)",
+        "  at lambda (tasks.ens:684)"];
+    try assertArguments(runner.stoppedResult(tests[0], 134, errors), ["FAIL first: panic: boom",
+        "  at helper (alpha_test.ens:4)", "  at \"first\" (alpha_test.ens:8, inlined)"]);
+    try assertArguments(runner.ownErrors(errors), ["a line of its own"]);
+    try assertArguments(runner.panicLines(errors), ["panic: boom", "  at helper (alpha_test.ens:4)",
+        "  at \"first\" (alpha_test.ens:8, inlined)", "  at $run0 ($ens_test_runner.ens:48)",
+        "  at lambda (tasks.ens:684)"]);
+    string[] silent = ["a line of its own"];
+    try assertArguments(runner.stoppedResult(tests[0], 139, silent),
+        ["FAIL first: the test ended the program with code 139"]);
+    try assertArguments(runner.ownErrors(silent), ["a line of its own"]);
+    try assertArguments(runner.panicLines(silent), []);
 }
 
-test "a run that stopped with every result in reports that rather than naming a test" {
-    let tests = try discovered("outcome-late", "test \"only\" \{ \}\n");
-    let crashed = runner.outcomeOf(3, tests, outputOf(tests, ["start 0", "line 0 PASS only",
-        "pass 0"]));
-    try testing.assertEqual(crashed.exitCode(), 2);
-    try testing.assertEqual(crashed.failure(), "the test program ended with code 3 after all of "
-        + "its tests had reported a result, so the failure is outside the tests");
-    try testing.assertTrue(crashed.failure().indexOf("--filter") < 0,
-        "there is no test to point a filter at: {crashed.failure()}");
-}
-
-test "a run that stopped between tests says no test was running" {
-    let tests = try discovered("outcome-between", "test \"first\" \{ \}\n\ntest \"second\" \{ \}\n");
-    let stopped = runner.outcomeOf(1, tests, outputOf(tests, ["start 0", "line 0 PASS first",
-        "pass 0"]));
-    try testing.assertEqual(stopped.exitCode(), 2);
-    try testing.assertEqual(stopped.failure(), "the test program stopped with code 1 when no test "
-        + "was running, after 1 of 2 had reported a result, so the failure is outside the tests");
+// A run that stopped knows which of its tests were running and which never started, and a test
+// run again alone starts over.
+test "the output tells the tests a stop cut short from the ones it never reached" {
+    let tests = try discovered("output-stop",
+        "test \"first\" \{ \}\n\ntest \"second\" \{ \}\n\ntest \"third\" \{ \}\n");
+    let output = outputOf(tests, ["start 0", "start 1", "line 1 PASS second", "pass 1"]);
+    long[] every = [0, 1, 2];
+    try assertPositions(output.unfinishedAmong(every), [0]);
+    try assertPositions(output.unstartedAmong(every), [2]);
+    try testing.assertFalse(output.finishedAll(every), "the first and third have no result");
+    output.rerun(0);
+    try testing.assertFalse(output.hasStarted(0), "the first runs again from its start");
+    try assertShown(output, "$ens_test_runner start 0", []);
+    string[] shown = output.stopped(0, ["FAIL first: panic: boom", "  at \"first\" (a:1)"]);
+    try assertArguments(shown, ["FAIL first: panic: boom", "  at \"first\" (a:1)", "PASS second"]);
+    try testing.assertTrue(output.hasFinished(0), "the stopped test has its result");
+    try testing.assertEqual(output.passed(), 1L);
+    try testing.assertFalse(output.finishedAll(every), "the third has no result yet");
+    try testing.assertTrue(output.finishedAll([0, 1]), "the first two have their results");
 }
 
 // Results come out in the order the tests were given, each as soon as every test before it has
@@ -227,7 +250,7 @@ test "the output shows results in order and a test's own lines at once" {
         "FAIL second: expected '1', got '2'", "  at \"second\" (alpha_test.ens:3)", "PASS third"]);
     try testing.assertEqual(output.finished(), 3L);
     try testing.assertEqual(output.passed(), 2L);
-    try testing.assertEqual(output.running().length, 0L);
+    try testing.assertTrue(output.finishedAll([0, 1, 2]), "every test has its result");
 }
 
 // A test that finished after one before it that never did still has a result, shown once the
@@ -242,7 +265,7 @@ test "the results held behind an unfinished test are shown when the runner ends"
     string[] remaining = output.remaining();
     try testing.assertEqual(remaining.length, 1L);
     try testing.assertEqual(remaining[0], "PASS second");
-    try testing.assertEqual(output.running()[0].description(), "first");
+    try assertPositions(output.unfinishedAmong([0, 1]), [0]);
 }
 
 // A line that starts like the runner's but names no test of the run is a test's own output.
@@ -253,7 +276,7 @@ test "a marked line naming no test of the run is shown as it is" {
     try assertShown(output, "$ens_test_runner start x", ["$ens_test_runner start x"]);
     try assertShown(output, "$ens_test_runner begin 0", ["$ens_test_runner begin 0"]);
     try assertShown(output, "$ens_test_runner", ["$ens_test_runner"]);
-    try testing.assertEqual(output.running().length, 0L);
+    try assertPositions(output.unfinishedAmong([0]), []);
 }
 
 test "the runner's file name is one no source file can have" {
@@ -319,6 +342,20 @@ assertShown(RunnerOutput output, string line, string[] expected) throws {
     try testing.assertEqual(shown.length, expected.length);
     for (long i = 0; i < shown.length; i++) {
         try testing.assertEqual(shown[i], expected[i]);
+    }
+}
+
+assertArguments(string[] actual, string[] expected) throws {
+    try testing.assertEqual(actual.length, expected.length);
+    for (long i = 0; i < actual.length; i++) {
+        try testing.assertEqual(actual[i], expected[i]);
+    }
+}
+
+assertPositions(long[] actual, long[] expected) throws {
+    try testing.assertEqual(actual.length, expected.length);
+    for (long i = 0; i < actual.length; i++) {
+        try testing.assertEqual(actual[i], expected[i]);
     }
 }
 

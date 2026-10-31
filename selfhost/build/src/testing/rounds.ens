@@ -1,0 +1,145 @@
+// A test run over as many starts of the suite as it takes for every test to have a result. A start
+// that stops partway, on a panic, an exit or a crash, is followed by one start for each test that
+// was running, alone, so the one that stopped it fails with what it printed and the others get
+// their results, and then by a start over the tests that had not started.
+import ProcessError from @std.process;
+import IoError from @std.io.streams;
+import List from @std.collections.list;
+import DiscoveredTest from testing.discovery;
+import RunnerOutput from testing.runner;
+import testing.runner;
+
+// How one start of the suite ended: the code it ended with, and what it wrote to its error stream.
+export final class SuiteEnd {
+    protected int code;
+    protected string[] errors;
+
+    export constructor(this.code, this.errors);
+}
+
+// What a run starts the suite through and shows its lines with.
+export interface SuiteLauncher {
+    // Starts the suite with `arguments`, passes each line of its output to `output` and shows the
+    // lines that returns, and returns how the suite ended. What it wrote to its error stream is
+    // returned rather than shown, since a panic in it may become a test's result.
+    launch(string[] arguments, RunnerOutput output) -> SuiteEnd throws ProcessError, IoError;
+
+    show(string line);
+}
+
+// What a run came to: 0 every test passed, 1 some of them failed, 2 a stop no test explains ended
+// it; how many tests passed; and what to report beside the results.
+export final class RunEnd {
+    int code;
+    long passedTests;
+    string[] problems;
+
+    protected constructor(this.code, this.passedTests, this.problems);
+
+    export exitCode() -> int {
+        return this.code;
+    }
+
+    export passed() -> long {
+        return this.passedTests;
+    }
+
+    export failures() -> string[] {
+        return this.problems;
+    }
+}
+
+// Runs `tests` on `jobs` tasks through the launcher until each has a result, showing every result
+// in order and then how many passed.
+export run(DiscoveredTest[] tests, long jobs, SuiteLauncher launcher) -> RunEnd
+           throws ProcessError, IoError {
+    let output = new RunnerOutput(tests);
+    let problems = new List<string>();
+    long[] pending = everyPosition(tests.length);
+    while (pending.length > 0) {
+        let round = try start(launcher, jobs, pending, output);
+        if (output.finishedAll(pending)) {
+            showAll(launcher, round.errors);
+            if (!runner.endedWithResults(round.code)) {
+                return stoppedOutside(launcher, output, round.code, true, problems);
+            }
+            break;
+        }
+        long[] unfinished = output.unfinishedAmong(pending);
+        if (unfinished.length == 0) {
+            showAll(launcher, round.errors);
+            return stoppedOutside(launcher, output, round.code, false, problems);
+        }
+        showAll(launcher, runner.ownErrors(round.errors));
+        bool explained = false;
+        for (let position in unfinished) {
+            output.rerun(position);
+            let alone = try start(launcher, 1, [position], output);
+            if (output.hasFinished(position)) {
+                showAll(launcher, alone.errors);
+                if (!runner.endedWithResults(alone.code)) {
+                    return stoppedOutside(launcher, output, alone.code, true, problems);
+                }
+                continue;
+            }
+            if (!output.hasStarted(position)) {
+                showAll(launcher, alone.errors);
+                return stoppedOutside(launcher, output, alone.code, false, problems);
+            }
+            showAll(launcher, runner.ownErrors(alone.errors));
+            showAll(launcher, output.stopped(position, runner.stoppedResult(tests[position],
+                alone.code, alone.errors)));
+            explained = true;
+        }
+        if (!explained) {
+            showAll(launcher, runner.panicLines(round.errors));
+            problems.push(runner.stoppedOnlyTogether(round.code, testsAt(tests, unfinished)));
+        }
+        pending = output.unstartedAmong(pending);
+    }
+    showAll(launcher, output.remaining());
+    launcher.show("{output.passed()}/{tests.length} tests passed");
+    int code = output.passed() == tests.length && problems.length() == 0 ? 0 : 1;
+    return new RunEnd(code, output.passed(), problems.toArray());
+}
+
+// Starts the suite over the tests at `positions` on `jobs` tasks.
+start(SuiteLauncher launcher, long jobs, long[] positions, RunnerOutput output) -> SuiteEnd
+      throws ProcessError, IoError {
+    let arguments = new List<string>();
+    arguments.push("{jobs}");
+    for (let range in runner.positionArguments(positions)) {
+        arguments.push(range);
+    }
+    return try launcher.launch(arguments.toArray(), output);
+}
+
+// Ends a run the suite stopped where no test explains it, showing the results that are in.
+stoppedOutside(SuiteLauncher launcher, RunnerOutput output, int code, bool everyResultIn,
+               List<string> problems) -> RunEnd {
+    showAll(launcher, output.remaining());
+    problems.push(runner.stoppedOutsideTests(code, output, everyResultIn));
+    return new RunEnd(2, output.passed(), problems.toArray());
+}
+
+showAll(SuiteLauncher launcher, string[] lines) {
+    for (let line in lines) {
+        launcher.show(line);
+    }
+}
+
+everyPosition(long count) -> long[] {
+    let positions = new List<long>();
+    for (long i = 0; i < count; i++) {
+        positions.push(i);
+    }
+    return positions.toArray();
+}
+
+testsAt(DiscoveredTest[] tests, long[] positions) -> DiscoveredTest[] {
+    let found = new List<DiscoveredTest>();
+    for (let position in positions) {
+        found.push(tests[position]);
+    }
+    return found.toArray();
+}

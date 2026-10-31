@@ -1,0 +1,152 @@
+// A run over as many starts of the suite as it takes, played against a suite whose every start is
+// scripted, so which starts a run makes and what it shows are observable without a process.
+import Path from @std.fs;
+import @std.testing;
+import List from @std.collections.list;
+import Map from @std.collections.map;
+import ProcessError from @std.process;
+import IoError from @std.io.streams;
+import SystemFileLoader from @ens.sema.support.loader;
+import DiscoveredTest from testing.discovery;
+import testing.discovery;
+import Runner from testing.runner;
+import RunnerOutput from testing.runner;
+import SuiteEnd from testing.rounds;
+import SuiteLauncher from testing.rounds;
+import testing.rounds;
+import support;
+
+test "a start that reports every result is the whole run" {
+    let tests = try threeTests("rounds-whole");
+    let suite = new ScriptedSuite();
+    suite.script("2 0-2", ["start 0", "line 0 PASS first", "pass 0", "start 1",
+        "line 1 PASS second", "pass 1", "start 2", "line 2 FAIL third: no", "fail 2"], 1, []);
+    let ended = try rounds.run(tests, 2, suite);
+    try testing.assertEqual(ended.exitCode(), 1);
+    try testing.assertEqual(ended.passed(), 2L);
+    try assertLines(suite.started.toArray(), ["2 0-2"]);
+    try assertLines(suite.shown.toArray(), ["PASS first", "PASS second", "FAIL third: no",
+        "2/3 tests passed"]);
+    try assertLines(ended.failures(), []);
+}
+
+// Each test running at the stop starts again alone, the one that stops its program alone fails
+// with its panic, and the test that never started runs after them.
+test "a stop runs the tests it cut short alone and then the ones it never reached" {
+    let tests = try threeTests("rounds-stop");
+    let suite = new ScriptedSuite();
+    suite.script("2 0-2", ["start 0", "start 1"], 134, ["printed by a test", "panic: boom",
+        "  at \"first\" (alpha_test.ens:2)", "  at $run0 ($ens_test_runner.ens:40)"]);
+    suite.script("1 0", ["start 0"], 134, ["panic: boom", "  at \"first\" (alpha_test.ens:2)",
+        "  at $run0 ($ens_test_runner.ens:40)"]);
+    suite.script("1 1", ["start 1", "line 1 PASS second", "pass 1"], 0, []);
+    suite.script("2 2", ["start 2", "line 2 PASS third", "pass 2"], 0, []);
+    let ended = try rounds.run(tests, 2, suite);
+    try testing.assertEqual(ended.exitCode(), 1);
+    try testing.assertEqual(ended.passed(), 2L);
+    try assertLines(suite.started.toArray(), ["2 0-2", "1 0", "1 1", "2 2"]);
+    try assertLines(suite.shown.toArray(), ["printed by a test", "FAIL first: panic: boom",
+        "  at \"first\" (alpha_test.ens:2)", "PASS second", "PASS third", "2/3 tests passed"]);
+    try assertLines(ended.failures(), []);
+}
+
+// None of the tests running at the stop stops its program alone, so the stop's panic is shown and
+// the run fails although every test passed.
+test "a stop no test repeats alone fails the run and shows the stop's panic" {
+    let tests = try threeTests("rounds-together");
+    let suite = new ScriptedSuite();
+    suite.script("3 0-2", ["start 0", "start 1", "start 2", "line 2 PASS third", "pass 2"], 3,
+        ["panic: only together"]);
+    suite.script("1 0", ["start 0", "line 0 PASS first", "pass 0"], 0, []);
+    suite.script("1 1", ["start 1", "line 1 PASS second", "pass 1"], 0, []);
+    let ended = try rounds.run(tests, 3, suite);
+    try testing.assertEqual(ended.exitCode(), 1);
+    try testing.assertEqual(ended.passed(), 3L);
+    try assertLines(suite.started.toArray(), ["3 0-2", "1 0", "1 1"]);
+    try assertLines(suite.shown.toArray(), ["PASS first", "PASS second", "PASS third",
+        "panic: only together", "3/3 tests passed"]);
+    try assertLines(ended.failures(), ["the test program stopped with code 3 while 'first' and "
+        + "'second' were running at the same time, and each of them finished when run alone, so "
+        + "the stop happens only when they run together"]);
+}
+
+// A stop while no test was running is not one a test explains, so nothing runs again and the run
+// ends with the results it has.
+test "a stop between tests ends the run without starting it again" {
+    let tests = try threeTests("rounds-between");
+    let suite = new ScriptedSuite();
+    suite.script("1 0-2", ["start 0", "line 0 PASS first", "pass 0"], 6, ["something broke"]);
+    let ended = try rounds.run(tests, 1, suite);
+    try testing.assertEqual(ended.exitCode(), 2);
+    try testing.assertEqual(ended.passed(), 1L);
+    try assertLines(suite.started.toArray(), ["1 0-2"]);
+    try assertLines(suite.shown.toArray(), ["PASS first", "something broke"]);
+    try assertLines(ended.failures(), ["the test program stopped with code 6 when no test was "
+        + "running, after 1 of 3 had reported a result, so the failure is outside the tests"]);
+}
+
+// A suite whose starts are written out ahead, keyed by their arguments, recording each start and
+// every line shown.
+class ScriptedSuite implements SuiteLauncher {
+    Map<string, Script> scripts;
+    protected List<string> started;
+    protected List<string> shown;
+
+    protected constructor() {
+        this.scripts = new Map<string, Script>();
+        this.started = new List<string>();
+        this.shown = new List<string>();
+    }
+
+    protected script(string arguments, string[] events, int code, string[] errors) {
+        this.scripts.set(arguments, new Script(events, code, errors));
+    }
+
+    protected override launch(string[] arguments, RunnerOutput output) -> SuiteEnd
+                              throws ProcessError, IoError {
+        string key = joined(arguments, " ");
+        this.started.push(key);
+        let found = this.scripts.get(key);
+        if (found == null) {
+            return new SuiteEnd(99, ["no start was scripted for '{key}'"]);
+        }
+        for (let event in found.events) {
+            for (let line in output.accept(Runner.marker + event)) {
+                this.show(line);
+            }
+        }
+        return new SuiteEnd(found.code, found.errors);
+    }
+
+    protected override show(string line) {
+        this.shown.push(line);
+    }
+}
+
+class Script {
+    protected string[] events;
+    protected int code;
+    protected string[] errors;
+
+    protected constructor(this.events, this.code, this.errors);
+}
+
+threeTests(string label) -> DiscoveredTest[] throws {
+    let rootFolder = try support.scratch(label);
+    Path root = rootFolder.path();
+    try support.writeFile(root, "alpha_test.ens",
+        "test \"first\" \{ \}\n\ntest \"second\" \{ \}\n\ntest \"third\" \{ \}\n");
+    return discovery.plan(new SystemFileLoader(), root, "").tests();
+}
+
+assertLines(string[] actual, string[] expected) throws {
+    try testing.assertEqual(joined(actual, "\n"), joined(expected, "\n"));
+}
+
+joined(string[] parts, string separator) -> string {
+    string text = "";
+    for (long i = 0; i < parts.length; i++) {
+        text = i == 0 ? parts[i] : text + separator + parts[i];
+    }
+    return text;
+}

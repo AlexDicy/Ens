@@ -1,9 +1,10 @@
 // The program a test run actually runs, ordinary Ens written out of what discovery found. A
 // description is spliced in as the literal it was written as, so nothing needs escaping again.
 // Several tests run at the same time, on as many tasks as the run was given jobs, each taking the
-// next test nobody has started, and every line the runner writes about a test is marked with the test's place in
-// the run, so the command reading it can put the results back in order whatever order they
-// finished in.
+// next test nobody has started, and every line the runner writes about a test is marked with the
+// test's place in the run, so the command reading it can put the results back in order whatever
+// order they finished in. A run that stopped partway is started again over the tests it did not
+// finish, so the program is told which of them to run.
 import StringBuilder from @std.text.stringbuilder;
 import List from @std.collections.list;
 import Map from @std.collections.map;
@@ -28,6 +29,9 @@ export final class Runner {
     // How many tests one dispatch function chooses between, so no function's switch grows with
     // the suite.
     export static const long groupSize = 64;
+
+    // What starts the report a panic writes to the error stream.
+    export static const string panicPrefix = "panic: ";
 }
 
 // The runner for these tests, in the order they are given.
@@ -52,6 +56,8 @@ appendImports(StringBuilder out, DiscoveredTest[] tests) {
     out.append("import @std.tasks;\n");
     out.append("import Atomic from @std.tasks;\n");
     out.append("import @std.text.parse;\n");
+    out.append("import List from @std.collections.list;\n");
+    out.append("import FrozenList from @std.collections.frozen;\n");
     string last = "";
     for (let one in tests) {
         if (one.modulePath() == last) {
@@ -138,17 +144,18 @@ appendDispatch(StringBuilder out, long total) {
     out.append("\}\n\n");
 }
 
-// The entry point: as many workers as the run has jobs, each running the next test nobody has
-// started until none are left, then how many of them passed. All passing is a run that worked;
-// anything less is a run that failed. The number of jobs is the program's first argument.
+// The entry point: as many workers as the run has jobs, each running the next test of the order
+// nobody has started until none are left. All passing is a run that worked; anything less is a run
+// that failed. The number of jobs is the program's first argument, and the tests to run follow it
+// as places in the run, each one alone or a range such as '3-10', all of them when none follow.
 appendEntry(StringBuilder out, long total) {
-    out.append("$work(Atomic<long> next, Atomic<long> passed) \{\n");
-    out.append("    long position = next.increment() - 1;\n");
-    out.append("    while (position < {total}) \{\n");
-    out.append("        if ($run(position)) \{\n");
+    out.append("$work(FrozenList<long> order, Atomic<long> next, Atomic<long> passed) \{\n");
+    out.append("    long taken = next.increment() - 1;\n");
+    out.append("    while (taken < order.length()) \{\n");
+    out.append("        if ($run(order.get(taken))) \{\n");
     out.append("            passed.increment();\n");
     out.append("        \}\n");
-    out.append("        position = next.increment() - 1;\n");
+    out.append("        taken = next.increment() - 1;\n");
     out.append("    \}\n");
     out.append("\}\n\n");
     out.append("$jobs() -> long \{\n");
@@ -159,20 +166,59 @@ appendEntry(StringBuilder out, long total) {
     out.append("    \}\n");
     out.append("    return jobs;\n");
     out.append("\}\n\n");
+    out.append("$order() -> FrozenList<long> \{\n");
+    out.append("    string[] given = environment.arguments();\n");
+    out.append("    let order = new List<long>();\n");
+    out.append("    if (given.length < 2) \{\n");
+    out.append("        for (long position = 0; position < {total}; position++) \{\n");
+    out.append("            order.push(position);\n");
+    out.append("        \}\n");
+    out.append("        return order.frozen();\n");
+    out.append("    \}\n");
+    out.append("    for (long i = 1; i < given.length; i++) \{\n");
+    out.append("        long dash = given[i].indexOf(\"-\");\n");
+    out.append("        long? first = parse.parseLong(dash < 0 ? given[i] "
+        + ": given[i].substring(0, dash));\n");
+    out.append("        long? last = parse.parseLong(dash < 0 ? given[i] "
+        + ": given[i].substring(dash + 1, given[i].length));\n");
+    out.append("        if (first != null && last != null) \{\n");
+    out.append("            for (long position = first; position <= last; position++) \{\n");
+    out.append("                order.push(position);\n");
+    out.append("            \}\n");
+    out.append("        \}\n");
+    out.append("    \}\n");
+    out.append("    return order.frozen();\n");
+    out.append("\}\n\n");
     out.append("main() -> int \{\n");
     out.append("    long jobs = $jobs();\n");
+    out.append("    let order = $order();\n");
     out.append("    let next = new Atomic<long>(0);\n");
     out.append("    let passed = new Atomic<long>(0);\n");
     out.append("    tasks.scope((scope) -> \{\n");
-    out.append("        for (long worker = 0; worker < jobs && worker < {total}; worker++) \{\n");
-    out.append("            scope.launch(() -> $work(next, passed));\n");
+    out.append("        for (long worker = 0; worker < jobs && worker < order.length(); "
+        + "worker++) \{\n");
+    out.append("            scope.launch(() -> $work(order, next, passed));\n");
     out.append("        \}\n");
     out.append("    \});\n");
-    out.append("    long count = passed.read();\n");
-    out.append("    print(\"\{count\}/{total} tests passed\");\n");
-    out.append("    if (count == {total}) \{\n        return 0;\n    \}\n");
+    out.append("    if (passed.read() == order.length()) \{\n        return 0;\n    \}\n");
     out.append("    return 1;\n");
     out.append("\}\n");
+}
+
+// The arguments that tell the runner to run `positions` in that order, a run of consecutive
+// places written as one range.
+export positionArguments(long[] positions) -> string[] {
+    let written = new List<string>();
+    long i = 0;
+    while (i < positions.length) {
+        long end = i;
+        while (end + 1 < positions.length && positions[end + 1] == positions[end] + 1) {
+            end++;
+        }
+        written.push(end == i ? "{positions[i]}" : "{positions[i]}-{positions[end]}");
+        i = end + 1;
+    }
+    return written.toArray();
 }
 
 // The name an imported module's own members are reached through, which is its last segment.
@@ -240,24 +286,6 @@ export class RunnerOverlay implements FileLoader {
             return this.runnerSource.toBytes();
         }
         return try this.tree.readBytes(path);
-    }
-}
-
-// What a run came to, read from the code the runner ended with.
-export final class RunnerOutcome {
-    int code;
-    string problem;
-
-    protected constructor(this.code, this.problem);
-
-    // 0 every test passed, 1 some of them failed, 2 the run did not finish.
-    export exitCode() -> int {
-        return this.code;
-    }
-
-    // What to report about a run that did not finish, or empty text when it finished.
-    export failure() -> string {
-        return this.problem;
     }
 }
 
@@ -334,6 +362,11 @@ export final class RunnerOutput {
         return shown.toArray();
     }
 
+    // How many tests the run has.
+    export total() -> long {
+        return this.tests.length;
+    }
+
     // How many tests have reported a result.
     export finished() -> long {
         long count = 0;
@@ -356,15 +389,61 @@ export final class RunnerOutput {
         return count;
     }
 
-    // The tests that started and have not reported a result, in the order they were given.
-    export running() -> DiscoveredTest[] {
-        let found = new List<DiscoveredTest>();
-        for (long i = 0; i < this.tests.length; i++) {
-            if (this.begun[i] && !this.ended[i]) {
-                found.push(this.tests[i]);
+    // The places among `positions` whose tests started and have not reported a result.
+    export unfinishedAmong(long[] positions) -> long[] {
+        let found = new List<long>();
+        for (let position in positions) {
+            if (this.begun[position] && !this.ended[position]) {
+                found.push(position);
             }
         }
         return found.toArray();
+    }
+
+    // The places among `positions` whose tests never started.
+    export unstartedAmong(long[] positions) -> long[] {
+        let found = new List<long>();
+        for (let position in positions) {
+            if (!this.begun[position] && !this.ended[position]) {
+                found.push(position);
+            }
+        }
+        return found.toArray();
+    }
+
+    // Whether every test among `positions` has reported a result.
+    export finishedAll(long[] positions) -> bool {
+        for (let position in positions) {
+            if (!this.ended[position]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    export hasStarted(long position) -> bool {
+        return this.begun[position];
+    }
+
+    export hasFinished(long position) -> bool {
+        return this.ended[position];
+    }
+
+    // Forgets that the test at `position` started, before it runs again on its own.
+    export rerun(long position) {
+        this.begun[position] = false;
+    }
+
+    // Records the failure of a test that ended the program, as the lines of its result, and
+    // returns the lines to show now.
+    export stopped(long position, string[] result) -> string[] {
+        let lines = this.heldFor(position);
+        for (let line in result) {
+            lines.push(line);
+        }
+        this.ended[position] = true;
+        this.succeeded[position] = false;
+        return this.inOrder();
     }
 
     // The results of every finished test no unfinished test comes before, which have not been
@@ -400,43 +479,91 @@ export final class RunnerOutput {
     }
 }
 
-// What the code the runner ended with means, given what it reported. It ends with 0 when every
-// test passed and 1 when some failed, having reported every result; anything else, a 0 or a 1
-// before every result arrived included, means it stopped partway, on a panic, an uncaught
-// exception, an exit or a crash, in one of the tests that had started and not finished.
-export outcomeOf(int runnerExit, DiscoveredTest[] tests, RunnerOutput output) -> RunnerOutcome {
-    bool everyResultIn = output.finished() == tests.length;
-    if (runnerExit == 0 && everyResultIn) {
-        return new RunnerOutcome(0, "");
-    }
-    if (runnerExit == 1 && everyResultIn) {
-        return new RunnerOutcome(1, "");
-    }
+// Whether a runner that reported a result for every test it was given ended as one that did:
+// with 0 when all of them passed and 1 when some failed.
+export endedWithResults(int runnerExit) -> bool {
+    return runnerExit == 0 || runnerExit == 1;
+}
+
+// What to report about a runner that stopped where no test explains it: after every test it was
+// given had reported a result, or while none of them was running.
+export stoppedOutsideTests(int runnerExit, RunnerOutput output, bool everyResultIn) -> string {
     if (everyResultIn) {
-        return new RunnerOutcome(2, "the test program ended with code {runnerExit} after all of "
-            + "its tests had reported a result, so the failure is outside the tests");
+        return "the test program ended with code {runnerExit} after all of its tests had reported "
+            + "a result, so the failure is outside the tests";
     }
-    DiscoveredTest[] running = output.running();
-    if (running.length == 0) {
-        return new RunnerOutcome(2, "the test program stopped with code {runnerExit} when no "
-            + "test was running, after {output.finished()} of {tests.length} had reported a "
-            + "result, so the failure is outside the tests");
-    }
+    return "the test program stopped with code {runnerExit} when no test was running, after "
+        + "{output.finished()} of {output.total()} had reported a result, so the failure is outside the "
+        + "tests";
+}
+
+// What to report when the tests that were running as the program stopped each finished when run
+// again on their own, so none of them stops it alone.
+export stoppedOnlyTogether(int runnerExit, DiscoveredTest[] running) -> string {
     if (running.length == 1) {
-        string stopped = running[0].description();
-        string message = "the test program stopped with code {runnerExit} while running "
-            + "'{stopped}'";
-        if (tests.length > 1) {
-            message = message + ". Run that test alone with 'ens test --filter \"{stopped}\"' to "
-                + "see its output";
-        }
-        return new RunnerOutcome(2, message);
+        return "the test program stopped with code {runnerExit} while running "
+            + "'{running[0].description()}', and that test finished when run alone, so the stop "
+            + "happens only when it runs beside other tests";
     }
     let names = new List<string>();
     for (let one in running) {
         names.push(one.description());
     }
-    return new RunnerOutcome(2, "the test program stopped with code {runnerExit} while "
-        + report.quotedNames(names.toArray()) + " were running at the same time, so one of them "
-        + "stopped it. Run the tests one at a time with '--jobs 1' to see which");
+    return "the test program stopped with code {runnerExit} while "
+        + report.quotedNames(names.toArray()) + " were running at the same time, and each of them "
+        + "finished when run alone, so the stop happens only when they run together";
+}
+
+// Where the report of the last panic on a runner's error stream starts, or -1 when it has none.
+export panicStart(string[] errors) -> long {
+    for (long i = errors.length - 1; i >= 0; i--) {
+        if (errors[i].startsWith(Runner.panicPrefix)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// The result of a test that ended the program it ran in alone: its panic's message and the frames
+// up to the runner's own, or the code the program ended with when it printed no panic.
+export stoppedResult(DiscoveredTest test, int runnerExit, string[] errors) -> string[] {
+    long start = panicStart(errors);
+    if (start < 0) {
+        return ["FAIL {test.description()}: the test ended the program with code {runnerExit}"];
+    }
+    let result = new List<string>();
+    result.push("FAIL {test.description()}: " + errors[start]);
+    for (long i = start + 1; i < errors.length; i++) {
+        if (errors[i].indexOf("({Runner.fileName}:") >= 0) {
+            break;
+        }
+        result.push(errors[i]);
+    }
+    return result.toArray();
+}
+
+// The lines of a runner's error stream before its last panic, which a test wrote of its own.
+export ownErrors(string[] errors) -> string[] {
+    long start = panicStart(errors);
+    if (start < 0) {
+        return errors;
+    }
+    let own = new List<string>();
+    for (long i = 0; i < start; i++) {
+        own.push(errors[i]);
+    }
+    return own.toArray();
+}
+
+// The lines of a runner's error stream from its last panic on.
+export panicLines(string[] errors) -> string[] {
+    let lines = new List<string>();
+    long start = panicStart(errors);
+    if (start < 0) {
+        return lines.toArray();
+    }
+    for (long i = start; i < errors.length; i++) {
+        lines.push(errors[i]);
+    }
+    return lines.toArray();
 }

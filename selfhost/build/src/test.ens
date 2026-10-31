@@ -1,7 +1,8 @@
 // Running a target's tests: find them, build them into one program with a runner around them, run
 // it, and return what it came to. The output is read line by line, and each result is passed on
 // as soon as every test before it has finished, so the results come out in order while several
-// tests run at the same time.
+// tests run at the same time. A run the program stopped partway is started again, as
+// 'testing.rounds' describes.
 import ProcessError from @std.process;
 import @std.process;
 import IoError from @std.io.streams;
@@ -31,6 +32,9 @@ import Runner from testing.runner;
 import RunnerOverlay from testing.runner;
 import RunnerOutput from testing.runner;
 import testing.runner;
+import SuiteEnd from testing.rounds;
+import SuiteLauncher from testing.rounds;
+import testing.rounds;
 
 // What running one suite came to: the code it deserves, how many of its tests passed, how many were
 // going to run, and whether it ran them all. A suite that stopped partway or never compiled reports
@@ -220,42 +224,53 @@ runIn(FileLoader loader, BuildOptions options, Packaging packaging, Path folder,
 }
 
 // Runs the built suite on `jobs` tasks and passes every result on in order, as soon as the tests
-// before it have finished. Reading which tests started and finished is what lets a run that stopped
-// partway name the tests it stopped in. What a test wrote to the error stream follows the results,
-// since a suite ends before its error stream can be read without holding up the results.
+// before it have finished, starting it again after a stop until every test has a result.
 started(Path suite, TestPlan plan, long jobs, string announced, Reporter reporter)
         -> SuiteResult {
     DiscoveredTest[] tests = plan.tests();
-    let suiteRun = try process.spawn(suite, ["{jobs}"]);
-    let output = new RunnerOutput(tests);
-    string? line = try suiteRun.stdout().readLine();
-    while (line != null) {
-        for (let shown in output.accept(line)) {
-            reporter.relayed(shown);
-        }
-        line = try suiteRun.stdout().readLine();
+    let ended = try rounds.run(tests, jobs, new SpawnedSuite(suite, reporter));
+    for (let failure in ended.failures()) {
+        reporter.problem("{announced}: " + failure);
     }
-    for (let shown in output.remaining()) {
-        reporter.relayed(shown);
-    }
-    string? reported = try suiteRun.stderr().readLine();
-    while (reported != null) {
-        reporter.relayed(reported);
-        reported = try suiteRun.stderr().readLine();
-    }
-    int code = childexit.exitCodeOf(try suiteRun.wait());
-    let outcome = runner.outcomeOf(code, tests, output);
-    if (outcome.failure().length > 0) {
-        reporter.problem("{announced}: " + outcome.failure());
-    }
-    return new SuiteResult(outcome.exitCode(), output.passed(), tests.length,
-        outcome.exitCode() != 2);
+    return new SuiteResult(ended.exitCode(), ended.passed(), tests.length,
+        ended.exitCode() != 2);
 } catch (ProcessError error) {
     reporter.problem("{announced}: the tests were built, but {error.message}");
     return new SuiteResult(2, 0, plan.tests().length, false);
 } catch (IoError error) {
     reporter.problem("{announced}: the tests were built, but {error.message}");
     return new SuiteResult(2, 0, plan.tests().length, false);
+}
+
+// The built suite, started as a child whose output is shown as it arrives.
+final class SpawnedSuite implements SuiteLauncher {
+    Path suite;
+    Reporter reporter;
+
+    protected constructor(this.suite, this.reporter);
+
+    protected override launch(string[] arguments, RunnerOutput output) -> SuiteEnd
+                              throws ProcessError, IoError {
+        let suiteRun = try process.spawn(this.suite, arguments);
+        string? line = try suiteRun.stdout().readLine();
+        while (line != null) {
+            for (let shown in output.accept(line)) {
+                this.reporter.relayed(shown);
+            }
+            line = try suiteRun.stdout().readLine();
+        }
+        let errors = new List<string>();
+        string? reported = try suiteRun.stderr().readLine();
+        while (reported != null) {
+            errors.push(reported);
+            reported = try suiteRun.stderr().readLine();
+        }
+        return new SuiteEnd(childexit.exitCodeOf(try suiteRun.wait()), errors.toArray());
+    }
+
+    protected override show(string line) {
+        this.reporter.relayed(line);
+    }
 }
 
 // Compiles the tests and the runner around them into one program with every source module, which

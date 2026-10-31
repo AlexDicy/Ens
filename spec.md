@@ -1149,7 +1149,8 @@ test "addition adds small integers" {
 A test body may call throwing functions with `try` without declaring anything: a test is allowed to throw any `Error`.
 A test fails by throwing.
 The runner catches the error, reports it, and moves on, so one failure never stops the run.
-A `panic()` or a crash still aborts the whole run; tests are not isolated in separate processes yet.
+A `panic()`, an `exit` or a crash ends the program the tests run in, so `ens test` starts it again: each test that was running then runs again on its own, and the tests that had not started run after them.
+A test that ends the program on its own fails with its panic's message and frames, or with the code the program ended with when it printed no panic, and every other test still gets its result.
 
 The `@std.testing` module provides `TestFailure`, an `Error` subclass whose constructor takes a message and an optional cause, and assertion helpers that throw it:
 
@@ -1184,8 +1185,8 @@ FAIL subtraction fails on purpose: expected '1', got '-1'
 ```
 
 `--filter` runs only the tests whose description contains the substring.
-The exit code is `0` when every test passes, `1` when any test fails, and `2` when the tests do not compile or a test run stops before it has run them all.
-A run that stops, on a panic, an exit or a crash, names the tests that had started and not finished, since the stop happened in one of them, and still shows the results of the tests that had finished.
+The exit code is `0` when every test passes, `1` when any test fails, and `2` when the tests do not compile or the program stops where no test was running, which ends the run with the results it has.
+When the tests that were running as the program stopped each finish on their own, the run names them, says the stop happens only when they run together, and ends with `1`.
 Test files must have unique file names, and neither a test file nor anything it imports may define `main()`.
 
 At a workspace root every member is tested against its own tests.
