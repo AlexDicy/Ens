@@ -5,11 +5,13 @@ import EncodingError from @std.text;
 import ErrorKind from @std.io.streams;
 import IoError from @std.io.streams;
 import Reader from @std.io.streams;
+import TimedReader from @std.io.streams;
+import @std.system;
 import Writer from @std.io.streams;
 
 // Reads ahead into a buffer, so a caller taking a few bytes at a time reaches the source once per
 // bufferful. A capacity below one byte is raised to one.
-export final class BufferedReader implements Reader {
+export final class BufferedReader implements TimedReader {
     const Reader source;
 
     byte[] held;
@@ -27,41 +29,32 @@ export final class BufferedReader implements Reader {
     // Bytes out of the buffer, refilling it first when it is empty, and 0 only at the end of the
     // stream. A request at least a bufferful wide is read straight from the source.
     export override read(byte[] buffer) -> long throws IoError {
-        if (buffer.length == 0) {
-            return 0;
-        }
-        if (this.start == this.end && buffer.length >= this.held.length) {
-            return try this.bytesFromSource(buffer);
-        }
-        bool ready = try this.holdsBytes();
-        if (!ready) {
-            return 0;
-        }
-        long count = this.end - this.start;
-        if (count > buffer.length) {
-            count = buffer.length;
-        }
-        for (long i = 0; i < count; i++) {
-            buffer[i] = this.held[this.start + i];
-        }
-        this.start = this.start + count;
-        return count;
+        return try this.readBy(buffer, Deadline.none) ?? 0;
+    }
+
+    // The same, waiting at most `timeoutMillis` milliseconds for bytes when none are held, and null
+    // when none arrived in time. The bound holds when the source is a TimedReader; another source
+    // is read as it is.
+    export override read(byte[] buffer, long timeoutMillis) -> long? throws IoError {
+        return try this.readBy(buffer, deadlineAfter(timeoutMillis));
     }
 
     // The next line without its ending, or null once the stream has ended. A carriage return
     // before the newline belongs to the ending, and a last line without one is a line of its own.
     export readLine() -> string? throws IoError {
-        bool ready = try this.holdsBytes();
-        if (!ready) {
-            return null;
-        }
-        long at = this.newlineIndex();
-        if (at < 0) {
-            return try this.lineAcrossFills();
-        }
-        bytes line = this.heldBetween(this.start, at);
-        this.start = at + 1;
-        return try textOf(withoutReturn(line));
+        return try this.lineBy(Deadline.none);
+    }
+
+    // The same, waiting at most `timeoutMillis` milliseconds for the line to end, and null when it
+    // did not end in time, keeping what arrived of it for the next call; 'hasEnded' tells that null
+    // from the one at the end of the stream. The bound holds when the source is a TimedReader.
+    export readLine(long timeoutMillis) -> string? throws IoError {
+        return try this.lineBy(deadlineAfter(timeoutMillis));
+    }
+
+    // Whether the stream has ended and every byte read from it has been taken.
+    export hasEnded() -> bool {
+        return this.ended && this.start == this.end;
     }
 
     // How many bytes were read from the source ahead of what the caller has taken, which is what
@@ -74,7 +67,7 @@ export final class BufferedReader implements Reader {
     export readAll() -> bytes throws IoError {
         let collected = new BytesWriter();
         while (true) {
-            bool ready = try this.holdsBytes();
+            bool ready = try this.holdsBytes(Deadline.none) ?? false;
             if (!ready) {
                 return collected.toBytes();
             }
@@ -90,10 +83,52 @@ export final class BufferedReader implements Reader {
         return try textOf(raw);
     }
 
+    // Bytes out of the buffer by `deadline`, null when none arrived by then.
+    readBy(byte[] buffer, long deadline) -> long? throws IoError {
+        if (buffer.length == 0) {
+            return 0;
+        }
+        if (this.start == this.end && buffer.length >= this.held.length) {
+            return try this.bytesFromSource(buffer, deadline);
+        }
+        bool? ready = try this.holdsBytes(deadline);
+        if (ready == null) {
+            return null;
+        }
+        if (!ready) {
+            return 0;
+        }
+        long count = this.end - this.start;
+        if (count > buffer.length) {
+            count = buffer.length;
+        }
+        for (long i = 0; i < count; i++) {
+            buffer[i] = this.held[this.start + i];
+        }
+        this.start = this.start + count;
+        return count;
+    }
+
+    // The next line by `deadline`: null at the end of the stream, and null when the line did not
+    // end by then, with what arrived of it kept.
+    lineBy(long deadline) -> string? throws IoError {
+        bool? ready = try this.holdsBytes(deadline);
+        if (ready == null || !ready) {
+            return null;
+        }
+        long at = this.newlineIndex();
+        if (at < 0) {
+            return try this.lineAcrossFills(deadline);
+        }
+        bytes line = this.heldBetween(this.start, at);
+        this.start = at + 1;
+        return try textOf(withoutReturn(line));
+    }
+
     // A line whose bytes did not all arrive in one fill. They stay in the buffer, which grows to
-    // hold them, until the line's end arrives, so a read cut short by a failure or a cancel keeps
-    // them for the next call.
-    lineAcrossFills() -> string throws IoError {
+    // hold them, until the line's end arrives, so a read cut short by a failure, a cancel or the
+    // deadline keeps them for the next call.
+    lineAcrossFills(long deadline) -> string? throws IoError {
         long scanned = this.end - this.start;
         while (true) {
             long at = this.newlineIndexFrom(this.start + scanned);
@@ -103,7 +138,10 @@ export final class BufferedReader implements Reader {
                 return try textOf(withoutReturn(line));
             }
             scanned = this.end - this.start;
-            long arrived = try this.fillMore();
+            long? arrived = try this.fillMore(deadline);
+            if (arrived == null) {
+                return null;
+            }
             if (arrived == 0) {
                 bytes last = this.heldBetween(this.start, this.end);
                 this.start = this.end;
@@ -112,9 +150,9 @@ export final class BufferedReader implements Reader {
         }
     }
 
-    // How many more bytes the source put in after those held, moved to the front of the buffer and
-    // given room first, and 0 at the end of the stream.
-    fillMore() -> long throws IoError {
+    // How many more bytes the source put in by `deadline` after those held, moved to the front of
+    // the buffer and given room first: 0 at the end of the stream and null when none arrived.
+    fillMore(long deadline) -> long? throws IoError {
         long kept = this.end - this.start;
         if (this.start > 0) {
             for (long i = 0; i < kept; i++) {
@@ -131,7 +169,10 @@ export final class BufferedReader implements Reader {
             this.held = grown;
         }
         byte[] room = new byte[this.held.length - this.end];
-        long arrived = try this.bytesFromSource(room);
+        long? arrived = try this.bytesFromSource(room, deadline);
+        if (arrived == null) {
+            return null;
+        }
         for (long i = 0; i < arrived; i++) {
             this.held[this.end + i] = room[i];
         }
@@ -139,24 +180,40 @@ export final class BufferedReader implements Reader {
         return arrived;
     }
 
-    // Whether the buffer holds a byte to take, reading more into it when it is empty. False once
-    // the source has ended and nothing is left over.
-    holdsBytes() -> bool throws IoError {
+    // Whether the buffer holds a byte to take, reading more into it by `deadline` when it is empty:
+    // false once the source has ended and nothing is left over, and null when nothing arrived.
+    holdsBytes(long deadline) -> bool? throws IoError {
         if (this.start < this.end) {
             return true;
         }
         this.start = 0;
-        this.end = try this.bytesFromSource(this.held);
+        this.end = 0;
+        long? arrived = try this.bytesFromSource(this.held, deadline);
+        if (arrived == null) {
+            return null;
+        }
+        this.end = arrived;
         return this.end > 0;
     }
 
     // How many bytes the source itself put into `buffer`, with the end of the stream recorded so
-    // nothing reads it again afterwards.
-    bytesFromSource(byte[] buffer) -> long throws IoError {
+    // nothing reads it again afterwards, and null when a source that can wait had none by
+    // `deadline`.
+    bytesFromSource(byte[] buffer, long deadline) -> long? throws IoError {
         if (this.ended) {
             return 0;
         }
-        long count = try this.source.read(buffer);
+        long? count = null;
+        TimedReader? timed = this.source as? TimedReader;
+        if (deadline == Deadline.none || timed == null) {
+            count = try this.source.read(buffer);
+        } else {
+            long remaining = deadline - system.monotonicMillis();
+            count = try timed.read(buffer, remaining < 0 ? 0 : remaining);
+        }
+        if (count == null) {
+            return null;
+        }
         if (count == 0) {
             this.ended = true;
         }
@@ -236,6 +293,16 @@ export final class BufferedWriter implements Writer {
         try this.flush();
     } catch (IoError ignored) {
     }
+}
+
+final class Deadline {
+    // No deadline at all: wait as long as the source takes.
+    protected static const long none = -1;
+}
+
+// The point on the monotonic clock `timeoutMillis` from now, a bound below 0 counting as 0.
+deadlineAfter(long timeoutMillis) -> long {
+    return system.monotonicMillis() + (timeoutMillis < 0 ? 0 : timeoutMillis);
 }
 
 // `raw` without a carriage return at its end, which a Windows line ending writes before the
