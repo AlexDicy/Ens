@@ -10,6 +10,7 @@ import ErrorKind as IoErrorKind from @std.io.streams;
 import IoError from @std.io.streams;
 import @std.io.streams;
 import Reader from @std.io.streams;
+import TimedReader from @std.io.streams;
 import Writer from @std.io.streams;
 import List from @std.collections.list;
 import @std.process.blocks;
@@ -26,6 +27,7 @@ import NativeWatch from @std.system;
 import Poller from @std.system;
 import Platform from @std.platform;
 import @std.system;
+import Cancelled from @std.tasks;
 import EventEnd from @std.tasks;
 import @std.tasks;
 
@@ -361,6 +363,34 @@ export final class ChildProcess {
             token)).end;
     }
 
+    // Whether the child's `stream` holds bytes or has ended by `deadline` on the monotonic clock,
+    // parked on the poller so a cancel ends the wait, which the result reports as Cancelled.
+    protected streamReadyBy(int stream, long deadline) -> EventEnd throws ProcessError {
+        int bit = stream == Stream.output ? Ready.output : Ready.errors;
+        while (true) {
+            if ((try this.pollFor(0) & bit) != 0) {
+                return EventEnd.Arrived;
+            }
+            long remaining = deadline - system.monotonicMillis();
+            if (remaining <= 0) {
+                return EventEnd.Unwatched;
+            }
+            let waited = tasks.awaitEvents([(poller, token) -> system.watchProcess(this.child,
+                poller, stream, token)], deadline);
+            switch (waited.end) {
+                EventEnd.Arrived -> { },
+                EventEnd.Cancelled -> {
+                    return EventEnd.Cancelled;
+                },
+                EventEnd.Unwatched, EventEnd.Failed -> {
+                    try tasks.sleep(Pipe.turnMillis < remaining ? Pipe.turnMillis : remaining);
+                },
+            }
+        }
+    } catch (Cancelled stopped) {
+        return EventEnd.Cancelled;
+    }
+
     // As many of `data`'s bytes as the child's input took.
     protected writeInput(bytes data) -> NativeCount {
         return system.processWrite(this.child, data);
@@ -460,7 +490,7 @@ export final class ChildProcess {
 
 // One of the child's output pipes as a Reader. The child is held weakly, so a reader kept after the
 // child value is dropped reports Closed rather than reading a pipe that has been given back.
-final class PipeReader implements Reader {
+final class PipeReader implements TimedReader {
     weak ChildProcess? owner;
     const int stream;
     const string name;
@@ -474,6 +504,18 @@ final class PipeReader implements Reader {
     }
 
     protected override read(byte[] buffer) -> long throws IoError {
+        return try this.readBy(buffer, -1) ?? 0;
+    }
+
+    // The same, waiting at most `timeoutMillis` milliseconds for the child to write, and null when
+    // it wrote nothing and kept the stream open meanwhile.
+    protected override read(byte[] buffer, long timeoutMillis) -> long? throws IoError {
+        return try this.readBy(buffer,
+            system.monotonicMillis() + (timeoutMillis < 0 ? 0 : timeoutMillis));
+    }
+
+    // What arrived by `deadline`, a negative one meaning no bound at all.
+    readBy(byte[] buffer, long deadline) -> long? throws IoError {
         ChildProcess? owner = this.owner;
         if (owner == null) {
             throw new IoError("could not read the {this.name} of '{this.program}': the "
@@ -481,14 +523,26 @@ final class PipeReader implements Reader {
                 + "ChildProcess in a variable while its {this.name} is read", IoErrorKind.Closed,
                 0);
         }
-        if (owner.awaitStream(this.stream) == EventEnd.Cancelled) {
+        EventEnd waited = EventEnd.Arrived;
+        if (deadline < 0) {
+            waited = owner.awaitStream(this.stream);
+        } else {
+            waited = try owner.streamReadyBy(this.stream, deadline);
+        }
+        if (waited == EventEnd.Cancelled) {
             throw streams.cancelled("read the {this.name} of '{this.program}'");
+        }
+        if (deadline >= 0 && waited != EventEnd.Arrived) {
+            return null;
         }
         let read = owner.readStream(this.stream, buffer);
         if (read.code != 0) {
             throw pipeFailure("read the {this.name} of '{this.program}'", read.code);
         }
         return read.count;
+    } catch (ProcessError failed) {
+        throw new IoError("could not read the {this.name} of '{this.program}': "
+            + failed.message, IoErrorKind.Other, failed.nativeError);
     }
 }
 
@@ -576,6 +630,8 @@ final class Ready {
 // How many bytes one read takes from a pipe, which is what a pipe holds on Linux and Windows.
 final class Pipe {
     protected static const long chunk = 65536;
+    // How long a bounded wait on a stream that cannot be watched sleeps between looks at it.
+    protected static const long turnMillis = 5;
 }
 
 // The interpreters a command line runs through.

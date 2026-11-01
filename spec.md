@@ -2181,6 +2181,8 @@ A family's own name is a module too where one type stands at its head, which is 
 `@std.io` moves bytes, and two contracts from `@std.io.streams` describe every stream in it.
 `Reader` declares `read(byte[] buffer) -> long throws IoError`, which fills as much of the buffer as it has ready and returns how many bytes it wrote.
 That count is `0` only once the stream has ended, so a count shorter than the buffer is a reason to call `read` again, not a sign that the bytes have run out.
+`TimedReader` extends `Reader` with `read(buffer, timeoutMillis) -> long?`, the same read waiting at most that many milliseconds and returning `null` when no byte arrived in time, where a bound of `0` checks this moment alone.
+A child's pipes are timed readers, and so is a `BufferedReader`.
 `Writer` declares `write(bytes data) throws IoError`, which takes all of `data` and keeps nothing, and `flush() throws IoError`, which hands over everything accepted but not yet passed on.
 A `byte[]` is written by passing `bytes.of(array)`.
 `streams.copy(source, target)` moves everything the source has left into the target and returns how many bytes moved, flushing and closing neither, so flushing and closing the target is up to the caller.
@@ -2208,6 +2210,9 @@ A condition that only a call on a path can report, such as a file system with no
 `BufferedReader` and `BufferedWriter` from `@std.io.buffered` turn many small reads and writes into few large ones, each wrapping one stream and taking a capacity that defaults to 8192 bytes, where a capacity below one byte is raised to one.
 `BufferedReader` adds the reads a raw source cannot offer.
 `readLine()` returns the next line without its ending, and `null` once the stream has ended; a carriage return before the newline belongs to the ending, and a last line that ends in no newline is a line of its own.
+`readLine(timeoutMillis)` and `read(buffer, timeoutMillis)` wait at most that many milliseconds and return `null` when the line has not ended or no byte has arrived by then, and `hasEnded()` tells that `null` from the one at the end of the stream.
+The bound holds when the wrapped stream is a `TimedReader`, and any other stream is read as it is.
+A line that a read stopped partway through, at a bound, on a failure or on a cancel, is kept, and the next call returns it whole.
 `readAll()` returns everything left as `bytes`, and `readAllText()` returns it as text, raising an `IoError` for bytes that spell no character, since text in Ens is always valid UTF-8.
 That refusal is an `IoError` of kind `Other` naming the offset where the bytes stop spelling text, and it carries the `EncodingError` underneath as its cause.
 `BufferedWriter` passes what it holds on when it fills, when `flush` is called, and when the wrapper is dropped, and the flush a drop does discards any failure, so a program that must confirm the bytes arrived calls `flush` itself.
@@ -2417,7 +2422,7 @@ With `mergeOutput`, which defaults to `false`, the child writes its standard err
 A merged child leaves no second stream for this process to drain, which is the shape for a program whose two streams are one account of what it is doing, such as a build tool whose lines are shown as they arrive.
 `waitForOutput(timeoutMillis)` reports whether reading can go ahead without waiting for the child: `true` when either stream has bytes or has ended, and `false` when that many milliseconds went by with neither, where a bound of `0` checks this moment alone.
 Bytes that `stdout()` or `stderr()` has already taken from its pipe count as well, so a second line that arrived together with the first is reported without asking the system.
-Reading itself waits as long as the child takes, so a program that can wait never needs to call `waitForOutput`.
+Reading itself waits as long as the child takes, a bounded `readLine(timeoutMillis)` waits as long as it is told, and `waitForOutput` is the one call that waits on both streams at once, which is how a program reading both on one task bounds its wait for either.
 `wait()` returns the exit status, waiting for the child to finish first and reading and throwing away output nobody read meanwhile, because a child whose output nobody reads is stopped by a full pipe.
 `wait(timeoutMillis)` is the same call bounded, returning `null` once that many milliseconds have passed with the child still running.
 Either one returns the same status however often it is called.
