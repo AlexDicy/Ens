@@ -1,0 +1,206 @@
+// A test run over as many worker programs at a time as the run has jobs, each running the tests it
+// is given one after another. A worker takes a share of the tests nobody has taken, smaller as
+// fewer are left, so a slow test holds up only the tests behind it in its own share. A worker
+// that stops partway, on a panic, an exit or a crash, fails the one test it was running with what
+// it printed, and the tests of its share it never reached go back to be taken by another worker.
+import ProcessError from @std.process;
+import IoError from @std.io.streams;
+import List from @std.collections.list;
+import FrozenList from @std.collections.frozen;
+import @std.tasks;
+import Cancelled from @std.tasks;
+import Mutex from @std.tasks;
+import DiscoveredTest from testing.discovery;
+import RunnerOutput from testing.runner;
+import testing.runner;
+
+// How one worker ended: the code it ended with, and what it wrote to its error stream.
+export shared final class WorkerEnd {
+    protected const int code;
+    protected const FrozenList<string> errors;
+
+    export constructor(this.code, this.errors);
+}
+
+// What starts a worker: the suite, run over the arguments, which passes each line of its output to
+// `line` as it arrives and returns how the worker ended. What it wrote to its error stream is
+// returned rather than shown, since a panic in it may become a test's result.
+export shared interface WorkerLauncher {
+    launch(string[] arguments, (shared (string) -> void throws Cancelled) line) -> WorkerEnd
+        throws ProcessError, IoError, Cancelled;
+}
+
+// Where the lines of a run go, one at a time and in the order they are to be shown.
+export interface RunDisplay {
+    show(string line);
+}
+
+// What a run came to: 0 every test passed, 1 some of them failed, 2 a stop no test explains or a
+// worker that could not be run ended it; how many tests passed; and what to report beside the
+// results.
+export shared final class RunEnd {
+    const int code;
+    const long passedTests;
+    const FrozenList<string> problems;
+
+    protected constructor(this.code, this.passedTests, this.problems);
+
+    export exitCode() -> int {
+        return this.code;
+    }
+
+    export passed() -> long {
+        return this.passedTests;
+    }
+
+    export failures() -> string[] {
+        return this.problems.toArray();
+    }
+}
+
+// Runs `tests` on as many workers at a time as `jobs` says until each test has a result, showing
+// every result in order and then how many passed.
+export run(DiscoveredTest[] tests, long jobs, WorkerLauncher launcher, RunDisplay display)
+           -> RunEnd {
+    let dispatch = new Mutex<Dispatch>(new Dispatch(tests, jobs, display));
+    long workers = jobs < tests.length ? jobs : tests.length;
+    tasks.scope((scope) -> {
+        for (long i = 0; i < workers; i++) {
+            scope.launch(() -> try work(dispatch, launcher));
+        }
+    });
+    return try dispatch.lock((state) -> state.ended());
+} catch (Cancelled stopped) {
+    panic("Internal: the task running a test run was cancelled, and nothing cancels it");
+}
+
+// One worker's turns: take a share, run it, and settle what it came to, until no test is left to
+// take or the run has ended.
+work(Mutex<Dispatch> dispatch, WorkerLauncher launcher) throws Cancelled {
+    FrozenList<long> share = try dispatch.lock((state) -> state.take());
+    while (share.length() > 0) {
+        let arguments = runner.positionArguments(share.toArray());
+        let ended = try launcher.launch(arguments,
+            (line) -> try dispatch.lock((state) -> state.accept(line)));
+        bool going = try dispatch.lock((state) -> state.settle(share.toArray(), ended));
+        if (!going) {
+            return;
+        }
+        share = try dispatch.lock((state) -> state.take());
+    }
+} catch (ProcessError failed) {
+    string problem = "the tests were built, but " + failed.message;
+    bool stopped = try dispatch.lock((state) -> state.halt(problem));
+} catch (IoError failed) {
+    string problem = "the tests were built, but " + failed.message;
+    bool stopped = try dispatch.lock((state) -> state.halt(problem));
+}
+
+// Everything the workers share, changed by one of them at a time: which tests are left to take,
+// what the workers have reported, and whether the run has ended early.
+final class Dispatch {
+    DiscoveredTest[] tests;
+    long jobs;
+    RunDisplay display;
+    RunnerOutput output;
+    List<long> untaken;
+    List<string> problems;
+    bool halted;
+
+    protected constructor(DiscoveredTest[] tests, long jobs, RunDisplay display) {
+        this.tests = tests;
+        this.jobs = jobs;
+        this.display = display;
+        this.output = new RunnerOutput(tests);
+        this.untaken = new List<long>();
+        for (long i = 0; i < tests.length; i++) {
+            this.untaken.push(i);
+        }
+        this.problems = new List<string>();
+        this.halted = false;
+    }
+
+    // The next share of untaken tests, in order: a part of what is left for each worker, so
+    // shares shrink as the run nears its end, and nothing once the run has ended.
+    protected take() -> FrozenList<long> {
+        let share = new List<long>();
+        if (this.halted) {
+            return share.frozen();
+        }
+        long left = this.untaken.length();
+        long size = (left + 2 * this.jobs - 1) / (2 * this.jobs);
+        for (long i = 0; i < size && i < left; i++) {
+            share.push(this.untaken.get(i));
+        }
+        let rest = new List<long>();
+        for (long i = share.length(); i < left; i++) {
+            rest.push(this.untaken.get(i));
+        }
+        this.untaken = rest;
+        return share.frozen();
+    }
+
+    protected accept(string line) -> bool {
+        this.showAll(this.output.accept(line));
+        return true;
+    }
+
+    // Settles a worker that ran `share` and ended as `ended`, and returns whether the run goes on.
+    protected settle(long[] share, WorkerEnd ended) -> bool {
+        string[] errors = ended.errors.toArray();
+        if (this.output.finishedAll(share)) {
+            this.showAll(errors);
+            if (!runner.endedWithResults(ended.code)) {
+                return this.halt(runner.stoppedOutsideTests(ended.code, this.output, true));
+            }
+            return !this.halted;
+        }
+        long[] unfinished = this.output.unfinishedAmong(share);
+        if (unfinished.length == 0) {
+            this.showAll(errors);
+            return this.halt(runner.stoppedOutsideTests(ended.code, this.output, false));
+        }
+        long stopped = unfinished[0];
+        this.showAll(runner.ownErrors(errors));
+        this.showAll(this.output.stopped(stopped, runner.stoppedResult(this.tests[stopped],
+            ended.code, errors)));
+        this.giveBack(this.output.unstartedAmong(share));
+        return !this.halted;
+    }
+
+    // Ends the run early with `problem`, letting every worker finish the share it has.
+    protected halt(string problem) -> bool {
+        this.problems.push(problem);
+        this.halted = true;
+        return false;
+    }
+
+    // What the run came to, once every worker has ended.
+    protected ended() -> RunEnd {
+        this.showAll(this.output.remaining());
+        if (this.halted) {
+            return new RunEnd(2, this.output.passed(), this.problems.frozen());
+        }
+        this.display.show("{this.output.passed()}/{this.tests.length} tests passed");
+        int code = this.output.passed() == this.tests.length ? 0 : 1;
+        return new RunEnd(code, this.output.passed(), this.problems.frozen());
+    }
+
+    // Puts tests a worker never reached back in front of the untaken ones, which they came before.
+    giveBack(long[] positions) {
+        let merged = new List<long>();
+        for (let position in positions) {
+            merged.push(position);
+        }
+        for (long i = 0; i < this.untaken.length(); i++) {
+            merged.push(this.untaken.get(i));
+        }
+        this.untaken = merged;
+    }
+
+    showAll(string[] lines) {
+        for (let line in lines) {
+            this.display.show(line);
+        }
+    }
+}

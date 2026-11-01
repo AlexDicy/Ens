@@ -1,0 +1,208 @@
+// A run over worker programs, played against workers whose every start is scripted, so which
+// workers a run starts, over which tests, and what it shows are observable without a process.
+import Path from @std.fs;
+import @std.testing;
+import List from @std.collections.list;
+import FrozenList from @std.collections.frozen;
+import FrozenMap from @std.collections.frozen;
+import Map from @std.collections.map;
+import ProcessError from @std.process;
+import IoError from @std.io.streams;
+import Cancelled from @std.tasks;
+import Mutex from @std.tasks;
+import SystemFileLoader from @ens.sema.support.loader;
+import DiscoveredTest from testing.discovery;
+import testing.discovery;
+import Runner from testing.runner;
+import WorkerEnd from testing.workers;
+import WorkerLauncher from testing.workers;
+import RunDisplay from testing.workers;
+import testing.workers;
+import support;
+
+// One job takes half of what is left each time, so the shares shrink to single tests at the end.
+test "a worker's share is a part of the untaken tests that shrinks as fewer are left" {
+    let tests = try testsNamed("workers-shares", 8);
+    let scripts = new Map<string, Script>();
+    scripts.set("0-3", passing([0, 1, 2, 3]));
+    scripts.set("4-5", passing([4, 5]));
+    scripts.set("6", passing([6]));
+    scripts.set("7", passing([7]));
+    let scripted = new ScriptedWorkers(scripts.frozen());
+    let shown = new ShownLines();
+    let ended = workers.run(tests, 1, scripted, shown);
+    try testing.assertEqual(ended.exitCode(), 0);
+    try testing.assertEqual(ended.passed(), 8L);
+    try assertLines(try scripted.startedInOrder(), ["0-3", "4-5", "6", "7"]);
+    try testing.assertEqual(shown.lines.get(8), "8/8 tests passed");
+    try assertLines(ended.failures(), []);
+}
+
+// A worker that stops in a test fails that test with its panic, and the tests of its share it
+// never reached are taken again, before the ones nobody had taken.
+test "a worker that stops fails the test it was running and gives back the rest of its share" {
+    let tests = try testsNamed("workers-stop", 3);
+    let scripts = new Map<string, Script>();
+    scripts.set("0-1", new Script(FrozenList.of(["start 0"]), 134, FrozenList.of([
+        "printed by a test", "panic: boom", "  at \"case 0\" (alpha_test.ens:2)",
+        "  at $run0 ($ens_test_runner.ens:40)"])));
+    scripts.set("1", passing([1]));
+    scripts.set("2", passing([2]));
+    let scripted = new ScriptedWorkers(scripts.frozen());
+    let shown = new ShownLines();
+    let ended = workers.run(tests, 1, scripted, shown);
+    try testing.assertEqual(ended.exitCode(), 1);
+    try testing.assertEqual(ended.passed(), 2L);
+    try assertLines(try scripted.startedInOrder(), ["0-1", "1", "2"]);
+    try assertLines(shown.lines.toArray(), ["printed by a test", "FAIL case 0: panic: boom",
+        "  at \"case 0\" (alpha_test.ens:2)", "PASS case 1", "PASS case 2", "2/3 tests passed"]);
+    try assertLines(ended.failures(), []);
+}
+
+// A worker that printed nothing as it stopped fails the test with the code it ended with.
+test "a worker that stops without a panic fails the test with the code it ended with" {
+    let tests = try testsNamed("workers-exit", 1);
+    let scripts = new Map<string, Script>();
+    scripts.set("0", new Script(FrozenList.of(["start 0"]), 3, noLines()));
+    let scripted = new ScriptedWorkers(scripts.frozen());
+    let shown = new ShownLines();
+    let ended = workers.run(tests, 1, scripted, shown);
+    try testing.assertEqual(ended.exitCode(), 1);
+    try assertLines(shown.lines.toArray(), ["FAIL case 0: the test ended the program with code 3",
+        "0/1 tests passed"]);
+}
+
+// A stop between two tests, or after every result, is not one a test explains, so the run ends
+// with the results it has and takes no more tests.
+test "a worker that stops outside its tests ends the run" {
+    let tests = try testsNamed("workers-between", 3);
+    let scripts = new Map<string, Script>();
+    scripts.set("0-1", new Script(FrozenList.of(["start 0", "line 0 PASS case 0", "pass 0"]), 6,
+        FrozenList.of(["something broke"])));
+    let scripted = new ScriptedWorkers(scripts.frozen());
+    let shown = new ShownLines();
+    let ended = workers.run(tests, 1, scripted, shown);
+    try testing.assertEqual(ended.exitCode(), 2);
+    try testing.assertEqual(ended.passed(), 1L);
+    try assertLines(try scripted.startedInOrder(), ["0-1"]);
+    try assertLines(shown.lines.toArray(), ["PASS case 0", "something broke"]);
+    try assertLines(ended.failures(), ["the test program stopped with code 6 when no test was "
+        + "running, after 1 of 3 had reported a result, so the failure is outside the tests"]);
+
+    let late = new Map<string, Script>();
+    late.set("0-1", new Script(FrozenList.of(["start 0", "line 0 PASS case 0", "pass 0",
+        "start 1", "line 1 PASS case 1", "pass 1"]), 3, noLines()));
+    let lateScripted = new ScriptedWorkers(late.frozen());
+    let lateEnded = workers.run(tests, 1, lateScripted, new ShownLines());
+    try testing.assertEqual(lateEnded.exitCode(), 2);
+    try assertLines(try lateScripted.startedInOrder(), ["0-1"]);
+    try assertLines(lateEnded.failures(), ["the test program ended with code 3 after all of its "
+        + "tests had reported a result, so the failure is outside the tests"]);
+}
+
+// Workers run at the same time and finish in any order, and the results still come out in the
+// order of the tests.
+test "several workers show their results in the order of the tests" {
+    let tests = try testsNamed("workers-several", 4);
+    let scripts = new Map<string, Script>();
+    for (long i = 0; i < 4; i++) {
+        scripts.set("{i}", passing([i]));
+    }
+    let scripted = new ScriptedWorkers(scripts.frozen());
+    let shown = new ShownLines();
+    let ended = workers.run(tests, 4, scripted, shown);
+    try testing.assertEqual(ended.exitCode(), 0);
+    try testing.assertEqual((try scripted.startedInOrder()).length, 4L);
+    try assertLines(shown.lines.toArray(), ["PASS case 0", "PASS case 1", "PASS case 2",
+        "PASS case 3", "4/4 tests passed"]);
+}
+
+// A worker whose start is written out ahead: the events it reports after the marker, the code it
+// ends with and what it writes to its error stream.
+shared final class Script {
+    protected const FrozenList<string> events;
+    protected const int code;
+    protected const FrozenList<string> errors;
+
+    protected constructor(this.events, this.code, this.errors);
+}
+
+passing(long[] positions) -> Script {
+    let events = new List<string>();
+    for (let position in positions) {
+        events.push("start {position}");
+        events.push("line {position} PASS case {position}");
+        events.push("pass {position}");
+    }
+    return new Script(events.frozen(), 0, noLines());
+}
+
+// Workers whose starts are scripted by their arguments, recording each start.
+shared final class ScriptedWorkers implements WorkerLauncher {
+    const FrozenMap<string, Script> scripts;
+    const Mutex<List<string>> started;
+
+    protected constructor(this.scripts) {
+        this.started = new Mutex<List<string>>(new List<string>());
+    }
+
+    protected override launch(string[] arguments, (shared (string) -> void throws Cancelled) line)
+                              -> WorkerEnd throws ProcessError, IoError, Cancelled {
+        string key = joined(arguments, " ");
+        bool recorded = try this.started.lock((all) -> {
+            all.push(key);
+            return true;
+        });
+        let found = this.scripts.get(key);
+        if (found == null) {
+            return new WorkerEnd(99, FrozenList.of(["no worker was scripted for '{key}'"]));
+        }
+        for (long i = 0; i < found.events.length(); i++) {
+            try line(Runner.marker + found.events.get(i));
+        }
+        return new WorkerEnd(found.code, found.errors);
+    }
+
+    protected startedInOrder() -> string[] throws Cancelled {
+        return (try this.started.lock((all) -> all.frozen())).toArray();
+    }
+}
+
+final class ShownLines implements RunDisplay {
+    protected List<string> lines;
+
+    protected constructor() {
+        this.lines = new List<string>();
+    }
+
+    protected override show(string line) {
+        this.lines.push(line);
+    }
+}
+
+noLines() -> FrozenList<string> {
+    return new List<string>().frozen();
+}
+
+testsNamed(string label, long count) -> DiscoveredTest[] throws {
+    let rootFolder = try support.scratch(label);
+    Path root = rootFolder.path();
+    string source = "";
+    for (long i = 0; i < count; i++) {
+        source = source + "test \"case {i}\" \{ \}\n\n";
+    }
+    try support.writeFile(root, "alpha_test.ens", source);
+    return discovery.plan(new SystemFileLoader(), root, "").tests();
+}
+
+assertLines(string[] actual, string[] expected) throws {
+    try testing.assertEqual(joined(actual, "\n"), joined(expected, "\n"));
+}
+
+joined(string[] parts, string separator) -> string {
+    string text = "";
+    for (long i = 0; i < parts.length; i++) {
+        text = i == 0 ? parts[i] : text + separator + parts[i];
+    }
+    return text;
+}

@@ -1149,7 +1149,7 @@ test "addition adds small integers" {
 A test body may call throwing functions with `try` without declaring anything: a test is allowed to throw any `Error`.
 A test fails by throwing.
 The runner catches the error, reports it, and moves on, so one failure never stops the run.
-A `panic()` or a crash still aborts the whole run; tests are not isolated in separate processes yet.
+A `panic()`, an `exit` or a crash ends the program the test runs in, and fails that one test with its panic's message and frames, or with the code the program ended with when it printed no panic; every other test still gets its result.
 
 The `@std.testing` module provides `TestFailure`, an `Error` subclass whose constructor takes a message and an optional cause, and assertion helpers that throw it:
 
@@ -1168,8 +1168,9 @@ test "empty input is refused" {
 ```
 
 `ens test [path] [--tests <folder>] [--filter <substring>] [--jobs <count>]` discovers every `_test.ens` file under the tests folder (a package's `tests/` folder, or the source folder itself when there is none) and orders the tests deterministically: files by path, tests in source order.
-Several tests run at the same time: as many as `--jobs` says, and by default one for each processor `environment.processorCount()` counts, each task taking the next test in that order that has not started.
-They run in one program, so they share what a program shares: the files on disk, state an `external` call changes, and the values a test keeps where others can reach them, such as a `lazy const`.
+Several tests run at the same time: as many as `--jobs` says, and by default one for each processor `environment.processorCount()` counts.
+Each of them runs in a program of its own that runs one test at a time, taking a share of the tests no program has started, in that order, and a new program takes over the tests that remain when one ends.
+Tests that run in the same program one after another share what a program shares: state an `external` call changes, and the values a test keeps where later tests can reach them, such as a `lazy const`; every test shares the files on disk.
 `--jobs 1` runs them one after another.
 With `--tests`, test files live outside the source tree: their imports resolve against the source folder first and then the tests folder, and a module present under both folders is an error.
 Each test prints one line, a failing test also prints its message and the stack trace of the failure, and the run ends with a summary.
@@ -1184,8 +1185,7 @@ FAIL subtraction fails on purpose: expected '1', got '-1'
 ```
 
 `--filter` runs only the tests whose description contains the substring.
-The exit code is `0` when every test passes, `1` when any test fails, and `2` when the tests do not compile or a test run stops before it has run them all.
-A run that stops, on a panic, an exit or a crash, names the tests that had started and not finished, since the stop happened in one of them, and still shows the results of the tests that had finished.
+The exit code is `0` when every test passes, `1` when any test fails, and `2` when the tests do not compile or a program stops while it is running no test, which ends the run with the results it has.
 Test files must have unique file names, and neither a test file nor anything it imports may define `main()`.
 
 At a workspace root every member is tested against its own tests.
