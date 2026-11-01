@@ -4,6 +4,9 @@
 import Environment from @std.environment;
 import Path from @std.fs;
 import IoError from @std.io.streams;
+import BufferedReader from @std.io.buffered;
+import BytesWriter from @std.io.memory;
+import ChildProcess from @std.process;
 import ExitStatus from @std.process;
 import ProcessError from @std.process;
 import @std.process;
@@ -15,10 +18,12 @@ export final class ToolRun {
     bool ran;
     int code;
     string[] outputLines;
+    string[] errorsLines;
     string problem;
     string stopping;
 
-    protected constructor(this.ran, this.code, this.outputLines, this.problem, this.stopping);
+    protected constructor(this.ran, this.code, this.outputLines, this.errorsLines, this.problem,
+                          this.stopping);
 
     // Whether the program ran at all. A program that could not be started printed nothing, which is a
     // different thing from a program that ran and refused.
@@ -34,9 +39,16 @@ export final class ToolRun {
         return this.ran && this.code == 0;
     }
 
-    // Everything the program wrote, in the order it wrote it, both streams together.
+    // What the program wrote to its output: the value of a command run for its output, and both
+    // streams in the order it wrote them for a command whose output was passed on.
     export lines() -> string[] {
         return this.outputLines;
+    }
+
+    // What the program said about itself: what it wrote to its error stream, and both streams in
+    // the order it wrote them for a command whose output was passed on.
+    export errorLines() -> string[] {
+        return this.errorsLines;
     }
 
     // Why the program could not be run at all, or "" when it ran.
@@ -49,23 +61,21 @@ export final class ToolRun {
         return this.stopping;
     }
 
-    // The last line the program printed, which is the part of its account worth repeating when a
-    // command that failed has to be explained. Empty when it printed nothing.
+    // The last line the program wrote to its output. Empty when it wrote nothing there.
     export said() -> string {
-        for (long i = this.outputLines.length - 1; i >= 0; i--) {
-            string line = this.outputLines[i].trim();
-            if (line.length > 0) {
-                return line;
-            }
-        }
-        return "";
+        return lastOf(this.outputLines);
     }
 
     // The report for a run that is no good: why it was stopped when this build stopped it, and
-    // otherwise the last line it printed. Empty when there is nothing to add.
+    // otherwise the last line it said about itself, or failing that the last line of its output.
+    // Empty when there is nothing to add.
     export report() -> string {
         if (this.stopping.length > 0) {
             return this.stopping;
+        }
+        string complaint = lastOf(this.errorsLines);
+        if (complaint.length > 0) {
+            return complaint;
         }
         return this.said();
     }
@@ -87,56 +97,167 @@ export silenceProblem(string program, long milliseconds) -> string {
 }
 
 // Runs the program and keeps everything it wrote, showing none of it: this is for a command whose
-// output is a value the build reads rather than an account of itself.
+// output is a value the build reads rather than an account of itself. Its two streams are kept
+// apart, so what the program says about itself never becomes part of the value.
 export read(string program, string[] arguments, string[] environmentOverrides) -> ToolRun {
-    return ranWith(program, arguments, environmentOverrides, null);
-}
-
-// Runs the program, keeps everything it wrote, and passes every line on to `progress` the moment it
-// arrives: this is for a command whose own account of itself belongs in the build's output.
-export relay(string program, string[] arguments, string[] environmentOverrides,
-             Progress progress) -> ToolRun {
-    return ranWith(program, arguments, environmentOverrides, progress);
-}
-
-// Every line the program writes, both streams in one, until it has printed everything or has
-// printed nothing for so long that it is taken to be wedged. The wait is bounded because the
-// programs' own limits cover a network that has stalled and a prompt nobody can complete, and
-// neither of them covers a program stuck for a reason of its own: without a bound here, that is a
-// build that never finishes.
-ranWith(string program, string[] arguments, string[] environmentOverrides, Progress? progress) -> ToolRun {
-    long bound = SilenceLimit.milliseconds;
-    let running = try process.spawn(Path(program), arguments,
-        environment: childEnvironment(environmentOverrides), mergeOutput: true);
-    let output = running.stdout();
-    let collected = new List<string>();
-    bool speaking = try running.waitForOutput(bound);
-    while (speaking) {
-        string? line = try output.readLine();
-        if (line == null) {
-            return new ToolRun(true, reportedCode(try running.wait()), collected.toArray(), "", "");
-        }
-        collected.push(line);
-        if (progress != null) {
-            progress.relayed(line);
-        }
-        speaking = try running.waitForOutput(bound);
-    }
-    try running.kill();
-    let stopped = try running.wait();
-    return new ToolRun(true, reportedCode(stopped), collected.toArray(), "",
-        silenceProblem(program, bound));
+    return try readApart(program, arguments, environmentOverrides);
 } catch (ProcessError error) {
     return notRun(error.message);
 } catch (IoError error) {
     return notRun(error.message);
 }
 
+// Runs the program, keeps everything it wrote, and passes every line on to `progress` the moment it
+// arrives: this is for a command whose own account of itself belongs in the build's output, so its
+// two streams are one account, in the order it wrote them.
+export relay(string program, string[] arguments, string[] environmentOverrides,
+             Progress progress) -> ToolRun {
+    return try relayMerged(program, arguments, environmentOverrides, progress);
+} catch (ProcessError error) {
+    return notRun(error.message);
+} catch (IoError error) {
+    return notRun(error.message);
+}
+
+// Each stream's lines, read as each arrives until both have ended or the program has printed
+// nothing on either for so long that it is taken to be wedged. The wait is bounded because the
+// programs' own limits cover a network that has stalled and a prompt nobody can complete, and
+// neither of them covers a program stuck for a reason of its own: without a bound here, that is a
+// build that never finishes.
+readApart(string program, string[] arguments, string[] environmentOverrides) -> ToolRun
+          throws ProcessError, IoError {
+    long bound = SilenceLimit.milliseconds;
+    let running = try process.spawn(Path(program), arguments,
+        environment: childEnvironment(environmentOverrides));
+    let output = new LineAssembler(running.stdout());
+    let errors = new LineAssembler(running.stderr());
+    while (!output.ended() || !errors.ended()) {
+        bool speaking = try running.waitForOutput(bound);
+        if (!speaking) {
+            return try stopped(running, program, bound, output.lines(), errors.lines());
+        }
+        try output.take();
+        try errors.take();
+    }
+    return new ToolRun(true, reportedCode(try running.wait()), output.lines(), errors.lines(), "",
+        "");
+}
+
+// Every line of the program's two streams together, in the order it wrote them, passed on to
+// `progress` as each arrives, with the same bound on how long it may print nothing.
+relayMerged(string program, string[] arguments, string[] environmentOverrides, Progress progress)
+            -> ToolRun throws ProcessError, IoError {
+    long bound = SilenceLimit.milliseconds;
+    let running = try process.spawn(Path(program), arguments,
+        environment: childEnvironment(environmentOverrides), mergeOutput: true);
+    let output = running.stdout();
+    let collected = new List<string>();
+    while (true) {
+        string? line = try output.readLine(bound);
+        if (line == null) {
+            if (output.hasEnded()) {
+                string[] said = collected.toArray();
+                return new ToolRun(true, reportedCode(try running.wait()), said, said, "", "");
+            }
+            string[] said = collected.toArray();
+            return try stopped(running, program, bound, said, said);
+        }
+        collected.push(line);
+        progress.relayed(line);
+    }
+}
+
+// Stops a program that printed nothing for `bound` milliseconds and reports it with what it had
+// written by then.
+stopped(ChildProcess running, string program, long bound, string[] output, string[] errors)
+        -> ToolRun throws ProcessError {
+    try running.kill();
+    let ended = try running.wait();
+    return new ToolRun(true, reportedCode(ended), output, errors, "",
+        silenceProblem(program, bound));
+}
+
+// One of the program's streams read into lines without waiting, as many bytes as are there each
+// time, so nothing of it is left waiting in a reader while the program is waited on.
+final class LineAssembler {
+    BufferedReader reader;
+    List<string> taken;
+    BytesWriter partial;
+    bool done;
+
+    protected constructor(this.reader) {
+        this.taken = new List<string>();
+        this.partial = new BytesWriter();
+        this.done = false;
+    }
+
+    // Takes whatever the stream holds now, ending each line it completes.
+    protected take() throws IoError {
+        byte[] buffer = new byte[Chunk.bytes];
+        while (!this.done) {
+            long? count = try this.reader.read(buffer, 0);
+            if (count == null) {
+                return;
+            }
+            if (count == 0) {
+                this.done = true;
+                this.endLine();
+                return;
+            }
+            for (long i = 0; i < count; i++) {
+                if (buffer[i] == '\n') {
+                    this.endLine();
+                } else {
+                    this.partial.write(bytes.of(buffer.slice(i, i + 1)));
+                }
+            }
+        }
+    }
+
+    protected ended() -> bool {
+        return this.done;
+    }
+
+    protected lines() -> string[] {
+        return this.taken.toArray();
+    }
+
+    // The bytes since the last newline as a line of their own, without a carriage return written
+    // before the newline. A stream that ends after a newline has no line after it.
+    endLine() {
+        bytes raw = this.partial.toBytes();
+        if (this.done && raw.length == 0) {
+            return;
+        }
+        if (raw.length > 0 && raw[raw.length - 1] == '\r') {
+            raw = raw.slice(0, raw.length - 1);
+        }
+        this.taken.push(string.fromBytesLossy(raw));
+        this.partial = new BytesWriter();
+    }
+}
+
+final class Chunk {
+    // How many bytes one look at a stream takes at most.
+    protected static const long bytes = 8192;
+}
+
+// The last line among `lines` that holds more than blanks, trimmed, or empty when none does.
+lastOf(string[] lines) -> string {
+    for (long i = lines.length - 1; i >= 0; i--) {
+        string line = lines[i].trim();
+        if (line.length > 0) {
+            return line;
+        }
+    }
+    return "";
+}
+
 // A program that could not be run, or could not be read, is reported as not run with the code a
 // shell gives a command it could not start.
 notRun(string problem) -> ToolRun {
     string[] nothing = [];
-    return new ToolRun(false, 127, nothing, problem, "");
+    return new ToolRun(false, 127, nothing, nothing, problem, "");
 }
 
 // The variables the program runs with: this process's own under `overrides`, each a 'NAME=VALUE'
