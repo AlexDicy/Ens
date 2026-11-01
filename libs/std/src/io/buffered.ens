@@ -90,24 +90,53 @@ export final class BufferedReader implements Reader {
         return try textOf(raw);
     }
 
-    // A line whose bytes did not all arrive in one fill, assembled out of every fill it spans.
+    // A line whose bytes did not all arrive in one fill. They stay in the buffer, which grows to
+    // hold them, until the line's end arrives, so a read cut short by a failure or a cancel keeps
+    // them for the next call.
     lineAcrossFills() -> string throws IoError {
-        let assembled = new BytesWriter();
+        long scanned = this.end - this.start;
         while (true) {
-            long at = this.newlineIndex();
+            long at = this.newlineIndexFrom(this.start + scanned);
             if (at >= 0) {
-                assembled.write(this.heldBetween(this.start, at));
+                bytes line = this.heldBetween(this.start, at);
                 this.start = at + 1;
-                break;
+                return try textOf(withoutReturn(line));
             }
-            assembled.write(this.heldBetween(this.start, this.end));
-            this.start = this.end;
-            bool ready = try this.holdsBytes();
-            if (!ready) {
-                break;
+            scanned = this.end - this.start;
+            long arrived = try this.fillMore();
+            if (arrived == 0) {
+                bytes last = this.heldBetween(this.start, this.end);
+                this.start = this.end;
+                return try textOf(withoutReturn(last));
             }
         }
-        return try textOf(withoutReturn(assembled.toBytes()));
+    }
+
+    // How many more bytes the source put in after those held, moved to the front of the buffer and
+    // given room first, and 0 at the end of the stream.
+    fillMore() -> long throws IoError {
+        long kept = this.end - this.start;
+        if (this.start > 0) {
+            for (long i = 0; i < kept; i++) {
+                this.held[i] = this.held[this.start + i];
+            }
+            this.start = 0;
+            this.end = kept;
+        }
+        if (this.end == this.held.length) {
+            byte[] grown = new byte[this.held.length * 2];
+            for (long i = 0; i < kept; i++) {
+                grown[i] = this.held[i];
+            }
+            this.held = grown;
+        }
+        byte[] room = new byte[this.held.length - this.end];
+        long arrived = try this.bytesFromSource(room);
+        for (long i = 0; i < arrived; i++) {
+            this.held[this.end + i] = room[i];
+        }
+        this.end = this.end + arrived;
+        return arrived;
     }
 
     // Whether the buffer holds a byte to take, reading more into it when it is empty. False once
@@ -141,7 +170,11 @@ export final class BufferedReader implements Reader {
 
     // The index of the next newline among the held bytes, or -1 when none of them ends a line.
     newlineIndex() -> long {
-        for (long i = this.start; i < this.end; i++) {
+        return this.newlineIndexFrom(this.start);
+    }
+
+    newlineIndexFrom(long from) -> long {
+        for (long i = from; i < this.end; i++) {
             if (this.held[i] == '\n') {
                 return i;
             }
