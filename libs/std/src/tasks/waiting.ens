@@ -178,14 +178,16 @@ public final class Clockwork {
     public lazy const Events events = new Events();
 }
 
-// Deadlines in order, the waiters of watched streams and children by the token each was watched
-// under, and the thread that waits on the poller until the nearest deadline, then wakes the waiters
-// of the deadlines that passed and of the tokens that fired, and runs the actions that were due.
+// Deadlines in order, the waiters and actions of watched streams and children by the token each
+// was watched under, and the thread that waits on the poller until the nearest deadline, then wakes
+// the waiters of the deadlines that passed and of the tokens that fired, and runs the actions that
+// were due.
 export shared final class Events {
     const ThreadLock lock;
     public const Poller poller;
     List<Timer> heap;
     Map<long, Waiter> watched;
+    Map<long, (shared () -> void)> actions;
     long lastToken;
 
     protected constructor() {
@@ -193,6 +195,7 @@ export shared final class Events {
         this.poller = system.createPoller();
         this.heap = new List<Timer>();
         this.watched = new Map<long, Waiter>();
+        this.actions = new Map<long, (shared () -> void)>();
         this.lastToken = 0;
         let thread = system.startThread(() -> this.run());
     }
@@ -210,18 +213,33 @@ export shared final class Events {
     // A token no other watch holds, which wakes `waiter` when the poller returns it.
     public enlist(Waiter waiter) -> long {
         system.acquireLock(this.lock);
-        this.lastToken = this.lastToken + 1;
-        long token = this.lastToken;
+        long token = this.nextToken();
         this.watched.set(token, waiter);
         system.releaseLock(this.lock);
         return token;
     }
 
-    // Forgets the token, so the poller returning it later wakes nothing.
+    // A token no other watch holds, which runs `action` on the events thread when the poller
+    // returns it; the action must not wait.
+    public enlistAction((shared () -> void) action) -> long {
+        system.acquireLock(this.lock);
+        long token = this.nextToken();
+        this.actions.set(token, action);
+        system.releaseLock(this.lock);
+        return token;
+    }
+
+    // Forgets the token, so the poller returning it later wakes and runs nothing.
     public discharge(long token) {
         system.acquireLock(this.lock);
-        let removed = this.watched.remove(token);
+        let removedWaiter = this.watched.remove(token);
+        let removedAction = this.actions.remove(token);
         system.releaseLock(this.lock);
+    }
+
+    nextToken() -> long {
+        this.lastToken = this.lastToken + 1;
+        return this.lastToken;
     }
 
     schedule(Timer timer) {
@@ -240,6 +258,7 @@ export shared final class Events {
         while (true) {
             long got = system.waitOnPoller(this.poller, tokens, this.untilNearest());
             let woken = new List<Waiter>();
+            let fired = new List<(shared () -> void)>();
             system.acquireLock(this.lock);
             for (long i = 0; i < got; i++) {
                 Waiter? waiter = this.watched.get(tokens[i]);
@@ -247,11 +266,19 @@ export shared final class Events {
                     let removed = this.watched.remove(tokens[i]);
                     woken.push(waiter);
                 }
+                (shared () -> void)? action = this.actions.get(tokens[i]);
+                if (action != null) {
+                    let removed = this.actions.remove(tokens[i]);
+                    fired.push(action);
+                }
             }
             let due = this.takeDue();
             system.releaseLock(this.lock);
             for (let waiter in woken) {
                 let woke = waiter.wake();
+            }
+            for (let action in fired) {
+                action();
             }
             for (let timer in due) {
                 timer.fire();

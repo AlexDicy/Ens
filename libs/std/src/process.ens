@@ -25,11 +25,14 @@ import NativeChild from @std.system;
 import NativeCount from @std.system;
 import NativeWatch from @std.system;
 import Poller from @std.system;
+import WatchState from @std.system;
 import Platform from @std.platform;
 import @std.system;
 import Cancelled from @std.tasks;
 import EventEnd from @std.tasks;
 import @std.tasks;
+import Clockwork from @std.tasks.waiting;
+import Events from @std.tasks.waiting;
 
 // What starting or driving a program could not do. `kind` is the condition a program acts on, and
 // the message says what was attempted, on which program, and why it did not happen.
@@ -328,12 +331,17 @@ export final class ChildProcess {
         }
     }
 
-    // Leaves the child running with nothing reading it, and on POSIX it becomes a zombie
-    // when it ends, until this process exits, since nothing is left to collect it. That is why
-    // ending a child is explicit, with `kill` or `wait`. A reader or writer taken from this value
-    // returns Closed from here on.
+    // Leaves the child running with its pipes closed, and on POSIX hands it to the events thread,
+    // which collects it once it ends so no finished child is left behind. Windows keeps nothing of a
+    // process once its handle is released. A reader or writer taken from this value returns Closed
+    // from here on.
     destructor() {
-        system.processRelease(this.child);
+        if (this.collected != null || environment.platform() == Platform.Windows) {
+            system.processRelease(this.child);
+            return;
+        }
+        system.processCloseStreams(this.child);
+        new DroppedChild(this.child).watch();
     }
 
     // Whether a reader taken from this child holds bytes it read ahead of what was taken from it.
@@ -485,6 +493,53 @@ export final class ChildProcess {
         ExitStatus ended = {code: status.exitCode, signal: status.signal};
         this.collected = ended;
         return ended;
+    }
+}
+
+// A child whose ChildProcess was dropped while it ran, with its pipes closed. From then on only the
+// events thread touches it, collecting it once it ends.
+shared final class DroppedChild {
+    // How long a child whose end no poller can watch is left before it is looked at again.
+    static const long checkMillis = 50;
+
+    const Child child;
+
+    protected constructor(this.child);
+
+    // Collects the child once it ends, and now when it has ended already.
+    protected watch() {
+        let events = Clockwork.events;
+        long token = events.enlistAction(() -> this.collect());
+        let watched = system.watchProcess(this.child, events.poller, Stream.ended, token);
+        switch (watched.state) {
+            WatchState.watching -> { },
+            WatchState.ready -> {
+                events.discharge(token);
+                this.collect();
+            },
+            WatchState.unwatchable, WatchState.failed -> {
+                events.discharge(token);
+                this.checkLater(events);
+            },
+        }
+    }
+
+    collect() {
+        let status = system.processWait(this.child);
+        system.processRelease(this.child);
+    }
+
+    checkLater(Events events) {
+        events.runAt(system.monotonicMillis() + DroppedChild.checkMillis, () -> this.check());
+    }
+
+    check() {
+        let polled = system.processPoll(this.child, 0);
+        if (polled.code == 0 && (polled.ready & Ready.ended) == 0) {
+            this.checkLater(Clockwork.events);
+            return;
+        }
+        system.processRelease(this.child);
     }
 }
 

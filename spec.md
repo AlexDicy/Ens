@@ -2427,7 +2427,8 @@ Reading itself waits as long as the child takes, a bounded `readLine(timeoutMill
 `wait(timeoutMillis)` is the same call bounded, returning `null` once that many milliseconds have passed with the child still running.
 Either one returns the same status however often it is called.
 `kill()` ends the child now and returns without waiting for it, and a child that had already ended is left as it is and keeps the code it ended with.
-A `ChildProcess` that is dropped lets the child go: it keeps running with nothing reading it, and on a POSIX system it stays a finished child nothing has collected until this program exits, which is why ending a child is explicit through `kill` or `wait`.
+A `ChildProcess` that is dropped lets the child go: its three pipes are closed, so it reads the end of its input and a write to either output stream finds no reader, and it keeps running until it ends by itself.
+Once it ends it is collected, so a dropped child leaves no finished process behind, and ending a child sooner is explicit through `kill` or `wait`.
 
 A write to a pipe whose reader has gone, which includes a write to a child that has closed its input and any write after `closeInput`, raises an `IoError` of kind `Closed`.
 It never ends this program instead: the signal a system would otherwise deliver for such a write is refused before any of the program's own code runs, since ending there would run not one destructor.
