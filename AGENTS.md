@@ -174,7 +174,7 @@ Recovery from a lost asset means rebuilding it from that tag, which needs the se
 - Ens packages use a workspace model: an `ens.package` manifest declares either one package or a workspace of member packages, a package's `dependency` declarations resolve by name against the enclosing workspace's members, and a package is consumed through its `src/` folder.
   Keep knowledge of the manifest format isolated where it already lives, `selfhost/sema/src/program/workspace.ens`; the language server reads manifests through its own copy under `lsp/frontend/module/`.
 - Per-file work (parsing, declaration scanning) must stay a pure function with no shared mutable state; cross-file phases are staged and return their results and diagnostics as values.
-  Threads are coming to Ens eventually; do not add designs that would need refactoring then.
+  Ens has tasks that run on several threads at once, so that work can be spread over them; do not add designs that would keep it from running in parallel.
 
 ## Diagnostics
 
