@@ -716,11 +716,12 @@ export shared final class TaskScope {
     // Starts `body` on another task at once and returns the task without waiting for it.
     export start<T, E: Error>((shared () -> T throws E) body) -> Task<(() -> T throws E)> {
         let control = new TaskControl(this.state, system.captureTrace(8));
-        let outcome = new TaskOutcome<T, E>(this.state.record(control.startedAt));
+        let record = this.state.record(control.startedAt);
+        let outcome = new TaskOutcome<T, E>(record);
         this.state.begin(control, () -> {
             outcome.complete(body, control);
             if (outcome.threw()) {
-                this.state.cancelTasks();
+                this.state.failed(record);
             }
         });
         return new Task<(() -> T throws E)>(control, outcome);
@@ -731,11 +732,12 @@ export shared final class TaskScope {
     export startDedicated<T, E: Error>(TaskPriority priority, (shared () -> T throws E) body)
             -> Task<(() -> T throws E)> {
         let control = new TaskControl(this.state, system.captureTrace(8));
-        let outcome = new TaskOutcome<T, E>(this.state.record(control.startedAt));
+        let record = this.state.record(control.startedAt);
+        let outcome = new TaskOutcome<T, E>(record);
         this.state.beginDedicated(control, priority as int, () -> {
             outcome.complete(body, control);
             if (outcome.threw()) {
-                this.state.cancelTasks();
+                this.state.failed(record);
             }
         });
         return new Task<(() -> T throws E)>(control, outcome);
@@ -754,6 +756,12 @@ export shared final class TaskScope {
         this.state.cancel();
     }
 
+    // Whether the scope was asked to stop, by its own cancel or time limit, by a task of its own
+    // that threw, or by whatever stops the task running its body.
+    export isCancelled() -> bool {
+        return this.state.isCancelled();
+    }
+
     protected limitTo(long millis) {
         this.state.limitTo(millis);
     }
@@ -762,23 +770,40 @@ export shared final class TaskScope {
         return this.state.hasTimedOut();
     }
 
+    // Runs the body, waits for every task, and returns what the body returned, unless a task
+    // failed and nothing awaited it: that failure leaves here when the body's throws list names
+    // its type, and aborts the program otherwise.
     public run<R, E: Error>(((TaskScope) -> R throws E) body) -> R throws E {
+        R result = try this.runBody(body);
+        this.state.end();
+        try this.state.throwFailure<E>();
+        return result;
+    }
+
+    // The body, with the scope cancelled and waited for when it throws. A body that threw because
+    // of a cancel is left with the scope's failure in its place when the scope has one nothing
+    // awaited, since that failure is what cancelled it; a body that threw on its own carries the
+    // scope's failure out, so the failure is dropped.
+    runBody<R, E: Error>(((TaskScope) -> R throws E) body) -> R throws E {
         this.state.enterBody();
         R result = try body(this);
         this.state.leaveBody();
-        this.state.end(true);
         return result;
     } catch (E failure) {
         this.state.leaveBody();
-        bool stopped = causedByCancel(failure) && this.state.wasAsked();
         this.state.cancel();
-        this.state.end(stopped);
+        this.state.end();
+        if (causedByCancel(failure)) {
+            try this.state.throwFailure<E>();
+        }
         rethrow;
     }
 
     destructor() {
         this.state.cancel();
-        this.state.end(true);
+        if (this.state.endIfOpen()) {
+            this.state.panicIfUnawaited();
+        }
     }
 }
 
@@ -931,7 +956,7 @@ export shared final class TaskControl {
     protected isCancelled() -> bool {
         let inner = this.innermostBody();
         if (inner != null) {
-            return inner.isBodyCancelled();
+            return inner.isCancelled();
         }
         return this.isCancelledAsTask();
     }
@@ -1139,22 +1164,22 @@ shared final class Monitor {
     }
 }
 
-// Whether a task threw and whether anything awaited it, which the scope reads when it ends, with
-// where the task was started and what it threw.
+// Whether a task threw, what it threw, and whether anything awaited it, which the scope reads when
+// it ends, with where the task was started.
 shared final class FailureRecord {
     const Atomic<bool> failed;
     const Atomic<bool> awaited;
     const long[] startedAt;
-    string thrown;
+    Error? error;
 
     protected constructor(this.startedAt) {
         this.failed = new Atomic<bool>(false);
         this.awaited = new Atomic<bool>(false);
-        this.thrown = "";
+        this.error = null;
     }
 
     protected fail(Error error) {
-        this.thrown = "an error with the message '{error.message}'";
+        this.error = error;
         this.failed.write(true);
     }
 
@@ -1162,16 +1187,50 @@ shared final class FailureRecord {
         return this.failed.read() && !this.awaited.read();
     }
 
-    // Why the scope aborts the program for this task.
-    protected refusal() -> string {
-        string started = "a task this scope started";
+    // Why a scope kept in an object aborts the program for this task when it is released.
+    protected unawaitedRefusal() -> string {
+        return "{this.started()} threw {this.thrown()}, and nothing awaited it, so nothing "
+            + "handled the error. Await every task started with 'start', or catch the error "
+            + "inside its body";
+    }
+
+    // Why a scope that ran a body aborts the program for this task.
+    protected undeclaredRefusal() -> string {
+        return "{this.started()} threw {this.thrown()}, and the scope's body throws no error of "
+            + "that type, so nothing handled the error. Await the task with 'try' where the body "
+            + "runs, or catch the error inside the task's body";
+    }
+
+    started() -> string {
         let site = startSite(this.startedAt);
         if (site != null) {
-            started = "the task started at {site}";
+            return "the task started at {site}";
         }
-        return "{started} threw {this.thrown}, and nothing awaited it, so nothing handled the "
-            + "error. Await every task started with 'start', or catch the error inside its body";
+        return "a task this scope started";
     }
+
+    thrown() -> string {
+        return "an error with the message '{this.error?.message ?? ""}'";
+    }
+}
+
+// Throws `failure`, so a catch clause over a throws list can select on its type.
+raiseError(Error failure) throws Error {
+    throw failure;
+}
+
+// Throws the error `failed` holds as one of the types `E` names, and aborts the program when it is
+// none of them, since nothing could then handle it.
+throwWithin<E: Error>(FailureRecord failed) throws E {
+    let error = failed.error;
+    if (error == null) {
+        return;
+    }
+    try raiseError(error);
+} catch (E matched) {
+    throw matched;
+} catch (Error outside) {
+    panic(failed.undeclaredRefusal());
 }
 
 final class Limits {
@@ -1355,18 +1414,18 @@ shared final class TaskOutcome<T, E: Error> {
 }
 
 // The tasks of one scope: those still running, the threads of its dedicated tasks, the body of the
-// owner's scope it was opened in, whether the scope was asked to stop, a task of it threw or its
-// time limit passed, and whether it has ended.
+// owner's scope it was opened in, whether the scope was asked to stop and whether its time limit
+// passed, the first of its tasks to fail, and whether it has ended.
 shared final class ScopeState {
     const Monitor lock;
     const WaitList emptied;
     const TaskControl? owner;
     const ScopeState? openedIn;
     const Atomic<bool> asked;
-    const Atomic<bool> taskFailed;
     const Atomic<bool> timedOut;
     List<NativeThread> threads;
     List<FailureRecord> records;
+    FailureRecord? firstFailure;
     Map<long, TaskControl> running;
     long started;
     bool ended;
@@ -1376,10 +1435,10 @@ shared final class ScopeState {
         this.emptied = new WaitList();
         this.openedIn = this.owner?.innermostBody();
         this.asked = new Atomic<bool>(false);
-        this.taskFailed = new Atomic<bool>(false);
         this.timedOut = new Atomic<bool>(false);
         this.threads = new List<NativeThread>();
         this.records = new List<FailureRecord>();
+        this.firstFailure = null;
         this.running = new Map<long, TaskControl>();
         this.started = 0;
         this.ended = false;
@@ -1473,11 +1532,29 @@ shared final class ScopeState {
         this.owner?.wakeWithin(this);
     }
 
-    // Stops the scope's tasks once one of them threw, and leaves the body running, so it can await
-    // the task that threw and receive its error.
-    protected cancelTasks() {
-        this.taskFailed.write(true);
-        this.wakeTasks();
+    // Records that the task `record` stands for threw, and cancels the scope: the first failure is
+    // the scope's own, and leaves it when it ends.
+    protected failed(FailureRecord record) {
+        this.lock.enter();
+        if (this.firstFailure == null) {
+            this.firstFailure = record;
+        }
+        this.lock.leave();
+        this.cancel();
+    }
+
+    // Throws the first task failure, when a task failed and nothing awaited it, since a failure the
+    // body awaited is handled there. A failure that leaves counts as awaited, so releasing the
+    // scope does not report it again.
+    protected throwFailure<E: Error>() throws E {
+        this.lock.enter();
+        let failed = this.firstFailure;
+        this.lock.leave();
+        if (failed == null || failed.awaited.read()) {
+            return;
+        }
+        failed.awaited.write(true);
+        try throwWithin<E>(failed);
     }
 
     // Wakes every task of the scope from the wait it is in.
@@ -1491,21 +1568,16 @@ shared final class ScopeState {
         }
     }
 
-    // Whether the scope's tasks were asked to stop: by its own cancel, by one of them throwing, or by
-    // whatever stops its body.
+    // Whether the scope, body and tasks alike, was asked to stop: by its own cancel or time limit,
+    // by a task of its own that threw, by the scope whose body it was opened in, or by whatever
+    // stops its owner.
     protected isCancelled() -> bool {
-        return this.taskFailed.read() || this.isBodyCancelled();
-    }
-
-    // Whether the scope's body was asked to stop: by the scope's own cancel or time limit, by the
-    // scope whose body it was opened in, or by whatever stops its owner.
-    protected isBodyCancelled() -> bool {
         if (this.asked.read()) {
             return true;
         }
         let outer = this.openedIn;
         if (outer != null) {
-            return outer.isBodyCancelled();
+            return outer.isCancelled();
         }
         let started = this.owner;
         return started != null && started.isCancelledAsTask();
@@ -1515,12 +1587,6 @@ shared final class ScopeState {
     // has ended by then.
     protected limitTo(long millis) {
         Clockwork.events.runAt(system.monotonicMillis() + millis, () -> this.timeOut());
-    }
-
-    // Whether the scope's body was asked to stop by the scope itself, through its cancel or its time
-    // limit.
-    protected wasAsked() -> bool {
-        return this.asked.read();
     }
 
     protected hasTimedOut() -> bool {
@@ -1538,9 +1604,8 @@ shared final class ScopeState {
     }
 
     // Waits for every task the scope started, including any they start meanwhile, then ends the
-    // scope. When `reporting` is set, a task that threw and that nothing awaited aborts the program
-    // here.
-    protected end(bool reporting) {
+    // scope.
+    protected end() {
         this.lock.enter();
         while (!this.running.isEmpty()) {
             this.lock.wait(this.emptied, -1);
@@ -1548,8 +1613,6 @@ shared final class ScopeState {
         this.ended = true;
         let threads = this.threads;
         this.threads = new List<NativeThread>();
-        let finished = this.records;
-        this.records = new List<FailureRecord>();
         this.lock.leave();
         for (let thread in threads) {
             system.joinThread(thread);
@@ -1558,11 +1621,28 @@ shared final class ScopeState {
         if (parent != null) {
             parent.disown(this);
         }
-        if (reporting) {
-            for (let record in finished) {
-                if (record.unhandled()) {
-                    panic(record.refusal());
-                }
+    }
+
+    // Ends the scope like 'end' and returns true, or returns false when it had ended already.
+    protected endIfOpen() -> bool {
+        this.lock.enter();
+        bool open = !this.ended;
+        this.lock.leave();
+        if (open) {
+            this.end();
+        }
+        return open;
+    }
+
+    // Aborts the program for a task that threw and that nothing awaited, which is how a scope kept
+    // in an object, with no body to throw from, reports a failure nothing handled.
+    protected panicIfUnawaited() {
+        this.lock.enter();
+        let finished = this.records.toArray();
+        this.lock.leave();
+        for (let record in finished) {
+            if (record.unhandled()) {
+                panic(record.unawaitedRefusal());
             }
         }
     }
