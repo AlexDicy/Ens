@@ -497,12 +497,77 @@ export class Cancelled extends Error {
     }
 }
 
+// Thrown by 'withTimeout' when its time limit passed before its body finished, with what the body
+// threw as it stopped as the cause.
+export class TimedOut extends Error {
+    // The time limit that passed, in milliseconds.
+    export const long limitMillis;
+
+    export constructor(long limitMillis, Error? cause = null) {
+        this.limitMillis = limitMillis;
+        super("the time limit of {limitMillis} milliseconds passed before the work finished",
+            cause);
+    }
+}
+
 // Runs `body` with a new scope on the calling task, and returns what the body returns once the body
 // has returned and every task started in the scope has finished. When the body throws, the scope's
-// tasks are cancelled and waited for before the error goes on.
+// tasks are cancelled and waited for before the error goes on. A cancel of the scope reaches the
+// waits in the body as well as in the scope's tasks.
 export scope<R, E: Error>(((TaskScope) -> R throws E) body) -> R throws E {
-    let created = new TaskScope();
-    return try created.run(body);
+    let adopted = adoptThread();
+    return try scopeRun(adopted, body);
+}
+
+scopeRun<R, E: Error>(TaskControl? adopted, ((TaskScope) -> R throws E) body) -> R throws E {
+    R result = try new TaskScope().run(body);
+    leaveThread(adopted);
+    return result;
+} catch (E failure) {
+    leaveThread(adopted);
+    rethrow;
+}
+
+// Runs `body` like 'scope', and cancels the body and every task it started once `millis`
+// milliseconds have passed. A body the limit stopped ends the call with 'TimedOut', whose cause is
+// what the body threw, while a cancel from outside still ends it with what the body threw.
+export withTimeout<R, E: Error>(long millis, ((TaskScope) -> R throws E) body)
+        -> R throws E, TimedOut {
+    let adopted = adoptThread();
+    let limited = new TaskScope();
+    limited.limitTo(millis);
+    return try timedRun(adopted, limited, millis, body);
+}
+
+timedRun<R, E: Error>(TaskControl? adopted, TaskScope limited, long millis,
+                      ((TaskScope) -> R throws E) body) -> R throws E, TimedOut {
+    R result = try limited.run(body);
+    leaveThread(adopted);
+    return result;
+} catch (E failure) {
+    leaveThread(adopted);
+    if (limited.hasTimedOut() && causedByCancel(failure) && !isCancelled()) {
+        throw new TimedOut(millis, failure);
+    }
+    rethrow;
+}
+
+// Registers a thread that runs no task, such as the program's main thread, as a task for as long
+// as a scope's body runs, so a cancel can reach the waits in the body there too. Null when the
+// thread runs a task already.
+adoptThread() -> TaskControl? {
+    if (Registry.current() != null) {
+        return null;
+    }
+    let control = new TaskControl(new ScopeState(null), new long[0]);
+    Registry.dedicated.enter(control);
+    return control;
+}
+
+leaveThread(TaskControl? adopted) {
+    if (adopted != null) {
+        Registry.dedicated.leave(adopted);
+    }
 }
 
 // Returns whether the calling task was asked to stop, by its own 'cancel', by a scope it belongs to,
@@ -655,7 +720,7 @@ export shared final class TaskScope {
         this.state.begin(control, () -> {
             outcome.complete(body, control);
             if (outcome.threw()) {
-                this.state.cancel();
+                this.state.cancelTasks();
             }
         });
         return new Task<(() -> T throws E)>(control, outcome);
@@ -670,7 +735,7 @@ export shared final class TaskScope {
         this.state.beginDedicated(control, priority as int, () -> {
             outcome.complete(body, control);
             if (outcome.threw()) {
-                this.state.cancel();
+                this.state.cancelTasks();
             }
         });
         return new Task<(() -> T throws E)>(control, outcome);
@@ -684,24 +749,30 @@ export shared final class TaskScope {
         this.state.begin(control, () -> runLaunched(body, control));
     }
 
-    // Asks every task in the scope to stop.
+    // Asks every task in the scope to stop, and the scope's body when the scope runs one.
     export cancel() {
         this.state.cancel();
     }
 
-    // Asks every task in the scope to stop once `millis` milliseconds have passed, unless the scope
-    // has ended by then.
-    export cancelAfter(long millis) {
-        this.state.cancelAfter(millis);
+    protected limitTo(long millis) {
+        this.state.limitTo(millis);
+    }
+
+    protected hasTimedOut() -> bool {
+        return this.state.hasTimedOut();
     }
 
     public run<R, E: Error>(((TaskScope) -> R throws E) body) -> R throws E {
+        this.state.enterBody();
         R result = try body(this);
+        this.state.leaveBody();
         this.state.end(true);
         return result;
     } catch (E failure) {
+        this.state.leaveBody();
+        bool stopped = causedByCancel(failure) && this.state.wasAsked();
         this.state.cancel();
-        this.state.end(false);
+        this.state.end(stopped);
         rethrow;
     }
 
@@ -812,6 +883,7 @@ export shared final class TaskControl {
     const ThreadLock lock;
     Waiter? blockedOn;
     List<ScopeState> scopes;
+    List<ScopeState> bodies;
     public (shared () -> void)? body;
     public Context? context;
 
@@ -824,6 +896,7 @@ export shared final class TaskControl {
         this.lock = system.createLock();
         this.blockedOn = null;
         this.scopes = new List<ScopeState>();
+        this.bodies = new List<ScopeState>();
         this.body = null;
         this.context = null;
     }
@@ -853,8 +926,44 @@ export shared final class TaskControl {
         this.wake();
     }
 
+    // Whether the task was asked to stop, through its own cancel, its scope, or a scope whose body
+    // it runs.
     protected isCancelled() -> bool {
+        let inner = this.innermostBody();
+        if (inner != null) {
+            return inner.isBodyCancelled();
+        }
+        return this.isCancelledAsTask();
+    }
+
+    // Whether the task was asked to stop through its own cancel or its scope, leaving out the scopes
+    // whose bodies it runs.
+    protected isCancelledAsTask() -> bool {
         return this.cancelled.read() || this.scope.isCancelled();
+    }
+
+    // The scope whose body the task runs at this moment, innermost first, or null outside every
+    // body.
+    protected innermostBody() -> ScopeState? {
+        system.acquireLock(this.lock);
+        ScopeState? inner = null;
+        if (!this.bodies.isEmpty()) {
+            inner = this.bodies.get(this.bodies.length() - 1);
+        }
+        system.releaseLock(this.lock);
+        return inner;
+    }
+
+    protected enterBody(ScopeState scope) {
+        system.acquireLock(this.lock);
+        this.bodies.push(scope);
+        system.releaseLock(this.lock);
+    }
+
+    protected leaveBody(ScopeState scope) {
+        system.acquireLock(this.lock);
+        let removed = this.bodies.remove(scope);
+        system.releaseLock(this.lock);
     }
 
     // A waiter for this task: one that parks it when it runs on the pool, one that puts its thread
@@ -889,6 +998,25 @@ export shared final class TaskControl {
         system.acquireLock(this.lock);
         let removed = this.scopes.remove(ended);
         system.releaseLock(this.lock);
+    }
+
+    // Wakes the task from its wait when it runs the body of `cancelled` or of a scope inside it,
+    // and every task of the scopes it opened inside that body, so each checks again whether it was
+    // cancelled.
+    protected wakeWithin(ScopeState cancelled) {
+        system.acquireLock(this.lock);
+        bool inside = this.bodies.contains(cancelled);
+        let waiter = this.blockedOn;
+        let started = this.scopes.toArray();
+        system.releaseLock(this.lock);
+        if (inside && waiter != null) {
+            let woke = waiter.wake();
+        }
+        for (let scope in started) {
+            if (scope != cancelled && scope.isInside(cancelled)) {
+                scope.wakeTasks();
+            }
+        }
     }
 
     // Wakes the task from the wait it is in, and every task in the scopes it started, so each of
@@ -1179,7 +1307,7 @@ shared final class TaskOutcome<T, E: Error> {
     protected take(TaskControl? waiting) -> T throws E, Cancelled {
         this.lock.enter();
         while (!this.done) {
-            if (!this.lock.waitUnlessCancelled(this.awaiters, -1)) {
+            if (!this.lock.waitUnlessCancelled(this.awaiters, -1) && !this.done) {
                 this.lock.leave();
                 waiting?.stopAwaiting();
                 throw new Cancelled();
@@ -1226,32 +1354,60 @@ shared final class TaskOutcome<T, E: Error> {
     }
 }
 
-// The tasks of one scope: those still running, the threads of its dedicated tasks, whether the
-// scope was asked to stop, and whether it has ended.
+// The tasks of one scope: those still running, the threads of its dedicated tasks, the body of the
+// owner's scope it was opened in, whether the scope was asked to stop, a task of it threw or its
+// time limit passed, and whether it has ended.
 shared final class ScopeState {
     const Monitor lock;
     const WaitList emptied;
     const TaskControl? owner;
+    const ScopeState? openedIn;
+    const Atomic<bool> asked;
+    const Atomic<bool> taskFailed;
+    const Atomic<bool> timedOut;
     List<NativeThread> threads;
     List<FailureRecord> records;
     Map<long, TaskControl> running;
     long started;
-    bool cancelled;
     bool ended;
 
     protected constructor(this.owner) {
         this.lock = new Monitor();
         this.emptied = new WaitList();
+        this.openedIn = this.owner?.innermostBody();
+        this.asked = new Atomic<bool>(false);
+        this.taskFailed = new Atomic<bool>(false);
+        this.timedOut = new Atomic<bool>(false);
         this.threads = new List<NativeThread>();
         this.records = new List<FailureRecord>();
         this.running = new Map<long, TaskControl>();
         this.started = 0;
-        this.cancelled = false;
         this.ended = false;
         let parent = this.owner;
         if (parent != null) {
             parent.adopt(this);
         }
+    }
+
+    // Records that the owner runs this scope's body from here on.
+    protected enterBody() {
+        this.owner?.enterBody(this);
+    }
+
+    protected leaveBody() {
+        this.owner?.leaveBody(this);
+    }
+
+    // Whether this scope was opened inside the body of `outer`, directly or through other scopes.
+    protected isInside(ScopeState outer) -> bool {
+        ScopeState? next = this.openedIn;
+        while (next != null) {
+            if (next == outer) {
+                return true;
+            }
+            next = next.openedIn;
+        }
+        return false;
     }
 
     protected record(long[] startedAt) -> FailureRecord {
@@ -1312,9 +1468,15 @@ shared final class ScopeState {
     }
 
     protected cancel() {
-        this.lock.enter();
-        this.cancelled = true;
-        this.lock.leave();
+        this.asked.write(true);
+        this.wakeTasks();
+        this.owner?.wakeWithin(this);
+    }
+
+    // Stops the scope's tasks once one of them threw, and leaves the body running, so it can await
+    // the task that threw and receive its error.
+    protected cancelTasks() {
+        this.taskFailed.write(true);
         this.wakeTasks();
     }
 
@@ -1329,32 +1491,48 @@ shared final class ScopeState {
         }
     }
 
+    // Whether the scope's tasks were asked to stop: by its own cancel, by one of them throwing, or by
+    // whatever stops its body.
     protected isCancelled() -> bool {
-        this.lock.enter();
-        bool asked = this.cancelled;
-        this.lock.leave();
-        let started = this.owner;
-        return asked || (started != null && started.isCancelled());
+        return this.taskFailed.read() || this.isBodyCancelled();
     }
 
-    // Sets a timer that cancels the scope at the deadline, unless the scope has ended by then.
-    protected cancelAfter(long millis) {
-        long deadline = system.monotonicMillis() + millis;
-        this.lock.enter();
-        if (this.ended) {
-            this.lock.leave();
-            panic("tried to set a deadline on a scope that has ended. Call 'cancelAfter' while the "
-                + "scope's body runs");
+    // Whether the scope's body was asked to stop: by the scope's own cancel or time limit, by the
+    // scope whose body it was opened in, or by whatever stops its owner.
+    protected isBodyCancelled() -> bool {
+        if (this.asked.read()) {
+            return true;
         }
-        this.lock.leave();
-        Clockwork.events.runAt(deadline, () -> this.cancelIfOpen());
+        let outer = this.openedIn;
+        if (outer != null) {
+            return outer.isBodyCancelled();
+        }
+        let started = this.owner;
+        return started != null && started.isCancelledAsTask();
     }
 
-    cancelIfOpen() {
+    // Sets a timer that cancels the scope once `millis` milliseconds have passed, unless the scope
+    // has ended by then.
+    protected limitTo(long millis) {
+        Clockwork.events.runAt(system.monotonicMillis() + millis, () -> this.timeOut());
+    }
+
+    // Whether the scope's body was asked to stop by the scope itself, through its cancel or its time
+    // limit.
+    protected wasAsked() -> bool {
+        return this.asked.read();
+    }
+
+    protected hasTimedOut() -> bool {
+        return this.timedOut.read();
+    }
+
+    timeOut() {
         this.lock.enter();
         bool open = !this.ended;
         this.lock.leave();
         if (open) {
+            this.timedOut.write(true);
             this.cancel();
         }
     }

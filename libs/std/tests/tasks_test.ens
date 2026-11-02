@@ -6,6 +6,7 @@ import Cancelled from @std.tasks;
 import Task from @std.tasks;
 import TaskScope from @std.tasks;
 import TaskPriority from @std.tasks;
+import TimedOut from @std.tasks;
 import Atomic from @std.tasks;
 import Mutex from @std.tasks;
 import TurnLock from @std.tasks;
@@ -262,12 +263,122 @@ test "cancelling a task stops it and the tasks it started" {
     try testing.assertEqual(outcome, "22");
 }
 
-test "a deadline cancels the scope's tasks once it passes" {
-    string outcome = tasks.scope((scope) -> {
-        scope.cancelAfter(5);
-        return awaitedMessage(scope.start(() -> try untilCancelled()));
+sleepInBody(TaskScope scope) throws Cancelled {
+    try tasks.sleep(30000);
+}
+
+endOfCancelledBody() -> string {
+    try tasks.scope((scope) -> {
+        scope.launch(() -> {
+            try tasks.sleep(20);
+            scope.cancel();
+        });
+        try sleepInBody(scope);
     });
-    try testing.assertEqual(outcome, "the task was cancelled");
+    return "the body slept through its scope's cancel";
+} catch (Cancelled stopped) {
+    return stopped.message;
+}
+
+test "a scope's cancel ends a wait in the scope's own body" {
+    long before = system.monotonicMillis();
+    try testing.assertEqual(endOfCancelledBody(), "the task was cancelled");
+    long waited = system.monotonicMillis() - before;
+    try testing.assertTrue(waited < 10000, "the cancelled body waited {waited} milliseconds");
+}
+
+endOfLimitedBody(long millis) -> string throws Cancelled {
+    try tasks.withTimeout(millis, (scope) -> try sleepInBody(scope));
+    return "the body slept through its time limit";
+} catch (TimedOut stopped) {
+    bool cancelledCause = stopped.cause is Cancelled;
+    return "{stopped.message} ({stopped.limitMillis}, caused by Cancelled: {cancelledCause})";
+}
+
+test "a time limit ends a wait in its body with 'TimedOut'" {
+    try testing.assertEqual(try endOfLimitedBody(20), "the time limit of 20 milliseconds passed "
+        + "before the work finished (20, caused by Cancelled: true)");
+}
+
+test "a time limit ends a wait in a body inside a task" {
+    string outcome = try tasks.scope((scope) -> {
+        let limited = scope.start(() -> try endOfLimitedBody(20));
+        return try limited.await();
+    });
+    try testing.assertEqual(outcome, "the time limit of 20 milliseconds passed before the work "
+        + "finished (20, caused by Cancelled: true)");
+}
+
+test "a time limit stops the tasks its body started" {
+    let stopped = new Atomic<bool>(false);
+    string outcome = try timedOutMessage(() -> try tasks.withTimeout(20, (scope) -> {
+        scope.launch(() -> idleUntilCancelled(stopped));
+        try sleepInBody(scope);
+    }));
+    try testing.assertEqual(outcome, "the time limit of 20 milliseconds passed before the work "
+        + "finished");
+    try testing.assertTrue(stopped.read(), "the task the body started was not stopped");
+}
+
+timedOutMessage((() -> void throws Cancelled, TimedOut) work) -> string throws Cancelled {
+    try work();
+    return "the work finished";
+} catch (TimedOut stopped) {
+    return stopped.message;
+}
+
+test "work that finishes within its time limit returns what its body returns" {
+    int total = try tasks.withTimeout(30000, (scope) -> {
+        let half = scope.start(() -> 21);
+        return try half.await() * 2;
+    });
+    try testing.assertEqual(total, 42);
+}
+
+// A task whose time limit is still far off, and which its scope cancels from outside.
+outsideCancel() -> string {
+    return try tasks.scope((scope) -> {
+        let limited = scope.start(() -> try endOfLimitedBody(30000));
+        limited.cancel();
+        return try limited.await();
+    });
+} catch (Cancelled stopped) {
+    return "Cancelled: {stopped.message}";
+}
+
+test "a cancel from outside a time limit stays 'Cancelled'" {
+    try testing.assertEqual(outsideCancel(), "Cancelled: the task was cancelled");
+}
+
+test "a scope opened in a body is stopped by the outer scope's cancel" {
+    let stopped = new Atomic<bool>(false);
+    string outcome = try timedOutMessage(() -> try tasks.withTimeout(20, (outer) -> {
+        try tasks.scope((inner) -> {
+            inner.launch(() -> idleUntilCancelled(stopped));
+            try sleepInBody(inner);
+        });
+    }));
+    try testing.assertEqual(outcome, "the time limit of 20 milliseconds passed before the work "
+        + "finished");
+    try testing.assertTrue(stopped.read(), "the inner scope's task was not stopped");
+}
+
+test "an inner scope's cancel leaves the outer scope's tasks running" {
+    string outcome = try tasks.scope((outer) -> {
+        let sibling = outer.start(() -> {
+            try tasks.sleep(50);
+            return "the sibling finished";
+        });
+        innerCancelled();
+        return try sibling.await();
+    });
+    try testing.assertEqual(outcome, "the sibling finished");
+}
+
+innerCancelled() {
+    tasks.scope((inner) -> {
+        inner.cancel();
+    });
 }
 
 test "code outside every task is never cancelled" {

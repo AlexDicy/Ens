@@ -2529,8 +2529,13 @@ loadBoth(Path first, Path second) -> Module[] throws ParseError, IoError, Cancel
 ```
 
 A task stops when it is asked to and when it chooses to: cancellation is cooperative.
-`scope.cancel()` marks every task in the scope cancelled, `task.cancel()` marks one task and everything it started, and `scope.cancelAfter(millis)` marks the scope after that many milliseconds, which is how a deadline is written.
-The first task in a scope to throw, other than with the `Cancelled` it was asked for, marks the scope cancelled as well, so the others stop wasting work, while the scope still waits for every one of them before the error reaches whoever awaits it.
+`scope.cancel()` marks every task in the scope cancelled and the scope's body as well, so a wait in the body ends too, and `task.cancel()` marks one task and everything it started.
+A body that a cancel of its own scope ended throws the `Cancelled` its wait threw, which leaves `tasks.scope` like any error the body throws.
+The first task in a scope to throw, other than with the `Cancelled` it was asked for, marks the scope's other tasks cancelled, so they stop wasting work, while the body runs on, so it can await the task that threw and receive its error, and the scope still waits for every task before that error reaches whoever awaits it.
+`tasks.withTimeout(millis, body)` is `tasks.scope(body)` with a time limit: once that many milliseconds have passed, the scope is cancelled, body and tasks alike, which is how a deadline is written.
+A body the limit ended leaves `tasks.withTimeout` as a `TimedOut`, whose `limitMillis` is the limit and whose cause is what the body threw, so a read the limit cut short is the `IoError` beneath it; a body that returns in time returns its value, and a cancel from outside the call still leaves it as the body threw it.
+`TimedOut` is not a kind of `Cancelled`, so a caller that handles a timeout never mistakes it for its own cancellation.
+The program's `main` runs on no task, and while it runs the body of a scope it counts as one, so a cancel or a time limit reaches the waits there as it does in any task.
 A task reads `tasks.isCancelled()` to learn that it was asked to stop, and `tasks.checkCancelled()` throws `Cancelled` when it was, so a loop writes `try tasks.checkCancelled();` once per iteration, and its body's throws list, and so its task's type, then say that the task can be cut short.
 A call that waits, for a channel, a lock, another task or the clock, declares `Cancelled`: in a cancelled task it throws `Cancelled` instead of waiting, and a task cancelled while it waits is woken to throw it at once.
 A read from a stream ends early in a cancelled task by throwing the `IoError` it declares anyway, of kind `Cancelled` and with a `Cancelled` as its cause.
