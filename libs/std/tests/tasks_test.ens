@@ -6,6 +6,7 @@ import Cancelled from @std.tasks;
 import Task from @std.tasks;
 import TaskScope from @std.tasks;
 import TaskPriority from @std.tasks;
+import TimedOut from @std.tasks;
 import Atomic from @std.tasks;
 import Mutex from @std.tasks;
 import TurnLock from @std.tasks;
@@ -262,12 +263,212 @@ test "cancelling a task stops it and the tasks it started" {
     try testing.assertEqual(outcome, "22");
 }
 
-test "a deadline cancels the scope's tasks once it passes" {
-    string outcome = tasks.scope((scope) -> {
-        scope.cancelAfter(5);
-        return awaitedMessage(scope.start(() -> try untilCancelled()));
+sleepInBody(TaskScope scope) throws Cancelled {
+    try tasks.sleep(30000);
+}
+
+endOfCancelledBody() -> string {
+    try tasks.scope((scope) -> {
+        scope.launch(() -> {
+            try tasks.sleep(20);
+            scope.cancel();
+        });
+        try sleepInBody(scope);
     });
-    try testing.assertEqual(outcome, "the task was cancelled");
+    return "the body slept through its scope's cancel";
+} catch (Cancelled stopped) {
+    return stopped.message;
+}
+
+// A task's failure cancels the whole scope, and leaves it in place of the 'Cancelled' the body's
+// wait threw, whichever task the body was awaiting at the time.
+awaitedInOrder() -> string throws Cancelled {
+    return try tasks.scope((scope) -> {
+        let slow = scope.start(() -> try untilCancelled());
+        let failing = scope.start(() -> try refuse());
+        return "{try slow.await()} {try failing.await()}";
+    });
+} catch (Refused refused) {
+    return "scope threw {refused.message}";
+}
+
+test "a task's failure leaves the scope even when the body awaits another task first" {
+    try testing.assertEqual(try awaitedInOrder(), "scope threw refused");
+}
+
+// The body works first and awaits the task after, which is what puts the task's error in the
+// body's throws list; the failure arrives during the work.
+failureStopsBody() -> string throws Cancelled {
+    int value = try tasks.scope((scope) -> {
+        let failing = scope.start(() -> {
+            try tasks.sleep(20);
+            try refuse();
+            return 0;
+        });
+        try sleepInBody(scope);
+        return try failing.await();
+    });
+    return "the body slept through the failure";
+} catch (Refused refused) {
+    return "scope threw {refused.message}";
+}
+
+test "a task's failure ends a wait in the scope's body" {
+    long before = system.monotonicMillis();
+    try testing.assertEqual(try failureStopsBody(), "scope threw refused");
+    long waited = system.monotonicMillis() - before;
+    try testing.assertTrue(waited < 10000, "the body waited {waited} milliseconds");
+}
+
+handledFailure() -> string throws Cancelled {
+    return try tasks.scope((scope) -> {
+        let failing = scope.start(() -> try refuse());
+        return try refusedMessage(failing);
+    });
+}
+
+refusedMessage(Task<(() -> int throws Refused)> task) -> string throws Cancelled {
+    return "{try task.await()}";
+} catch (Refused refused) {
+    return "the body handled {refused.message}";
+}
+
+test "a failure the body awaited and returned past is handled" {
+    try testing.assertEqual(try handledFailure(), "the body handled refused");
+}
+
+// The failure the body handled cancelled the scope, so the body's next wait ends as 'Cancelled',
+// and the handled failure is not thrown a second time.
+handledThenCancelled() -> string {
+    return try tasks.scope((scope) -> {
+        let failing = scope.start(() -> try refuse());
+        let sleeping = scope.start(() -> try untilCancelled());
+        string handled = try refusedMessage(failing);
+        return "{handled}, then {try sleeping.await()}";
+    });
+} catch (Cancelled stopped) {
+    return "scope threw {stopped.message}";
+}
+
+test "a body that handled a task's failure and waits again is cancelled, and the failure stays handled" {
+    try testing.assertEqual(handledThenCancelled(), "scope threw the task was cancelled");
+}
+
+timedOutOrFailed() -> string throws Cancelled {
+    return try tasks.withTimeout(30000, (scope) -> {
+        let failing = scope.start(() -> try refuse());
+        try sleepInBody(scope);
+        return "the body slept on to {try failing.await()}";
+    });
+} catch (Refused refused) {
+    return "scope threw {refused.message}";
+} catch (TimedOut stopped) {
+    return stopped.message;
+}
+
+test "a task's failure under a time limit leaves as the failure, not as 'TimedOut'" {
+    try testing.assertEqual(try timedOutOrFailed(), "scope threw refused");
+}
+
+test "a scope's cancel ends a wait in the scope's own body" {
+    long before = system.monotonicMillis();
+    try testing.assertEqual(endOfCancelledBody(), "the task was cancelled");
+    long waited = system.monotonicMillis() - before;
+    try testing.assertTrue(waited < 10000, "the cancelled body waited {waited} milliseconds");
+}
+
+endOfLimitedBody(long millis) -> string throws Cancelled {
+    try tasks.withTimeout(millis, (scope) -> try sleepInBody(scope));
+    return "the body slept through its time limit";
+} catch (TimedOut stopped) {
+    bool cancelledCause = stopped.cause is Cancelled;
+    return "{stopped.message} ({stopped.limitMillis}, caused by Cancelled: {cancelledCause})";
+}
+
+test "a time limit ends a wait in its body with 'TimedOut'" {
+    try testing.assertEqual(try endOfLimitedBody(20), "the time limit of 20 milliseconds passed "
+        + "before the work finished (20, caused by Cancelled: true)");
+}
+
+test "a time limit ends a wait in a body inside a task" {
+    string outcome = try tasks.scope((scope) -> {
+        let limited = scope.start(() -> try endOfLimitedBody(20));
+        return try limited.await();
+    });
+    try testing.assertEqual(outcome, "the time limit of 20 milliseconds passed before the work "
+        + "finished (20, caused by Cancelled: true)");
+}
+
+test "a time limit stops the tasks its body started" {
+    let stopped = new Atomic<bool>(false);
+    string outcome = try timedOutMessage(() -> try tasks.withTimeout(20, (scope) -> {
+        scope.launch(() -> idleUntilCancelled(stopped));
+        try sleepInBody(scope);
+    }));
+    try testing.assertEqual(outcome, "the time limit of 20 milliseconds passed before the work "
+        + "finished");
+    try testing.assertTrue(stopped.read(), "the task the body started was not stopped");
+}
+
+timedOutMessage((() -> void throws Cancelled, TimedOut) work) -> string throws Cancelled {
+    try work();
+    return "the work finished";
+} catch (TimedOut stopped) {
+    return stopped.message;
+}
+
+test "work that finishes within its time limit returns what its body returns" {
+    int total = try tasks.withTimeout(30000, (scope) -> {
+        let half = scope.start(() -> 21);
+        return try half.await() * 2;
+    });
+    try testing.assertEqual(total, 42);
+}
+
+// A task whose time limit is still far off, and which its scope cancels from outside.
+outsideCancel() -> string {
+    return try tasks.scope((scope) -> {
+        let limited = scope.start(() -> try endOfLimitedBody(30000));
+        limited.cancel();
+        return try limited.await();
+    });
+} catch (Cancelled stopped) {
+    return "Cancelled: {stopped.message}";
+}
+
+test "a cancel from outside a time limit stays 'Cancelled'" {
+    try testing.assertEqual(outsideCancel(), "Cancelled: the task was cancelled");
+}
+
+test "a scope opened in a body is stopped by the outer scope's cancel" {
+    let stopped = new Atomic<bool>(false);
+    string outcome = try timedOutMessage(() -> try tasks.withTimeout(20, (outer) -> {
+        try tasks.scope((inner) -> {
+            inner.launch(() -> idleUntilCancelled(stopped));
+            try sleepInBody(inner);
+        });
+    }));
+    try testing.assertEqual(outcome, "the time limit of 20 milliseconds passed before the work "
+        + "finished");
+    try testing.assertTrue(stopped.read(), "the inner scope's task was not stopped");
+}
+
+test "an inner scope's cancel leaves the outer scope's tasks running" {
+    string outcome = try tasks.scope((outer) -> {
+        let sibling = outer.start(() -> {
+            try tasks.sleep(50);
+            return "the sibling finished";
+        });
+        innerCancelled();
+        return try sibling.await();
+    });
+    try testing.assertEqual(outcome, "the sibling finished");
+}
+
+innerCancelled() {
+    tasks.scope((inner) -> {
+        inner.cancel();
+    });
 }
 
 test "code outside every task is never cancelled" {
@@ -423,6 +624,27 @@ test "a loop over a channel goes on waiting in a cancelled task until the channe
 test "a task that throws 'Cancelled' after it was cancelled is no unhandled failure" {
     tasks.scope((scope) -> {
         let waiting = scope.start(() -> try untilCancelled());
+        scope.cancel();
+    });
+}
+
+// What a library call throws when a cancel ends its wait: an error of its own, caused by the
+// 'Cancelled'.
+class StoppedWait extends Error {
+    constructor(Cancelled cause) {
+        super("could not wait: the task was cancelled", cause);
+    }
+}
+
+stoppedWait() -> int throws StoppedWait {
+    return try untilCancelled();
+} catch (Cancelled stopped) {
+    throw new StoppedWait(stopped);
+}
+
+test "a task that throws an error its cancel caused is no unhandled failure" {
+    tasks.scope((scope) -> {
+        let waiting = scope.start(() -> try stoppedWait());
         scope.cancel();
     });
 }

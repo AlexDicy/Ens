@@ -2508,8 +2508,12 @@ The type is `Task<F>` where `F` is the function type the task runs: a body retur
 A `Task` is shareable, so a task may await one of its siblings, and a value that is not shareable is taken once, a second `await()` aborting the program, while a shareable value is returned to every awaiter.
 `scope.launch(body)` starts a body that returns nothing and throws nothing but `Cancelled`, and returns nothing: it is the form for work nobody waits for, such as serving one connection, and a body that could throw anything else is refused with the advice the lambda rules give, to move the work into a function with a `catch` clause of its own.
 A launched task that throws `Cancelled` after it was cancelled simply ends, and one that throws it without being cancelled aborts the program, since nothing awaits it to handle the error.
-A task started with `start` is meant to be awaited, so one that threw and was never awaited aborts the program when its scope ends, naming the line that started it, because an error nobody handled is unhandled.
-A task that throws `Cancelled` after it was cancelled has done what it was asked, so it is not counted, and neither is any task when the scope's body throws, since the body's error already carries the scope's failure out.
+The first task in a scope to throw fails the scope: the scope is cancelled, body and tasks alike, so the others stop wasting work, and when the scope has waited for every task the failure leaves `tasks.scope` in place of the `Cancelled` the body's wait threw.
+A body's throws list names what can leave the scope, so the failure leaves only when the list names its type, which `try task.await()` written anywhere in the body does; a failure of a type the list does not name has nowhere to go, so the program aborts when the scope ends, naming the line that started the task.
+A failure the body awaited is handled there, whatever the body does with it, and leaves no second time; the scope is still cancelled, so a body that handles one task's failure and then waits for another gets `Cancelled`.
+A body that throws on its own carries the scope's failure out, so a task failure beside it is dropped.
+A task that throws `Cancelled` after it was cancelled has done what it was asked, so it is no failure, and neither is one that throws an error caused by a `Cancelled`, such as the `IoError` a cancelled read throws.
+A `TaskScope` kept in a field has no body to throw from, so a task of it that threw and that nothing awaited aborts the program when the scope is released.
 `scope.startDedicated(priority, body)` is `start` on an operating-system thread of the task's own, for a loop that must not share one, such as audio or rendering, under the same rules for what the body may capture.
 Its `priority` is a `TaskPriority`: `Normal`, `High` for work someone is watching, or `Realtime` for work with a deadline, and a system that refuses the level runs the thread at the highest level it allows.
 Every other task runs on whichever thread of the program's pool is free when it starts or wakes, so it may be on one thread before a wait and another after it; a library that has to be called from one thread throughout is used from a task started with `startDedicated`.
@@ -2529,8 +2533,12 @@ loadBoth(Path first, Path second) -> Module[] throws ParseError, IoError, Cancel
 ```
 
 A task stops when it is asked to and when it chooses to: cancellation is cooperative.
-`scope.cancel()` marks every task in the scope cancelled, `task.cancel()` marks one task and everything it started, and `scope.cancelAfter(millis)` marks the scope after that many milliseconds, which is how a deadline is written.
-The first task in a scope to throw, other than with the `Cancelled` it was asked for, marks the scope cancelled as well, so the others stop wasting work, while the scope still waits for every one of them before the error reaches whoever awaits it.
+`scope.cancel()` marks every task in the scope cancelled and the scope's body as well, so a wait in the body ends too, and `task.cancel()` marks one task and everything it started.
+A body that a cancel of its own scope ended throws the `Cancelled` its wait threw, which leaves `tasks.scope` like any error the body throws, and `scope.isCancelled()` reports whether the scope was asked to stop.
+`tasks.withTimeout(millis, body)` is `tasks.scope(body)` with a time limit: once that many milliseconds have passed, the scope is cancelled, body and tasks alike, which is how a deadline is written.
+A body the limit ended leaves `tasks.withTimeout` as a `TimedOut`, whose `limitMillis` is the limit and whose cause is what the body threw, so a read the limit cut short is the `IoError` beneath it; a body that returns in time returns its value, and a cancel from outside the call still leaves it as the body threw it.
+`TimedOut` is not a kind of `Cancelled`, so a caller that handles a timeout never mistakes it for its own cancellation.
+The program's `main` runs on no task, and while it runs the body of a scope it counts as one, so a cancel or a time limit reaches the waits there as it does in any task.
 A task reads `tasks.isCancelled()` to learn that it was asked to stop, and `tasks.checkCancelled()` throws `Cancelled` when it was, so a loop writes `try tasks.checkCancelled();` once per iteration, and its body's throws list, and so its task's type, then say that the task can be cut short.
 A call that waits, for a channel, a lock, another task or the clock, declares `Cancelled`: in a cancelled task it throws `Cancelled` instead of waiting, and a task cancelled while it waits is woken to throw it at once.
 A read from a stream ends early in a cancelled task by throwing the `IoError` it declares anyway, of kind `Cancelled` and with a `Cancelled` as its cause.

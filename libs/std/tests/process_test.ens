@@ -16,6 +16,7 @@ import @std.system;
 import @std.parallel;
 import @std.tasks;
 import Cancelled from @std.tasks;
+import TimedOut from @std.tasks;
 import Atomic from @std.tasks;
 import Channel from @std.tasks;
 import ChannelClosed from @std.tasks;
@@ -515,6 +516,27 @@ test "children start while other tasks open and close files" {
 
 // What reading a child that writes nothing ends with, in a task whose scope is cancelled while
 // the read waits; the child is stopped afterwards either way.
+// A read in a body is stopped by the body's time limit, and the IoError it then throws becomes the
+// cause of the 'TimedOut' the limit ends the body with.
+test "a read of a child's output stopped by a time limit ends with 'TimedOut'" {
+    let child = try process.spawn(support.interpreter(), support.scriptArguments("sleep 30",
+        "ping -n 30 127.0.0.1 >NUL"));
+    string ended = try timedRead(child);
+    try child.kill();
+    let status = try child.wait();
+    try testing.assertEqual(ended, "the time limit of 50 milliseconds passed before the work "
+        + "finished, caused by a read that was cancelled: true");
+}
+
+timedRead(ChildProcess child) -> string throws Cancelled, IoError {
+    string? line = try tasks.withTimeout(50, (scope) -> try child.stdout().readLine());
+    return "the read returned";
+} catch (TimedOut stopped) {
+    let cause = stopped.cause;
+    bool cancelledRead = cause is IoError && cause.cause is Cancelled;
+    return "{stopped.message}, caused by a read that was cancelled: {cancelledRead}";
+}
+
 readSilentChild() -> string throws ProcessError {
     let child = try process.spawn(support.interpreter(), support.scriptArguments("sleep 30",
         "ping -n 30 127.0.0.1 >NUL"));
@@ -534,8 +556,11 @@ readLineOf(ChildProcess child) -> string {
 
 test "a read of a child's output in a cancelled task ends with a cancelled read" {
     string ended = try tasks.scope((scope) -> {
-        scope.cancelAfter(50);
         let reading = scope.start(() -> try readSilentChild());
+        scope.launch(() -> {
+            try tasks.sleep(50);
+            reading.cancel();
+        });
         return try reading.await();
     });
     try testing.assertEqual(ended, "could not read the standard output of '{support.interpreter()}': "
