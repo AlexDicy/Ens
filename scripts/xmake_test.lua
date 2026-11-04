@@ -3450,6 +3450,44 @@ task("test")
                 table.insert(failures, "a second build rewrote the member's lock")
             end
 
+            -- a macOS framework bound to its '.tbd' file links with no SDK from any machine, and one
+            -- named by its bundle name with no SDK to come from is refused naming the framework
+            local stub = path.join(files, "CoreFoundation.tbd")
+            io.writefile(stub, "--- !tapi-tbd\ntbd-version:     4\ntargets:         [ arm64-macos ]\n"
+                .. "install-name:    '/System/Library/Frameworks/CoreFoundation.framework/"
+                .. "Versions/A/CoreFoundation'\nexports:\n  - targets:         [ arm64-macos ]\n"
+                .. "    symbols: [ '_CFAbsoluteTimeGetCurrent' ]\n...\n", {encoding = "binary"})
+            local url_stub = "file:///" .. (path.absolute(stub):gsub("\\", "/"))
+            local framework = path.join(root, "framework")
+            os.mkdir(path.join(framework, "src"))
+            io.writefile(path.join(framework, "src", "main.ens"),
+                "external from apple {\n    CFAbsoluteTimeGetCurrent() -> double;\n}\n\n"
+                .. "main() -> int {\n    if (CFAbsoluteTimeGetCurrent() > 0.0) {\n"
+                .. '        print("time is after 2001");\n    }\n    return 0;\n}\n')
+            local function write_framework(binding)
+                io.writefile(path.join(framework, "ens.package"),
+                    "package demo.framework {\n" .. '    ens "0.1";\n\n'
+                    .. "    native apple {\n        " .. binding .. "\n    }\n}\n")
+            end
+            local without_sdk = withCache(cache)
+            without_sdk.SDKROOT = path.join(root, "no-sdk")
+            local in_framework = {curdir = framework, envs = without_sdk}
+            local framework_exe = path.join(framework, "framework-macos")
+            write_framework('macos artifact "' .. url_stub .. '" hash "sha256:'
+                .. hash.sha256(stub) .. '";')
+            run({"build", ".", "--target", "arm64-apple-macosx15.0", "--output", framework_exe},
+                in_framework, 0, "framework: Built '")
+            if is_host("macosx") and os.arch() == "arm64" then
+                run_program(framework_exe, 0, "time is after 2001")
+            end
+            write_framework('macos "CoreFoundation.framework";')
+            local no_sdk_reason = is_host("macosx")
+                and "and 'SDKROOT' names '" .. without_sdk.SDKROOT .. "', which is not a folder"
+                or "and an SDK is installed only on a Mac"
+            run({"build", ".", "--target", "arm64-apple-macosx15.0", "--output", framework_exe},
+                in_framework, 1, "native library 'apple' links the framework "
+                .. "'CoreFoundation.framework' from the macOS SDK", no_sdk_reason)
+
             if #failures == 0 then
                 return {name = name, ok = true}
             end
