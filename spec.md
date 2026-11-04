@@ -2375,6 +2375,7 @@ The matching is a rule about the values rather than about the machine, so a set 
 `Environment.current()` returns the variables this process inherited, as a snapshot: changing it changes nothing outside the program, and a child is given the variables it should see at the moment it is started.
 `Environment.empty(platform)` returns a set with no variables at all, matched by that platform's rule.
 `get(name)` returns a variable's value or `null`, `set(name, value)` gives it a value, `remove(name)` takes it out and returns whether it was there, `contains(name)` reports whether the set holds it, `length()` and `isEmpty()` measure the set, `names()` returns the names in ascending byte order, and `copy()` returns a second set holding the same variables under the same rule.
+`homeDirectory()` returns the home directory of the user running the program as the set names it, read from `USERPROFILE` on Windows and from `HOME` on every other system, and `null` when that variable is missing or empty.
 A name is kept as it was written, so a Windows set holding `PATH` that is given `path` reports `path` from then on.
 An empty name, and one holding `=`, names no variable a child could be given, so writing one stops the program the way an index out of range does.
 
