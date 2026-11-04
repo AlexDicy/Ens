@@ -2003,7 +2003,7 @@ A hole or `.toString()` call whose type has no text form for any type argument, 
 It is what whole contents are handed around as, where a `byte[]` is what a stream fills: `readAll()`, `readBytes()`, `toBytes()` and `embed` return `bytes`, `read(buffer)` takes a `byte[]`, `write` takes `bytes`, and `writeBytes` accepts either.
 `length` counts the bytes and `data[index]` reads one, with an index outside the data aborting the program, while writing one is refused when the program is compiled, as is passing a `bytes` where a `byte[]` is expected or the other way round.
 `slice(start, end)` and `slice(start)` return a half-open range as new data, copied from the original.
-`isEmpty()`, `contains(needle)`, `indexOf(needle)`, `indexOf(needle, from)`, `lastIndexOf(needle)`, `startsWith(prefix)` and `endsWith(suffix)` search exact bytes under the same rules as the string members of the same names.
+`isEmpty()`, `contains(needle)`, `indexOf(needle)`, `indexOf(needle, from)`, `lastIndexOf(needle)`, `startsWith(prefix)`, `startsWith(prefix, at)` and `endsWith(suffix)` search exact bytes under the same rules as the string members of the same names.
 `toArray()` returns the bytes as a new `byte[]`, `bytes.of(array)` returns `bytes` holding an array's contents, moving the storage when nothing else refers to the array and copying it otherwise, and `string.fromBytes(data)` decodes it as UTF-8.
 Two `bytes` compare and hash by content, and a `bytes` can be a key, a field of a shareable struct, and a value sent to another task, because nothing can write it.
 A literal of type `bytes` is written as an array literal where `bytes` is the target, as in `const bytes signature = [0x89, 'P', 'N', 'G'];`.
@@ -2697,6 +2697,7 @@ What text can do is declared on `string` itself, so every member below is called
 `byteAt(index)` returns one of the UTF-8 bytes, and an index outside the text aborts the program.
 `isEmpty()`, `contains(needle)`, `indexOf(needle)`, `indexOf(needle, from)` and `lastIndexOf(needle)` search by exact bytes, returning the byte offset of an occurrence or `-1`; an empty needle is found at offset `0`, and looking back, at the end.
 `startsWith(prefix)` and `endsWith(suffix)` report whether the first or last bytes are exactly that part; an empty part always matches, and a part longer than the text never does.
+`startsWith(prefix, at)` reports whether `prefix` begins at byte `at` and reads no further than its length, so testing one offset after another is not a search to the end each time; an offset before the text or one where the prefix does not fit never matches.
 `substring(start, end)` and `substring(start)` return the bytes of a half-open byte range as new text; a range outside the text, or one that cuts through the middle of a character, aborts the program.
 `trim()`, `trimStart()` and `trimEnd()` drop the whitespace at both ends or at one, where whitespace is a space or one of the ASCII layout controls: tab, line feed, vertical tab, form feed, and carriage return.
 `replace(needle, replacement)`, `repeat(times)`, `padStart(width, filler)` and `padEnd(width, filler)` build new text; an empty needle occurs nowhere to replace and gives the text back as it was, a negative `times` aborts, text already `width` bytes wide is returned as it is, and a filler of several bytes is only ever added whole.
