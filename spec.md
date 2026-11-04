@@ -1907,6 +1907,10 @@ let g = [[1, 2], [3, 4]];          // nested literal -> int[][]
 let h = [[1], []];                 // empty inner adopts first inner's type
 ```
 
+`...xs` among the elements puts every element of the array `xs` there, in order, so `[...head, middle, ...tail]` builds one array from two and a value between them.
+Each spread counts as elements of its array's element type for the rules above, so `long[] wide = [...ints, 3L];` converts every element of an `int[]`, and every element is read in the order written before the array is made.
+A spread is written only inside an array literal; a call takes the array itself, and a nullable array is checked for null first.
+
 An empty literal `[]` requires a target type, or as a branch of `?:` or an arm of a switch, another branch with a type of its own; `let xs = []` is rejected because there is no element to infer from. Write `int[] xs = []` or pass `[]` as an argument where the declared parameter type pins it down.
 
 An array literal is one way to construct an array of a non-nullable reference type: `[new Box(1), new Box(2)]` initializes every slot at construction, and the resulting type is `Box[]`.

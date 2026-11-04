@@ -3,6 +3,8 @@
 // redundant ones. An element slot owns what it holds, so a write releases what it replaced.
 import NewExpressionNode from @ens.frontend.syntax.generated.nodes;
 import ArrayLiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SpreadExpressionNode from @ens.frontend.syntax.generated.nodes;
+import Span from @ens.frontend.support.source;
 import SubscriptExpressionNode from @ens.frontend.syntax.generated.nodes;
 import ForEachStatementNode from @ens.frontend.syntax.generated.nodes;
 import @ens.sema.model.typenames;
@@ -23,6 +25,7 @@ import EirStorePtr from eir.model;
 import EirJump from eir.model;
 import EirBranch from eir.model;
 import LoweringContext from lower.context;
+import List from @std.collections.list;
 import Operand from lower.stores;
 import lower.classes;
 import lower.conversions;
@@ -146,21 +149,32 @@ public lowerLiteral(LoweringContext lowering, ArrayLiteralExpressionNode node) -
             node.span());
         return -1;
     }
+    for (long i = 0; i < node.elementsCount(); i++) {
+        if (node.elements(i) is SpreadExpressionNode) {
+            return lowerSpreadLiteral(lowering, node, type);
+        }
+    }
+    return lowerElements(lowering, node, type, 0, node.elementsCount());
+}
+
+// The elements of 'node' from 'start' up to 'end', none of them a spread, as a new array of 'type'.
+lowerElements(LoweringContext lowering, ArrayLiteralExpressionNode node, ArrayType type, long start,
+              long end) -> long {
     let elementType = type.element();
     let builder = lowering.builder();
     let longType = lowering.store().primitive(PrimitiveKind.Long);
     long count = builder.newTemp(longType);
-    builder.append(new EirConstInt(count, longType, node.elementsCount()));
+    builder.append(new EirConstInt(count, longType, end - start));
     long array = builder.newTemp(type);
     builder.append(new EirArrayNew(array, type, count));
     lowering.protectValue(array);
-    for (long i = 0; i < node.elementsCount(); i++) {
+    for (long i = start; i < end; i++) {
         let operand = stores.lowerOperand(lowering, node.elements(i), elementType);
         if (operand == null) {
             return -1;
         }
         long index = builder.newTemp(longType);
-        builder.append(new EirConstInt(index, longType, i));
+        builder.append(new EirConstInt(index, longType, i - start));
         long address = elementAddress(lowering, array, index, elementType, EirAccess.Write);
         if (!stores.initializeThroughAddress(lowering, address, elementType, operand)) {
             lowering.internalError("an array element borrows a struct with no storage to "
@@ -170,6 +184,129 @@ public lowerLiteral(LoweringContext lowering, ArrayLiteralExpressionNode node) -
     }
     lowering.unprotectValue(array);
     return array;
+}
+
+// '[a, ...b, c]': each run of plain elements becomes an array of its own and each spread is the
+// array it names, in the order they are written, so every element is read before the result is
+// sized. The result is then filled from those arrays in order, and they are released.
+lowerSpreadLiteral(LoweringContext lowering, ArrayLiteralExpressionNode node, ArrayType type)
+        -> long {
+    let builder = lowering.builder();
+    let longType = lowering.store().primitive(PrimitiveKind.Long);
+    let parts = new List<long>();
+    let partTypes = new List<ArrayType>();
+    long i = 0;
+    while (i < node.elementsCount()) {
+        let element = node.elements(i);
+        if (element is SpreadExpressionNode) {
+            let spreadType = lowering.typeOf(element.value());
+            if (!(spreadType is ArrayType)) {
+                lowering.internalError("a spread of a value that is not an array", element.span());
+                return -1;
+            }
+            long spread = stores.lowerOwned(lowering, element.value(), spreadType);
+            if (spread < 0) {
+                return -1;
+            }
+            lowering.protectValue(spread);
+            parts.push(spread);
+            partTypes.push(spreadType);
+            i++;
+            continue;
+        }
+        long start = i;
+        while (i < node.elementsCount() && !(node.elements(i) is SpreadExpressionNode)) {
+            i++;
+        }
+        long run = lowerElements(lowering, node, type, start, i);
+        if (run < 0) {
+            return -1;
+        }
+        lowering.protectValue(run);
+        parts.push(run);
+        partTypes.push(type);
+    }
+    long total = builder.newTemp(longType);
+    builder.append(new EirConstInt(total, longType, 0));
+    for (let part in parts) {
+        long length = builder.newTemp(longType);
+        builder.append(new EirArrayLength(length, longType, part));
+        long sum = builder.newTemp(longType);
+        builder.append(new EirBinary(sum, longType, EirBinaryOp.Add, total, length));
+        total = sum;
+    }
+    long result = builder.newTemp(type);
+    builder.append(new EirArrayNew(result, type, total));
+    long position = builder.addSlot("spread.position", longType, false, false);
+    long zero = builder.newTemp(longType);
+    builder.append(new EirConstInt(zero, longType, 0));
+    builder.append(new EirStoreSlot(position, zero));
+    for (long k = 0; k < parts.length(); k++) {
+        if (!copyElements(lowering, parts.get(k), partTypes.get(k), result, type, position,
+                node.span())) {
+            return -1;
+        }
+    }
+    for (long k = parts.length() - 1; k >= 0; k--) {
+        lowering.unprotectValue(parts.get(k));
+        ownership.releaseOwned(lowering, parts.get(k));
+    }
+    return result;
+}
+
+// Copies every element of 'source', of 'sourceType', into 'result' from the index the slot
+// 'position' holds, converting each to the element type of 'resultType' and giving it its own
+// reference, and leaves 'position' after the last one.
+copyElements(LoweringContext lowering, long source, ArrayType sourceType, long result,
+             ArrayType resultType, long position, Span span) -> bool {
+    let builder = lowering.builder();
+    let longType = lowering.store().primitive(PrimitiveKind.Long);
+    let boolType = lowering.store().primitive(PrimitiveKind.Bool);
+    let elementType = resultType.element();
+    long length = builder.newTemp(longType);
+    builder.append(new EirArrayLength(length, longType, source));
+    long indexSlot = builder.addSlot("spread.index", longType, false, false);
+    long zero = builder.newTemp(longType);
+    builder.append(new EirConstInt(zero, longType, 0));
+    builder.append(new EirStoreSlot(indexSlot, zero));
+    long conditionBlock = builder.newBlock("spread.cond");
+    long bodyBlock = builder.newBlock("spread.body");
+    long exitBlock = builder.newBlock("spread.end");
+    builder.terminate(new EirJump(conditionBlock));
+    builder.moveTo(conditionBlock);
+    long index = builder.newTemp(longType);
+    builder.append(new EirLoadSlot(index, longType, indexSlot));
+    long more = builder.newTemp(boolType);
+    builder.append(new EirBinary(more, boolType, EirBinaryOp.CmpLtSigned, index, length));
+    builder.terminate(new EirBranch(more, bodyBlock, exitBlock));
+    builder.moveTo(bodyBlock);
+    long readIndex = builder.newTemp(longType);
+    builder.append(new EirLoadSlot(readIndex, longType, indexSlot));
+    long from = elementAddress(lowering, source, readIndex, sourceType.element(), EirAccess.Read);
+    long value = places.readFrom(lowering, from, elementType, span);
+    if (value < 0) {
+        return false;
+    }
+    long writeIndex = builder.newTemp(longType);
+    builder.append(new EirLoadSlot(writeIndex, longType, position));
+    long into = elementAddress(lowering, result, writeIndex, elementType, EirAccess.Write);
+    let operand = stores.operandFor(lowering, value, false, elementType);
+    if (!stores.initializeThroughAddress(lowering, into, elementType, operand)) {
+        lowering.internalError("a spread element borrows a struct with no storage to retain",
+            span);
+        return false;
+    }
+    long one = builder.newTemp(longType);
+    builder.append(new EirConstInt(one, longType, 1));
+    long nextRead = builder.newTemp(longType);
+    builder.append(new EirBinary(nextRead, longType, EirBinaryOp.Add, readIndex, one));
+    builder.append(new EirStoreSlot(indexSlot, nextRead));
+    long nextWrite = builder.newTemp(longType);
+    builder.append(new EirBinary(nextWrite, longType, EirBinaryOp.Add, writeIndex, one));
+    builder.append(new EirStoreSlot(position, nextWrite));
+    builder.terminate(new EirJump(conditionBlock));
+    builder.moveTo(exitBlock);
+    return true;
 }
 
 // Reading 'xs[i]'. The element stays owned by the array, so the loaded value is borrowed.

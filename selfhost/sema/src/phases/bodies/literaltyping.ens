@@ -6,6 +6,9 @@ import LiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
 import PrefixExpressionNode from @ens.frontend.syntax.generated.nodes;
 import ParenthesizedExpressionNode from @ens.frontend.syntax.generated.nodes;
 import ArrayLiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
+import SpreadExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ListNode from @ens.frontend.syntax.generated.nodes;
+import ArgumentListNode from @ens.frontend.syntax.generated.nodes;
 import StructLiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
 import InterpolatedStringExpressionNode from @ens.frontend.syntax.generated.nodes;
 import SyntaxKind from @ens.frontend.syntax.generated.kind;
@@ -25,6 +28,7 @@ import PrimitiveType from model.types;
 import PrimitiveKind from model.types;
 import NullType from model.types;
 import ArrayType from model.types;
+import OptionalType from model.types;
 import ClassType from model.types;
 import TextFormObligation from phases.obligations;
 import ArrayElementObligation from phases.obligations;
@@ -600,6 +604,45 @@ public analyzeArrayLiteral(BodyChecker checker, ArrayLiteralExpressionNode node)
     return analyzed;
 }
 
+// A '...value' element: every element of the array 'value' is, in order, an element of the array
+// literal it is written in, so its type is the element type of that array. With 'target', the
+// element type the literal is built at, 'value' is analyzed as an array of it.
+public analyzeSpread(BodyChecker checker, SpreadExpressionNode node, Type? target) -> Type {
+    Type analyzed = checker.store().errorType();
+    if (target == null || target is ErrorType) {
+        analyzed = checker.analyzeExpression(node.value());
+    } else {
+        analyzed = checker.analyzeExpressionAdapt(node.value(), checker.store().arrayOf(target));
+    }
+    let list = node.parent();
+    if (!(list is ListNode) || !(list.parent() is ArrayLiteralExpressionNode)) {
+        string spelled = wording.oneLineSpelling(node.value());
+        string fix = "Write it among the elements between '[' and ']', as in '[...{spelled}]'.";
+        if (list is ListNode && list.parent() is ArgumentListNode) {
+            fix = "To pass '{spelled}' itself, remove '...'.";
+        }
+        checker.reporter().report("'...' puts the elements of an array into an array literal, so "
+            + "it can only be written inside one. {fix}", node.span());
+        return checker.store().errorType();
+    }
+    if (analyzed is ErrorType) {
+        return analyzed;
+    }
+    if (analyzed is ArrayType) {
+        return analyzed.element();
+    }
+    string spelled = wording.sideNamed(node.value(), "this value");
+    if (analyzed is OptionalType && analyzed.inner() is ArrayType) {
+        checker.reporter().report("'...' puts the elements of an array into this one, and "
+            + "{spelled} can be null, which is not an array. Check that it is not null before this "
+            + "array literal.", node.value().span());
+        return checker.store().errorType();
+    }
+    checker.reporter().report("'...' puts the elements of an array into this one, and {spelled} "
+        + "has type {checker.names().quoted(analyzed)}, which is not an array.", node.value().span());
+    return checker.store().errorType();
+}
+
 // An array literal whose element type mentions a type parameter fills every slot, so the one thing
 // left to judge for each instantiation is whether the element type has values at all.
 recordOpenElement(BodyChecker checker, Type analyzed, ArrayLiteralExpressionNode node) {
@@ -702,7 +745,7 @@ analyzeArrayElements(BodyChecker checker, ArrayLiteralExpressionNode node) -> Ty
             }
             string hint = nullguidance.elementAssignabilityHint(checker, elementType, actual,
                 node.elements(i), declared, false);
-            valuejoins.holdMismatch(checker, elementMismatch(i, elementType, actual, checker.names()) + hint,
+            valuejoins.holdMismatch(checker, elementMismatch(node.elements(i), i, elementType, actual, checker.names()) + hint,
                 node.elements(i).span());
         }
     }
@@ -778,7 +821,7 @@ analyzeArrayElementsAdapt(BodyChecker checker, ArrayLiteralExpressionNode node, 
         string hint = nullguidance.elementAssignabilityHint(checker, elementType, actual, node.elements(i),
             origin);
         checker.targets().joinMismatches().push(new HeldMismatch(
-            elementMismatch(i, elementType, actual, checker.names()) + hint, node.elements(i).span()));
+            elementMismatch(node.elements(i), i, elementType, actual, checker.names()) + hint, node.elements(i).span()));
     }
     return arrayType;
 }
@@ -1106,10 +1149,17 @@ fieldsListed(List<Field> settable, bool partial) -> string {
     return " Its fields are {wording.quotedList(listed)}.";
 }
 
-// The refusal of element 'index' of an array literal, whose type 'actual' is not the element type.
-elementMismatch(long index, Type elementType, Type actual, TypeNames names) -> string {
-    return "Element {index + 1} has type {names.quoted(actual)}, but the elements of this array have type "
-        + "{names.quoted(elementType)}.";
+// The refusal of 'element', element 'index' of an array literal, whose type 'actual' is not the
+// element type. A spread is named by the array whose elements it puts there.
+elementMismatch(Expression element, long index, Type elementType, Type actual, TypeNames names)
+        -> string {
+    string expected = "the elements of this array have type {names.quoted(elementType)}.";
+    if (element is SpreadExpressionNode) {
+        string source = wording.sideNamed(element.value(), "the array");
+        return "The elements of {source} that '...' puts here have type {names.quoted(actual)}, but "
+            + expected;
+    }
+    return "Element {index + 1} has type {names.quoted(actual)}, but {expected}";
 }
 
 // Whether 'node' is an untyped integer literal among the values of the join 'root'.
