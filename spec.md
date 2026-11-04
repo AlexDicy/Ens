@@ -914,6 +914,10 @@ For a Windows target, a program that names no native library beyond the system's
 A Windows program that links any other native library links the way that library was built, with Visual Studio's static C runtime from the folders `LIB` names, because that library was compiled against it.
 `native zlib;` links the library under its conventional platform name.
 The block form spells out base names per platform (`windows`, `linux`, `macos`), several per platform when needed.
+On a `macos` line, a name ending in `.framework` names an Apple framework, as in `macos "z" "CoreFoundation.framework";`, and the framework is linked from the macOS SDK in the order the line lists it.
+A framework name on a `windows` or `linux` line is an error, and so is `.framework` with no name in front of it.
+A macOS build that finds no SDK fails naming the framework it would have linked.
+A machine with no SDK, such as any machine but a Mac, links the framework through its `.tbd` file instead, the text file in the SDK that lists what the framework provides, bound as an artifact: `macos artifact "https://example.com/CoreFoundation.tbd" hash "sha256:...";`.
 A platform may instead bind a prebuilt artifact: `windows artifact "https://example.com/z.lib" hash "sha256:...";` downloads the file once into the cache, verifies it against the declared sha256 hash (a mismatch fails the build), and passes it to the linker.
 An artifact is a single library file for its platform.
 Artifact bindings and their hashes are recorded in `ens.lock`, so the exact native code a build links is reviewable in one place.
