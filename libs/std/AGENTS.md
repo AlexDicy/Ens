@@ -10,6 +10,7 @@ The conventions the API of `libs/std` follows, on top of the code style in the r
 - An immutable type such as `string` or `Path` has only the form that returns a new value, named as the imperative, as `trim()` and `normalize()` are.
 - `toX()` returns a copy, `asX()` returns a cheap view sharing storage, and text becomes a value through the `parseX(text)` functions of `@std.text.parse`.
 - A size is `length()`, beside `isEmpty()`, and never `size()`.
+- A directory is called a directory, in names and in messages alike, as `isDirectory()` and `createDirectories()` spell it, and never a folder.
 - A `bool` member is `is` with an adjective, as in `isEmpty()`, or a plain verb, as in `contains()` or `exists()`, and never a bare adjective.
 - Arguments go data first and options last, and a source before its destination.
 - No test depends on an order the library leaves unspecified, such as the walk of a `Map` or a `Set` or the order a sort leaves values it calls equal.

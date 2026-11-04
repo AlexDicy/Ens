@@ -230,6 +230,7 @@ Ens code (selfhost, libs, tests):
 - Group related fields with no blank lines inside a group, one blank line between groups.
 - Soft 100-column limit; prefer `switch` over if/else chains when dispatching on one value.
 - Full words for identifiers; American English everywhere.
+- The standard library says "directory", the word APIs everywhere use, in its names and its messages; `ens` itself and the spec outside `@std` say "folder", the word a newcomer sees in Finder and Explorer.
 - One concept has one declaration: a constraint such as a module that has to stay a leaf is met by moving the declaration or restructuring the modules, never by a second type that mirrors the first.
 - A number that crosses a boundary, such as a code a bridge reports, is carried by a numeric enum whose members declare their values, and converted with `as?`; a hand-written switch from an integer to an enum is refused in review.
 - No `get` prefix on a method that always returns a value: `stackTrace()`, not `getStackTrace()`.

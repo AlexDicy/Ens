@@ -2003,7 +2003,7 @@ A hole or `.toString()` call whose type has no text form for any type argument, 
 It is what whole contents are handed around as, where a `byte[]` is what a stream fills: `readAll()`, `readBytes()`, `toBytes()` and `embed` return `bytes`, `read(buffer)` takes a `byte[]`, `write` takes `bytes`, and `writeBytes` accepts either.
 `length` counts the bytes and `data[index]` reads one, with an index outside the data aborting the program, while writing one is refused when the program is compiled, as is passing a `bytes` where a `byte[]` is expected or the other way round.
 `slice(start, end)` and `slice(start)` return a half-open range as new data, copied from the original.
-`isEmpty()`, `contains(needle)`, `indexOf(needle)`, `indexOf(needle, from)`, `lastIndexOf(needle)`, `startsWith(prefix)` and `endsWith(suffix)` search exact bytes under the same rules as the string members of the same names.
+`isEmpty()`, `contains(needle)`, `indexOf(needle)`, `indexOf(needle, from)`, `lastIndexOf(needle)`, `startsWith(prefix)`, `startsWith(prefix, at)` and `endsWith(suffix)` search exact bytes under the same rules as the string members of the same names.
 `toArray()` returns the bytes as a new `byte[]`, `bytes.of(array)` returns `bytes` holding an array's contents, moving the storage when nothing else refers to the array and copying it otherwise, and `string.fromBytes(data)` decodes it as UTF-8.
 Two `bytes` compare and hash by content, and a `bytes` can be a key, a field of a shareable struct, and a value sent to another task, because nothing can write it.
 A literal of type `bytes` is written as an array literal where `bytes` is the target, as in `const bytes signature = [0x89, 'P', 'N', 'G'];`.
@@ -2191,12 +2191,13 @@ A child's pipes are timed readers, and so is a `BufferedReader`.
 A `byte[]` is written by passing `bytes.of(array)`.
 `streams.copy(source, target)` moves everything the source has left into the target and returns how many bytes moved, flushing and closing neither, so flushing and closing the target is up to the caller.
 
-`@std.io` itself provides the streams a program starts with: `io.out()` is standard output as a `Writer`, `io.err()` is standard error, and `io.in()` is standard input as a `StandardInput`, a `Reader` with the `readLine()`, `readAll()` and `readAllText()` a `BufferedReader` has.
+`@std.io` itself provides the streams a program starts with: `io.out()` is standard output and `io.err()` is standard error, each a `StandardWriter`, which is a `Writer`, and `io.in()` is standard input as a `StandardInput`, a `Reader` with the `readLine()`, `readAll()` and `readAllText()` a `BufferedReader` has.
 Standard output is buffered, so a line written there reaches the operating system once that buffer fills or something hands it over, and standard error is not, so what a program reports survives a crash.
 The buffer belongs to the stream rather than to the writer, so it makes no difference which writer returned by `io.out()` a program keeps.
 `io.in()` returns the same reader every call, because bytes read ahead cannot be put back and two readers of one input would steal from each other.
 Any task may read it, and tasks reading it at the same time take turns, each read or line whole.
 `io.flush()` hands over everything accepted by `io.out()` and not yet given to the operating system.
+`isTerminal()` on any of the three reports whether that stream is a terminal, the window a person types into and reads, rather than a file, a pipe or another device; on Windows a terminal is a console, so the `NUL` device is not one.
 
 `print(message)` and `eprint(message)` come from `@std.io.print`, which every program has with no import written, and each writes its message and a newline, the first to standard output and the second to standard error.
 Neither throws: printing a line is not an operation a program should have to handle the failure of, so a write the operating system does not carry out is dropped.
@@ -2316,6 +2317,7 @@ With `replace` set to `true` it moves over a file already at the destination in 
 `copyTo(destination)` copies the file at the path, replacing whatever was at the destination, and the copy carries the source's permissions and never its set-user-id, set-group-id or sticky bits, because a copy hands over permissions and not privileges.
 `permissions()` returns who may read, write and execute what is at the path, and `setPermissions(permissions)` gives it new ones; both follow a symbolic link, and a change never sets a set-user-id, set-group-id or sticky bit.
 `Permissions` from `@std.fs.permissions` is a struct holding an `Access` for the file's `owner`, for the users of its `group` and for all `others`, and an `Access` is a struct of three `bool` fields, `read`, `write` and `execute`; to execute a directory is to open what is inside it.
+`Permissions.fromBits(mode)` builds one from the nine low bits of a Unix mode and ignores every higher bit, and `bits()` returns those nine bits.
 Windows records only whether a file is read-only, so there `permissions()` reports that everyone may read and execute anything and may write anything that is not read-only, and `setPermissions` makes a file read-only exactly when its `owner` may not write it.
 `removeFile()` removes one file and raises a `FileSystemError` for a directory, and `removeDirectory()` removes one directory, which has to be empty already, so removing what a directory contains always takes a call of its own.
 `removeRecursively()` is that call: it removes everything under the path, then the path itself, and stops at the first thing it could not remove.
@@ -2374,6 +2376,7 @@ The matching is a rule about the values rather than about the machine, so a set 
 `Environment.current()` returns the variables this process inherited, as a snapshot: changing it changes nothing outside the program, and a child is given the variables it should see at the moment it is started.
 `Environment.empty(platform)` returns a set with no variables at all, matched by that platform's rule.
 `get(name)` returns a variable's value or `null`, `set(name, value)` gives it a value, `remove(name)` takes it out and returns whether it was there, `contains(name)` reports whether the set holds it, `length()` and `isEmpty()` measure the set, `names()` returns the names in ascending byte order, and `copy()` returns a second set holding the same variables under the same rule.
+`homeDirectory()` returns the home directory of the user running the program as the set names it, read from `USERPROFILE` on Windows and from `HOME` on every other system, and `null` when that variable is missing or empty.
 A name is kept as it was written, so a Windows set holding `PATH` that is given `path` reports `path` from then on.
 An empty name, and one holding `=`, names no variable a child could be given, so writing one stops the program the way an index out of range does.
 
@@ -2696,6 +2699,7 @@ What text can do is declared on `string` itself, so every member below is called
 `byteAt(index)` returns one of the UTF-8 bytes, and an index outside the text aborts the program.
 `isEmpty()`, `contains(needle)`, `indexOf(needle)`, `indexOf(needle, from)` and `lastIndexOf(needle)` search by exact bytes, returning the byte offset of an occurrence or `-1`; an empty needle is found at offset `0`, and looking back, at the end.
 `startsWith(prefix)` and `endsWith(suffix)` report whether the first or last bytes are exactly that part; an empty part always matches, and a part longer than the text never does.
+`startsWith(prefix, at)` reports whether `prefix` begins at byte `at` and reads no further than its length, so testing one offset after another is not a search to the end each time; an offset before the text or one where the prefix does not fit never matches.
 `substring(start, end)` and `substring(start)` return the bytes of a half-open byte range as new text; a range outside the text, or one that cuts through the middle of a character, aborts the program.
 `trim()`, `trimStart()` and `trimEnd()` drop the whitespace at both ends or at one, where whitespace is a space or one of the ASCII layout controls: tab, line feed, vertical tab, form feed, and carriage return.
 `replace(needle, replacement)`, `repeat(times)`, `padStart(width, filler)` and `padEnd(width, filler)` build new text; an empty needle occurs nowhere to replace and gives the text back as it was, a negative `times` aborts, text already `width` bytes wide is returned as it is, and a filler of several bytes is only ever added whole.
