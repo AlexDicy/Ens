@@ -408,7 +408,8 @@ Reads go through the type name, as in `Path.separator`, and each read compiles t
 A `lazy const` field is a type-level value with a written type and a mandatory initializer: `export lazy const FrozenMap<string, string> defaults = loadDefaults();`.
 The initializer runs on the first read and the value is kept for the rest of the program, so unlike a static const's it may call functions, allocate, and build aggregates.
 It may not throw, which is what keeps a read from needing `try`.
-A lazy const is read through the type name, as in `Settings.defaults`, and it is type-level already, so writing `static` beside `lazy` is an error.
+A lazy const is read through the type name, as in `Settings.defaults`.
+It is type-level already, and `static lazy const` declares the same field, so either spelling may be written.
 Every task in a program can read a lazy const by name, so its type must be shareable, as the section on tasks defines; `lazy const List<string> names` is refused naming the type, and a `FrozenList<string>` is what to write there.
 The value's destructor never runs, because the program holds the value to the end.
 On a generic type a lazy const's type and its initializer cannot mention the type's parameters, so every instantiation shares one value.
