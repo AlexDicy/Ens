@@ -73,6 +73,8 @@ Anywhere else, such as an operand of `+`, before a `.`, as an index, as a condit
 It may also be an arm of a switch used as a value or a branch of `?:`, where it takes no part in the common type, so the other arms decide the type of the whole, as in `long level = switch (shade) { Light -> 1, Dark -> panic("dark"), };`.
 When every arm or branch never returns, the whole switch or `?:` never returns either, and it counts as such a call wherever it is written.
 The built-in `panic` is itself a `noreturn` function, so this is one rule rather than a special case.
+`throw` may be written where a value is read too, as in `default -> throw new ParseError("no such code")` or `name ?? throw new MissingName()`, and it never returns, so the same places take it and the same places refuse it.
+It throws what it is given under the rules of the `throw` statement, so the value has to be an `Error` and the function lists or catches what it throws.
 An abstract or interface method may be `noreturn` as part of its contract, and an override of a `noreturn` method must remain `noreturn`, because callers rely on it never returning.
 A throwing `noreturn` function still takes part in checked exceptions as usual: its call sites need `try`, and its declared or inferred `throws` set applies normally.
 
