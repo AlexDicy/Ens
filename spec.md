@@ -405,12 +405,12 @@ A cycle between static const initializers is an error, and so are function calls
 A static const's type is therefore a primitive, `char`, `bool`, or `string`, and on a generic type neither it nor its initializer can mention the type's parameters, so every instantiation shares one value.
 Reads go through the type name, as in `Path.separator`, and each read compiles to the constant's value; assigning to a static const, or applying `++` or `--` to one, is an error.
 
-A `lazy const` field is a type-level value with a written type and a mandatory initializer: `export lazy const FrozenMap<string, string> defaults = loadDefaults();`.
+A `lazy const` field is a type-level value with a written type and a mandatory initializer, declared `static lazy const`: `export static lazy const FrozenMap<string, string> defaults = loadDefaults();`.
 The initializer runs on the first read and the value is kept for the rest of the program, so unlike a static const's it may call functions, allocate, and build aggregates.
 It may not throw, which is what keeps a read from needing `try`.
 A lazy const is read through the type name, as in `Settings.defaults`.
-It is type-level already, and `static lazy const` declares the same field, so either spelling may be written.
-Every task in a program can read a lazy const by name, so its type must be shareable, as the section on tasks defines; `lazy const List<string> names` is refused naming the type, and a `FrozenList<string>` is what to write there.
+`static` is required, since the value belongs to the type, so a `lazy const` written without it is an error that names the word to add.
+Every task in a program can read a lazy const by name, so its type must be shareable, as the section on tasks defines; `static lazy const List<string> names` is refused naming the type, and a `FrozenList<string>` is what to write there.
 The value's destructor never runs, because the program holds the value to the end.
 On a generic type a lazy const's type and its initializer cannot mention the type's parameters, so every instantiation shares one value.
 Assigning to a lazy const, or applying `++` or `--` to one, is an error.
@@ -2035,8 +2035,8 @@ import EmbeddedFile from @std.embed;
 import FrozenList from @std.collections.frozen;
 
 final class Assets {
-    lazy const bytes logo = embed "logo.png";
-    lazy const FrozenList<EmbeddedFile> icons = embed folder "icons";
+    static lazy const bytes logo = embed "logo.png";
+    static lazy const FrozenList<EmbeddedFile> icons = embed folder "icons";
 }
 ```
 
