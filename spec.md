@@ -1748,7 +1748,9 @@ In statement position an arm's body may be a `{ }` block; used as a value, each 
 Unification treats `null` as the absent case of a nullable type: a `null` branch or arm beside a `T` one yields `T?`, and a `T` one beside a `T?` one yields `T?`.
 Two class values that share a common ancestor unify to their nearest common base class, so `Circle` beside `Square` yields the closest class both extend.
 When either side is nullable, the result is that base class made nullable, so `Circle?` beside `Square` yields `Shape?`.
-Classes that share only an interface do not unify, because a class may implement several interfaces at once and the intended one would be ambiguous; give the expression an explicit type in that case.
+Classes that share only an interface do not unify on their own, because a class may implement several interfaces at once and the intended one would be ambiguous.
+Where the place the value is read in states a type, such as a declared variable, a parameter or a return type, each arm or branch only has to convert to that type, so `Interaction chosen = tapped ? new Tap() : new Drag();` is accepted when both classes implement `Interaction`.
+Where nothing states one, the error names the interfaces the values share and the declaration that gives the value one of them.
 Unrelated types still do not unify, and branches that are all `null` give the expression no type of its own, so it can appear only where a plain `null` could.
 
 ```ens
