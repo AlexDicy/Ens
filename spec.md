@@ -73,6 +73,8 @@ Anywhere else, such as an operand of `+`, before a `.`, as an index, as a condit
 It may also be an arm of a switch used as a value or a branch of `?:`, where it takes no part in the common type, so the other arms decide the type of the whole, as in `long level = switch (shade) { Light -> 1, Dark -> panic("dark"), };`.
 When every arm or branch never returns, the whole switch or `?:` never returns either, and it counts as such a call wherever it is written.
 The built-in `panic` is itself a `noreturn` function, so this is one rule rather than a special case.
+`throw` may be written where a value is read too, as in `default -> throw new ParseError("no such code")` or `name ?? throw new MissingName()`, and it never returns, so the same places take it and the same places refuse it.
+It throws what it is given under the rules of the `throw` statement, so the value has to be an `Error` and the function lists or catches what it throws.
 An abstract or interface method may be `noreturn` as part of its contract, and an override of a `noreturn` method must remain `noreturn`, because callers rely on it never returning.
 A throwing `noreturn` function still takes part in checked exceptions as usual: its call sites need `try`, and its declared or inferred `throws` set applies normally.
 
@@ -406,7 +408,8 @@ Reads go through the type name, as in `Path.separator`, and each read compiles t
 A `lazy const` field is a type-level value with a written type and a mandatory initializer: `export lazy const FrozenMap<string, string> defaults = loadDefaults();`.
 The initializer runs on the first read and the value is kept for the rest of the program, so unlike a static const's it may call functions, allocate, and build aggregates.
 It may not throw, which is what keeps a read from needing `try`.
-A lazy const is read through the type name, as in `Settings.defaults`, and it is type-level already, so writing `static` beside `lazy` is an error.
+A lazy const is read through the type name, as in `Settings.defaults`.
+It is type-level already, and `static lazy const` declares the same field, so either spelling may be written.
 Every task in a program can read a lazy const by name, so its type must be shareable, as the section on tasks defines; `lazy const List<string> names` is refused naming the type, and a `FrozenList<string>` is what to write there.
 The value's destructor never runs, because the program holds the value to the end.
 On a generic type a lazy const's type and its initializer cannot mention the type's parameters, so every instantiation shares one value.
@@ -1526,6 +1529,8 @@ int n = arr.length;      // error: long -> int, can be forced with `arr.length a
 A nullable number widens the same way under each level of null, so an `int?` converts to a `long?` and an `int??` to a `long??`, and a `null` stays `null`.
 Two numbers that meet, as the two results of a `?:` or the two sides of `==`, take the wider type under as many levels of null as either has, so an `int?` beside a `long` gives a `long?`.
 
+An integer literal is written in base 10, or after a prefix in base 16 with `0x`, in base 8 with `0o` or in base 2 with `0b`, as in `0x1F`, `0o755` and `0b1010`, and `_` may separate its digits, as in `1_000_000`.
+A base 10 literal with more than one digit cannot start with `0`, because C and shells read `0755` as base 8, so it is an error that names both spellings; `0O` is refused for a capital O that is hard to tell from a zero.
 Integer literals without a type suffix adapt to the surrounding type when it's an integer that fits the value. With no context they default to `int`. Values out of range produce a specific error.
 Where a nullable type such as `byte?` is expected, a literal adapts to the type without the `?`, so `byte? small = 1;` compiles, and so does `small += 1;` right after it.
 A literal in parentheses adapts the same way as the literal alone.
@@ -1744,7 +1749,9 @@ In statement position an arm's body may be a `{ }` block; used as a value, each 
 Unification treats `null` as the absent case of a nullable type: a `null` branch or arm beside a `T` one yields `T?`, and a `T` one beside a `T?` one yields `T?`.
 Two class values that share a common ancestor unify to their nearest common base class, so `Circle` beside `Square` yields the closest class both extend.
 When either side is nullable, the result is that base class made nullable, so `Circle?` beside `Square` yields `Shape?`.
-Classes that share only an interface do not unify, because a class may implement several interfaces at once and the intended one would be ambiguous; give the expression an explicit type in that case.
+Classes that share only an interface do not unify on their own, because a class may implement several interfaces at once and the intended one would be ambiguous.
+Where the place the value is read in states a type, such as a declared variable, a parameter or a return type, each arm or branch only has to convert to that type, so `Interaction chosen = tapped ? new Tap() : new Drag();` is accepted when both classes implement `Interaction`.
+Where nothing states one, the error names the interfaces the values share and the declaration that gives the value one of them.
 Unrelated types still do not unify, and branches that are all `null` give the expression no type of its own, so it can appear only where a plain `null` could.
 
 ```ens
@@ -1900,6 +1907,10 @@ let zs = [1, 2, 3];                // first-wins -> int[]
 let g = [[1, 2], [3, 4]];          // nested literal -> int[][]
 let h = [[1], []];                 // empty inner adopts first inner's type
 ```
+
+`...xs` among the elements puts every element of the array `xs` there, in order, so `[...head, middle, ...tail]` builds one array from two and a value between them.
+Each spread counts as elements of its array's element type for the rules above, so `long[] wide = [...ints, 3L];` converts every element of an `int[]`, and every element is read in the order written before the array is made.
+A spread is written only inside an array literal; a call takes the array itself, and a nullable array is checked for null first.
 
 An empty literal `[]` requires a target type, or as a branch of `?:` or an arm of a switch, another branch with a type of its own; `let xs = []` is rejected because there is no element to infer from. Write `int[] xs = []` or pass `[]` as an argument where the declared parameter type pins it down.
 
