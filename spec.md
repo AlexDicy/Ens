@@ -1526,6 +1526,8 @@ int n = arr.length;      // error: long -> int, can be forced with `arr.length a
 A nullable number widens the same way under each level of null, so an `int?` converts to a `long?` and an `int??` to a `long??`, and a `null` stays `null`.
 Two numbers that meet, as the two results of a `?:` or the two sides of `==`, take the wider type under as many levels of null as either has, so an `int?` beside a `long` gives a `long?`.
 
+An integer literal is written in base 10, or after a prefix in base 16 with `0x`, in base 8 with `0o` or in base 2 with `0b`, as in `0x1F`, `0o755` and `0b1010`, and `_` may separate its digits, as in `1_000_000`.
+A base 10 literal with more than one digit cannot start with `0`, because C and shells read `0755` as base 8, so it is an error that names both spellings; `0O` is refused for a capital O that is hard to tell from a zero.
 Integer literals without a type suffix adapt to the surrounding type when it's an integer that fits the value. With no context they default to `int`. Values out of range produce a specific error.
 Where a nullable type such as `byte?` is expected, a literal adapts to the type without the `?`, so `byte? small = 1;` compiles, and so does `small += 1;` right after it.
 A literal in parentheses adapts the same way as the literal alone.
