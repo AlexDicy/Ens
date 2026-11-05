@@ -194,7 +194,9 @@ public final class FunctionInfo {
 }
 
 // One lazy const of the program, with its field, the initializer that builds its value on the first
-// read, and the three symbols it owns. A generic type's instantiations share the template's.
+// read, and the three symbols it owns. A generic type's instantiations share the template's. A lazy
+// const of each object keeps its value and its state in the object, so it owns only the initializer,
+// one for each class or instantiation that declares it.
 public final class LazyValueInfo {
     Field declaredField;
     Expression valueInitializer;
@@ -202,12 +204,27 @@ public final class LazyValueInfo {
     string initializerLinkSymbol;
     string valueLinkSymbol;
     string stateLinkSymbol;
+    bool builtForEachObject;
 
     public constructor(this.declaredField, this.valueInitializer, this.owningType,
-                this.initializerLinkSymbol, this.valueLinkSymbol, this.stateLinkSymbol);
+                this.initializerLinkSymbol, this.valueLinkSymbol, this.stateLinkSymbol) {
+        this.builtForEachObject = false;
+    }
+
+    public constructor(this.declaredField, this.valueInitializer, this.owningType,
+                this.initializerLinkSymbol) {
+        this.valueLinkSymbol = "";
+        this.stateLinkSymbol = "";
+        this.builtForEachObject = true;
+    }
 
     public field() -> Field {
         return this.declaredField;
+    }
+
+    // Whether the value belongs to each object, which the initializer takes as its receiver.
+    public isForEachObject() -> bool {
+        return this.builtForEachObject;
     }
 
     public initializer() -> Expression {
@@ -677,6 +694,12 @@ indexRecords(ProgramAnalysis analysis, ProgramIndex index, ModuleContext context
                 continue;
             }
             moduleFunctions.classes().push(declared);
+            if (!declared.isGeneric()) {
+                for (let lazyInitializer in objectLazyInitializers(context, analysis.store(),
+                        declared, item.body(), null)) {
+                    index.addFunction(moduleFunctions, lazyInitializer);
+                }
+            }
             indexMethods(index, context, declared, declared.methods(), item.body(),
                 moduleFunctions, true);
             indexMethods(index, context, declared, declared.staticMethods(), item.body(),
@@ -749,6 +772,41 @@ indexLazyValues(ProgramIndex index, ModuleContext context, TypeStore store, Type
             Visibility.Public, false, null, null, null, null, info.initializerSymbol(), null,
             null, null, info));
     }
+}
+
+// The initializers of the lazy consts of each object 'classType' declares itself, the class or one
+// instantiation of it, each run over the object whose field is read first. 'active' is the
+// instantiation's substitution, or null for a class that is not generic.
+public objectLazyInitializers(ModuleContext context, TypeStore store, Type classType,
+                              MemberListNode body, Substitution? active) -> List<FunctionInfo> {
+    let found = new List<FunctionInfo>();
+    let fields = typemembers.fieldsOf(classType);
+    if (fields == null) {
+        return found;
+    }
+    for (long i = 0; i < body.membersCount(); i++) {
+        let member = body.members(i);
+        if (!(member is FieldDeclarationNode)) {
+            continue;
+        }
+        let initializer = member.defaultValue();
+        if (initializer == null) {
+            continue;
+        }
+        for (let field in fields) {
+            if (!field.isLazy() || field.nameSpan() != member.name().span()
+                    || field.definingType() != classType) {
+                continue;
+            }
+            let info = new LazyValueInfo(field, initializer.value(), classType,
+                symbols.objectLazyInitializerLinkName(classType, field.name()));
+            let signature = typemembers.synthesizedSignature(info.display(),
+                store.primitive(PrimitiveKind.Void), field.nameSpan());
+            found.push(new FunctionInfo(context, signature, Visibility.Public, false, null,
+                classType, null, null, info.initializerSymbol(), active, null, null, info));
+        }
+    }
+    return found;
 }
 
 // Instance methods run over their record, so their entries carry it as the receiver type; a

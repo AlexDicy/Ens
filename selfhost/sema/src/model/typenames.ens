@@ -27,38 +27,24 @@ import Map from @std.collections.map;
 import Set from @std.collections.set;
 import StringBuilder from @std.text.stringbuilder;
 
-// The refusal for a type written under a module name that declares it, with 'spelling' the name
-// as the file wrote it. Only a function can follow a module name, so the fix is the name this
-// file already has for the type, the import that would bind one, or why the module keeps the
-// type out of this file's reach and how to change that.
-public moduleQualifiedTypeMessage(string spelling, DeclaredType found, TypeNames names) -> string {
-    string refusal = moduleQualifiedRefusal(spelling);
-    if (!names.reaches(found)) {
-        string bound = freeNameFor(found, names);
-        string hidden = hiddenTypesMessage([offerOf(found, names)],
-            (offer) -> importWritten(found, bound, names), (offer) -> bound);
-        return "{refusal} {hidden}";
+// The refusal of 'spelling', a type written through the module that declares it, where that
+// module keeps the type out of this file's reach: why, and how to change that.
+public hiddenQualifiedTypeMessage(string spelling, DeclaredType found, TypeNames names) -> string {
+    let offer = offerOf(found, names);
+    string reason = hiddenReasonSentence(List.of([offer]));
+    if (!offer.isEditable()) {
+        return reason;
     }
-    let already = names.nameFor(found);
-    if (already != null) {
-        return "{refusal} This file already calls it '{already}', so write '{already}'.";
-    }
-    string bound = freeNameFor(found, names);
-    return "{refusal} Write '{importWritten(found, bound, names)}' and then '{bound}'.";
+    return "{reason} {offer.declarationFix()} in module '{offer.path()}' to write '{spelling}' here.";
 }
 
-// The same refusal where the module 'importPath', as the file's import writes it, declares no type
-// named 'name': the fix names the type the way the file can name it from another module, one of
-// 'candidates'.
+// The refusal of 'spelling', a type written through the module 'importPath', as the file's
+// import writes it, where that module declares no type named 'name': the fix names the type the
+// way the file can name it from another module, one of 'candidates'.
 public moduleQualifiedMissingTypeMessage(string spelling, string importPath, string name,
                                          TypeCandidates candidates, TypeNames names) -> string {
-    return "{moduleQualifiedRefusal(spelling)} Module '{diagnostics.sourceText(importPath)}' has no "
-        + "type named '{name}'. {missingTypeFix(name, "", candidates, names)}";
-}
-
-moduleQualifiedRefusal(string spelling) -> string {
-    return "'{spelling}' writes a type after a module name, and only a function can be written "
-        + "after a module name.";
+    return "Module '{diagnostics.sourceText(importPath)}' has no type named '{name}', so "
+        + "'{spelling}' names no type. {missingTypeFix(name, "", candidates, names)}";
 }
 
 // The import of 'found' this file would write, binding it under 'bound': 'import Kind as
@@ -90,18 +76,31 @@ public missingTypeFix(string name, string use, TypeCandidates candidates, TypeNa
     }
     let imported = new List<string>();
     let written = new List<string>();
+    let modules = new List<string>();
+    let throughModules = new List<string>();
     for (let offer in candidates.importable()) {
         let declared = offer.declared();
         let already = declared == null ? null : names.nameFor(declared);
-        if (already != null) {
-            string alias = already == name ? "" : " as '{already}'";
-            imported.push("'{name}' from '{offer.path()}'{alias}");
-            written.push("'{already}{use}'");
+        if (already == null) {
+            continue;
         }
+        if (already.contains(".")) {
+            modules.push("'{offer.path()}'");
+            throughModules.push("'{already}{use}'");
+            continue;
+        }
+        string alias = already == name ? "" : " as '{already}'";
+        imported.push("'{name}' from '{offer.path()}'{alias}");
+        written.push("'{already}{use}'");
     }
     if (imported.length() > 0) {
         return "This file already imports {diagnostics.andJoined(imported.toArray())}, so write "
             + "{diagnostics.andJoined(written.toArray(), "or")}.";
+    }
+    if (modules.length() > 0) {
+        string declares = modules.length() == 1 ? "which declares" : "which each declare";
+        return "This file already imports {diagnostics.andJoined(modules.toArray())}, {declares} "
+            + "'{name}', so write {diagnostics.andJoined(throughModules.toArray(), "or")}.";
     }
     if (candidates.importable().length > 0) {
         return importedTypesFix(candidates.importable(), use, names);
@@ -394,11 +393,6 @@ headSpelling(Type head, TypeNames names) -> string {
     return names.of(head);
 }
 
-// The sentence that writes the static 'member' of 'declared' in the file 'names' belongs to.
-public qualifiedMemberFix(DeclaredType declared, string member, TypeNames names) -> string {
-    return "Write {qualifiedMemberSpelling(declared, member, names)}.";
-}
-
 // The name a static of 'declaring' is written behind in the file 'names' belongs to.
 staticFront(DeclaredType declaring, TypeNames names) -> string {
     return names.nameFor(declaring) ?? freeNameFor(declaring, names);
@@ -613,6 +607,8 @@ export final class TypeNames {
     Map<DeclaredType, string> importedNames;
     Set<string> boundTypeNames;
     Set<string> boundModuleNames;
+    // The name each imported module is bound under, first import first, by its module path.
+    Map<string, string> moduleNamesByPath;
     // The type parameters in scope where these names are used, whose names hide a type of the file.
     Set<string> typeParameterNames;
 
@@ -628,7 +624,26 @@ export final class TypeNames {
         this.importedNames = imported;
         this.boundTypeNames = boundTypes;
         this.boundModuleNames = boundModules;
+        this.moduleNamesByPath = new Map<string, string>();
         this.typeParameterNames = new Set<string>();
+    }
+
+    // These names where the file also imports modules, 'modules' giving the name each is bound
+    // under by its module path, so a type the file names only through its module is spelled that
+    // way, as in 'version.Edition'.
+    public withModules(Map<string, string> modules) -> TypeNames {
+        let named = this.copied(this.importedNames, this.boundTypeNames);
+        named.moduleNamesByPath = modules;
+        return named;
+    }
+
+    copied(Map<DeclaredType, string> imported, Set<string> boundTypes) -> TypeNames {
+        let copy = new TypeNames(this.namingFilePath, this.namingModulePath, this.namingPackagePrefix,
+            this.namingStore, this.implicitModulePaths, imported, boundTypes, this.boundModuleNames,
+            this.namingEditable);
+        copy.moduleNamesByPath = this.moduleNamesByPath;
+        copy.typeParameterNames = this.typeParameterNames;
+        return copy;
     }
 
     // These names inside the declaration of 'owner', or of a function declaring 'declared', with
@@ -652,9 +667,8 @@ export final class TypeNames {
     // These names inside a declaration whose type parameters 'parameters' are in scope, where a
     // type of the file under one of those names cannot be written by it.
     public withTypeParameters(string[] parameters) -> TypeNames {
-        let scoped = new TypeNames(this.namingFilePath, this.namingModulePath, this.namingPackagePrefix,
-            this.namingStore, this.implicitModulePaths, this.importedNames, this.boundTypeNames,
-            this.boundModuleNames, this.namingEditable);
+        let scoped = this.copied(this.importedNames, this.boundTypeNames);
+        scoped.typeParameterNames = new Set<string>();
         for (let parameter in parameters) {
             scoped.typeParameterNames.add(parameter);
         }
@@ -816,6 +830,10 @@ export final class TypeNames {
         if (this.bareNameResolvesTo(declared)) {
             return declared.name();
         }
+        let module = this.moduleNamesByPath.get(declared.modulePath());
+        if (module != null && this.reaches(declared)) {
+            return "{module}.{declared.name()}";
+        }
         return null;
     }
 
@@ -893,11 +911,7 @@ export final class TypeNames {
         imported.set(declared, bound);
         let boundTypes = this.boundTypeNames.copy();
         boundTypes.add(bound);
-        let extended = new TypeNames(this.namingFilePath, this.namingModulePath, this.namingPackagePrefix,
-            this.namingStore, this.implicitModulePaths, imported, boundTypes, this.boundModuleNames,
-            this.namingEditable);
-        extended.typeParameterNames = this.typeParameterNames;
-        return extended;
+        return this.copied(imported, boundTypes);
     }
 
     // Whether this file can write the type, which a diagnostic offering code to paste has to
@@ -982,7 +996,7 @@ export final class TypeNames {
     }
 
     // Whether this file may name the type at all, by the visibility it was declared with.
-    protected reaches(DeclaredType declared) -> bool {
+    public reaches(DeclaredType declared) -> bool {
         return types.isVisibleFrom(declared.visibility(), declared.modulePath(),
             declared.packagePrefix(), this.namingModulePath, this.namingPackagePrefix);
     }

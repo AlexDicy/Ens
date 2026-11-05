@@ -652,27 +652,17 @@ public analyzeMemberValue(BodyChecker checker, MemberExpressionNode node,
         string objectName = object.name().text();
         let resolution = checker.resolveName(objectName);
         if (resolution is NamespaceName) {
-            return analyzeNamespaceMemberValue(checker, node, resolution, objectName, wanted, declared);
+            return analyzeNamespaceMemberValue(checker, node, resolution, objectName, position, wanted,
+                declared);
         }
         let enumType = enumTypeNamed(checker, resolution);
         if (enumType != null) {
-            checker.result().setType(object.green(), enumType);
-            long ordinal = switches.enumOrdinal(enumType, name);
-            if (ordinal >= 0) {
-                if (position == MemberPosition.Write) {
-                    checker.reporter().report("'{name}' is a member of enum "
-                        + "{checker.names().quotedName(enumType)}, so it cannot be assigned.",
-                        node.member().span());
-                    return checker.store().errorType();
-                }
-                checker.result().setEnumConstant(node.green(), ordinal);
-                return enumType;
-            }
-            checker.reporter().report("'{name}' is not a member of enum "
-                + "{checker.names().quotedName(enumType)}.{wording.membersListed(enumType)}",
-                node.member().span());
-            return checker.store().errorType();
+            return enumMemberValue(checker, node, object, enumType, position);
         }
+    }
+    let qualified = qualifiedTypeOf(checker, object);
+    if (qualified is EnumType) {
+        return enumMemberValue(checker, node, object, qualified, position);
     }
     let staticHead = staticmembers.resolveStaticHead(checker, object);
     if (staticHead != null) {
@@ -764,7 +754,11 @@ public analyzeMemberValue(BodyChecker checker, MemberExpressionNode node,
             }
             let receiver = syntax.unwrapParentheses(object);
             bool throughThis = receiver is ThisExpressionNode || receiver is SuperExpressionNode;
-            if (position != MemberPosition.Write && throughThis) {
+            if (position != MemberPosition.Write && throughThis && found.field.isLazy()
+                    && writtenMember == null) {
+                checker.assignment().checkThisUse(new ThisUse(ThisUseKind.LazyRead, null, name,
+                    node.span()));
+            } else if (position != MemberPosition.Write && throughThis) {
                 ThisUseKind kind = ThisUseKind.Read;
                 if (writtenMember != null) {
                     kind = ThisUseKind.MemberWrite;
@@ -1146,11 +1140,56 @@ public analyzeSafeMemberValue(BodyChecker checker, SafeMemberExpressionNode node
     }
 }
 
-// A module-qualified name written where a value, a call or a member head belongs, with 'head'
-// the module as this file writes it. A module name reaches only that module's functions, so a
-// type of that module is refused here whatever follows it.
+// The member 'node' names of the enum 'enumType', which 'object' names: the constant it is, or
+// the refusal of a member the enum does not have or of a write to one.
+enumMemberValue(BodyChecker checker, MemberExpressionNode node, Expression object,
+                EnumType enumType, MemberPosition position) -> Type {
+    string name = node.member().text();
+    checker.result().setType(object.green(), enumType);
+    long ordinal = switches.enumOrdinal(enumType, name);
+    if (ordinal >= 0) {
+        if (position == MemberPosition.Write) {
+            checker.reporter().report("'{name}' is a member of enum "
+                + "{checker.names().quotedName(enumType)}, so it cannot be assigned.",
+                node.member().span());
+            return checker.store().errorType();
+        }
+        checker.result().setEnumConstant(node.green(), ordinal);
+        return enumType;
+    }
+    checker.reporter().report("'{name}' is not a member of enum "
+        + "{checker.names().quotedName(enumType)}.{wording.membersListed(enumType)}",
+        node.member().span());
+    return checker.store().errorType();
+}
+
+// The type 'object' names when it is a type written through the module that declares it, as in
+// 'version.Edition', and this file may use that type. Null for anything else.
+public qualifiedTypeOf(BodyChecker checker, Expression object) -> DeclaredType? {
+    if (!(object is MemberExpressionNode)) {
+        return null;
+    }
+    let head = object.object();
+    if (!(head is IdentifierExpressionNode)) {
+        return null;
+    }
+    let resolution = checker.resolveName(head.name().text());
+    if (!(resolution is NamespaceName)) {
+        return null;
+    }
+    let found = checker.store().findDeclared(resolution.targetModulePath(), object.member().text());
+    if (found == null || !checker.names().reaches(found)) {
+        return null;
+    }
+    return found;
+}
+
+// A module-qualified name written where a value or, in the 'Covered' position, a call belongs,
+// with 'head' the module as this file writes it: a function of that module, or a type of it,
+// which is neither a value nor a function.
 analyzeNamespaceMemberValue(BodyChecker checker, MemberExpressionNode node, NamespaceName module,
-                            string head, FunctionType? wanted, Type? declared = null) -> Type {
+                            string head, MemberPosition position, FunctionType? wanted,
+                            Type? declared = null) -> Type {
     string name = node.member().text();
     Span memberSpan = node.member().span();
     let found = checker.store().findDeclared(module.targetModulePath(), name);
@@ -1158,8 +1197,16 @@ analyzeNamespaceMemberValue(BodyChecker checker, MemberExpressionNode node, Name
         reportNamespaceMember(checker, module, head, name, memberSpan, wanted, declared);
         return checker.store().errorType();
     }
-    checker.reporter().report(typenames.moduleQualifiedTypeMessage("{head}.{name}", found, checker.names()),
-        node.span());
+    if (!checker.names().reaches(found)) {
+        checker.reporter().report(typenames.hiddenQualifiedTypeMessage("{head}.{name}", found,
+            checker.names()), node.span());
+        return checker.store().errorType();
+    }
+    if (position == MemberPosition.Covered) {
+        identifiers.reportTypeAsCall(checker, "{head}.{name}", found, node.span());
+    } else {
+        identifiers.reportTypeAsValue(checker, "{head}.{name}", found, node.span());
+    }
     return checker.store().errorType();
 }
 
