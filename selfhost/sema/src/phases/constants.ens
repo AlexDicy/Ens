@@ -572,14 +572,17 @@ class ConstantEvaluator {
             },
             is GenericNameExpressionNode generic -> {
                 let head = generic.head();
-                string headName = "";
                 if (head is IdentifierExpressionNode) {
-                    headName = head.name().text();
-                    named = this.resolveTypeName(item, headName);
-                }
-                if (named == null) {
-                    this.reportUnknownHead(item, headName, memberName, member.span());
-                    return null;
+                    named = this.resolveTypeName(item, head.name().text());
+                    if (named == null) {
+                        this.reportUnknownHead(item, head.name().text(), memberName, member.span());
+                        return null;
+                    }
+                } else {
+                    named = this.resolveQualifiedHead(item, head, memberName, member.span());
+                    if (named == null) {
+                        return null;
+                    }
                 }
                 if (members.findField(typemembers.staticFieldsOf(named), memberName) == null) {
                     this.reportMissingStaticConst(item, member, named);
@@ -592,8 +595,10 @@ class ConstantEvaluator {
                 return null;
             },
             default -> {
-                this.reportQualifiedHead(item, member, memberName);
-                return null;
+                named = this.resolveQualifiedHead(item, object, memberName, member.span());
+                if (named == null) {
+                    return null;
+                }
             },
         }
         let field = members.findField(typemembers.staticFieldsOf(named), memberName);
@@ -714,6 +719,16 @@ class ConstantEvaluator {
             return;
         }
         let declared = this.resolveDeclared(item, headName);
+        if (declared != null) {
+            this.reportHeadWithoutStatics(item, declared, memberName, span);
+            return;
+        }
+        this.reportNotConstant(item, span, "'{headName}' is not a class or struct this file "
+            + "can name");
+    }
+
+    // A head that names an enum, or a class or struct that declares no statics.
+    reportHeadWithoutStatics(ConstantItem item, DeclaredType declared, string memberName, Span span) {
         if (declared is EnumType) {
             string quotedEnum = this.namesOf(item).quotedName(declared);
             string path = this.namesOf(item).quotedNamedCode(["", ".{memberName}"], [declared]);
@@ -732,13 +747,8 @@ class ConstantEvaluator {
                 + "and a static const can only have a number type, 'char', 'bool' or 'string'");
             return;
         }
-        if (declared != null) {
-            this.report(item, typenames.noStaticMembersMessage(declared, memberName, this.namesOf(item)),
-                span);
-            return;
-        }
-        this.reportNotConstant(item, span, "'{headName}' is not a class or struct this file "
-            + "can name");
+        this.report(item, typenames.noStaticMembersMessage(declared, memberName, this.namesOf(item)),
+            span);
     }
 
     // Whether the type declaring this constant introduced a type parameter of this name,
@@ -755,40 +765,50 @@ class ConstantEvaluator {
         return false;
     }
 
-    reportQualifiedHead(ConstantItem item, MemberExpressionNode member, string memberName) {
-        let object = member.object();
-        if (object is MemberExpressionNode) {
-            let inner = object.object();
+    // The class or struct a head such as 'sizes.Sizes' names through the module that declares it,
+    // or null once the head is reported.
+    resolveQualifiedHead(ConstantItem item, Expression head, string memberName, Span span)
+            -> DeclaredType? {
+        if (head is MemberExpressionNode) {
+            let inner = head.object();
             if (inner is IdentifierExpressionNode) {
                 let binding = item.context.linkTable().binding(inner.name().text());
                 if (binding is ImportedNamespace) {
-                    string typeName = object.member().text();
-                    this.reportNotConstant(item, member.span(), "it reads "
-                        + "'{typeName}.{memberName}' through the module name "
-                        + "'{inner.name().text()}'",
-                        this.importFix(item, binding, typeName, memberName));
-                    return;
+                    return this.resolveModuleType(item, binding, inner.name().text(), head,
+                        memberName, span);
                 }
             }
         }
-        this.reportNotConstant(item, member.span(),
+        this.reportNotConstant(item, span,
             "it reads a member of a value, which only exists at run time");
+        return null;
     }
 
-    // The fix for a static const read through a module name: the name this file already has for
-    // the type, the import that gives it one, or why no import can.
-    importFix(ConstantItem item, ImportedNamespace module, string typeName, string memberName)
-            -> string {
+    resolveModuleType(ConstantItem item, ImportedNamespace module, string moduleName,
+                      MemberExpressionNode head, string memberName, Span span) -> DeclaredType? {
+        string typeName = head.member().text();
+        string spelling = "{moduleName}.{typeName}";
+        let names = this.namesOf(item);
         let declared = item.context.resolver().typeStore().findDeclared(module.modulePath(),
             typeName);
         if (declared == null) {
             let candidates = item.context.linkTable().typeCandidates(typeName);
-            string fix = typenames.missingTypeFix(typeName, ".{memberName}", candidates,
-                this.namesOf(item));
-            return "Module '{diagnostics.sourceText(module.importPath())}' has no type named "
-                + "'{typeName}'. {fix}";
+            this.report(item, typenames.moduleQualifiedMissingTypeMessage(spelling,
+                module.importPath(), typeName, candidates, names), head.span());
+            return null;
         }
-        return typenames.qualifiedMemberFix(declared, memberName, this.namesOf(item));
+        if (!types.isVisibleFrom(declared.visibility(), declared.modulePath(),
+                declared.packagePrefix(), item.context.module().canonicalPath(),
+                item.context.module().packagePrefix())) {
+            this.report(item, typenames.hiddenQualifiedTypeMessage(spelling, declared, names),
+                head.span());
+            return null;
+        }
+        let owner = this.asStaticOwner(declared);
+        if (owner == null) {
+            this.reportHeadWithoutStatics(item, declared, memberName, span);
+        }
+        return owner;
     }
 
     evaluateIdentifier(ConstantItem item, IdentifierExpressionNode identifier) {

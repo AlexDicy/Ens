@@ -774,8 +774,9 @@ Source files are UTF-8 text.
 A byte order mark at the very start of a file is accepted and skipped; the same bytes anywhere else in the file are an error.
 
 A module's private declarations never leave its file; `public` declarations are visible to every module in the same package, and `export` declarations also to the packages that consume it.
-A type is reached only by the name the file binds to it, its own declaration or an import, so a module name never qualifies a type: after `import engine.renderer;` the spelling `renderer.Renderer` is an error that names the import to write.
-Free functions are the other way round, always called through their module name and never imported by name: write `import engine.renderer;` then call `renderer.configure()`.
+A type is also reached through the module that declares it: after `import engine.renderer;`, `renderer.Renderer` names the type wherever a type or a static member is written, as in `renderer.Renderer canvas = new renderer.Renderer();` and `renderer.Mode.Fast`, under the same visibility rules as an import of it.
+A diagnostic spells a type that way when the file has no other name for it.
+Free functions are only ever called through their module name and never imported by name: write `import engine.renderer;` then call `renderer.configure()`.
 Importing a function by name (`import configure from engine.renderer;`) is an error.
 The implicitly imported modules described below are the one exception: no import is written for them at all, so their exported functions are called unqualified.
 
