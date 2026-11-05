@@ -405,18 +405,21 @@ A cycle between static const initializers is an error, and so are function calls
 A static const's type is therefore a primitive, `char`, `bool`, or `string`, and on a generic type neither it nor its initializer can mention the type's parameters, so every instantiation shares one value.
 Reads go through the type name, as in `Path.separator`, and each read compiles to the constant's value; assigning to a static const, or applying `++` or `--` to one, is an error.
 
-A `lazy const` field is a type-level value with a written type and a mandatory initializer, declared `static lazy const`: `export static lazy const FrozenMap<string, string> defaults = loadDefaults();`.
-The initializer runs on the first read and the value is kept for the rest of the program, so unlike a static const's it may call functions, allocate, and build aggregates.
+A `lazy const` field has a written type and a mandatory initializer that runs on the first read of the field, so unlike a static const's it may call functions, allocate, and build aggregates.
 It may not throw, which is what keeps a read from needing `try`.
-A lazy const is read through the type name, as in `Settings.defaults`.
-`static` is required, since the value belongs to the type, so a `lazy const` written without it is an error that names the word to add.
-Every task in a program can read a lazy const by name, so its type must be shareable, as the section on tasks defines; `static lazy const List<string> names` is refused naming the type, and a `FrozenList<string>` is what to write there.
-The value's destructor never runs, because the program holds the value to the end.
-On a generic type a lazy const's type and its initializer cannot mention the type's parameters, so every instantiation shares one value.
-Assigning to a lazy const, or applying `++` or `--` to one, is an error.
+Declared `static lazy const`, it is a type-level value kept for the rest of the program: `export static lazy const FrozenMap<string, string> defaults = loadDefaults();`.
+A static lazy const is read through the type name, as in `Settings.defaults`.
+Every task in a program can read a static lazy const by name, so its type must be shareable, as the section on tasks defines; `static lazy const List<string> names` is refused naming the type, and a `FrozenList<string>` is what to write there.
+Its value's destructor never runs, because the program holds the value to the end.
+On a generic type a static lazy const's type and its initializer cannot mention the type's parameters, so every instantiation shares one value.
+Declared without `static` in a class, a lazy const is a field of each object: `lazy const string heading = this.makeHeading();`.
+Its initializer runs on the first read of the field on one object, may use `this` as a method does, and gives that object a value it keeps as long as the object lives.
+A constructor may read the field only once every field of the class has a value, since the initializer may read any of them.
+A struct declares only static lazy consts, because each copy of a struct value would build its own.
+Assigning to a lazy const, or applying `++` or `--` to one, is an error, in a constructor too.
 So is writing a field of a struct-typed lazy const, at any depth and in any of those forms, because a struct's fields are part of its value.
 So is calling a `mutating` method on one.
-A cycle between two lazy const initializers is a compile error where the initializers read each other directly; one that closes through a function call stops the program on the read that closes it, naming the value.
+A cycle between two lazy const initializers is a compile error where the initializers read each other directly, through the type name or through `this`; one that closes through a function call stops the program on the read that closes it, naming the value.
 
 A static of a generic type takes the type's arguments in one of three ways.
 They may be written on the type name: `List<int>.withCapacity(8)`.
@@ -2160,7 +2163,7 @@ shared interface Handler {
 serve(Config config, shared (Request) -> Response handler) { /* ... */ }
 ```
 
-The rule is checked in three places: at a lambda a task runs, at a value sent through a channel or kept in a `Mutex` or an `Atomic`, and at a `lazy const`, which every task can read by name.
+The rule is checked in three places: at a lambda a task runs, at a value sent through a channel or kept in a `Mutex` or an `Atomic`, and at a static `lazy const`, which every task can read by name.
 A capture, a send, a store or a `lazy const` of a type that is not shareable is an error naming the value and its type and saying what to write: `frozen()` for a container, a `Mutex` around a value that has to change, or the values the task should return instead.
 
 What a task returns is not held to the rule: the task has finished when its value is taken, so the value belongs to whoever takes it, whatever its type, and a task may build a syntax tree, a list or a map and hand it back.
@@ -2168,8 +2171,8 @@ A frozen copy, a `Mutex`, an `Atomic` and a task's result are therefore the ways
 A task may also lend what it owns for exactly as long as it waits: the loops of `@std.parallel` park the calling task until every piece of work is done, so an array only that task could write is handed to the pieces in disjoint parts to write, or whole to read, with no copy and no further rule.
 
 Reference counts are already shared between threads, so a shareable object may be held by any number of tasks at once, and a destructor runs on the task that released the last reference, which is the only task that could still reach the object.
-The initializer of a `lazy const` runs once however many tasks read it first at the same moment, and the others wait for its value.
-An object a `lazy const` holds is kept to the end of the program, so its reference count is never changed again once it is built, and reading it costs no task a write to it.
+The initializer of a `lazy const` runs once however many tasks read it first at the same moment, and the others wait for its value; for a lazy const of each object, that holds for each object of a `shared` class.
+An object a static `lazy const` holds is kept to the end of the program, so its reference count is never changed again once it is built, and reading it costs no task a write to it.
 
 ---
 

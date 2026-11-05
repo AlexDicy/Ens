@@ -2,9 +2,12 @@
 // value, and the guard a read is fronted by. The value is built once however many tasks read it
 // first, by the first of them while the others wait, and a reference it holds is made immortal, so a
 // read returns a borrowed one that no task's count changes and the cycle refusal stays off the hot
-// path.
+// path. A lazy const of each object keeps its value and its state in two fields of the object
+// instead, and is released with the object's other fields.
 import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
+import Span from @ens.frontend.support.source;
 import Field from @ens.sema.model.typemembers;
+import @ens.sema.model.typemembers;
 import PrimitiveKind from @ens.sema.model.types;
 import Type from @ens.sema.model.types;
 import @ens.sema.model.types;
@@ -25,6 +28,8 @@ import LoweringContext from lower.context;
 import lower.ownedreads;
 import lower.ownership;
 import lower.places;
+import lower.records;
+import lower.symbols;
 import lower.stores;
 import lower.strings;
 import support.primitives;
@@ -46,24 +51,58 @@ public lowerReadAddress(LoweringContext lowering, MemberExpressionNode member, F
             + "planned for it", member.span());
         return -1;
     }
+    guardRead(lowering, member.span(), stateAddress(lowering, lazyValue),
+        initializerCallee(lowering, lazyValue), -1);
+    return valueAddress(lowering, lazyValue);
+}
+
+// Reads the lazy const at 'index' of the object 'object' of 'classType', taking the call of the
+// initializer of the class that declares it only on the cold edge. Returns the address of the value.
+public lowerObjectReadAddress(LoweringContext lowering, Span span, Type classType, long object,
+                              long index) -> long {
+    let fields = records.fieldsOf(classType);
+    if (fields == null) {
+        return -1;
+    }
+    let field = fields.get(index);
+    let declaring = field.definingType();
+    string symbol = symbols.objectLazyInitializerLinkName(declaring, field.name());
+    if (lowering.index().functionForSymbol(symbol) == null) {
+        lowering.internalError("lazy const '{field.name()}' reached lowering with no initializer "
+            + "planned for it", span);
+        return -1;
+    }
+    long state = records.fieldAddressIn(lowering, object, classType, stateType(lowering), index + 1);
+    guardRead(lowering, span, state, new EirCallee(symbol, declaring, [], voidType(lowering)),
+        object);
+    return records.fieldAddressIn(lowering, object, classType, field.type(), index);
+}
+
+// The guard in front of a read: the value is there, or the initializer 'callee' builds it, run over
+// 'receiver' where it takes one.
+guardRead(LoweringContext lowering, Span span, long state, EirCallee callee, long receiver) {
     let builder = lowering.builder();
-    long ready = guardCall(lowering, booleanType(lowering), "ens_lazy_ready", lazyValue);
+    long ready = guardCall(lowering, booleanType(lowering), "ens_lazy_ready", state);
     let readyBlock = builder.newBlock("lazy.ready");
     let buildBlock = builder.newBlock("lazy.build");
     builder.terminate(new EirBranch(ready, readyBlock, buildBlock));
     builder.moveTo(buildBlock);
-    builder.append(new EirCall(-1, voidType(lowering), initializerCallee(lowering, lazyValue),
-        -1, [], -1, null, lowering.lineAt(member.span())));
+    builder.append(new EirCall(-1, voidType(lowering), callee, receiver, [], -1, null,
+        lowering.lineAt(span)));
     builder.terminate(new EirJump(readyBlock));
     builder.moveTo(readyBlock);
-    return valueAddress(lowering, lazyValue);
 }
 
 // Builds one lazy const's value in the module that declares it, between the marks that record the
 // building has begun and that the value is there.
 public lowerInitializer(LoweringContext lowering, LazyValueInfo lazyValue) -> bool {
     let builder = lowering.builder();
-    long entry = guardCall(lowering, entryType(lowering), "ens_lazy_enter", lazyValue);
+    long index = -1;
+    if (lazyValue.isForEachObject()) {
+        index = typemembers.inheritedOrOwnFieldIndex(lazyValue.owner(), lazyValue.field().name());
+    }
+    long entry = guardCall(lowering, entryType(lowering), "ens_lazy_enter",
+        storedStateAddress(lowering, lazyValue, index));
     let checkBlock = builder.newBlock("lazy.check");
     let builtBlock = builder.newBlock("lazy.built");
     let cycleBlock = builder.newBlock("lazy.cycle");
@@ -90,17 +129,18 @@ public lowerInitializer(LoweringContext lowering, LazyValueInfo lazyValue) -> bo
     if (operand == null) {
         return false;
     }
-    long address = valueAddress(lowering, lazyValue);
+    long address = storedValueAddress(lowering, lazyValue, index);
     if (!stores.initializeThroughAddress(lowering, address, valueType, operand)) {
         lowering.internalError("the initializer of lazy const '{lazyValue.display()}' borrows "
             + "a value with no storage to retain", lazyValue.initializer().span());
         return false;
     }
-    if (primitives.isReferenceType(valueType)) {
+    if (!lazyValue.isForEachObject() && primitives.isReferenceType(valueType)) {
         builder.append(new EirForeignCall(-1, voidType(lowering), "ens_lazy_keep",
             [valueAddress(lowering, lazyValue)], [valueType], [true]));
     }
-    guardCall(lowering, voidType(lowering), "ens_lazy_leave", lazyValue);
+    guardCall(lowering, voidType(lowering), "ens_lazy_leave",
+        storedStateAddress(lowering, lazyValue, index));
     ownership.releaseAllScopes(lowering);
     builder.terminate(new EirReturn(-1));
     lowering.popScope();
@@ -109,9 +149,8 @@ public lowerInitializer(LoweringContext lowering, LazyValueInfo lazyValue) -> bo
 
 // Calls one of the guard's bridges over the state word, which it is handed by address, and returns
 // the temp holding what it answers, or -1 for a bridge that answers nothing.
-guardCall(LoweringContext lowering, Type type, string symbol, LazyValueInfo lazyValue) -> long {
+guardCall(LoweringContext lowering, Type type, string symbol, long address) -> long {
     let builder = lowering.builder();
-    long address = stateAddress(lowering, lazyValue);
     long result = -1;
     if (!types.isVoidType(type)) {
         result = builder.newTemp(type);
@@ -130,6 +169,23 @@ entryTest(LoweringContext lowering, long entry, long against) -> long {
     builder.append(new EirBinary(result, booleanType(lowering), EirBinaryOp.CmpEq, entry,
         expected));
     return result;
+}
+
+// The state word an initializer marks: a global, or the field after the value in the object the
+// initializer runs over, whose layout places the value at 'index'.
+storedStateAddress(LoweringContext lowering, LazyValueInfo lazyValue, long index) -> long {
+    if (!lazyValue.isForEachObject()) {
+        return stateAddress(lowering, lazyValue);
+    }
+    return records.fieldAddressIn(lowering, 0, lazyValue.owner(), stateType(lowering), index + 1);
+}
+
+storedValueAddress(LoweringContext lowering, LazyValueInfo lazyValue, long index) -> long {
+    if (!lazyValue.isForEachObject()) {
+        return valueAddress(lowering, lazyValue);
+    }
+    Type valueType = lowering.substituted(lazyValue.field().type());
+    return records.fieldAddressIn(lowering, 0, lazyValue.owner(), valueType, index);
 }
 
 stateAddress(LoweringContext lowering, LazyValueInfo lazyValue) -> long {

@@ -13,6 +13,7 @@ import ParenthesizedExpressionNode from @ens.frontend.syntax.generated.nodes;
 import MemberExpressionNode from @ens.frontend.syntax.generated.nodes;
 import GenericNameExpressionNode from @ens.frontend.syntax.generated.nodes;
 import IdentifierExpressionNode from @ens.frontend.syntax.generated.nodes;
+import ThisExpressionNode from @ens.frontend.syntax.generated.nodes;
 import CallExpressionNode from @ens.frontend.syntax.generated.nodes;
 import NewExpressionNode from @ens.frontend.syntax.generated.nodes;
 import ArrayLiteralExpressionNode from @ens.frontend.syntax.generated.nodes;
@@ -125,7 +126,9 @@ class ConstantEvaluator {
             if (!modifiers.declaresStatic && !modifiers.declaresLazy) {
                 continue;
             }
-            let field = members.findField(typemembers.staticFieldsOf(owner), member.name().text());
+            let declaredIn = modifiers.declaresStatic ? typemembers.staticFieldsOf(owner)
+                : typemembers.fieldsOf(owner);
+            let field = members.findField(declaredIn, member.name().text());
             if (field == null || field.nameSpan() != member.name().span()) {
                 continue;
             }
@@ -197,17 +200,24 @@ class ConstantEvaluator {
         }
     }
 
+    // A read through a type name reaches a static lazy const, and a read through 'this' in the
+    // initializer of a lazy const of each object reaches another one of the same object.
     followLazyReference(ConstantItem item, MemberExpressionNode member) {
-        let object = member.object();
-        if (!(object is IdentifierExpressionNode)) {
-            return;
-        }
-        let named = this.resolveTypeName(item, object.name().text());
-        if (named == null) {
-            return;
-        }
+        let object = syntax.unwrapParentheses(member.object());
         string memberName = member.member().text();
-        let field = members.findField(typemembers.staticFieldsOf(named), memberName);
+        Field? field = null;
+        string read = "";
+        if (object is ThisExpressionNode && this.isObjectLazy(item)) {
+            field = typemembers.inheritedOrOwnField(item.owner, memberName);
+            read = "'this.{memberName}'";
+        } else if (object is IdentifierExpressionNode) {
+            let named = this.resolveTypeName(item, object.name().text());
+            if (named == null) {
+                return;
+            }
+            field = members.findField(typemembers.staticFieldsOf(named), memberName);
+            read = this.quotedMemberPath(item, named, memberName);
+        }
         if (field == null || !field.isLazy()) {
             return;
         }
@@ -216,13 +226,26 @@ class ConstantEvaluator {
             return;
         }
         if (target.state == ConstantItem.evaluating) {
-            string read = this.quotedMemberPath(item, named, memberName);
-            this.report(item, "{this.quotedItemName(item)} cannot take its value from {read}: "
+            this.report(item, "{this.lazyItemName(item)} cannot take its value from {read}: "
                 + "the lazy consts between them form a cycle. Build one of the two without "
                 + "reading the other.", member.span());
             return;
         }
         this.walkLazyItem(target);
+    }
+
+    // Whether the item is a lazy const of each object, which its owner's layout holds.
+    isObjectLazy(ConstantItem item) -> bool {
+        return members.findField(typemembers.fieldsOf(item.owner), item.field.name()) == item.field;
+    }
+
+    // The lazy const this item declares, as a diagnostic opens with it: 'Streams.input' for a
+    // static one, and 'first' of 'Loop' for one of each object.
+    lazyItemName(ConstantItem item) -> string {
+        if (this.isObjectLazy(item)) {
+            return "Lazy const '{item.field.name()}' of {this.quotedOwner(item)}";
+        }
+        return this.quotedItemName(item);
     }
 
     // The names the file declaring this constant has for the program's types.

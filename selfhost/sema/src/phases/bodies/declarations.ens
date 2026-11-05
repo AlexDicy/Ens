@@ -85,6 +85,7 @@ public checkClassBodies(BodyChecker checker, ClassDeclarationNode node) {
         checker.enterObligationOwner(found);
         checkFieldDefaults(checker, found, node.body());
         checkLazyInitializers(checker, found, node.body());
+        checkObjectLazyInitializers(checker, found, node.body());
         checkMemberBodies(checker, found, found.methods(), found.staticMethods(), node.body());
         checker.leaveObligationOwner();
     }
@@ -534,12 +535,13 @@ checkFieldDefaults(BodyChecker checker, DeclaredType owner, MemberListNode body)
     let fields = typemembers.fieldsOf(owner);
     long pushed = pushOwnerTypeParameters(checker, owner);
     let outerFrame = checker.enterBody(new Scope(null), new CallableFrame(owner));
-    // Type-level fields stay out on both sides. A static const's initializer is the
-    // compile-time constant the constants phase evaluates, and a lazy const's runs on the
-    // first read with no instance in reach, so neither is an expression over sibling fields.
+    // Type-level fields and lazy consts stay out on both sides. A static const's initializer is
+    // the compile-time constant the constants phase evaluates, and a lazy const's runs on the
+    // first read, so neither is an expression over sibling fields.
     for (long i = 0; i < body.membersCount(); i++) {
         let member = body.members(i);
-        if (member is FieldDeclarationNode && !members.isTypeLevelField(member)) {
+        if (member is FieldDeclarationNode && !members.isTypeLevelField(member)
+                && !members.isObjectLazyField(member)) {
             let sink = checker.currentScope();
             if (sink != null) {
                 sink.define(new LocalBinding(member.name().text(),
@@ -550,7 +552,8 @@ checkFieldDefaults(BodyChecker checker, DeclaredType owner, MemberListNode body)
     }
     for (long i = 0; i < body.membersCount(); i++) {
         let member = body.members(i);
-        if (member is FieldDeclarationNode && !members.isTypeLevelField(member)) {
+        if (member is FieldDeclarationNode && !members.isTypeLevelField(member)
+                && !members.isObjectLazyField(member)) {
             let defaultValue = member.defaultValue();
             if (defaultValue != null) {
                 Type expected = fieldTypeOrError(checker, fields, member.name().text());
@@ -631,13 +634,63 @@ checkLazyInitializers(BodyChecker checker, DeclaredType owner, MemberListNode bo
     checker.resolver().popTypeParameters(pushed);
 }
 
+// A lazy const of each object types its initializer the way a method body is typed: 'this' is the
+// object whose field is read first, and the owner's type parameters are that object's own.
+checkObjectLazyInitializers(BodyChecker checker, DeclaredType owner, MemberListNode body) {
+    Type receiver = thisTypeOf(checker, owner);
+    long pushed = pushOwnerTypeParameters(checker, owner);
+    for (long i = 0; i < body.membersCount(); i++) {
+        let member = body.members(i);
+        if (!(member is FieldDeclarationNode) || !members.isObjectLazyField(member)) {
+            continue;
+        }
+        let field = members.findField(typemembers.fieldsOf(owner), member.name().text());
+        let initializer = member.defaultValue();
+        if (field == null || initializer == null) {
+            continue;
+        }
+        Type expected = field.type();
+        if (types.isVoidType(expected)) {
+            expected = checker.store().errorType();
+        }
+        string subject = "Lazy const '{field.name()}' of {checker.names().quotedName(owner)}";
+        let parameterScope = new Scope(null);
+        let thisBinding = new LocalBinding("this", receiver, BindingKind.Parameter, true,
+            field.nameSpan());
+        let frame = new CallableFrame(parameterScope, thisBinding, receiver, owner, member,
+            expected, null, subject, "", isStatic: false, isNoreturn: false, isConstructor: false);
+        let outerFrame = checker.enterBody(parameterScope, frame);
+        checker.result().setReceiver(member.green(), receiver);
+        checker.assignment().reset();
+        let value = initializer.value();
+        Type actual = checker.analyzeExpressionAdapt(value, expected,
+            literalfixes.valueOrigin(checker, OriginKind.Declared, field.name(), expected, value, member));
+        let refused = voidcalls.refusedCall(checker, value, actual);
+        if (!(expected is ErrorType) && refused != null) {
+            checker.reporter().report("{refused} cannot be the value of lazy const "
+                + "'{field.name()}'. Give '{field.name()}' an initializer that builds "
+                + "{voidcalls.valueOf(expected, checker.names()) ?? "a value"}.", value.span());
+        } else if (!(expected is ErrorType) && !(actual is ErrorType)
+                && !convert.isAssignableStrict(expected, actual)) {
+            checker.reporter().report("{subject} has type {checker.names().quoted(expected)}, but "
+                + "its initializer has type {checker.names().quoted(actual)}."
+                + "{nullguidance.valueAssignabilityHint(checker, expected, actual, value)}", value.span());
+        }
+        checker.leaveBody(outerFrame);
+    }
+    checker.resolver().popTypeParameters(pushed);
+}
+
 // The refusal a type parameter written anywhere inside a lazy const's initializer reads.
 lazyTypeParameterRefusal(BodyChecker checker, DeclaredType owner, Field field) -> string {
     string constant = checker.names().quotedNamedCode(["", ".{field.name()}"], [owner]);
     string quotedOwner = checker.names().quotedName(owner);
-    return "The initializer of lazy const {constant} cannot use a type parameter, "
-        + "because one lazy const value is shared by every type argument of {quotedOwner}. Remove "
-        + "'static lazy const' to give each instance its own '{field.name()}'.";
+    string refusal = "The initializer of lazy const {constant} cannot use a type parameter, "
+        + "because one lazy const value is shared by every type argument of {quotedOwner}.";
+    if (types.isStructLike(owner)) {
+        return refusal;
+    }
+    return "{refusal} Remove 'static' to give each object its own '{field.name()}'.";
 }
 
 fieldTypeOrError(BodyChecker checker, List<Field>? fields, string name) -> Type {
