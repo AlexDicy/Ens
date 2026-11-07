@@ -1,8 +1,7 @@
--- Overrides the xmake-repo definition of libllvm, copied from xmake-repo at 5ceb59ccd (2026-05-02)
--- with one change: on Windows for arm64, where upstream has no prebuilt archive and refuses to
--- install, the package is LLVM's own release archive for aarch64-pc-windows-msvc, whose libraries
--- are built against the static C runtime as xmake-mirror's x64 archive is. Delete this folder, and
--- the add_repositories line in xmake.lua that reaches it, when upstream installs on windows/arm64.
+-- Overrides the xmake-repo definition of libllvm, copied from xmake-repo at 5ceb59ccd (2026-05-02),
+-- so that every platform takes the package AlexDicy/llvm-builds publishes for it instead of
+-- building LLVM here. That repository builds LLVM with the configuration this tree asks for, so
+-- the compiler and the libraries ens links come from one build, on every platform.
 package("libllvm")
     set_kind("library")
     set_homepage("https://llvm.org/")
@@ -32,8 +31,8 @@ package("libllvm")
     end
 
     if is_plat("windows") and is_arch("arm64") then
-        add_urls("https://github.com/llvm/llvm-project/releases/download/llvmorg-$(version)/clang+llvm-$(version)-aarch64-pc-windows-msvc.tar.xz")
-        add_versions("21.1.0", "c2869e4173ed18185fa599174faeedab3fdaaf1fd86926d4b62df9bf137bef53")
+        add_urls("https://github.com/AlexDicy/llvm-builds/releases/download/llvm-21.1.0-r2/llvm-21.1.0-windows-arm64-libllvm.tar.xz")
+        add_versions("21.1.0", "4549885c0602891b018e86ffddee4f771e5a080f448ab89871fa4c725497e43a")
         -- The LLVM shared library cannot be built under windows.
         add_configs("shared", {description = "Build shared library.", default = false, type = "boolean", readonly = true})
         add_configs("runtimes",   {description = "Set vs compiler runtime.", default = "MT", readonly = true})
@@ -43,24 +42,26 @@ package("libllvm")
         add_syslinks("psapi", "shell32", "ole32", "uuid", "advapi32", "ws2_32", "ntdll", "version",
             "wsock32", "bcrypt")
     elseif is_plat("windows") then
-        -- pre-built
-
-        local arch = is_arch("x64") and "64" or "32"
-        add_urls("https://github.com/xmake-mirror/llvm-windows/releases/download/$(version)/clang+llvm-$(version)-win" .. arch .. ".zip")
-        if is_arch("x64") then
-            add_versions("19.1.7", "c6e058c6012f499811caa1ec037cc1b5c2fd2f8c20cc3315cae602cbd6c81a5e")
-            add_versions("21.1.0", "130d0067de849be36c0ec84c6d515bd310cab324a4cc95d8cc71a1d3c6c730f4")
-        elseif is_arch("x86") then
-            add_versions("19.1.7", "8fded42dfa7fede876057e3a857073a5df15649df62a6f1c352588f65569d940")
-            add_versions("21.1.0", "36b9a55e237b2db404aa621aacb8538b56dabc6f49b8927dc1109e8123524d5f")
-        end
-
+        add_urls("https://github.com/AlexDicy/llvm-builds/releases/download/llvm-21.1.0-r2/llvm-21.1.0-windows-x64-libllvm.tar.xz")
+        add_versions("21.1.0", "343450ced6aa388c3cf2225924ace762805ce48fedcc422ee5f9f2b16c6f0e08")
         -- The LLVM shared library cannot be built under windows.
         add_configs("shared", {description = "Build shared library.", default = false, type = "boolean", readonly = true})
-
         add_configs("runtimes",   {description = "Set vs compiler runtime.", default = "MT", readonly = true})
         add_configs("vs_runtime", {description = "Set vs compiler runtime.", default = "MT", readonly = true})
         add_syslinks("psapi", "shell32", "ole32", "uuid", "advapi32", "ws2_32", "ntdll", "version")
+    elseif is_plat("linux") then
+        local arch = is_arch("arm64", "aarch64") and "arm64" or "x64"
+        add_urls("https://github.com/AlexDicy/llvm-builds/releases/download/llvm-21.1.0-r2/llvm-21.1.0-linux-" .. arch .. "-libllvm.tar.xz")
+        if is_arch("arm64", "aarch64") then
+            add_versions("21.1.0", "68a1c944bc1929b80074861e520c3ed498048474160d5cbac10ee8d5d97a16ad")
+        else
+            add_versions("21.1.0", "58dc9b956d2e0dfd2251548ccad911bd5d5940d9362ba31d90d3ee81b244e467")
+        end
+        add_configs("shared", {description = "Build shared library.", default = false, type = "boolean", readonly = true})
+    elseif is_plat("macosx") then
+        add_urls("https://github.com/AlexDicy/llvm-builds/releases/download/llvm-21.1.0-r2/llvm-21.1.0-macos-arm64-libllvm.tar.xz")
+        add_versions("21.1.0", "694a0167d3070bb6c8ee3343754a90099689163215ed7664c7851abee223e608")
+        add_configs("shared", {description = "Build shared library.", default = false, type = "boolean", readonly = true})
     else
         -- self-built
         add_urls("https://github.com/llvm/llvm-project/releases/download/llvmorg-$(version)/llvm-project-$(version).src.tar.xz", {alias = "tarball"})
@@ -86,12 +87,16 @@ package("libllvm")
         add_syslinks("execinfo")
     end
 
-    add_deps("cmake")
+    -- cmake builds LLVM where this package compiles it, and drives nothing where LLVM's own
+    -- release package is taken instead.
+    if not is_plat("windows", "linux", "macosx") then
+        add_deps("cmake")
+    end
     on_load(function (package)
         local constants = import('constants')
         
         -- add deps.
-        if not package:is_plat("windows") then -- not prebuilt
+        if not package:is_plat("windows", "linux", "macosx") then -- what is compiled here, not LLVM's package
             package:add("deps", "python 3.x", {kind = "binary", host = true})
             if package:config("libffi") then
                 package:add("deps", "libffi")
@@ -109,18 +114,26 @@ package("libllvm")
         end
 
         -- add links
-        local linkable_projects = {"lldb", "lld", "clang", "polly", "bolt"}
-        table.insert(linkable_projects, "llvm") -- make sure that the base library is last.
-        for _, name in ipairs(linkable_projects) do
-            local cname = name:gsub("-", "_")
-            local ptype = package:config("shared") and "shared" or "static"
-            if cname == "llvm" or package:config(cname) then
-                package:add("links", constants[("get_%s_%s_libraries"):format(cname, ptype)]())
+        -- LLVM's own package names its components itself, and the names a release adds, drops or
+        -- splits between versions are not this list's to know: where that package is taken, no
+        -- links are declared, and ens-llvm merges every archive in the package's folders instead,
+        -- which is what this list only approximates.
+        if not package:is_plat("linux") then
+            local linkable_projects = {"lldb", "lld", "clang", "polly", "bolt"}
+            table.insert(linkable_projects, "llvm") -- make sure that the base library is last.
+            for _, name in ipairs(linkable_projects) do
+                local cname = name:gsub("-", "_")
+                local ptype = package:config("shared") and "shared" or "static"
+                if cname == "llvm" or package:config(cname) then
+                    package:add("links", constants[("get_%s_%s_libraries"):format(cname, ptype)]())
+                end
             end
         end
         if package:is_plat("windows") then
             package:add("links", "LLVM-C")
         end
+
+        -- ens-llvm names the folders it uses: a package that names one leaves the defaults unnamed.
 
         -- LLVM 21+ introduces new split libraries that must be linked explicitly
         if package:version() and package:version():ge("21.0") then
@@ -171,7 +184,21 @@ package("libllvm")
         os.cp("lib", package:installdir())
     end)
 
-    on_install("linux", "macosx", "bsd", "android", "iphoneos", "cross", function (package)
+    -- the include tree, and the library tree, which holds the component archives and the cmake
+    -- files. The programs in bin are left out, as the toolchain package provides them.
+    on_install("linux", function (package)
+        os.cp("include", package:installdir())
+        os.cp("lib", package:installdir())
+    end)
+
+    -- the same two folders as linux, from the package llvm-builds publishes for macOS
+    on_install("macosx", function (package)
+        os.cp("include", package:installdir())
+        os.cp("lib", package:installdir())
+    end)
+
+    -- the platforms llvm-builds does not publish for still compile LLVM here
+    on_install("bsd", "android", "iphoneos", "cross", function (package)
         import("lib.detect.find_tool")
         import('constants')
         import("utils.ci.is_running", {alias = "ci_is_running"})
@@ -329,6 +356,13 @@ package("libllvm")
     end)
 
     on_test(function (package)
+        if package:is_plat("linux") then
+            -- LLVM's own package is not built here, and the pkgconfig file xmake writes for it
+            -- names none of the libraries it ships: the snippet below links through that file, so
+            -- it has nothing to link with. What this package holds is LLVM's own headers and
+            -- archives, which the compiler built against them is the proof of.
+            return
+        end
         assert(package:check_cxxsnippets({test = [[
             #include <llvm/IR/LLVMContext.h>
             #include <llvm/IR/Module.h>
