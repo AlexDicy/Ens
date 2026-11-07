@@ -147,18 +147,10 @@ package("libllvm")
             package:add("links", "LLVM-C")
         end
 
-        if package:is_plat("linux") then
-            -- LLVM's package keeps the runtime it was built with, and the builtins beside them,
-            -- under the name of its own triple and under clang's folder. Both are named as
-            -- folders here so the merge in ens-llvm, which looks in the folders a package names
-            -- its libraries in, finds the runtime the bridge is compiled against and the builtins
-            -- its objects reference.
-            local triple = package:is_arch("arm64", "aarch64") and "aarch64-unknown-linux-gnu" or "x86_64-unknown-linux-gnu"
-            local major = tostring(package:version()):split("%.")[1]
-            package:add("linkdirs", path.join("lib", triple))
-            package:add("linkdirs", path.join("lib", "clang", major, "lib", triple))
-            package:add("includedirs", path.join("include", "c++", "v1"))
-        end
+        -- the folders this package keeps its headers and libraries in are named by ens-llvm, which
+        -- is what uses them: a package that names a folder of its own leaves the default ones
+        -- unnamed, and LLVM's release keeps its runtime, its builtins beside it and its headers in
+        -- folders the defaults are not.
 
         -- LLVM 21+ introduces new split libraries that must be linked explicitly
         if package:version() and package:version():ge("21.0") then
