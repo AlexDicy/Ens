@@ -1,93 +1,41 @@
--- Overrides the xmake-repo definition of llvm, copied from xmake-repo at 8cbe31d0 (2026-11-06),
--- so that every platform takes the toolchain AlexDicy/llvm-builds publishes for it instead of
--- building LLVM here. That repository builds LLVM with the configuration this tree asks for, so
--- the compiler and the libraries ens links come from one build, on every platform.
+-- The toolchain comes from AlexDicy/llvm-builds, which builds LLVM with the configuration this
+-- tree asks for and publishes it per platform, so the compiler and the libraries ens links come
+-- from one build everywhere. xmake cannot change an external package's download, so this replaces
+-- xmake-repo's llvm package with one that only downloads: no source build, no components.
 package("llvm")
     set_kind("toolchain")
     set_homepage("https://llvm.org/")
     set_description("The LLVM Compiler Infrastructure")
-    add_configs("shared",            {description = "Build shared library.", default = false, type = "boolean", readonly = true})
 
-    add_configs("all",               {description = "Enable all projects.", default = false, type = "boolean"})
-    add_configs("bolt",              {description = "Enable bolt project.", default = false, type = "boolean"})
-    add_configs("clang",             {description = "Enable clang project.", default = true, type = "boolean"})
-    add_configs("clang-tools-extra", {description = "Enable extra clang tools project.", default = false, type = "boolean"})
-    add_configs("libclc",            {description = "Enable libclc project.", default = false, type = "boolean"})
-    add_configs("lld",               {description = "Enable lld project.", default = false, type = "boolean"})
-    add_configs("lldb",              {description = "Enable lldb project.", default = false, type = "boolean"})
-    add_configs("polly",             {description = "Enable polly project.", default = false, type = "boolean"})
-    add_configs("pstl",              {description = "Enable pstl project.", default = false, type = "boolean"})
-    add_configs("mlir",              {description = "Enable mlir project.", default = false, type = "boolean"})
-    add_configs("flang",             {description = "Enable flang project.", default = false, type = "boolean"})
-
-    add_configs("compiler-rt",       {description = "Enable compiler-rt runtime.", default = true, type = "boolean"})
-    add_configs("libunwind",         {description = "Enable libunwind runtime.", default = true, type = "boolean"})
-    add_configs("libc",              {description = "Enable libc runtime.", default = false, type = "boolean"})
-    add_configs("libcxx",            {description = "Enable libcxx runtime.", default = true, type = "boolean"})
-    add_configs("libcxxabi",         {description = "Enable libcxxabi runtime.", default = true, type = "boolean"})
-    add_configs("openmp",            {description = "Enable openmp runtime.", default = false, type = "boolean"})
-
-    add_schemes("binary", "source")
-
-    on_source(function (package)
-        import("schemes.binary")
-        import("schemes.source")
-        binary.add_urls(package, "binary")
-        source.add_urls(package, "source")
-    end)
-
-    on_load(function (package)
-        if package:current_scheme():name() == "source" then
-            if not package:is_plat("windows", "msys") then
-                package:add("deps", "cmake")
-                package:add("deps", "python 3.x", {kind = "binary", host = true})
-                package:add("deps", "zlib", "libffi", {host = true})
-            end
-            if package:is_plat("linux") then
-                package:add("deps", "binutils", {host = true}) -- needed for gold and strip
-            end
-            if package:is_plat("linux", "bsd") then
-                if package:config("openmp") then
-                    package:add("deps", "libelf", {host = true})
-                end
-            end
-        end
-        -- add components
-        if package:is_library() then
-            local components = {"mlir", "clang", "libunwind"}
-            for _, name in ipairs(components) do
-                if package:config(name) or package:config("all") then
-                    package:add("components", name, {deps = "base"})
-                end
-            end
-            package:add("components", "base", {default = true})
-        end
-    end)
-
-    on_fetch("fetch")
-
-    on_install("@windows", "@msys", "@linux", "@macosx", "@bsd", function (package)
-        import("schemes.binary")
-        import("schemes.source")
-        if package:current_scheme():name() == "binary" then
-            binary.install(package)
+    local release = "https://github.com/AlexDicy/llvm-builds/releases/download/llvm-21.1.0-r2/llvm-21.1.0-"
+    if is_plat("linux") then
+        if is_arch("arm64", "aarch64") then
+            add_urls(release .. "linux-arm64-llvm.tar.xz")
+            add_versions("21.1.0", "3ad6dd3759f088171de3f678ce072e142412f5bd15c00580b9298cfc9ac8628b")
         else
-            source.install(package)
+            add_urls(release .. "linux-x64-llvm.tar.xz")
+            add_versions("21.1.0", "b854d5f70450d36b3b19f05813b4ecd76b6038415853f49e78d4a4d9bc36a9c6")
         end
-    end)
+    elseif is_plat("macosx") then
+        add_urls(release .. "macos-arm64-llvm.tar.xz")
+        add_versions("21.1.0", "14bdfaec139cc73e970eade4de0d59ea586d47fa38b79df9973eb3d6ae6d4000")
+    elseif is_plat("windows") then
+        if is_arch("arm64") then
+            add_urls(release .. "windows-arm64-llvm.tar.xz")
+            add_versions("21.1.0", "d2c0437e58304f40fa67c1d17ce556c524aa68503e4c3074b6f234e2ebc5c8b7")
+        else
+            add_urls(release .. "windows-x64-llvm.tar.xz")
+            add_versions("21.1.0", "191b345596f426126f670ba87dd971a7ded982e749aa15dbf7496f704edbca76")
+        end
+    end
 
-    on_component("mlir",      "components.mlir")
-    on_component("clang",     "components.clang")
-    on_component("libunwind", "components.libunwind")
-    on_component("base",      "components.base")
+    on_install(function (package)
+        os.cp("*", package:installdir(), {symlink = true})
+    end)
 
     on_test(function (package)
-        if package:is_toolchain() and not package:is_cross() then
-            if not package:is_plat("windows") then
-                os.vrun("llvm-config --version")
-            end
-            if package:config("clang") then
-                os.vrun("clang --version")
-            end
+        if not package:is_plat("windows") then
+            os.vrun("llvm-config --version")
         end
+        os.vrun("clang --version")
     end)
