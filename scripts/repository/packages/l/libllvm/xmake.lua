@@ -61,6 +61,21 @@ package("libllvm")
         add_configs("runtimes",   {description = "Set vs compiler runtime.", default = "MT", readonly = true})
         add_configs("vs_runtime", {description = "Set vs compiler runtime.", default = "MT", readonly = true})
         add_syslinks("psapi", "shell32", "ole32", "uuid", "advapi32", "ws2_32", "ntdll", "version")
+    elseif is_plat("linux") then
+        -- pre-built: LLVM's own release package for linux, which carries the headers, the builtins
+        -- and one archive per component, the libraries constants.lua names and the rest. It is
+        -- built with libc++, and with LTO, so its archives hold bitcode and linking what ens-llvm
+        -- merges compiles them. No LLVM is built here.
+        local arch = is_arch("arm64", "aarch64") and "ARM64" or "X64"
+        add_urls("https://github.com/llvm/llvm-project/releases/download/llvmorg-$(version)/LLVM-$(version)-Linux-" .. arch .. ".tar.xz")
+        if is_arch("arm64", "aarch64") then
+            add_versions("21.1.0", "ffd51d9a583c1f662abc101f3a125d7303b21ad7d4e15773c8ad2c14cf621d5e")
+        else
+            add_versions("21.1.0", "4a8c4b07646a4a2eb76ccf1d73522c3e13519745b72ef09d631c09b7577b0ed2")
+        end
+        -- the package also carries the shared libraries its own tools load, which nothing here
+        -- links: what ens-llvm merges is the static archives beside them.
+        add_configs("shared", {description = "Build shared library.", default = false, type = "boolean", readonly = true})
     else
         -- self-built
         add_urls("https://github.com/llvm/llvm-project/releases/download/llvmorg-$(version)/llvm-project-$(version).src.tar.xz", {alias = "tarball"})
@@ -86,12 +101,16 @@ package("libllvm")
         add_syslinks("execinfo")
     end
 
-    add_deps("cmake")
+    -- cmake builds LLVM where this package compiles it, and drives nothing where LLVM's own
+    -- release package is taken instead.
+    if not is_plat("windows", "linux") then
+        add_deps("cmake")
+    end
     on_load(function (package)
         local constants = import('constants')
         
         -- add deps.
-        if not package:is_plat("windows") then -- not prebuilt
+        if not package:is_plat("windows", "linux") then -- what is compiled here, not LLVM's package
             package:add("deps", "python 3.x", {kind = "binary", host = true})
             if package:config("libffi") then
                 package:add("deps", "libffi")
@@ -109,17 +128,36 @@ package("libllvm")
         end
 
         -- add links
-        local linkable_projects = {"lldb", "lld", "clang", "polly", "bolt"}
-        table.insert(linkable_projects, "llvm") -- make sure that the base library is last.
-        for _, name in ipairs(linkable_projects) do
-            local cname = name:gsub("-", "_")
-            local ptype = package:config("shared") and "shared" or "static"
-            if cname == "llvm" or package:config(cname) then
-                package:add("links", constants[("get_%s_%s_libraries"):format(cname, ptype)]())
+        -- LLVM's own package names its components itself, and the names a release adds, drops or
+        -- splits between versions are not this list's to know: where that package is taken, no
+        -- links are declared, and ens-llvm merges every archive in the package's folders instead,
+        -- which is what this list only approximates.
+        if not package:is_plat("linux") then
+            local linkable_projects = {"lldb", "lld", "clang", "polly", "bolt"}
+            table.insert(linkable_projects, "llvm") -- make sure that the base library is last.
+            for _, name in ipairs(linkable_projects) do
+                local cname = name:gsub("-", "_")
+                local ptype = package:config("shared") and "shared" or "static"
+                if cname == "llvm" or package:config(cname) then
+                    package:add("links", constants[("get_%s_%s_libraries"):format(cname, ptype)]())
+                end
             end
         end
         if package:is_plat("windows") then
             package:add("links", "LLVM-C")
+        end
+
+        if package:is_plat("linux") then
+            -- LLVM's package keeps the runtime it was built with, and the builtins beside them,
+            -- under the name of its own triple and under clang's folder. Both are named as
+            -- folders here so the merge in ens-llvm, which looks in the folders a package names
+            -- its libraries in, finds the runtime the bridge is compiled against and the builtins
+            -- its objects reference.
+            local triple = package:is_arch("arm64", "aarch64") and "aarch64-unknown-linux-gnu" or "x86_64-unknown-linux-gnu"
+            local major = tostring(package:version()):split("%.")[1]
+            package:add("linkdirs", path.join("lib", triple))
+            package:add("linkdirs", path.join("lib", "clang", major, "lib", triple))
+            package:add("includedirs", path.join("include", "c++", "v1"))
         end
 
         -- LLVM 21+ introduces new split libraries that must be linked explicitly
@@ -171,7 +209,17 @@ package("libllvm")
         os.cp("lib", package:installdir())
     end)
 
-    on_install("linux", "macosx", "bsd", "android", "iphoneos", "cross", function (package)
+    -- the same two folders as windows|arm64, and for the same reason: the include tree, and the
+    -- library tree, which holds the component archives, the C++ runtime and builtins LLVM built
+    -- for this host, and the cmake files. The programs in bin are left out, as the toolchain
+    -- package provides them.
+    on_install("linux", function (package)
+        os.cp("include", package:installdir())
+        os.cp("lib", package:installdir())
+    end)
+
+    -- linux is not among these: its LLVM is LLVM's own release package, installed above.
+    on_install("macosx", "bsd", "android", "iphoneos", "cross", function (package)
         import("lib.detect.find_tool")
         import('constants')
         import("utils.ci.is_running", {alias = "ci_is_running"})
@@ -329,6 +377,13 @@ package("libllvm")
     end)
 
     on_test(function (package)
+        if package:is_plat("linux") then
+            -- LLVM's own package is not built here, and the pkgconfig file xmake writes for it
+            -- names none of the libraries it ships: the snippet below links through that file, so
+            -- it has nothing to link with. What this package holds is LLVM's own headers and
+            -- archives, which the compiler built against them is the proof of.
+            return
+        end
         assert(package:check_cxxsnippets({test = [[
             #include <llvm/IR/LLVMContext.h>
             #include <llvm/IR/Module.h>

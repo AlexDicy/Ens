@@ -79,6 +79,12 @@ target("ens-llvm")
     if is_plat("macosx") then
         add_packages("libcxx")
     end
+    if is_plat("linux") then
+        -- libllvm is LLVM's own build on linux, whose libraries are built with libc++, and the
+        -- package carries that runtime's headers: the bridge is compiled against it, and GCC's
+        -- C++ headers are kept out so nothing compiled here expects the other one.
+        add_cxxflags("-nostdinc++", {force = true})
+    end
     -- For a target that names a C runtime, xmake has clang on Windows write a reference to clang's
     -- builtins library into every object, by a path relative to clang's own folders, which `ens`
     -- does not link through. xmake's rules give a target that names none the dynamic runtime while
@@ -117,13 +123,17 @@ target("ens-llvm")
         local sharedOnly = {["LLVM-C"] = true, LTO = true, Remarks = true}
         local function addPackage(package)
             local dirs = table.wrap(package:get("linkdirs"))
+            -- LLVM's own package names its components itself, and every archive in its folders is
+            -- merged below under whatever name it gives them, so one this list knows by another
+            -- name is not a package that cannot hold it.
+            local namedByLLVM = package:name() == "libllvm" and target:is_plat("linux")
             for _, link in ipairs(table.wrap(package:get("links"))) do
                 if package:name() ~= "libllvm" or not sharedOnly[link] then
                     local file = staticArchive(dirs, link)
                     if file then
                         add(file)
                         provided[link] = true
-                    else
+                    elseif not namedByLLVM then
                         table.insert(missing, {package = package:name(), link = link, dirs = dirs})
                     end
                 end
@@ -184,17 +194,26 @@ target("ens-llvm")
             end
             add(file)
         elseif target:is_plat("linux") then
-            local compiler = target:tool("cxx")
-            local printed = os.iorunv(compiler, {"-print-file-name=libstdc++.a"}):trim()
-            if not os.isfile(printed) then
-                raise("'%s' has no 'libstdc++.a' to link `ens` with", compiler)
+            -- Linux takes its C++ runtime, the unwinder beside it and clang's builtins from the
+            -- libllvm package, which is LLVM's own build and carries the runtime its libraries
+            -- were built with. GCC's runtime library is not merged, since nothing here is
+            -- compiled by GCC.
+            local dirs = {}
+            for _, package in ipairs(target:orderpkgs()) do
+                if package:name() == "libllvm" then
+                    for _, dir in ipairs(table.wrap(package:get("linkdirs"))) do
+                        table.insert(dirs, dir)
+                    end
+                end
             end
-            add(printed)
-            local libgcc = os.iorunv(compiler, {"-print-libgcc-file-name"}):trim()
-            if not os.isfile(libgcc) then
-                raise("'%s' has no '%s' to link `ens` with", compiler, path.filename(libgcc))
+            for _, name in ipairs({"c++", "c++abi", "unwind", "clang_rt.builtins"}) do
+                local file = staticArchive(dirs, name)
+                if not file then
+                    raise("the libllvm package has no static archive of '%s' to link `ens` with",
+                        name)
+                end
+                add(file)
             end
-            add(libgcc)
         end
         -- llvm-ar reads an MRI script on every platform, so one merge serves every archive format.
         -- The archive is made again from the bridge's objects each time, never from the archive a
