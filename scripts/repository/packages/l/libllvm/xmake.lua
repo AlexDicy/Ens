@@ -147,10 +147,7 @@ package("libllvm")
             package:add("links", "LLVM-C")
         end
 
-        -- the folders this package keeps its headers and libraries in are named by ens-llvm, which
-        -- is what uses them: a package that names a folder of its own leaves the default ones
-        -- unnamed, and LLVM's release keeps its runtime, its builtins beside it and its headers in
-        -- folders the defaults are not.
+        -- ens-llvm names the folders it uses: a package that names one leaves the defaults unnamed.
 
         -- LLVM 21+ introduces new split libraries that must be linked explicitly
         if package:version() and package:version():ge("21.0") then

@@ -80,19 +80,12 @@ target("ens-llvm")
         add_packages("libcxx")
     end
     if is_plat("linux") then
-        -- libllvm is LLVM's own build on linux, whose libraries are built with libc++, and the
-        -- package carries that runtime's headers: the bridge is compiled against it, and GCC's
-        -- C++ headers are kept out so nothing here expects the other one. The package's folders
-        -- are named here, as a package that names one of its own has no default ones named for it.
-        -- LLVM's own builds carry no run-time type information, and the bridge reads LLVM through
-        -- the same interface: nothing in it asks a type of another at run time.
+        -- LLVM's own build is libc++ and no RTTI; the bridge follows it.
         add_cxxflags("-nostdinc++", "-fno-rtti", {force = true})
         on_config(function (target)
             for _, package in ipairs(target:orderpkgs()) do
                 if package:name() == "libllvm" then
-                    -- libc++ keeps its headers in c++/v1 and the one file its build generates, the
-                    -- configuration the headers are read with, under the name of the processor they
-                    -- were built for, so both folders are named here.
+                    -- libc++'s headers, and the configuration its build generates under the triple.
                     local root = package:installdir()
                     local triple = target:is_arch("arm64", "aarch64") and "aarch64-unknown-linux-gnu" or "x86_64-unknown-linux-gnu"
                     target:add("includedirs", path.join(root, "include"), {public = true})
@@ -138,11 +131,7 @@ target("ens-llvm")
         -- LLVM names LTO and Remarks, which it builds only as shared libraries: C interfaces over
         -- component archives merged here, and ones `ens` binds none of.
         local sharedOnly = {["LLVM-C"] = true, LTO = true, Remarks = true}
-        -- The folders a package keeps its libraries in: the ones it names itself, and for LLVM's
-        -- own package the ones its release uses, which it names none of, since naming any folder
-        -- of its own would leave xmake's default ones unnamed. LLVM keeps its component archives in
-        -- lib, the C++ runtime and the builtins it was built with in the folder of its triple, and
-        -- clang's builtins under clang's own.
+        -- the folders a package keeps its libraries in, and LLVM's own for its runtime and builtins
         local function libraryDirs(package)
             local dirs = {}
             for _, dir in ipairs(table.wrap(package:get("linkdirs"))) do
@@ -176,9 +165,8 @@ target("ens-llvm")
                     end
                 end
             end
-            -- the LLVM package's list of links leaves some of its own components out, such as
-            -- LLVMCGData, so every component archive in its folders is taken. Polly's library is
-            -- named apart from LLVM's own, and LTO asks it for a pass the optimiser links in.
+            -- every component archive, which the package's own list of links leaves some of out.
+            -- Polly's is named apart from LLVM's and LTO asks it for a pass.
             if package:name() == "libllvm" then
                 for _, dir in ipairs(dirs) do
                     for _, pattern in ipairs({"libLLVM*.a", "liblld*.a", "libPolly*.a", "LLVM*.lib", "lld*.lib", "Polly*.lib"}) do
