@@ -8,6 +8,7 @@ import Span from @ens.frontend.support.source;
 import SubscriptExpressionNode from @ens.frontend.syntax.generated.nodes;
 import ForEachStatementNode from @ens.frontend.syntax.generated.nodes;
 import @ens.sema.model.typenames;
+import @ens.sema.model.types;
 import Type from @ens.sema.model.types;
 import ArrayType from @ens.sema.model.types;
 import PrimitiveKind from @ens.sema.model.types;
@@ -27,10 +28,12 @@ import EirBranch from eir.model;
 import LoweringContext from lower.context;
 import List from @std.collections.list;
 import Operand from lower.stores;
+import lower.calls;
 import lower.classes;
 import lower.conversions;
 import lower.defaults;
 import lower.expressions;
+import lower.freezes;
 import lower.iterators;
 import lower.ownedreads;
 import lower.ownership;
@@ -138,17 +141,51 @@ allocateLevel(LoweringContext lowering, NewExpressionNode node, long level, Type
     return array;
 }
 
-// '[a, b, c]' allocates for the written count and fills each slot in order.
+// '[a, b, c]' allocates for the written count and fills each slot in order, or becomes the frozen
+// list the literal is declared as.
 public lowerLiteral(LoweringContext lowering, ArrayLiteralExpressionNode node) -> long {
     let type = lowering.typeOf(node);
     if (type == null) {
         return -1;
     }
     if (!(type is ArrayType)) {
-        lowering.internalError("an array literal has type '{typenames.display(type)}'",
+        return lowerFrozenLiteral(lowering, node, type);
+    }
+    return lowerElementsOf(lowering, node, type);
+}
+
+// '[a, b, c]' written where a 'FrozenList<T>' is declared: the array of 'T' the literal builds,
+// which nothing else refers to, and then 'FrozenList.wrapping', which keeps that array as the
+// list's store.
+lowerFrozenLiteral(LoweringContext lowering, ArrayLiteralExpressionNode node, Type frozenType)
+        -> long {
+    let elementType = types.frozenListElement(frozenType);
+    if (elementType == null) {
+        lowering.internalError("an array literal has type '{typenames.display(frozenType)}'",
             node.span());
         return -1;
     }
+    let wrap = freezes.staticInfo(lowering, frozenType, "wrapping", node.span());
+    if (wrap == null) {
+        return -1;
+    }
+    let arrayType = lowering.store().arrayOf(elementType);
+    if (!(arrayType is ArrayType)) {
+        lowering.internalError("the elements of '{typenames.display(frozenType)}' build "
+            + "'{typenames.display(arrayType)}'", node.span());
+        return -1;
+    }
+    long array = lowerElementsOf(lowering, node, arrayType);
+    if (array < 0) {
+        return -1;
+    }
+    long list = calls.emitCall(lowering, wrap, null, -1, [array], -1, null, node.span());
+    ownership.releaseValue(lowering, array);
+    return list;
+}
+
+// The array the literal's elements build, of 'type'.
+lowerElementsOf(LoweringContext lowering, ArrayLiteralExpressionNode node, ArrayType type) -> long {
     for (long i = 0; i < node.elementsCount(); i++) {
         if (node.elements(i) is SpreadExpressionNode) {
             return lowerSpreadLiteral(lowering, node, type);
