@@ -823,7 +823,7 @@ task("test")
         -- sources are unchanged pays nothing for it. A run that skipped it would link every fixture
         -- through whatever archive an earlier build left behind.
         local function buildNativeArchive()
-            os.execv("xmake", {"build", "ens-llvm"})
+            os.execv("xmake", {"build", "ens-llvm", "-P", os.projectdir()})
             if not os.isfile(native_archive) then
                 os.raise("Could not locate the native archive at " .. native_archive)
             end
@@ -3865,7 +3865,7 @@ main() -> int {
         -- input to answer with, so a prompt would hang the whole run.
         local function run_lsp_build(job)
             local log = path.join(out_dir, job.name .. ".log")
-            local rc = execMerged("xmake", {"build", "-y", "ens-lsp"}, log)
+            local rc = execMerged("xmake", {"build", "-y", "ens-lsp", "-P", os.projectdir()}, log)
             if rc == 0 then
                 return {name = job.name, ok = true}
             end
