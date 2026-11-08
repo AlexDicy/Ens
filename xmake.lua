@@ -67,7 +67,7 @@ target("lsp-frontend")
 
 -- Everything native that `ens` links, as one static archive: the linker bridge, the LLVM and lld
 -- libraries it and the ens.llvm binding call, the libraries those depend on, the C++ runtime on
--- Linux and macOS, GCC's runtime library on Linux, and clang's builtins on Windows. `ens` is then
+-- Linux and macOS, and clang's builtins on Windows. `ens` is then
 -- one executable that needs nothing beside it, and it holds one copy of LLVM. All link policy
 -- lives in selfhost/link.
 target("ens-llvm")
@@ -184,17 +184,20 @@ target("ens-llvm")
             end
             add(file)
         elseif target:is_plat("linux") then
-            local compiler = target:tool("cxx")
-            local printed = os.iorunv(compiler, {"-print-file-name=libstdc++.a"}):trim()
-            if not os.isfile(printed) then
-                raise("'%s' has no 'libstdc++.a' to link `ens` with", compiler)
+            -- the C++ runtime the packages carry, built on the image they were made on, rather than
+            -- the machine's, which is built against its own glibc
+            local found = false
+            for _, package in ipairs(target:orderpkgs()) do
+                if package:name() == "libllvm" then
+                    for _, file in ipairs(os.files(path.join(package:installdir(), "lib", "gcc", "*.a"))) do
+                        add(file)
+                        found = true
+                    end
+                end
             end
-            add(printed)
-            local libgcc = os.iorunv(compiler, {"-print-libgcc-file-name"}):trim()
-            if not os.isfile(libgcc) then
-                raise("'%s' has no '%s' to link `ens` with", compiler, path.filename(libgcc))
+            if not found then
+                raise("the libllvm package has no C++ runtime to link `ens` with")
             end
-            add(libgcc)
         end
         -- llvm-ar reads an MRI script on every platform, so one merge serves every archive format.
         -- The archive is made again from the bridge's objects each time, never from the archive a

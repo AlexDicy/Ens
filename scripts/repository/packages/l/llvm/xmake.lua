@@ -8,13 +8,14 @@ package("llvm")
     set_description("The LLVM Compiler Infrastructure")
 
     local release = "https://github.com/AlexDicy/llvm-builds/releases/download/llvm-21.1.0-r2/llvm-21.1.0-"
+    local linux_release = "https://github.com/AlexDicy/llvm-builds/releases/download/llvm-21.1.0-r3/llvm-21.1.0-"
     if is_plat("linux") then
         if is_arch("arm64", "aarch64") then
-            add_urls(release .. "linux-arm64-llvm.tar.xz")
-            add_versions("21.1.0", "3ad6dd3759f088171de3f678ce072e142412f5bd15c00580b9298cfc9ac8628b")
+            add_urls(linux_release .. "linux-arm64-llvm.tar.xz")
+            add_versions("21.1.0", "e0bebd397cc75b036553d9b7aeba336348c7063ceefb0557457fe150285088f4")
         else
-            add_urls(release .. "linux-x64-llvm.tar.xz")
-            add_versions("21.1.0", "b854d5f70450d36b3b19f05813b4ecd76b6038415853f49e78d4a4d9bc36a9c6")
+            add_urls(linux_release .. "linux-x64-llvm.tar.xz")
+            add_versions("21.1.0", "32e4c2a65a4450863d50a4917f848c16d4b0e8bb0e68962dbcb52ec488986a1a")
         end
     elseif is_plat("macosx") then
         add_urls(release .. "macos-arm64-llvm.tar.xz")

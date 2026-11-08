@@ -51,11 +51,11 @@ package("libllvm")
         add_syslinks("psapi", "shell32", "ole32", "uuid", "advapi32", "ws2_32", "ntdll", "version")
     elseif is_plat("linux") then
         local arch = is_arch("arm64", "aarch64") and "arm64" or "x64"
-        add_urls("https://github.com/AlexDicy/llvm-builds/releases/download/llvm-21.1.0-r2/llvm-21.1.0-linux-" .. arch .. "-libllvm.tar.xz")
+        add_urls("https://github.com/AlexDicy/llvm-builds/releases/download/llvm-21.1.0-r3/llvm-21.1.0-linux-" .. arch .. "-libllvm.tar.xz")
         if is_arch("arm64", "aarch64") then
-            add_versions("21.1.0", "68a1c944bc1929b80074861e520c3ed498048474160d5cbac10ee8d5d97a16ad")
+            add_versions("21.1.0", "2c177af18ca2e123674c3f5b87a11afb5ee4ab88ed2fc697db9d1ca4804c8ce1")
         else
-            add_versions("21.1.0", "58dc9b956d2e0dfd2251548ccad911bd5d5940d9362ba31d90d3ee81b244e467")
+            add_versions("21.1.0", "bde69f078a67c98e56be87fe066ab71607bfca3de3cea947756bfba02578a304")
         end
         add_configs("shared", {description = "Build shared library.", default = false, type = "boolean", readonly = true})
     elseif is_plat("macosx") then
