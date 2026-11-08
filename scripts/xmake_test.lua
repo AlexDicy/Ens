@@ -822,8 +822,12 @@ task("test")
         -- the native archive, built every run. The build is incremental. A run whose bridge
         -- sources are unchanged pays nothing for it. A run that skipped it would link every fixture
         -- through whatever archive an earlier build left behind.
+        -- the child is given this project by name and as its working directory: `-P` is what stops
+        -- it ascending to an enclosing project, and xmake resolves `build/` against the working
+        -- directory, so the archive only lands where this run looks for it from inside the project.
         local function buildNativeArchive()
-            os.execv("xmake", {"build", "ens-llvm", "-P", os.projectdir()})
+            local project = os.projectdir()
+            os.execv("xmake", {"build", "-P", project, "ens-llvm"}, {curdir = project})
             if not os.isfile(native_archive) then
                 os.raise("Could not locate the native archive at " .. native_archive)
             end
@@ -3865,7 +3869,9 @@ main() -> int {
         -- input to answer with, so a prompt would hang the whole run.
         local function run_lsp_build(job)
             local log = path.join(out_dir, job.name .. ".log")
-            local rc = execMerged("xmake", {"build", "-y", "ens-lsp", "-P", os.projectdir()}, log)
+            local project = os.projectdir()
+            local rc = execMerged("xmake", {"build", "-y", "-P", project, "ens-lsp"}, log,
+                {curdir = project})
             if rc == 0 then
                 return {name = job.name, ok = true}
             end
