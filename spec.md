@@ -1427,6 +1427,7 @@ describe(string?? value) -> string {
 
 Every operator that looks through one nullable level rejects a value that has two, and the error names which level to unwrap first: `?.`, `?[`, `.`, `[`, `for (... in ...)`, `switch`, `is`, `as?`, and interpolation.
 `?.` and `?[` are not an exception to that rule and not a way to make one: they flatten the level they would add, so reading a member that is already nullable produces a value at that member's own level and a chain keeps working, while a receiver that is already doubly nullable is still rejected.
+A value declared at two levels whose every level narrowing proved present is not doubly nullable where it is read: `?.` reads the member of the type narrowing proved and answers one level of null, so `t?.length ?? 0` compiles on a `string??` that holds a string.
 A `weak` field stays single-level by rule, `weak T?` over a class and nothing deeper.
 
 ---
