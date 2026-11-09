@@ -28,6 +28,8 @@ import VariableDeclarationNode from @ens.frontend.syntax.generated.nodes;
 import ExpressionStatementNode from @ens.frontend.syntax.generated.nodes;
 import GreenNode from @ens.frontend.syntax.green;
 import IfStatementNode from @ens.frontend.syntax.generated.nodes;
+import ElseClauseNode from @ens.frontend.syntax.generated.nodes;
+import LambdaExpressionNode from @ens.frontend.syntax.generated.nodes;
 import TernaryExpressionNode from @ens.frontend.syntax.generated.nodes;
 import Statement from @ens.frontend.syntax.generated.nodes;
 import SyntaxKind from @ens.frontend.syntax.generated.kind;
@@ -363,15 +365,165 @@ factsAfterWrites(BranchChanges ran, Expression right) -> Map<NarrowingPath, Narr
 // Whether 'condition', where it evaluates to 'conditionHolds', holds only where the place 'path' is null,
 // because it is a null check of that place or a '&&' or '||' whose right operand ends in one.
 endsInNullCheck(BodyChecker checker, Expression condition, bool conditionHolds, NarrowingPath path) -> bool {
+    return nullComparison(checker, condition, conditionHolds, path) != null;
+}
+
+// A comparison with 'null' that a condition ends in, where the place 'path' is null, and whether that
+// comparison itself is true wherever the condition is.
+final class NullComparison {
+    protected Expression node;
+    protected bool testHolds;
+
+    protected constructor(this.node, this.testHolds);
+}
+
+// The comparison with 'null' in 'condition' that holds only where the place 'path' is null, where
+// 'condition' evaluates to 'conditionHolds', or null where none does.
+nullComparison(BodyChecker checker, Expression condition, bool conditionHolds, NarrowingPath path)
+        -> NullComparison? {
     Expression core = syntax.unwrapParentheses(condition);
     if (core is PrefixExpressionNode && core.operator().kind() == SyntaxKind.Exclamation) {
-        return endsInNullCheck(checker, core.operand(), !conditionHolds, path);
+        return nullComparison(checker, core.operand(), !conditionHolds, path);
     }
     if (core is BinaryExpressionNode && runsRight(core.operator().kind(), conditionHolds)) {
-        return endsInNullCheck(checker, core.right(), conditionHolds, path);
+        return nullComparison(checker, core.right(), conditionHolds, path);
     }
     let check = detectNullCheck(checker, core);
-    return check != null && check.narrowsWhenTrue != conditionHolds && check.path == path;
+    if (check == null || check.narrowsWhenTrue == conditionHolds || check.path != path) {
+        return null;
+    }
+    return new NullComparison(core, conditionHolds);
+}
+
+// The branch of an 'if' that a read is in, where that branch runs only where the place it reads is
+// null: the comparison with 'null' that proves it, whether that comparison is true there, whether the
+// read is in the branch the condition holds in, and whether the branch that runs where the place is
+// not null is written.
+public final class NullBranch {
+    protected string provenBy;
+    protected bool comparisonHolds;
+    protected bool trueBranch;
+    protected bool otherWritten;
+
+    protected constructor(this.provenBy, this.comparisonHolds, this.trueBranch, this.otherWritten);
+
+    public proof() -> string {
+        return this.provenBy;
+    }
+
+    public proofHolds() -> bool {
+        return this.comparisonHolds;
+    }
+
+    public inTrueBranch() -> bool {
+        return this.trueBranch;
+    }
+
+    public otherBranchWritten() -> bool {
+        return this.otherWritten;
+    }
+}
+
+// The 'if' branch 'value' is read in, where that branch runs only where the place 'value' reads is
+// null, or null where no 'if' that encloses the read proves that, the value reads no place, or the
+// branch writes the place before the read. A lambda body is read where the lambda runs, not where it
+// is written, so no branch outside it proves anything of what it reads.
+public nullBranchOf(BodyChecker checker, Expression value) -> NullBranch? {
+    let path = buildNarrowingPath(checker, value);
+    if (path == null) {
+        return null;
+    }
+    SyntaxNode? node = value.parent();
+    while (node != null) {
+        if (node is LambdaExpressionNode) {
+            return null;
+        }
+        if (node is IfStatementNode) {
+            let found = nullBranchIn(checker, node, value, path);
+            if (found != null) {
+                return found;
+            }
+        }
+        node = node.parent();
+    }
+    return null;
+}
+
+// The branch of 'statement' that holds 'value', where it runs only where 'path' is null, or null where
+// the read is in neither branch, no test proves that, or the branch writes the place before the read.
+nullBranchIn(BodyChecker checker, IfStatementNode statement, Expression value, NarrowingPath path)
+        -> NullBranch? {
+    let elseClause = statement.elseClause();
+    bool inThen = within(value.span(), statement.thenBranch().span());
+    bool inElse = elseClause != null && within(value.span(), elseClause.span());
+    if (inThen == inElse) {
+        return null;
+    }
+    let comparison = nullComparison(checker, statement.condition(), inThen, path);
+    if (comparison == null) {
+        return null;
+    }
+    SyntaxNode branch = statement.thenBranch();
+    bool otherWritten = elseClause != null;
+    if (!inThen) {
+        if (elseClause == null) {
+            return null;
+        }
+        otherWritten = true;
+        switch (elseClause.body()) {
+            is BlockNode block -> { branch = block; },
+            is IfStatementNode chained -> { branch = chained; },
+            default -> { return null; },
+        }
+    }
+    if (writesNameBefore(checker, statement.condition(), value.span().start, path)
+            || writesNameBefore(checker, branch, value.span().start, path)
+            || writesNameInLoopAround(checker, value, branch, path)) {
+        return null;
+    }
+    return new NullBranch(wording.oneLineSpelling(comparison.node), comparison.testHolds, inThen,
+        otherWritten);
+}
+
+// Whether a part of 'node' that comes before the offset 'at' writes a local or a parameter named for
+// the root of 'path'.
+writesNameBefore(BodyChecker checker, SyntaxNode node, long at, NarrowingPath path) -> bool {
+    let root = path.root();
+    if (root == null || node.span().start >= at) {
+        return false;
+    }
+    if (node.span().end() <= at) {
+        return writeNamesOf(checker, node).contains(root.name());
+    }
+    for (let child in node.childNodes()) {
+        if (writesNameBefore(checker, child, at, path)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Whether a loop that holds 'value' and lies within 'branch' writes the place 'path' names, so a pass
+// round it reads the place again after the write, when the branch's test no longer proves it null.
+writesNameInLoopAround(BodyChecker checker, Expression value, SyntaxNode branch, NarrowingPath path)
+        -> bool {
+    let root = path.root();
+    if (root == null) {
+        return false;
+    }
+    SyntaxNode? node = value.parent();
+    while (node != null && within(node.span(), branch.span())) {
+        if (isLoopStatement(node) && writeNamesOf(checker, node).contains(root.name())) {
+            return true;
+        }
+        node = node.parent();
+    }
+    return false;
+}
+
+// Whether 'node' is a 'while', 'for' or 'for (... in ...)' loop.
+isLoopStatement(SyntaxNode node) -> bool {
+    return node is WhileStatementNode || node is ForStatementNode || node is ForEachStatementNode;
 }
 
 public applyFacts(BodyChecker checker, List<NarrowingFact> facts) {
