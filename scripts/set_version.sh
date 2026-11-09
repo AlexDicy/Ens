@@ -20,7 +20,7 @@ fi
 
 folder="$(cd "$(dirname "$0")/../selfhost/language/src" && pwd)"
 file="$folder/version.ens"
-updated="$(mktemp)"
+updated="$(mktemp "${TMPDIR:-/tmp}/set_version.XXXXXX")"
 trap 'rm -f "$updated"' EXIT
 if ! awk -v version="$version" '
     /^    export static const string release = "/ {
@@ -34,4 +34,4 @@ if ! awk -v version="$version" '
     echo "'$file' does not declare 'release' once, so the version cannot be written into it" >&2
     exit 1
 fi
-mv "$updated" "$file"
+cat "$updated" > "$file"
