@@ -326,7 +326,8 @@ public oneLevelGuidance(BodyChecker checker, Expression value, Type type) -> str
 }
 
 // The null guidance for 'value' of type 'type' where a use takes it with 'levels' fewer '?'.
-public nullGuidance(BodyChecker checker, Expression value, Type type, long levels) -> string? {
+public nullGuidance(BodyChecker checker, Expression value, Type type, long levels,
+                    string? noFallback = null) -> string? {
     let branches = new List<Expression>();
     for (let branch in syntax.joinValues(value)) {
         if (checker.recordedType(branch) is OptionalType) {
@@ -336,7 +337,7 @@ public nullGuidance(BodyChecker checker, Expression value, Type type, long level
     if (branches.length() == 0 || !isJoin(syntax.unwrapParentheses(value))) {
         let operand = classifyOperand(checker, value, levels, "", false);
         operand.everyLevel = levels == wording.optionalLevels(type);
-        return operandsAdvice([operand]);
+        return operandsAdvice([operand], "", noFallback);
     }
     let operands = new List<NullableOperand>();
     for (let branch in branches) {
@@ -355,8 +356,9 @@ public nullGuidance(BodyChecker checker, Expression value, Type type, long level
             return joinAdvice(checker, value, levels, levels == wording.optionalLevels(type));
         }
     }
-    let advice = operandsAdvice(classified);
-    if (advice == null || advice.endsWith("'??'.") || advice.endsWith("once for each '?'.")) {
+    let advice = operandsAdvice(classified, "", noFallback);
+    if (advice == null || noFallback != null || advice.endsWith("'??'.")
+            || advice.endsWith("once for each '?'.")) {
         return advice;
     }
     string clause = fallbackAdvice(classified, true) ?? "";
@@ -696,13 +698,14 @@ holdsNullCheckBefore(SyntaxNode node, string spelled, long before) -> bool {
 
 // 'opening', which the words 'may be null' continue, with the null guidance for 'value' of type
 // 'type' in a use that takes none of its '?'.
-public maybeNullRefusal(BodyChecker checker, string opening, Expression value, Type type) -> string {
+public maybeNullRefusal(BodyChecker checker, string opening, Expression value, Type type,
+                        string? noFallback = null) -> string {
     long levels = wording.optionalLevels(type);
     string why = "{opening} may be null here.";
     if (levels > 1) {
         why = "{opening} may be null at more than one level.";
     }
-    return withGuidance(checker, why, nullGuidance(checker, value, type, levels));
+    return withGuidance(checker, why, nullGuidance(checker, value, type, levels, noFallback));
 }
 
 // Both operands of a binary operator and their fixes. Two locals that would share a name get
@@ -1833,14 +1836,15 @@ valueConversion(BodyChecker checker, Type target, Type source, Expression? value
 }
 
 // The advice for the operands, said once when both take the same fix. Null when none has advice.
-operandsAdvice(NullableOperand[] operands, string operatorText = "") -> string? {
+// 'noFallback' says why a '??' fallback cannot replace the value, where one cannot.
+operandsAdvice(NullableOperand[] operands, string operatorText = "", string? noFallback = null) -> string? {
     if (operands.length == 2 && operands[0].form() == operands[1].form()
             && operands[0].levels == operands[1].levels && !samePlace(operands[0], operands[1])
             && sameOuterLevels(operands[0], operands[1]) && !operands[0].redeclares()
             && !operands[1].redeclares()
             && operands[0].laterAssignment.length == 0 && operands[1].laterAssignment.length == 0
             && operands[0].endedReason.length == 0 && operands[1].endedReason.length == 0) {
-        let paired = formAdvice(operands, operatorText);
+        let paired = formAdvice(operands, operatorText, noFallback);
         if (paired != null) {
             return paired;
         }
@@ -1848,7 +1852,7 @@ operandsAdvice(NullableOperand[] operands, string operatorText = "") -> string? 
     string advice = "";
     string first = "";
     for (long i = 0; i < operands.length; i++) {
-        let one = formAdvice([operands[i]], operatorText);
+        let one = formAdvice([operands[i]], operatorText, noFallback);
         if (one != null && (i == 0 || (!samePlace(operands[0], operands[i]) && one != first))) {
             advice = "{advice} {one}";
         }
@@ -1863,8 +1867,9 @@ operandsAdvice(NullableOperand[] operands, string operatorText = "") -> string? 
 }
 
 // The advice for one operand, or for two of the same form, which then share each sentence. Two
-// operands are joined by 'operatorText'.
-formAdvice(NullableOperand[] operands, string operatorText) -> string? {
+// operands are joined by 'operatorText'. 'noFallback' says why a '??' fallback cannot replace the
+// value, where one cannot.
+formAdvice(NullableOperand[] operands, string operatorText, string? noFallback = null) -> string? {
     let first = operands[0];
     if (first.laterAssignment.length > 0) {
         string name = first.spelling;
@@ -1907,9 +1912,12 @@ formAdvice(NullableOperand[] operands, string operatorText) -> string? {
             return storedAdvice(operands);
         },
         Guarded -> {
-            return guardedAdvice(operands, operatorText);
+            return guardedAdvice(operands, operatorText, noFallback);
         },
         NoFix -> {
+            if (noFallback != null) {
+                return null;
+            }
             return fallbackAdvice(operands, false);
         },
         default -> {
@@ -2037,15 +2045,20 @@ storedAdvice(NullableOperand[] operands) -> string? {
 }
 
 // The advice for one or two values read through '?.' or '?[', which is null whenever the value in
-// front of the '?' is null. Two operands are joined by 'operatorText'.
-guardedAdvice(NullableOperand[] operands, string operatorText) -> string? {
+// front of the '?' is null. Two operands are joined by 'operatorText'. 'noFallback' says why a '??'
+// fallback cannot replace the value, which leaves only the null check.
+guardedAdvice(NullableOperand[] operands, string operatorText, string? noFallback) -> string? {
     let first = operands[0];
     let second = operands[operands.length - 1];
     if (second.guard != first.guard && first.held().length > 0 && second.held().length > 0) {
-        return "'{first.spelling}' is null whenever '{first.guard}' is null, and '{second.spelling}' "
-            + "whenever '{second.guard}' is null. Check both for null first ('if ({first.guard} != null "
-            + "&& {second.guard} != null)') and write '{first.held()} {operatorText} {second.held()}', or "
-            + "supply fallbacks with '??'.";
+        string both = "'{first.spelling}' is null whenever '{first.guard}' is null, and "
+            + "'{second.spelling}' whenever '{second.guard}' is null. Check both for null first "
+            + "('if ({first.guard} != null && {second.guard} != null)') and write "
+            + "'{first.held()} {operatorText} {second.held()}'";
+        if (noFallback == null) {
+            return "{both}, or supply fallbacks with '??'.";
+        }
+        return "{both}. {noFallback}";
     }
     if (second.guard != first.guard || (first.held().length == 0) != (second.held().length == 0)) {
         return null;
@@ -2058,10 +2071,16 @@ guardedAdvice(NullableOperand[] operands, string operatorText) -> string? {
     }
     string refusal = "{reads} null whenever '{first.guard}' is null.";
     if (first.held().length == 0) {
-        return "{refusal} Supply a fallback with '??'.";
+        if (noFallback == null) {
+            return "{refusal} Supply a fallback with '??'.";
+        }
+        return null;
     }
-    return "{refusal} Check '{first.guard}' for null first ('if ({first.guard} != null)') and write "
-        + "{plain}, or supply a fallback with '??'.";
+    string check = "Check '{first.guard}' for null first ('if ({first.guard} != null)') and write {plain}";
+    if (noFallback == null) {
+        return "{refusal} {check}, or supply a fallback with '??'.";
+    }
+    return "{refusal} {noFallback} {check}.";
 }
 
 // The advice for one or two operands that read a field or an element, for a check named 'check'.
