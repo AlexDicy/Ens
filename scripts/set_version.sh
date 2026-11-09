@@ -23,8 +23,9 @@ file="$folder/version.ens"
 updated="$(mktemp "${TMPDIR:-/tmp}/set_version.XXXXXX")"
 trap 'rm -f "$updated"' EXIT
 if ! awk -v version="$version" '
-    /^    export static const string release = "/ {
-        print "    export static const string release = \"" version "\";"
+    /^[ \t]*export static const string release = "/ {
+        indent = substr($0, 1, index($0, "export") - 1)
+        print indent "export static const string release = \"" version "\";"
         found++
         next
     }
