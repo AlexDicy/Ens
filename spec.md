@@ -1912,6 +1912,8 @@ let g = [[1, 2], [3, 4]];          // nested literal -> int[][]
 let h = [[1], []];                 // empty inner adopts first inner's type
 ```
 
+A list literal written where a `FrozenList<T>` is declared builds the frozen list from the array its elements make, which becomes its store, so nothing is copied and no `frozen()` call is written: `FrozenList<string> names = ["in", "out", "err"];` gives the same value as `["in", "out", "err"].frozen()`.
+
 `...xs` among the elements puts every element of the array `xs` there, in order, so `[...head, middle, ...tail]` builds one array from two and a value between them.
 Each spread counts as elements of its array's element type for the rules above, so `long[] wide = [...ints, 3L];` converts every element of an `int[]`, and every element is read in the order written before the array is made.
 A spread is written only inside an array literal; a call takes the array itself, and a nullable array is checked for null first.
